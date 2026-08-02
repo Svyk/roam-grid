@@ -1,5 +1,5 @@
-/* Roam Grid v0.2.1 | MIT | generated from src/extension.js */
-const VERSION = "0.2.1";
+/* Roam Grid v0.2.2 | MIT | generated from src/extension.js */
+const VERSION = "0.2.2";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -1003,6 +1003,7 @@ class RegistrySet {
     this.importers = new Map();
     this.exporters = new Map();
     this.dataSources = new Map();
+    this.templates = new Map();
   }
 
   register(map, key, value) {
@@ -1638,6 +1639,9 @@ function createPublicApi() {
     registerImporter: (name, importer) => registries.register(registries.importers, name, importer),
     registerExporter: (name, exporter) => registries.register(registries.exporters, name, exporter),
     registerDataSource: (name, source) => registries.register(registries.dataSources, name, source),
+    registerTemplate: (name, template) => registries.register(registries.templates, name, template),
+    listTemplates: () => [...registries.templates.keys()].sort(),
+    createFromTemplate: async (name) => createNativeTableFromModel(await resolveTemplateModel(name)),
     getTableModel: (tableUid) => {
       const mount = runtime.mounts.get(tableUid);
       if (mount?.model) return deepClone(mount.model.toJSON());
@@ -2608,14 +2612,67 @@ async function createNativeTableFromModel(model, afterUid = null) {
   }
   const adapter = new NativeTableAdapter(tableUid);
   const loaded = adapter.load();
-  loaded.columnIds = [...model.columnIds]; loaded.merges = deepClone(model.merges); loaded.widths = { ...model.widths }; loaded.frozenRows = model.frozenRows; loaded.frozenCols = model.frozenCols; loaded.charts = deepClone(model.charts); loaded.showHeaders = model.showHeaders !== false; loaded.fitToWidth = model.fitToWidth !== false;
+  loaded.columnIds = [...model.columnIds]; loaded.merges = deepClone(model.merges); loaded.widths = { ...model.widths }; loaded.headerColumns = [...model.headerColumns]; loaded.frozenRows = model.frozenRows; loaded.frozenCols = model.frozenCols; loaded.charts = deepClone(model.charts); loaded.showHeaders = model.showHeaders !== false; loaded.fitToWidth = model.fitToWidth !== false;
   for (let row = 0; row < Math.min(model.rowCount, loaded.rowCount); row += 1) {
     loaded.setRowHeight(row, model.getRowHeight(row));
+    if (model.isHeaderRow(row)) loaded.toggleHeaderRow(row);
     for (let col = 0; col < Math.min(model.colCount, loaded.colCount); col += 1) loaded.setAlignment(row, col, model.getAlignment(row, col));
   }
   await runtime.metadata.set(tableUid, loaded, "native");
   scheduleScan();
   return tableUid;
+}
+
+export function mealPrepTemplateModel() {
+  const rows = [
+    ["**Meat + Pasta Meal Prep Calculator**", "", "", "", "", "", "", "", "", "", "", ""],
+    ["Meals", "5", "Replace the example price and nutrition values with the numbers from your package labels.", "", "", "", "", "", "", "", "", ""],
+    ["Ingredient", "Batch g", "$ / 100g", "kcal / 100g", "Protein / 100g", "Carbs / 100g", "Fat / 100g", "Batch cost", "Batch kcal", "Protein g", "Carbs g", "Fat g"],
+    ["Lean ground meat", "1000", "1.20", "200", "26", "0", "10", "=ROUND(B4*C4/100,2)", "=ROUND(B4*D4/100,0)", "=ROUND(B4*E4/100,1)", "=ROUND(B4*F4/100,1)", "=ROUND(B4*G4/100,1)"],
+    ["Dry pasta", "500", "0.35", "350", "12", "72", "1.5", "=ROUND(B5*C5/100,2)", "=ROUND(B5*D5/100,0)", "=ROUND(B5*E5/100,1)", "=ROUND(B5*F5/100,1)", "=ROUND(B5*G5/100,1)"],
+    ["Tomato sauce", "700", "0.45", "60", "2", "10", "1", "=ROUND(B6*C6/100,2)", "=ROUND(B6*D6/100,0)", "=ROUND(B6*E6/100,1)", "=ROUND(B6*F6/100,1)", "=ROUND(B6*G6/100,1)"],
+    ["Mixed vegetables", "500", "0.50", "50", "3", "8", "0.5", "=ROUND(B7*C7/100,2)", "=ROUND(B7*D7/100,0)", "=ROUND(B7*E7/100,1)", "=ROUND(B7*F7/100,1)", "=ROUND(B7*G7/100,1)"],
+    ["Olive oil", "30", "1.60", "884", "0", "0", "100", "=ROUND(B8*C8/100,2)", "=ROUND(B8*D8/100,0)", "=ROUND(B8*E8/100,1)", "=ROUND(B8*F8/100,1)", "=ROUND(B8*G8/100,1)"],
+    ["**BATCH TOTAL**", "", "", "", "", "", "", "=ROUND(SUM(H4:H8),2)", "=ROUND(SUM(I4:I8),0)", "=ROUND(SUM(J4:J8),1)", "=ROUND(SUM(K4:K8),1)", "=ROUND(SUM(L4:L8),1)"],
+    ["**PER MEAL**", "", "", "", "", "", "", "=ROUND(H9/$B$2,2)", "=ROUND(I9/$B$2,0)", "=ROUND(J9/$B$2,1)", "=ROUND(K9/$B$2,1)", "=ROUND(L9/$B$2,1)"],
+  ];
+  const model = new GridModel({ rows, frozenRows: 3, showHeaders: false, fitToWidth: true });
+  model.merge({ startRow: 0, endRow: 0, startCol: 0, endCol: 11 });
+  model.merge({ startRow: 1, endRow: 1, startCol: 2, endCol: 11 });
+  model.merge({ startRow: 8, endRow: 8, startCol: 0, endCol: 6 });
+  model.merge({ startRow: 9, endRow: 9, startCol: 0, endCol: 6 });
+  model.toggleHeaderRow(2);
+
+  [210, 82, 88, 98, 104, 98, 88, 100, 100, 96, 92, 86].forEach((width, col) => { model.widths[model.columnIds[col]] = width; });
+  [42, 44, 50, 34, 34, 34, 34, 34, 40, 42].forEach((height, row) => model.setRowHeight(row, height));
+  model.setAlignment(0, 0, "center");
+  model.setAlignment(1, 0, "right");
+  model.setAlignment(1, 1, "center");
+  model.setAlignment(1, 2, "left");
+  for (let col = 0; col < model.colCount; col += 1) model.setAlignment(2, col, "center");
+  for (let row = 3; row <= 7; row += 1) for (let col = 1; col < model.colCount; col += 1) model.setAlignment(row, col, "right");
+  for (const row of [8, 9]) {
+    model.setAlignment(row, 0, "center");
+    for (let col = 7; col < model.colCount; col += 1) model.setAlignment(row, col, "right");
+  }
+  return model;
+}
+
+async function resolveTemplateModel(name) {
+  const normalized = String(name).toUpperCase();
+  const template = runtime.registries?.templates.get(normalized);
+  if (!template) throw new GridError("TEMPLATE_NOT_FOUND", `Unknown Roam Grid template: ${name}`);
+  const value = typeof template === "function" ? await template() : template;
+  if (value instanceof GridModel) return new GridModel(value.snapshot());
+  if (value?.schema === "roam-grid") return GridModel.fromJSON(deepClone(value));
+  return new GridModel(deepClone(value));
+}
+
+async function newMealPrepCalculator() {
+  try {
+    await createNativeTableFromModel(await resolveTemplateModel("MEAT_PASTA_MEAL_PREP"));
+    toast("Created a Meat + Pasta meal-prep calculator. Replace the example inputs with your package-label values.", "success", 6500);
+  } catch (error) { toast(error.message, "danger", 8000); }
 }
 
 async function copyNativeToLarge(model) {
@@ -2750,6 +2807,7 @@ function registerCommands(extensionAPI) {
   const commands = [
     ["Roam Grid: Enhance this table", enhanceFocusedTable],
     ["Roam Grid: Restore native table", restoreFocusedTable],
+    ["Roam Grid: New meal-prep calculator", newMealPrepCalculator],
     ["Roam Grid: New large grid", newLargeGrid],
     ["Roam Grid: Copy/convert table", convertFocusedGrid],
     ["Roam Grid: Import", importCommand],
@@ -2774,6 +2832,7 @@ async function initializeSettings(extensionAPI) {
 
 async function onload({ extensionAPI }) {
   runtime.extensionAPI = extensionAPI; runtime.registries = new RegistrySet(); runtime.metadata = new MetadataStore();
+  runtime.registries.register(runtime.registries.templates, "MEAT_PASTA_MEAL_PREP", mealPrepTemplateModel);
   await runtime.metadata.initialize(); await initializeSettings(extensionAPI); registerCommands(extensionAPI);
   const publicApi = createPublicApi(); globalThis.window.roamGrid = { ...(globalThis.window.roamGrid || {}), v1: publicApi };
   document.addEventListener("focusin", rememberFocusedUid, true);

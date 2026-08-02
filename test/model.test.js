@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { FormulaEngine, GridError, GridModel, columnLabel, parseCellReference, rewriteFormula } from "../src/extension.js";
+import { FormulaEngine, GridError, GridModel, columnLabel, mealPrepTemplateModel, parseCellReference, rewriteFormula } from "../src/extension.js";
 
 const model = (rows, options = {}) => new GridModel({ rows, ...options });
 
@@ -238,4 +238,16 @@ test("JSON round trip preserves layout", () => {
   assert.equal(roundTrip.isHeaderRow(0), true);
   assert.equal(roundTrip.showHeaders, false);
   assert.equal(roundTrip.fitToWidth, false);
+});
+
+test("meal-prep template calculates batch and per-meal nutrition", () => {
+  const grid = mealPrepTemplateModel();
+  const values = new FormulaEngine(grid).evaluateAll();
+  assert.deepEqual([grid.rowCount, grid.colCount], [10, 12]);
+  assert.equal(grid.merges.length, 4);
+  assert.equal(grid.isHeaderRow(2), true);
+  assert.equal(grid.showHeaders, false);
+  assert.equal(grid.fitToWidth, true);
+  assert.deepEqual(values[8].slice(7), [19.88, 4685, 349, 470, 147]);
+  assert.deepEqual(values[9].slice(7), [3.98, 937, 69.8, 94, 29.4]);
 });

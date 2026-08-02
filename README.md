@@ -55,6 +55,10 @@ The extension deliberately does not use `roam/js`.
 ## Start
 
 - Focus an existing native table and run **Roam Grid: Enhance this table**.
+- Run **Roam Grid: New meal-prep calculator** for an editable Meat + Pasta
+  template that calculates batch cost and per-meal price, calories, protein,
+  carbs, and fat. Replace its illustrative price and nutrition inputs with the
+  values from your own package labels.
 - Run **Roam Grid: New large grid** to insert a file-backed grid.
 - Enhanced-table metadata is stored on `[[roam/grid/metadata]]`; cell contents
   stay in their original Roam blocks.
@@ -101,12 +105,22 @@ count, and sparklines.
 ## Public API
 
 `window.roamGrid.v1` exposes disposable registration methods for safe formula
-functions, renderers/editors, importers/exporters, and data sources, plus
-`getTableModel` and transactional `applyPatch`. Cell editors return an input or
+functions, renderers/editors, importers/exporters, data sources, and reusable
+templates, plus `listTemplates`, `createFromTemplate`, `getTableModel`, and
+transactional `applyPatch`. Cell editors return an input or
 textarea-like element whose `value` is committed through the normal transaction
 path. Registered formula functions
 receive evaluated values only; arbitrary JavaScript or `=elisp:` execution is
 never allowed.
+
+```js
+const dispose = window.roamGrid.v1.registerTemplate("MY_MEAL", () => ({
+  rows: [["Ingredient", "Cost"], ["Pasta", "2.50"]],
+  showHeaders: false,
+}));
+await window.roamGrid.v1.createFromTemplate("MY_MEAL");
+dispose();
+```
 
 ## Showcase
 

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2
+
+- Added a built-in Meat + Pasta Meal Prep Calculator with editable example
+  inputs and formulas for batch cost, calories, protein, carbs, and fat plus
+  per-meal totals.
+- Added disposable template registration, discovery, and creation through
+  `window.roamGrid.v1`, making reusable grid templates an extension point.
+- Preserved UID-backed header-row styling when a generated model becomes a
+  native Roam table.
+
 ## 0.2.1
 
 - Made every visible vertical gridline a direct column-resize target, including
