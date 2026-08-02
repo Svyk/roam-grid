@@ -202,6 +202,22 @@ test("cell alignment follows stable UIDs and merged anchors", () => {
   assert.throws(() => grid.setAlignment(0, 0, "justify"), { code: "ALIGNMENT" });
 });
 
+test("native-style header formatting follows stable row and column IDs", () => {
+  const grid = model([
+    [{ uid: "row-b", raw: "B" }, { uid: "b2", raw: "2" }],
+    [{ uid: "row-a", raw: "A" }, { uid: "a2", raw: "1" }],
+  ], { columnIds: ["c1", "c2"], frozenRows: 0 });
+  grid.toggleHeaderRow(0);
+  grid.toggleHeaderColumn(1);
+  grid.sortBy(0, "asc", 0);
+  assert.equal(grid.isHeaderRow(1), true);
+  assert.equal(grid.isHeaderColumn(1), true);
+  grid.deleteCols(1, 1);
+  assert.deepEqual(grid.headerColumns, []);
+  grid.deleteRows(1, 1);
+  assert.deepEqual(grid.headerRows, []);
+});
+
 test("malformed merge metadata is dropped without touching raw data", () => {
   const grid = model([["a", "hidden"]], { merges: [{ id: "bad", row: 0, col: 0, rowSpan: 1, colSpan: 2 }] });
   assert.equal(grid.merges.length, 0);
@@ -209,7 +225,7 @@ test("malformed merge metadata is dropped without touching raw data", () => {
 });
 
 test("JSON round trip preserves layout", () => {
-  const grid = model([[{ uid: "row-one", raw: "a" }, { uid: "cell-two", raw: "" }]], { columnIds: ["c1", "c2"], widths: { c1: 200 }, rowHeights: { "row-one": 54 }, alignments: { "row-one": "center" }, frozenRows: 1, charts: [{ id: "chart", type: "line" }], showHeaders: false, fitToWidth: false });
+  const grid = model([[{ uid: "row-one", raw: "a" }, { uid: "cell-two", raw: "" }]], { columnIds: ["c1", "c2"], widths: { c1: 200 }, rowHeights: { "row-one": 54 }, alignments: { "row-one": "center" }, headerColumns: ["c1"], headerRows: ["row-one"], frozenRows: 1, charts: [{ id: "chart", type: "line" }], showHeaders: false, fitToWidth: false });
   grid.merge({ startRow: 0, endRow: 0, startCol: 0, endCol: 1 });
   const roundTrip = GridModel.fromJSON(JSON.parse(JSON.stringify(grid.toJSON())));
   assert.deepEqual(roundTrip.rows.map((row) => row.map((cell) => cell.raw)), [["a", ""]]);
@@ -218,6 +234,8 @@ test("JSON round trip preserves layout", () => {
   assert.equal(roundTrip.widths.c1, 200);
   assert.equal(roundTrip.getRowHeight(0), 54);
   assert.equal(roundTrip.getAlignment(0, 0), "center");
+  assert.equal(roundTrip.isHeaderColumn(0), true);
+  assert.equal(roundTrip.isHeaderRow(0), true);
   assert.equal(roundTrip.showHeaders, false);
   assert.equal(roundTrip.fitToWidth, false);
 });

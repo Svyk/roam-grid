@@ -39,9 +39,9 @@ test("content-only native save updates changed block and metadata", async (t) =>
   t.after(() => { delete globalThis.window; });
   const metadata = { get: () => metadataValue, set: async (...args) => {
     metadataWrites.push(args); const saved = args[1];
-    metadataValue = { columnIds: [...saved.columnIds], merges: structuredClone(saved.merges), widths: { ...saved.widths }, rowHeights: { ...saved.rowHeights }, alignments: { ...saved.alignments }, frozenRows: saved.frozenRows, frozenCols: saved.frozenCols, charts: structuredClone(saved.charts), showHeaders: saved.showHeaders, fitToWidth: saved.fitToWidth };
+    metadataValue = { columnIds: [...saved.columnIds], merges: structuredClone(saved.merges), widths: { ...saved.widths }, rowHeights: { ...saved.rowHeights }, alignments: { ...saved.alignments }, headerColumns: [...saved.headerColumns], headerRows: [...saved.headerRows], frozenRows: saved.frozenRows, frozenCols: saved.frozenCols, charts: structuredClone(saved.charts), showHeaders: saved.showHeaders, fitToWidth: saved.fitToWidth };
   } };
-  const adapter = new NativeTableAdapter("table0001", metadata); const model = adapter.load(); model.setRaw(1, 1, "42"); model.widths[model.columnIds[0]] = 212; model.setRowHeight(1, 46); model.setAlignment(1, 1, "right"); model.fitToWidth = false;
+  const adapter = new NativeTableAdapter("table0001", metadata); const model = adapter.load(); model.setRaw(1, 1, "42"); model.widths[model.columnIds[0]] = 212; model.setRowHeight(1, 46); model.setAlignment(1, 1, "right"); model.toggleHeaderColumn(0); model.toggleHeaderRow(1); model.fitToWidth = false;
   const saved = await adapter.save(model);
   assert.deepEqual(updates, [{ uid: "cell00002", string: "42" }]);
   assert.equal(metadataWrites.length, 1);
@@ -50,6 +50,8 @@ test("content-only native save updates changed block and metadata", async (t) =>
   assert.equal(saved.getRaw(1, 1), "42");
   assert.equal(saved.getRowHeight(1), 46);
   assert.equal(saved.getAlignment(1, 1), "right");
+  assert.equal(saved.isHeaderColumn(0), true);
+  assert.equal(saved.isHeaderRow(1), true);
   assert.equal(saved.fitToWidth, false);
 });
 

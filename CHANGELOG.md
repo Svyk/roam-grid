@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.1
+
+- Made every visible vertical gridline a direct column-resize target, including
+  clean tables with row/column labels hidden.
+- Added right-edge and bottom-edge resize grips to the selected cell. For a
+  merged cell, the grips resize its outermost column and row.
+- Made responsive column dragging track the rendered width directly and then
+  persist the resulting proportions without a first-drag jump.
+- Added Roam-native top/left cell grabbers with familiar header, sort, insert,
+  clear, and delete actions, followed by a separated Roam Grid action section.
+- Made the grabber menus compatible with native table-menu augmentations, so
+  the existing Live AI row/column commands can inject and keep using the
+  transactional Roam Grid adapter.
+
 ## 0.2.0
 
 - Added drag, exact-pixel, compact, and automatic per-row sizing with stable

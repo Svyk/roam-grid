@@ -64,15 +64,23 @@ The extension deliberately does not use `roam/js`.
 ## Interaction
 
 - Arrow keys navigate; typing, Enter, or F2 edits; Tab advances; Escape cancels.
-- Drag across cells to select a rectangle. Drag headers to reorder, the header
-  edge to resize columns, any row boundary to resize that individual row, a
-  selected range to move it, or the fill handle to repeat it. Double-click a
+- Drag across cells to select a rectangle. Drag headers to reorder, any vertical
+  gridline or a selected cell's right edge to resize its column, and the
+  selected cell's bottom edge or any horizontal boundary to resize its row.
+  These grips remain available when A/B/C and row labels are hidden. On a
+  merged cell they control the merge's outermost row or column. Double-click a
   resize edge to restore automatic sizing.
 - Row heights and column widths are stored per table. Row sizes follow their
   stable Roam row UID through sorting and reordering; both dimensions survive
   extension reloads, native/large-grid copies, and large-grid manifest saves.
 - The `⋯` menu can set exact pixel sizes, compact selected rows to 24 px, or
   reset selected rows/columns to automatic sizing—even when labels are hidden.
+- Selecting a cell also reveals Roam-style column and row grabbers. Their menus
+  retain the familiar header, sorting, insertion, clearing, and deletion
+  actions, then add a separate **Roam Grid** section for merges, sizing,
+  alignment, references, charts, and conversion. The menu exposes the native
+  compatibility hooks used by Live AI, whose injected table commands continue
+  to write through `window.roamGrid.v1`.
 - Tables fit the available Roam pane by default, preserving saved column-width
   ratios so every stage stays visible in a smaller window. The `⋯` menu can
   switch back to fixed widths and horizontal scrolling when preferred.

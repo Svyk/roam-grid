@@ -167,6 +167,29 @@ body.roam-body.dark .rg-root {
   background: color-mix(in srgb, var(--rg-active) 45%, transparent);
 }
 
+.rg-column-resize-track {
+  z-index: 13;
+  width: 9px;
+  margin-right: -5px;
+  justify-self: end;
+  cursor: col-resize;
+  pointer-events: auto;
+}
+
+.rg-column-resize-track::after {
+  content: "";
+  display: block;
+  width: 2px;
+  height: 100%;
+  margin-left: 3px;
+  background: transparent;
+}
+
+.rg-column-resize-track:hover::after,
+.rg-column-resize-track:active::after {
+  background: color-mix(in srgb, var(--rg-active) 55%, transparent);
+}
+
 .rg-row-resize {
   z-index: 14;
   align-self: end;
@@ -250,7 +273,118 @@ body.roam-body.dark .rg-root {
 
 .rg-cell--active {
   z-index: 4;
+  overflow: visible;
   box-shadow: inset 0 0 0 2px var(--rg-active);
+}
+
+.rg-cell--header {
+  font-weight: 600;
+  background: var(--rg-header);
+}
+
+.rg-native-pill-proxy {
+  display: contents;
+}
+
+.rg-axis-grabber {
+  position: absolute;
+  z-index: 19;
+  display: grid;
+  padding: 0;
+  border: 1px solid var(--rg-bg);
+  outline: none;
+  box-shadow: 0 1px 3px rgb(17 20 24 / 22%);
+  cursor: pointer;
+}
+
+.rg-axis-grabber--column {
+  top: 0;
+  left: 50%;
+  grid-template-columns: repeat(3, 3px);
+  grid-template-rows: repeat(2, 3px);
+  gap: 2px;
+  width: 39px;
+  height: 19px;
+  place-content: center;
+  color: #fff;
+  background: var(--rg-active);
+  border-radius: 6px;
+  transform: translate(-50%, -44%);
+}
+
+.rg-axis-grabber--column i {
+  width: 3px;
+  height: 3px;
+  background: currentColor;
+  border-radius: 50%;
+  pointer-events: none;
+}
+
+.rg-axis-grabber--row {
+  top: 50%;
+  left: 0;
+  width: 10px;
+  height: 35px;
+  background: color-mix(in srgb, var(--rg-muted) 42%, var(--rg-bg));
+  border-radius: 6px;
+  transform: translate(-44%, -50%);
+}
+
+.rg-axis-grabber:hover,
+.rg-axis-grabber.bp3-popover-open {
+  background: var(--rg-active);
+}
+
+.rg-cell-width-resize,
+.rg-cell-height-resize {
+  position: absolute;
+  z-index: 17;
+  display: block;
+}
+
+.rg-cell-width-resize {
+  top: 10px;
+  right: 0;
+  bottom: 14px;
+  width: 8px;
+  cursor: col-resize;
+}
+
+.rg-cell-height-resize {
+  right: 14px;
+  bottom: 0;
+  left: 10px;
+  height: 8px;
+  cursor: row-resize;
+}
+
+.rg-cell-width-resize::after,
+.rg-cell-height-resize::after {
+  content: "";
+  position: absolute;
+  background: color-mix(in srgb, var(--rg-active) 65%, transparent);
+  border-radius: 2px;
+}
+
+.rg-cell-width-resize::after {
+  top: 25%;
+  right: 1px;
+  width: 2px;
+  height: 50%;
+}
+
+.rg-cell-height-resize::after {
+  bottom: 1px;
+  left: 25%;
+  width: 50%;
+  height: 2px;
+}
+
+.rg-cell-width-resize:hover::after,
+.rg-cell-width-resize:active::after,
+.rg-cell-height-resize:hover::after,
+.rg-cell-height-resize:active::after {
+  background: var(--rg-active);
 }
 
 .rg-cell--error {
@@ -336,10 +470,13 @@ body.roam-body.dark .rg-root {
   border: 1px solid rgb(0 0 0 / 16%);
   border-radius: 6px;
   box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
+  list-style: none;
 }
 
 .rg-context-menu .bp3-menu-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 9px;
   width: 100%;
   padding: 6px 9px;
   text-align: left;
@@ -350,6 +487,69 @@ body.roam-body.dark .rg-root {
 
 .rg-context-menu .bp3-menu-item:hover {
   background: rgb(91 141 239 / 14%);
+}
+
+.rg-axis-menu {
+  min-width: 270px;
+}
+
+.rg-axis-menu > li {
+  list-style: none;
+}
+
+.rg-context-menu .bp3-menu-divider {
+  height: 1px;
+  margin: 5px 4px;
+  padding: 0;
+  background: color-mix(in srgb, var(--rg-border-strong, var(--bc-menu, #c5cbd3)) 70%, transparent);
+  border: 0;
+}
+
+.rg-menu-section {
+  padding: 5px 9px 3px;
+  color: var(--cl-gray-500, #738091);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+}
+
+.rg-context-menu .bp3-icon {
+  flex: 0 0 16px;
+  color: var(--cl-gray-550, #5f6b7c);
+}
+
+.rg-menu-item-label {
+  flex: 1 1 auto;
+}
+
+.rg-menu-switch {
+  position: relative;
+  flex: 0 0 31px;
+  width: 31px;
+  height: 18px;
+  background: color-mix(in srgb, var(--rg-muted, var(--cl-gray-550, #5f6b7c)) 28%, transparent);
+  border-radius: 10px;
+}
+
+.rg-menu-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  background: var(--rg-bg, var(--bc-main, #fff));
+  border-radius: 50%;
+  box-shadow: 0 1px 2px rgb(17 20 24 / 30%);
+  transition: transform 100ms ease;
+}
+
+.rg-menu-switch--on {
+  background: var(--rg-active, var(--cl-blue, #2d72d2));
+}
+
+.rg-menu-switch--on::after {
+  transform: translateX(13px);
 }
 
 .rg-toasts {

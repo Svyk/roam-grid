@@ -1,4 +1,4 @@
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -402,7 +402,7 @@ function normalizeCells(rows, width) {
 }
 
 export class GridModel {
-  constructor({ rows = [[]], tableUid = null, columnIds = [], merges = [], widths = {}, rowHeights = {}, alignments = {}, frozenRows = 1, frozenCols = 0, charts = [], showHeaders = true, fitToWidth = true, revision = null } = {}) {
+  constructor({ rows = [[]], tableUid = null, columnIds = [], merges = [], widths = {}, rowHeights = {}, alignments = {}, headerColumns = [], headerRows = [], frozenRows = 1, frozenCols = 0, charts = [], showHeaders = true, fitToWidth = true, revision = null } = {}) {
     const width = Math.max(1, columnIds.length, ...rows.map((row) => row.length));
     this.tableUid = tableUid;
     this.rows = normalizeCells(rows.length ? rows : [[]], width);
@@ -411,6 +411,9 @@ export class GridModel {
     this.widths = { ...widths };
     this.rowHeights = { ...rowHeights };
     this.alignments = { ...alignments };
+    this.headerColumns = [...new Set(headerColumns)].filter((id) => this.columnIds.includes(id));
+    const availableRowKeys = new Set(this.rows.map((row) => row[0]?.uid).filter(Boolean));
+    this.headerRows = [...new Set(headerRows)].filter((id) => availableRowKeys.has(id));
     this.frozenRows = clamp(Number(frozenRows) || 0, 0, this.rows.length);
     this.frozenCols = clamp(Number(frozenCols) || 0, 0, width);
     this.charts = deepClone(charts);
@@ -458,10 +461,22 @@ export class GridModel {
     else if (["left", "center", "right"].includes(alignment)) this.alignments[key] = alignment;
     else throw new GridError("ALIGNMENT", `Unsupported alignment: ${alignment}`);
   }
+  isHeaderColumn(col) { return this.headerColumns.includes(this.columnIds[col]); }
+  isHeaderRow(row) { return this.headerRows.includes(this.rowKey(row)); }
+  toggleHeaderColumn(col) {
+    const id = this.columnIds[col];
+    if (!id) throw new GridError("OUT_OF_BOUNDS", `Column ${columnLabel(col)} is outside the grid`);
+    this.headerColumns = this.headerColumns.includes(id) ? this.headerColumns.filter((value) => value !== id) : [...this.headerColumns, id];
+  }
+  toggleHeaderRow(row) {
+    const id = this.rowKey(row);
+    if (!id) throw new GridError("OUT_OF_BOUNDS", `Row ${row + 1} is outside the grid`);
+    this.headerRows = this.headerRows.includes(id) ? this.headerRows.filter((value) => value !== id) : [...this.headerRows, id];
+  }
 
   snapshot() {
     return {
-      rows: deepClone(this.rows), columnIds: [...this.columnIds], merges: deepClone(this.merges), widths: { ...this.widths }, rowHeights: { ...this.rowHeights }, alignments: { ...this.alignments },
+      rows: deepClone(this.rows), columnIds: [...this.columnIds], merges: deepClone(this.merges), widths: { ...this.widths }, rowHeights: { ...this.rowHeights }, alignments: { ...this.alignments }, headerColumns: [...this.headerColumns], headerRows: [...this.headerRows],
       frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: deepClone(this.charts), showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, revision: this.revision,
     };
   }
@@ -473,6 +488,8 @@ export class GridModel {
     this.widths = { ...snapshot.widths };
     this.rowHeights = { ...(snapshot.rowHeights || {}) };
     this.alignments = { ...(snapshot.alignments || {}) };
+    this.headerColumns = [...(snapshot.headerColumns || [])];
+    this.headerRows = [...(snapshot.headerRows || [])];
     this.frozenRows = snapshot.frozenRows;
     this.frozenCols = snapshot.frozenCols;
     this.charts = deepClone(snapshot.charts);
@@ -604,6 +621,7 @@ export class GridModel {
     const removedCellKeys = removedRows.flat().map((cell) => cell.uid);
     this.rows.splice(start, end - start + 1);
     for (const key of removedRowKeys) delete this.rowHeights[key];
+    this.headerRows = this.headerRows.filter((key) => !removedRowKeys.includes(key));
     for (const key of removedCellKeys) delete this.alignments[key];
     const next = [];
     for (const merge of this.merges) {
@@ -651,6 +669,7 @@ export class GridModel {
     const removedCellKeys = this.rows.flatMap((row) => row.slice(start, end + 1).map((cell) => cell.uid));
     const removedIds = this.columnIds.splice(start, removed);
     for (const id of removedIds) delete this.widths[id];
+    this.headerColumns = this.headerColumns.filter((id) => !removedIds.includes(id));
     for (const key of removedCellKeys) delete this.alignments[key];
     for (const row of this.rows) row.splice(start, removed);
     const next = [];
@@ -744,7 +763,7 @@ export class GridModel {
   }
 
   toJSON() {
-    return { schema: "roam-grid", version: 1, tableUid: this.tableUid, rows: this.rows, columnIds: this.columnIds, merges: this.merges, widths: this.widths, rowHeights: this.rowHeights, alignments: this.alignments, frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: this.charts, showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, revision: this.revision };
+    return { schema: "roam-grid", version: 1, tableUid: this.tableUid, rows: this.rows, columnIds: this.columnIds, merges: this.merges, widths: this.widths, rowHeights: this.rowHeights, alignments: this.alignments, headerColumns: this.headerColumns, headerRows: this.headerRows, frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: this.charts, showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, revision: this.revision };
   }
 
   static fromJSON(value) {
@@ -1110,13 +1129,13 @@ class MetadataStore {
   get(tableUid) {
     const value = this.entries.get(tableUid)?.value;
     if (!value) return null;
-    return { columnIds: value.columnIds || [], merges: value.merges || [], widths: value.widths || {}, rowHeights: value.rowHeights || {}, alignments: value.alignments || {}, frozenRows: value.frozenRows ?? 1, frozenCols: value.frozenCols ?? 0, charts: value.charts || [], showHeaders: value.showHeaders !== false, fitToWidth: value.fitToWidth !== false };
+    return { columnIds: value.columnIds || [], merges: value.merges || [], widths: value.widths || {}, rowHeights: value.rowHeights || {}, alignments: value.alignments || {}, headerColumns: value.headerColumns || [], headerRows: value.headerRows || [], frozenRows: value.frozenRows ?? 1, frozenCols: value.frozenCols ?? 0, charts: value.charts || [], showHeaders: value.showHeaders !== false, fitToWidth: value.fitToWidth !== false };
   }
 
   has(tableUid) { return this.entries.has(tableUid); }
 
   async set(tableUid, model, mode = "native") {
-    const value = { schema: 1, mode, tableUid, columnIds: model.columnIds, merges: model.merges, widths: model.widths, rowHeights: model.rowHeights, alignments: model.alignments, frozenRows: model.frozenRows, frozenCols: model.frozenCols, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, updatedAt: new Date().toISOString() };
+    const value = { schema: 1, mode, tableUid, columnIds: model.columnIds, merges: model.merges, widths: model.widths, rowHeights: model.rowHeights, alignments: model.alignments, headerColumns: model.headerColumns, headerRows: model.headerRows, frozenRows: model.frozenRows, frozenCols: model.frozenCols, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, updatedAt: new Date().toISOString() };
     const string = `${METADATA_PREFIX} ${JSON.stringify(value)}`;
     const entry = this.entries.get(tableUid);
     const blockUid = entry ? entry.blockUid : await createBlock(this.pageUid, string);
@@ -1802,6 +1821,7 @@ export class GridView {
       }
       grid.appendChild(this.rowResizeHandle(row, offset));
     }
+    this.model.columnIds.forEach((id, col) => grid.appendChild(this.columnResizeHandle(id, col, offset)));
     viewport.appendChild(grid);
     this.root.appendChild(viewport);
     if (this.model.charts.length) {
@@ -1831,7 +1851,10 @@ export class GridView {
 
   applyGridTemplateColumns(grid = this.gridElement) {
     if (!grid) return;
-    const widths = this.model.columnIds.map((id) => this.columnResizePreview?.id === id ? this.columnResizePreview.width : this.model.widths[id] || DEFAULT_COL_WIDTH);
+    const widths = this.model.columnIds.map((id) => {
+      if (this.columnResizePreview?.id === id) return this.columnResizePreview.width;
+      return this.columnResizePreview?.baseWidths?.[id] || this.model.widths[id] || DEFAULT_COL_WIDTH;
+    });
     grid.style.width = this.model.fitToWidth ? "100%" : "max-content";
     grid.style.gridTemplateColumns = `${this.model.showHeaders ? "42px " : ""}${widths.map((width) => this.model.fitToWidth ? `minmax(${MIN_COL_WIDTH}px, ${width}fr)` : `${width}px`).join(" ")}`;
   }
@@ -1847,17 +1870,23 @@ export class GridView {
 
   startColumnResize(id, event) {
     event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.();
-    const startX = event.clientX; const startWidth = this.model.widths[id] || DEFAULT_COL_WIDTH; let moved = false;
+    const offset = this.model.showHeaders ? 1 : 0;
+    const resolvedTracks = getComputedStyle(this.gridElement).gridTemplateColumns.split(/\s+/);
+    const baseWidths = Object.fromEntries(this.model.columnIds.map((columnId, col) => [columnId, Number.parseFloat(resolvedTracks[col + offset]) || this.model.widths[columnId] || DEFAULT_COL_WIDTH]));
+    const startX = event.clientX; const startWidth = baseWidths[id]; let moved = false;
     const move = (moveEvent) => {
       moved = true;
-      this.columnResizePreview = { id, width: clamp(Math.round(startWidth + moveEvent.clientX - startX), MIN_COL_WIDTH, MAX_COL_WIDTH) };
+      this.columnResizePreview = { id, baseWidths: this.model.fitToWidth ? baseWidths : null, width: clamp(Math.round(startWidth + moveEvent.clientX - startX), MIN_COL_WIDTH, MAX_COL_WIDTH) };
       this.applyGridTemplateColumns();
     };
     const up = () => {
       const width = this.columnResizePreview?.width ?? startWidth;
       cleanup(); this.columnResizePreview = null;
       if (!moved) return;
-      this.commitMutation("Resize column", () => { this.model.widths[id] = width; }, true);
+      this.commitMutation("Resize column", () => {
+        if (this.model.fitToWidth) Object.assign(this.model.widths, baseWidths);
+        this.model.widths[id] = width;
+      }, true);
     };
     const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
     this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
@@ -1878,6 +1907,15 @@ export class GridView {
     resize.title = "Drag to resize row · double-click to auto-fit";
     resize.addEventListener("pointerdown", (event) => this.startRowResize(row, event));
     resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.commitMutation("Auto-fit row", () => this.model.setRowHeight(row, null), true); });
+    return resize;
+  }
+
+  columnResizeHandle(id, col, offset) {
+    const resize = document.createElement("span"); resize.className = "rg-column-resize-track"; resize.dataset.col = String(col);
+    resize.style.gridRow = `${1 + offset} / -1`; resize.style.gridColumn = String(col + 1 + offset);
+    resize.title = `Drag any ${columnLabel(col)} column edge to resize · double-click to auto-fit`;
+    resize.addEventListener("pointerdown", (event) => this.startColumnResize(id, event));
+    resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.commitMutation("Auto-fit column", () => { delete this.model.widths[id]; }, true); });
     return resize;
   }
 
@@ -1906,6 +1944,7 @@ export class GridView {
     const cell = document.createElement("div");
     cell.className = "rg-cell"; cell.dataset.row = String(row); cell.dataset.col = String(col); cell.tabIndex = -1;
     cell.classList.toggle("rg-cell--merged", Boolean(merge));
+    cell.classList.toggle("rg-cell--header", this.model.isHeaderRow(row) || this.model.isHeaderColumn(col));
     const alignment = this.model.getAlignment(row, col);
     if (alignment) cell.classList.add(`rg-cell--align-${alignment}`);
     cell.style.gridRow = `${row + 1 + offset} / span ${merge?.rowSpan || 1}`; cell.style.gridColumn = `${col + 1 + offset} / span ${merge?.colSpan || 1}`;
@@ -1955,6 +1994,7 @@ export class GridView {
 
   updateSelection() {
     this.root.querySelectorAll(".rg-cell--selected,.rg-cell--active").forEach((cell) => cell.classList.remove("rg-cell--selected", "rg-cell--active"));
+    this.root.querySelectorAll(".rg-cell-width-resize,.rg-cell-height-resize,.rg-native-pill-proxy").forEach((handle) => handle.remove());
     for (const cell of this.cells.values()) {
       const row = Number(cell.dataset.row); const col = Number(cell.dataset.col);
       const merge = this.model.mergeAt(row, col);
@@ -1964,6 +2004,19 @@ export class GridView {
     const activeMerge = this.model.mergeAt(this.selection.startRow, this.selection.startCol);
     const active = this.cells.get(`${activeMerge?.row ?? this.selection.startRow}:${activeMerge?.col ?? this.selection.startCol}`);
     active?.classList.add("rg-cell--active");
+    if (active) {
+      const anchorRow = activeMerge?.row ?? this.selection.startRow;
+      const anchorCol = activeMerge?.col ?? this.selection.startCol;
+      const edgeRow = anchorRow + (activeMerge?.rowSpan || 1) - 1;
+      const edgeCol = anchorCol + (activeMerge?.colSpan || 1) - 1;
+      const widthHandle = document.createElement("span"); widthHandle.className = "rg-cell-width-resize"; widthHandle.title = `Resize column ${columnLabel(edgeCol)}`;
+      widthHandle.addEventListener("pointerdown", (event) => this.startColumnResize(this.model.columnIds[edgeCol], event));
+      widthHandle.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.commitMutation("Auto-fit column", () => { delete this.model.widths[this.model.columnIds[edgeCol]]; }, true); });
+      const heightHandle = document.createElement("span"); heightHandle.className = "rg-cell-height-resize"; heightHandle.title = `Resize row ${edgeRow + 1}`;
+      heightHandle.addEventListener("pointerdown", (event) => this.startRowResize(edgeRow, event));
+      heightHandle.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.commitMutation("Auto-fit row", () => this.model.setRowHeight(edgeRow, null), true); });
+      active.append(widthHandle, heightHandle, this.axisGrabber("column", anchorCol), this.axisGrabber("row", anchorRow));
+    }
     this.root.querySelector(".rg-fill-handle")?.remove();
     const endMerge = this.model.mergeAt(this.selection.endRow, this.selection.endCol);
     const end = this.cells.get(`${endMerge?.row ?? this.selection.endRow}:${endMerge?.col ?? this.selection.endCol}`);
@@ -1972,6 +2025,22 @@ export class GridView {
       handle.addEventListener("pointerdown", (event) => { event.preventDefault(); event.stopPropagation(); this.fillStart = deepClone(this.selection); this.fillTarget = { row: this.selection.endRow, col: this.selection.endCol }; });
       end.appendChild(handle);
     }
+  }
+
+  axisGrabber(type, index) {
+    const proxy = document.createElement("td");
+    proxy.className = `rg-native-pill-proxy rg-native-pill-proxy--${type}`;
+    proxy.dataset[type === "row" ? "row" : "col"] = String(index);
+    const grip = document.createElement("button");
+    grip.type = "button";
+    grip.className = `rg-axis-grabber rg-axis-grabber--${type} rm-table__${type === "row" ? "row" : "col"}-pill-target`;
+    grip.title = `${type === "row" ? "Row" : "Column"} ${type === "row" ? index + 1 : columnLabel(index)} menu`;
+    grip.setAttribute("aria-label", grip.title);
+    if (type === "column") for (let dot = 0; dot < 6; dot += 1) grip.appendChild(document.createElement("i"));
+    grip.addEventListener("pointerdown", (event) => { event.preventDefault(); event.stopPropagation(); });
+    grip.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); this.openAxisMenu(type, index, grip); });
+    proxy.appendChild(grip);
+    return proxy;
   }
 
   finishPointerAction() {
@@ -2093,6 +2162,31 @@ export class GridView {
   unmergeSelection() { this.commitMutation("Unmerge cells", () => { if (!this.model.unmerge(this.selection.startRow, this.selection.startCol)) throw new GridError("NOT_MERGED", "The active cell is not merged"); }, true); }
   insertRow() { const row = this.selection.endRow + 1; this.commitMutation("Insert row", () => this.model.insertRows(row, 1), true); this.select({ startRow: row, endRow: row, startCol: this.selection.startCol, endCol: this.selection.startCol }); }
   insertCol() { const col = this.selection.endCol + 1; this.commitMutation("Insert column", () => this.model.insertCols(col, 1), true); this.select({ startRow: this.selection.startRow, endRow: this.selection.startRow, startCol: col, endCol: col }); }
+  insertAxis(type, index, after) {
+    const at = clamp(index + (after ? 1 : 0), 0, type === "row" ? this.model.rowCount : this.model.colCount);
+    const row = type === "row" ? at : this.selection.startRow;
+    const col = type === "column" ? at : this.selection.startCol;
+    return this.commitMutation(`Insert ${type}`, () => type === "row" ? this.model.insertRows(at, 1) : this.model.insertCols(at, 1), true).then((model) => {
+      if (model) this.select({ startRow: clamp(row, 0, this.model.rowCount - 1), endRow: clamp(row, 0, this.model.rowCount - 1), startCol: clamp(col, 0, this.model.colCount - 1), endCol: clamp(col, 0, this.model.colCount - 1) });
+    });
+  }
+  deleteAxis(type, index) {
+    return this.commitMutation(`Delete ${type}`, () => type === "row" ? this.model.deleteRows(index, 1) : this.model.deleteCols(index, 1), true).then((model) => {
+      if (!model) return;
+      const row = clamp(type === "row" ? index : this.selection.startRow, 0, this.model.rowCount - 1);
+      const col = clamp(type === "column" ? index : this.selection.startCol, 0, this.model.colCount - 1);
+      this.select({ startRow: row, endRow: row, startCol: col, endCol: col });
+    });
+  }
+  clearAxis(type, index) {
+    return this.commitMutation(`Clear ${type}`, () => {
+      if (type === "row") for (let col = 0; col < this.model.colCount; col += 1) { if (!this.model.isCovered(index, col)) this.model.setRaw(index, col, ""); }
+      else for (let row = 0; row < this.model.rowCount; row += 1) { if (!this.model.isCovered(row, index)) this.model.setRaw(row, index, ""); }
+    }, false);
+  }
+  toggleAxisHeader(type, index) {
+    return this.commitMutation(`Toggle header ${type}`, () => type === "row" ? this.model.toggleHeaderRow(index) : this.model.toggleHeaderColumn(index), true);
+  }
   undo() { if (this.model.undo()) { this.render(); this.markChanged(true); } }
   redo() { if (this.model.redo()) { this.render(); this.markChanged(true); } }
 
@@ -2103,9 +2197,11 @@ export class GridView {
   }
 
   openMenu(anchor, x = null, y = null) {
-    document.querySelector(".rg-context-menu")?.remove();
+    const existing = document.querySelector(".rg-context-menu"); existing?.__rgDismiss?.(); existing?.remove();
     const menu = document.createElement("div"); menu.className = "bp3-menu rg-context-menu";
-    const item = (label, action) => { const element = button(label, label, () => { menu.remove(); action(); }); element.className = "bp3-menu-item"; return element; };
+    let closed = false;
+    const dismiss = () => { if (closed) return; closed = true; menu.remove(); document.removeEventListener("pointerdown", close, true); };
+    const item = (label, action) => { const element = button(label, label, () => { dismiss(); action(); }); element.className = "bp3-menu-item"; return element; };
     menu.append(
       item("Merge selection", () => this.mergeSelection()), item("Unmerge", () => this.unmergeSelection()),
       item("Insert row below", () => this.insertRow()), item("Insert column right", () => this.insertCol()),
@@ -2128,10 +2224,87 @@ export class GridView {
       item("Sort descending", () => this.commitMutation("Sort rows", () => this.model.sortBy(this.selection.startCol, "desc"), true)),
       item("Copy to large grid", () => copyNativeToLarge(this.model))
     );
+    menu.__rgDismiss = dismiss;
     document.body.appendChild(menu);
     const rect = anchor.getBoundingClientRect(); menu.style.left = `${x ?? rect.left}px`; menu.style.top = `${y ?? rect.bottom}px`;
-    const close = (event) => { if (!menu.contains(event.target)) { menu.remove(); document.removeEventListener("pointerdown", close, true); } };
+    const close = (event) => { if (!menu.contains(event.target)) dismiss(); };
     setTimeout(() => document.addEventListener("pointerdown", close, true));
+  }
+
+  openAxisMenu(type, index, anchor) {
+    const existing = document.querySelector(".rg-context-menu"); existing?.__rgDismiss?.(); existing?.remove();
+    document.querySelectorAll(".rg-axis-grabber.bp3-popover-open").forEach((grip) => grip.classList.remove("bp3-popover-open"));
+    anchor.classList.add("bp3-popover-open");
+    const menu = document.createElement("ul"); menu.className = "bp3-menu rg-context-menu rg-axis-menu"; menu.dataset.axis = type; menu.dataset.index = String(index);
+    let closed = false;
+    const dismiss = () => {
+      if (closed) return; closed = true; menu.remove(); anchor.classList.remove("bp3-popover-open");
+      document.removeEventListener("pointerdown", closeOutside, true); document.removeEventListener("keydown", closeOnEscape, true);
+    };
+    const closeOutside = (event) => { if (!menu.contains(event.target) && event.target !== anchor) dismiss(); };
+    const closeOnEscape = (event) => { if (event.key === "Escape") dismiss(); };
+    const item = (label, action, { icon = null, className = "", checked = null } = {}) => {
+      const wrapper = document.createElement("li");
+      const element = document.createElement("button"); element.type = "button"; element.className = `bp3-menu-item ${className}`.trim();
+      if (icon) { const iconElement = document.createElement("span"); iconElement.className = `bp3-icon bp3-icon-${icon}`; element.appendChild(iconElement); }
+      const text = document.createElement("span"); text.className = "bp3-fill rg-menu-item-label"; text.textContent = label; element.appendChild(text);
+      if (checked != null) { const toggle = document.createElement("span"); toggle.className = `rg-menu-switch${checked ? " rg-menu-switch--on" : ""}`; toggle.setAttribute("aria-hidden", "true"); element.appendChild(toggle); }
+      element.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); dismiss(); action(); });
+      wrapper.appendChild(element); return wrapper;
+    };
+    const divider = () => { const element = document.createElement("li"); element.className = "bp3-menu-divider"; return element; };
+    const section = (label) => { const element = document.createElement("li"); element.className = "rg-menu-section"; element.textContent = label; return element; };
+    const headerOn = type === "row" ? this.model.isHeaderRow(index) : this.model.isHeaderColumn(index);
+    menu.append(section(type === "row" ? `ROW ${index + 1}` : `COLUMN ${columnLabel(index)}`));
+    menu.append(item(`Header ${type}`, () => this.toggleAxisHeader(type, index), { checked: headerOn }));
+    if (type === "column") {
+      menu.append(
+        item("Sort ascending", () => this.commitMutation("Sort rows", () => this.model.sortBy(index, "asc"), true), { icon: "sort" }),
+        item("Sort descending", () => this.commitMutation("Sort rows", () => this.model.sortBy(index, "desc"), true), { icon: "sort-desc" }),
+        item("Insert left", () => this.insertAxis("column", index, false), { icon: "arrow-left" }),
+        item("Insert right", () => this.insertAxis("column", index, true), { icon: "arrow-right" })
+      );
+    } else {
+      menu.append(
+        item("Insert above", () => this.insertAxis("row", index, false), { icon: "arrow-up" }),
+        item("Insert below", () => this.insertAxis("row", index, true), { icon: "arrow-down" })
+      );
+    }
+    menu.append(
+      item("Clear contents", () => this.clearAxis(type, index), { icon: "cross" }),
+      item(`Delete ${type}`, () => this.deleteAxis(type, index), { icon: "trash", className: "rm-table__delete-col" }),
+      divider(), section("ROAM GRID"),
+      item("Merge selection", () => this.mergeSelection()), item("Unmerge", () => this.unmergeSelection()),
+      item("Insert chart", () => this.insertChart()),
+      item("Set selected row height…", () => this.setSelectedRowHeight()),
+      item("Compact selected rows", () => this.resizeSelectedRows(24)),
+      item("Auto-fit selected rows", () => this.resizeSelectedRows(null)),
+      item("Set selected column width…", () => this.setSelectedColumnWidth()),
+      item("Reset selected column widths", () => this.resizeSelectedColumns(null)),
+      item("Align left", () => this.alignSelection("left")),
+      item("Align center", () => this.alignSelection("center")),
+      item("Align right", () => this.alignSelection("right")),
+      item("Reset alignment", () => this.alignSelection(null)),
+      item("Copy Roam block reference", () => this.copyRoamReference(false)),
+      item("Copy table block reference", () => this.copyRoamReference(true)),
+      item(this.model.showHeaders ? "Hide row/column labels" : "Show row/column labels", () => this.commitMutation("Toggle row and column labels", () => { this.model.showHeaders = !this.model.showHeaders; }, true)),
+      item(this.model.fitToWidth ? "Use fixed column widths" : "Fit table to window", () => this.commitMutation("Toggle fit to window", () => { this.model.fitToWidth = !this.model.fitToWidth; }, true)),
+      item("Copy to large grid", () => copyNativeToLarge(this.model))
+    );
+    menu.__rgDismiss = dismiss;
+    document.body.appendChild(menu);
+    const position = () => {
+      if (!menu.isConnected) return;
+      const rect = anchor.getBoundingClientRect(); const bounds = menu.getBoundingClientRect();
+      const preferredLeft = type === "row" ? rect.right + 6 : rect.left - 18;
+      const preferredTop = type === "row" ? rect.top - 6 : rect.bottom + 6;
+      menu.style.left = `${clamp(preferredLeft, 8, Math.max(8, innerWidth - bounds.width - 8))}px`;
+      menu.style.top = `${clamp(preferredTop, 8, Math.max(8, innerHeight - bounds.height - 8))}px`;
+      menu.style.visibility = "visible";
+    };
+    menu.style.visibility = "hidden"; position();
+    setTimeout(() => { position(); document.addEventListener("pointerdown", closeOutside, true); document.addEventListener("keydown", closeOnEscape, true); }, 0);
+    setTimeout(position, 80);
   }
 
   resizeSelectedRows(height) {
