@@ -1,0 +1,430 @@
+.rg-native-hidden,
+.rg-large-marker-hidden {
+  display: none !important;
+}
+
+.rg-root {
+  --rg-border: var(--bc-menu, #d3d8de);
+  --rg-border-strong: var(--bc-main, #c5cbd3);
+  --rg-bg: var(--bc-main, #ffffff);
+  --rg-header: var(--bc-hover, #f6f7f9);
+  --rg-toolbar: var(--bc-main, #ffffff);
+  --rg-muted: var(--cl-gray-550, #5f6b7c);
+  --rg-selection: color-mix(in srgb, var(--rg-active) 13%, transparent);
+  --rg-active: var(--cl-blue, #2d72d2);
+  position: relative;
+  width: min(100%, 1200px);
+  margin: 4px 0 10px;
+  color: var(--cl-text-color, inherit);
+  background: var(--rg-bg);
+  border: 1px solid var(--rg-border-strong);
+  border-radius: 4px;
+  box-shadow: 0 1px 2px rgb(17 20 24 / 8%);
+  overflow: hidden;
+  font-family: var(--ff-main, inherit);
+  font-size: 13px;
+  outline: none;
+}
+
+.bp3-dark .rg-root,
+body.roam-body.dark .rg-root {
+  --rg-border: #5f6b7c;
+  --rg-border-strong: #738091;
+  --rg-bg: var(--bc-main, #293742);
+  --rg-header: var(--bc-hover, #30404d);
+  --rg-toolbar: var(--bc-main, #293742);
+  --rg-muted: #abb3bf;
+  --rg-active: #48aff0;
+}
+
+.rg-root:focus-within {
+  border-color: color-mix(in srgb, var(--rg-active) 55%, var(--rg-border));
+}
+
+.rg-root--saving::after {
+  content: "Saving…";
+  position: absolute;
+  right: 9px;
+  bottom: 8px;
+  z-index: 30;
+  padding: 3px 7px;
+  color: #fff;
+  background: rgb(25 32 44 / 78%);
+  border-radius: 4px;
+  font-size: 11px;
+  pointer-events: none;
+}
+
+.rg-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 36px;
+  padding: 3px 5px;
+  background: var(--rg-toolbar);
+  border-bottom: 1px solid var(--rg-border);
+  overflow-x: auto;
+}
+
+.rg-button.bp3-button {
+  min-height: 27px;
+  padding: 3px 7px;
+  color: inherit;
+  background: transparent;
+  border-radius: 3px;
+  box-shadow: none;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.rg-button.bp3-button:hover {
+  background: var(--rg-header);
+  box-shadow: none;
+}
+
+.rg-status {
+  margin-left: auto;
+  padding: 0 7px;
+  color: var(--rg-muted);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.rg-viewport {
+  max-height: min(68vh, 720px);
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.rg-grid {
+  display: grid;
+  position: relative;
+  width: max-content;
+  min-width: 100%;
+  align-items: stretch;
+  background: var(--rg-bg);
+}
+
+.rg-header {
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  color: var(--rg-muted);
+  background: var(--rg-header);
+  border-right: 1px solid var(--rg-border);
+  border-bottom: 1px solid var(--rg-border);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  user-select: none;
+}
+
+.rg-corner,
+.rg-col-header {
+  position: sticky;
+  top: 0;
+}
+
+.rg-corner {
+  left: 0;
+  z-index: 12;
+}
+
+.rg-row-header {
+  position: sticky;
+  left: 0;
+  z-index: 8;
+  font-variant-numeric: tabular-nums;
+}
+
+.rg-col-header,
+.rg-row-header {
+  cursor: grab;
+}
+
+.rg-col-header:active,
+.rg-row-header:active {
+  cursor: grabbing;
+}
+
+.rg-col-resize {
+  position: absolute;
+  top: 0;
+  right: -3px;
+  bottom: 0;
+  width: 7px;
+  cursor: col-resize;
+}
+
+.rg-col-resize:hover {
+  background: color-mix(in srgb, var(--rg-active) 45%, transparent);
+}
+
+.rg-cell {
+  position: relative;
+  min-width: 0;
+  min-height: 32px;
+  padding: 6px 8px;
+  background: var(--rg-bg);
+  border-right: 1px solid var(--rg-border);
+  border-bottom: 1px solid var(--rg-border);
+  line-height: 1.45;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  cursor: default;
+  user-select: none;
+}
+
+.rg-grid--clean .rg-cell:first-child {
+  border-left: 0;
+}
+
+.rg-cell--merged {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px 10px;
+  text-align: center;
+}
+
+.rg-cell--merged > * {
+  max-width: 100%;
+}
+
+.rg-cell img {
+  display: block;
+  max-width: 100%;
+  max-height: 180px;
+  margin: 2px auto;
+  border-radius: 4px;
+  object-fit: contain;
+  cursor: zoom-in;
+}
+
+.rg-cell a,
+.rg-cell .rm-page-ref,
+.rg-cell .rm-block-ref {
+  user-select: text;
+}
+
+.rg-cell--selected {
+  background: var(--rg-selection);
+}
+
+.rg-cell--active {
+  z-index: 4;
+  box-shadow: inset 0 0 0 2px var(--rg-active);
+}
+
+.rg-cell--error {
+  color: #c23030;
+}
+
+.rg-editor {
+  position: absolute;
+  inset: 1px;
+  z-index: 20;
+  width: calc(100% - 2px);
+  height: calc(100% - 2px);
+  min-height: 31px;
+  padding: 5px 7px;
+  color: inherit;
+  background: var(--rg-bg);
+  border: 2px solid var(--rg-active);
+  border-radius: 1px;
+  outline: none;
+  resize: none;
+  font: inherit;
+  line-height: 1.45;
+  user-select: text;
+}
+
+.rg-fill-handle {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  z-index: 18;
+  width: 8px;
+  height: 8px;
+  background: var(--rg-active);
+  border: 1px solid var(--rg-bg);
+  border-radius: 2px;
+  cursor: crosshair;
+}
+
+.rg-charts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 8px;
+  padding: 8px;
+  border-top: 1px solid var(--rg-border);
+}
+
+.rg-chart-card {
+  position: relative;
+  min-width: 0;
+  padding: 7px;
+  background: var(--rg-bg);
+  border: 1px solid var(--rg-border);
+  border-radius: 6px;
+}
+
+.rg-chart-card > button {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  z-index: 2;
+}
+
+.rg-chart {
+  display: block;
+  width: 100%;
+  height: auto;
+  color: currentColor;
+}
+
+.rg-chart-axis {
+  stroke: var(--rg-border-strong);
+  stroke-width: 1;
+}
+
+.rg-context-menu {
+  position: fixed;
+  z-index: 10020;
+  min-width: 190px;
+  max-height: min(70vh, 540px);
+  padding: 5px;
+  overflow-y: auto;
+  background: var(--bc-main, #fff);
+  border: 1px solid rgb(0 0 0 / 16%);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
+}
+
+.rg-context-menu .bp3-menu-item {
+  display: block;
+  width: 100%;
+  padding: 6px 9px;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+}
+
+.rg-context-menu .bp3-menu-item:hover {
+  background: rgb(91 141 239 / 14%);
+}
+
+.rg-toasts {
+  position: fixed;
+  top: 46px;
+  right: 18px;
+  z-index: 11000;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  width: min(390px, calc(100vw - 36px));
+  pointer-events: none;
+}
+
+.rg-toast {
+  padding: 9px 12px;
+  color: #fff;
+  background: #28303d;
+  border-radius: 6px;
+  box-shadow: 0 5px 18px rgb(0 0 0 / 24%);
+  font-size: 13px;
+  pointer-events: auto;
+}
+
+.rg-toast--success { background: #087f5b; }
+.rg-toast--warning { background: #a15c00; }
+.rg-toast--danger { background: #b42318; }
+
+.rg-dialog-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10500;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(11 17 25 / 42%);
+}
+
+.rg-dialog.bp3-dialog {
+  width: min(500px, 100%);
+  margin: 0;
+  padding: 18px;
+  color: inherit;
+  background: var(--bc-main, #fff);
+  border-radius: 8px;
+}
+
+.rg-dialog-input {
+  width: 100%;
+  margin: 10px 0 16px;
+}
+
+.rg-dialog-footer,
+.rg-choice-list {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.rg-choice-list {
+  justify-content: flex-start;
+  margin-top: 14px;
+}
+
+.rg-large-root {
+  width: min(100%, 1400px);
+}
+
+.rg-large-viewport {
+  position: relative;
+  height: min(68vh, 720px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  background: var(--rg-bg);
+}
+
+.rg-large-canvas {
+  position: relative;
+  min-width: 100%;
+}
+
+.rg-large-cell,
+.rg-large-row-header,
+.rg-large-col-header {
+  position: absolute;
+  box-sizing: border-box;
+}
+
+.rg-large-row-header {
+  left: 0;
+  width: 42px;
+  height: 32px;
+}
+
+.rg-large-col-header {
+  top: 0;
+  height: 28px;
+}
+
+@media (max-width: 700px) {
+  .rg-root { width: 100%; border-radius: 4px; }
+  .rg-toolbar { padding: 2px; }
+  .rg-button.bp3-button { padding-inline: 5px; }
+  .rg-viewport,
+  .rg-large-viewport { max-height: 62vh; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rg-root *,
+  .rg-toasts * { scroll-behavior: auto !important; transition: none !important; }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "roam-grid",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Native-first advanced tables for Roam Research",
+  "type": "module",
+  "main": "extension.js",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/extension.js && npm test",
+    "dev": "npm run build -- --watch"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
+
