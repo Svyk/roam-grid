@@ -17,10 +17,11 @@ test("fit-to-window resize expands the dragged column while preserving total wid
   assert.ok(Math.abs(Object.values(resized).reduce((sum, width) => sum + width, 0) - 400) < 0.001);
   assert.ok(resized.b >= 56);
   assert.ok(resized.c >= 56);
-  const capped = fittedTrackResize({ a: 200, b: 100, c: 100 }, "a", 500, 56);
-  assert.equal(capped.a, 288);
-  assert.ok(Math.abs(capped.b - 56) < 0.001);
-  assert.ok(Math.abs(capped.c - 56) < 0.001);
+  const overflow = fittedTrackResize({ a: 200, b: 100, c: 100 }, "a", 500, 56);
+  assert.equal(overflow.a, 500);
+  assert.ok(Math.abs(overflow.b - 56) < 0.001);
+  assert.ok(Math.abs(overflow.c - 56) < 0.001);
+  assert.ok(Object.values(overflow).reduce((sum, width) => sum + width, 0) > 400);
 });
 
 test("formula engine handles arithmetic, ranges, strings, and functions", () => {

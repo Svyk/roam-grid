@@ -1,5 +1,5 @@
-/* Roam Grid v0.3.0 | MIT | generated from src/extension.js */
-const VERSION = "0.3.0";
+/* Roam Grid v0.3.1 | MIT | generated from src/extension.js */
+const VERSION = "0.3.1";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -51,7 +51,8 @@ export function fittedTrackResize(widths, targetId, requestedWidth, minimum = MI
   if (!ids.includes(targetId)) return { ...widths };
   if (ids.length === 1) return { [targetId]: clamp(requestedWidth, minimum, MAX_COL_WIDTH) };
   const total = ids.reduce((sum, id) => sum + Math.max(minimum, Number(widths[id]) || minimum), 0);
-  const target = clamp(requestedWidth, minimum, Math.max(minimum, total - minimum * (ids.length - 1)));
+  const requested = clamp(requestedWidth, minimum, MAX_COL_WIDTH);
+  const target = Math.min(requested, Math.max(minimum, total - minimum * (ids.length - 1)));
   const result = { [targetId]: target };
   let remaining = total - target;
   let pending = ids.filter((id) => id !== targetId);
@@ -66,6 +67,7 @@ export function fittedTrackResize(widths, targetId, requestedWidth, minimum = MI
     for (const id of pinned) { result[id] = minimum; remaining -= minimum; }
     pending = pending.filter((id) => !pinned.includes(id));
   }
+  if (requested > target) result[targetId] = requested;
   return result;
 }
 
@@ -2036,10 +2038,15 @@ export class GridView {
     };
     const up = () => {
       const widths = this.columnResizePreview?.widths || baseWidths;
+      const baseTotal = Object.values(baseWidths).reduce((sum, width) => sum + width, 0);
+      const previewTotal = Object.values(widths).reduce((sum, width) => sum + width, 0);
       cleanup(); this.columnResizePreview = null;
       if (!moved) return;
       this.commitMutation("Resize column", () => {
-        if (this.model.fitToWidth) for (const columnId of this.model.columnIds) this.model.widths[columnId] = Math.round(widths[columnId]);
+        if (this.model.fitToWidth) {
+          for (const columnId of this.model.columnIds) this.model.widths[columnId] = Math.round(widths[columnId]);
+          if (previewTotal > baseTotal + 0.5) this.model.fitToWidth = false;
+        }
         else this.model.widths[id] = Math.round(widths[id]);
       }, true);
     };

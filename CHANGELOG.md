@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- Allowed a column to expand when every neighboring fit-to-window column is
+  already at minimum width. The table switches to persistent fixed-width
+  scrolling instead of silently rejecting the drag.
+
 ## 0.3.0
 
 - Fixed fit-to-window column dragging so the selected edge tracks the pointer in

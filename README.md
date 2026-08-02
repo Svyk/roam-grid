@@ -77,7 +77,9 @@ The extension deliberately does not use `roam/js`.
   resize edge to restore automatic sizing.
 - In fit-to-window mode, a dragged column now follows the pointer in pixels while
   adjacent columns contract proportionally. The final proportions are persisted,
-  so the resized column stays the same after a developer-extension reload.
+  so the resized column stays the same after a developer-extension reload. If
+  every neighboring column is already at its minimum, dragging wider switches
+  that table to fixed-width horizontal scrolling so the requested size still wins.
 - Row heights and column widths are stored per table. Row sizes follow their
   stable Roam row UID through sorting and reordering; both dimensions survive
   extension reloads, native/large-grid copies, and large-grid manifest saves.
