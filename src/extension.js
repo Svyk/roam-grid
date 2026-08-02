@@ -1,4 +1,4 @@
-const VERSION = "0.2.2";
+const VERSION = "0.2.3";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -2001,7 +2001,9 @@ export class GridView {
 
   updateSelection() {
     this.root.querySelectorAll(".rg-cell--selected,.rg-cell--active").forEach((cell) => cell.classList.remove("rg-cell--selected", "rg-cell--active"));
-    this.root.querySelectorAll(".rg-cell-width-resize,.rg-cell-height-resize,.rg-native-pill-proxy").forEach((handle) => handle.remove());
+    this.root.querySelectorAll(".rg-cell-width-resize,.rg-cell-height-resize,.rg-native-pill-proxy,.rg-range-overlay").forEach((handle) => handle.remove());
+    const range = normalizeRange(this.selection);
+    const multiple = range.startRow !== range.endRow || range.startCol !== range.endCol;
     for (const cell of this.cells.values()) {
       const row = Number(cell.dataset.row); const col = Number(cell.dataset.col);
       const merge = this.model.mergeAt(row, col);
@@ -2010,8 +2012,8 @@ export class GridView {
     }
     const activeMerge = this.model.mergeAt(this.selection.startRow, this.selection.startCol);
     const active = this.cells.get(`${activeMerge?.row ?? this.selection.startRow}:${activeMerge?.col ?? this.selection.startCol}`);
-    active?.classList.add("rg-cell--active");
-    if (active) {
+    if (!multiple) active?.classList.add("rg-cell--active");
+    if (active && !multiple) {
       const anchorRow = activeMerge?.row ?? this.selection.startRow;
       const anchorCol = activeMerge?.col ?? this.selection.startCol;
       const edgeRow = anchorRow + (activeMerge?.rowSpan || 1) - 1;
@@ -2024,13 +2026,28 @@ export class GridView {
       heightHandle.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.commitMutation("Auto-fit row", () => this.model.setRowHeight(edgeRow, null), true); });
       active.append(widthHandle, heightHandle, this.axisGrabber("column", anchorCol), this.axisGrabber("row", anchorRow));
     }
+    let rangeOverlay = null;
+    if (multiple) {
+      const offset = this.model.showHeaders ? 1 : 0;
+      rangeOverlay = document.createElement("div"); rangeOverlay.className = "rg-range-overlay";
+      rangeOverlay.style.gridRow = `${range.startRow + 1 + offset} / ${range.endRow + 2 + offset}`;
+      rangeOverlay.style.gridColumn = `${range.startCol + 1 + offset} / ${range.endCol + 2 + offset}`;
+      const rows = range.endRow - range.startRow + 1; const cols = range.endCol - range.startCol + 1;
+      const badge = document.createElement("button"); badge.type = "button"; badge.className = "rg-range-badge"; badge.textContent = `${rows} × ${cols}`;
+      badge.title = `Selected ${cellLabel(range.startRow, range.startCol)}:${cellLabel(range.endRow, range.endCol)} · click for range actions`;
+      badge.setAttribute("aria-label", badge.title);
+      badge.addEventListener("pointerdown", (event) => { event.preventDefault(); event.stopPropagation(); });
+      badge.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); this.openMenu(badge); });
+      rangeOverlay.appendChild(badge); this.gridElement.appendChild(rangeOverlay);
+    }
     this.root.querySelector(".rg-fill-handle")?.remove();
     const endMerge = this.model.mergeAt(this.selection.endRow, this.selection.endCol);
     const end = this.cells.get(`${endMerge?.row ?? this.selection.endRow}:${endMerge?.col ?? this.selection.endCol}`);
-    if (end) {
+    const fillParent = rangeOverlay || end;
+    if (fillParent) {
       const handle = document.createElement("span"); handle.className = "rg-fill-handle"; handle.title = "Drag to fill";
       handle.addEventListener("pointerdown", (event) => { event.preventDefault(); event.stopPropagation(); this.fillStart = deepClone(this.selection); this.fillTarget = { row: this.selection.endRow, col: this.selection.endCol }; });
-      end.appendChild(handle);
+      fillParent.appendChild(handle);
     }
   }
 

@@ -85,6 +85,9 @@ The extension deliberately does not use `roam/js`.
   alignment, references, charts, and conversion. The menu exposes the native
   compatibility hooks used by Live AI, whose injected table commands continue
   to write through `window.roamGrid.v1`.
+- Selecting a rectangular range replaces the single-cell grabbers with one
+  outlined selection and a compact `rows × columns` badge. Click the badge for
+  range actions; drag the bottom-right square to fill.
 - Tables fit the available Roam pane by default, preserving saved column-width
   ratios so every stage stays visible in a smaller window. The `⋯` menu can
   switch back to fixed widths and horizontal scrolling when preferred.

@@ -272,7 +272,7 @@ body.roam-body.dark .rg-root {
 }
 
 .rg-cell--active {
-  z-index: 4;
+  z-index: 16;
   overflow: visible;
   box-shadow: inset 0 0 0 2px var(--rg-active);
 }
@@ -286,8 +286,13 @@ body.roam-body.dark .rg-root {
 .rg-root:not(.rg-root--interaction-active) .rg-axis-grabber,
 .rg-root:not(.rg-root--interaction-active) .rg-cell-width-resize,
 .rg-root:not(.rg-root--interaction-active) .rg-cell-height-resize,
+.rg-root:not(.rg-root--interaction-active) .rg-range-badge,
 .rg-root:not(.rg-root--interaction-active) .rg-fill-handle {
   display: none;
+}
+
+.rg-root:not(.rg-root--interaction-active) .rg-range-overlay {
+  box-shadow: none;
 }
 
 .rg-cell--header {
@@ -308,26 +313,33 @@ body.roam-body.dark .rg-root {
   outline: none;
   box-shadow: 0 1px 3px rgb(17 20 24 / 22%);
   cursor: pointer;
+  overflow: visible;
+}
+
+.rg-axis-grabber::before {
+  content: "";
+  position: absolute;
+  inset: -4px;
 }
 
 .rg-axis-grabber--column {
   top: 0;
   left: 50%;
-  grid-template-columns: repeat(3, 3px);
-  grid-template-rows: repeat(2, 3px);
+  grid-template-columns: repeat(3, 2px);
+  grid-template-rows: repeat(2, 2px);
   gap: 2px;
-  width: 39px;
-  height: 19px;
+  width: 29px;
+  height: 15px;
   place-content: center;
   color: #fff;
   background: var(--rg-active);
-  border-radius: 6px;
-  transform: translate(-50%, -44%);
+  border-radius: 5px;
+  transform: translate(-50%, -40%);
 }
 
 .rg-axis-grabber--column i {
-  width: 3px;
-  height: 3px;
+  width: 2px;
+  height: 2px;
   background: currentColor;
   border-radius: 50%;
   pointer-events: none;
@@ -336,11 +348,11 @@ body.roam-body.dark .rg-root {
 .rg-axis-grabber--row {
   top: 50%;
   left: 0;
-  width: 10px;
-  height: 35px;
+  width: 8px;
+  height: 27px;
   background: color-mix(in srgb, var(--rg-muted) 42%, var(--rg-bg));
-  border-radius: 6px;
-  transform: translate(-44%, -50%);
+  border-radius: 5px;
+  transform: translate(-38%, -50%);
 }
 
 .rg-axis-grabber:hover,
@@ -366,9 +378,48 @@ body.roam-body.dark .rg-root {
 .rg-cell-height-resize {
   right: 14px;
   bottom: 0;
-  left: 10px;
+  left: 14px;
   height: 8px;
   cursor: row-resize;
+}
+
+.rg-range-overlay {
+  position: relative;
+  z-index: 16;
+  min-width: 0;
+  min-height: 0;
+  box-shadow: inset 0 0 0 2px var(--rg-active);
+  pointer-events: none;
+}
+
+.rg-range-badge {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  z-index: 20;
+  min-width: 0;
+  min-height: 18px;
+  padding: 1px 5px;
+  color: #fff;
+  background: color-mix(in srgb, var(--rg-active) 92%, transparent);
+  border: 1px solid var(--rg-bg);
+  border-radius: 4px;
+  box-shadow: 0 1px 3px rgb(17 20 24 / 20%);
+  font: 600 10px/1 var(--ff-main, inherit);
+  white-space: nowrap;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.rg-range-badge:hover,
+.rg-range-badge:focus-visible {
+  background: var(--rg-active);
+  outline: 2px solid color-mix(in srgb, var(--rg-active) 35%, transparent);
+  outline-offset: 1px;
+}
+
+.rg-range-overlay > .rg-fill-handle {
+  pointer-events: auto;
 }
 
 .rg-cell-width-resize::after,

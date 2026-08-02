@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.3
+
+- Made native-style row and column grabbers visually smaller while retaining a
+  forgiving invisible pointer target.
+- Raised active-cell controls above global resize tracks so the left row menu
+  no longer competes with row resizing.
+- Replaced single-cell grabbers on rectangular selections with a compact range
+  outline and `rows × columns` action badge.
+
 ## 0.2.2
 
 - Added a built-in Meat + Pasta Meal Prep Calculator with editable example
