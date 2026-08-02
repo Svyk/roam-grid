@@ -1754,7 +1754,10 @@ export class GridView {
     this.boundPaste = (event) => this.onPaste(event);
     this.boundKeydown = (event) => this.onKeydown(event);
     this.keyboardActive = false;
-    this.boundDocumentPointerDown = (event) => { this.keyboardActive = this.root.contains(event.target); };
+    this.boundDocumentPointerDown = (event) => {
+      this.keyboardActive = this.root.contains(event.target);
+      this.root.classList.toggle("rg-root--interaction-active", this.keyboardActive);
+    };
     this.boundWindowKeydown = (event) => { if (this.keyboardActive) this.onKeydown(event); };
     this.boundPointerUp = () => this.finishPointerAction();
     this.mount();

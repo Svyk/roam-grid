@@ -277,6 +277,19 @@ body.roam-body.dark .rg-root {
   box-shadow: inset 0 0 0 2px var(--rg-active);
 }
 
+.rg-root:not(.rg-root--interaction-active) .rg-cell--active {
+  z-index: auto;
+  overflow: hidden;
+  box-shadow: none;
+}
+
+.rg-root:not(.rg-root--interaction-active) .rg-axis-grabber,
+.rg-root:not(.rg-root--interaction-active) .rg-cell-width-resize,
+.rg-root:not(.rg-root--interaction-active) .rg-cell-height-resize,
+.rg-root:not(.rg-root--interaction-active) .rg-fill-handle {
+  display: none;
+}
+
 .rg-cell--header {
   font-weight: 600;
   background: var(--rg-header);
