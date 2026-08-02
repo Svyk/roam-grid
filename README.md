@@ -2,6 +2,16 @@
 
 Native-first advanced tables for Roam Research.
 
+## Status
+
+Version 0.1 is a functional private release candidate and live demo. Native
+opt-in tables, safe merges, core formulas, interactions, imports/exports,
+charts, chunked large-grid persistence, the public API, and clean fallback are
+implemented. Before a public Depot release, the project still needs the full
+Thymer formula-function vocabulary, broader browser interaction automation, and
+a measured 100,000 × 26 live 50+ FPS acceptance run. See
+[Testing](docs/TESTING.md) for the exact evidence already collected.
+
 Roam Grid enhances only the native `{{[[table]]}}` blocks you explicitly opt in.
 The original nested Roam blocks remain the source of truth, so links, references,
 search, exports, and native fallback continue to work. A separate

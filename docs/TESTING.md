@@ -28,3 +28,13 @@ Current release acceptance:
 - A 100 × 26 file-backed grid created, verified, edited one dirty chunk, and
   advanced its manifest pointer.
 - Developer-extension reload exposes the untouched native block structure.
+
+Remaining public-release gates:
+
+- Measure 50+ FPS scrolling with an actual 100,000 × 26 live grid on the
+  development Mac; the automated test currently verifies bounded chunk loading,
+  not browser frame rate.
+- Bring the remaining host-neutral Thymer formula functions into the Roam
+  evaluator while retaining the safe registration boundary.
+- Add browser-level coverage for the complete pointer, clipboard-image,
+  encrypted-file read, interrupted upload, and orphan-cleanup paths.
