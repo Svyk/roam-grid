@@ -70,6 +70,33 @@ test("single-cell edit uploads only its dirty chunk and a new manifest", async (
   assert.ok(store.manifest.previous);
 });
 
+test("large-grid row heights and column widths persist in manifest-only saves", async (t) => {
+  const mock = installRoamMock({ blocks: { anchor006: { string: "{{[[roam/grid]]}}", children: [] } } });
+  t.after(mock.dispose);
+  const model = new GridModel({ rows: [[{ uid: "row-one", raw: "a" }, { uid: "cell-two", raw: "b" }]], columnIds: ["col-a", "col-b"], widths: { "col-a": 190 }, rowHeights: { "row-one": 44 }, alignments: { "cell-two": "right" }, fitToWidth: false });
+  const store = await new LargeGridStore("anchor006").initialize(model);
+  assert.equal(store.rowHeight(0), 44);
+  assert.equal(store.manifest.widths["col-a"], 190);
+  assert.equal(store.getAlignment(0, 1), "right");
+  assert.equal(store.manifest.fitToWidth, false);
+  const before = mock.uploads.length;
+  store.setRowHeight(0, 58);
+  store.setColumnWidth(1, 230);
+  store.setAlignment(0, 0, "center");
+  await store.commit();
+  const uploads = mock.uploads.slice(before);
+  assert.equal(uploads.filter((item) => item.text.schema === "roam-grid/chunk").length, 0);
+  assert.equal(uploads.filter((item) => item.text.schema === "roam-grid/manifest").length, 1);
+  assert.equal(store.rowHeight(0), 58);
+  assert.equal(store.manifest.widths["col-b"], 230);
+  const roundTrip = await store.toModel();
+  assert.equal(roundTrip.getRowHeight(0), 58);
+  assert.equal(roundTrip.widths["col-b"], 230);
+  assert.equal(roundTrip.getAlignment(0, 0), "center");
+  assert.equal(roundTrip.getAlignment(0, 1), "right");
+  assert.equal(roundTrip.fitToWidth, false);
+});
+
 test("large grid refuses stale manifest overwrite", async (t) => {
   const mock = installRoamMock({ blocks: { anchor003: { string: "{{[[roam/grid]]}}", children: [] } } });
   t.after(mock.dispose);

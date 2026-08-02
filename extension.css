@@ -13,7 +13,9 @@
   --rg-selection: color-mix(in srgb, var(--rg-active) 13%, transparent);
   --rg-active: var(--cl-blue, #2d72d2);
   position: relative;
-  width: min(100%, 1200px);
+  width: 100%;
+  max-width: 1200px;
+  min-width: 0;
   margin: 4px 0 10px;
   color: var(--cl-text-color, inherit);
   background: var(--rg-bg);
@@ -92,6 +94,8 @@ body.roam-body.dark .rg-root {
 }
 
 .rg-viewport {
+  width: 100%;
+  max-width: 100%;
   max-height: min(68vh, 720px);
   overflow: auto;
   overscroll-behavior: contain;
@@ -163,10 +167,33 @@ body.roam-body.dark .rg-root {
   background: color-mix(in srgb, var(--rg-active) 45%, transparent);
 }
 
+.rg-row-resize {
+  z-index: 14;
+  align-self: end;
+  height: 7px;
+  margin-bottom: -4px;
+  cursor: row-resize;
+  pointer-events: auto;
+}
+
+.rg-row-resize::after {
+  content: "";
+  display: block;
+  height: 2px;
+  margin-top: 3px;
+  background: transparent;
+}
+
+.rg-row-resize:hover::after,
+.rg-row-resize:active::after {
+  background: color-mix(in srgb, var(--rg-active) 55%, transparent);
+}
+
 .rg-cell {
   position: relative;
+  box-sizing: border-box;
   min-width: 0;
-  min-height: 32px;
+  min-height: 0;
   padding: 6px 8px;
   background: var(--rg-bg);
   border-right: 1px solid var(--rg-border);
@@ -193,6 +220,13 @@ body.roam-body.dark .rg-root {
 .rg-cell--merged > * {
   max-width: 100%;
 }
+
+.rg-cell--align-left { text-align: left; }
+.rg-cell--align-center { text-align: center; }
+.rg-cell--align-right { text-align: right; }
+.rg-cell--merged.rg-cell--align-left { justify-content: flex-start; }
+.rg-cell--merged.rg-cell--align-center { justify-content: center; }
+.rg-cell--merged.rg-cell--align-right { justify-content: flex-end; }
 
 .rg-cell img {
   display: block;
@@ -382,7 +416,8 @@ body.roam-body.dark .rg-root {
 }
 
 .rg-large-root {
-  width: min(100%, 1400px);
+  width: 100%;
+  max-width: 1400px;
 }
 
 .rg-large-viewport {
@@ -409,6 +444,20 @@ body.roam-body.dark .rg-root {
   left: 0;
   width: 42px;
   height: 32px;
+}
+
+.rg-large-row-resize {
+  position: absolute;
+  right: 0;
+  bottom: -3px;
+  left: 0;
+  z-index: 15;
+  height: 7px;
+  cursor: row-resize;
+}
+
+.rg-large-row-resize:hover {
+  background: color-mix(in srgb, var(--rg-active) 45%, transparent);
 }
 
 .rg-large-col-header {

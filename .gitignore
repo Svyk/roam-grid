@@ -1,5 +1,6 @@
 node_modules/
+deploy/
+.wrangler/
 .DS_Store
 coverage/
 *.log
-

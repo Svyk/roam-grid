@@ -157,6 +157,51 @@ test("transactions rollback failures and support undo redo", () => {
   assert.equal(grid.redo(), true); assert.equal(grid.getRaw(0, 0), "b");
 });
 
+test("row heights are UID-backed, transactional, and follow sorted rows", () => {
+  const grid = model([
+    [{ uid: "row-b", raw: "B" }, { uid: "b2", raw: "" }],
+    [{ uid: "row-a", raw: "A" }, { uid: "a2", raw: "" }],
+  ], { frozenRows: 0 });
+  grid.transact("resize", () => grid.setRowHeight(0, 67));
+  assert.equal(grid.getRowHeight(0), 67);
+  assert.equal(grid.undo(), true);
+  assert.equal(grid.getRowHeight(0), null);
+  assert.equal(grid.redo(), true);
+  grid.sortBy(0, "asc", 0);
+  assert.equal(grid.getRaw(1, 0), "B");
+  assert.equal(grid.getRowHeight(1), 67);
+  assert.equal(grid.getRowHeight(0), null);
+});
+
+test("row height deletion prunes metadata and values clamp safely", () => {
+  const grid = model([
+    [{ uid: "row-one", raw: "one" }],
+    [{ uid: "row-two", raw: "two" }],
+  ]);
+  grid.setRowHeight(0, 1);
+  grid.setRowHeight(1, 9999);
+  assert.equal(grid.getRowHeight(0), 22);
+  assert.equal(grid.getRowHeight(1), 480);
+  grid.deleteRows(0, 1);
+  assert.equal(Object.hasOwn(grid.rowHeights, "row-one"), false);
+  assert.equal(grid.getRowHeight(0), 480);
+});
+
+test("cell alignment follows stable UIDs and merged anchors", () => {
+  const grid = model([
+    [{ uid: "row-b", raw: "B" }, { uid: "b2", raw: "" }],
+    [{ uid: "row-a", raw: "A" }, { uid: "a2", raw: "" }],
+  ], { frozenRows: 0 });
+  grid.setAlignment(0, 0, "right");
+  grid.sortBy(0, "asc", 0);
+  assert.equal(grid.getAlignment(1, 0), "right");
+  grid.merge({ startRow: 1, endRow: 1, startCol: 0, endCol: 1 });
+  assert.equal(grid.getAlignment(1, 1), "right");
+  grid.setAlignment(1, 1, "center");
+  assert.equal(grid.getAlignment(1, 0), "center");
+  assert.throws(() => grid.setAlignment(0, 0, "justify"), { code: "ALIGNMENT" });
+});
+
 test("malformed merge metadata is dropped without touching raw data", () => {
   const grid = model([["a", "hidden"]], { merges: [{ id: "bad", row: 0, col: 0, rowSpan: 1, colSpan: 2 }] });
   assert.equal(grid.merges.length, 0);
@@ -164,11 +209,15 @@ test("malformed merge metadata is dropped without touching raw data", () => {
 });
 
 test("JSON round trip preserves layout", () => {
-  const grid = model([["a", ""]], { widths: { c1: 200 }, frozenRows: 1, charts: [{ id: "chart", type: "line" }], showHeaders: false });
+  const grid = model([[{ uid: "row-one", raw: "a" }, { uid: "cell-two", raw: "" }]], { columnIds: ["c1", "c2"], widths: { c1: 200 }, rowHeights: { "row-one": 54 }, alignments: { "row-one": "center" }, frozenRows: 1, charts: [{ id: "chart", type: "line" }], showHeaders: false, fitToWidth: false });
   grid.merge({ startRow: 0, endRow: 0, startCol: 0, endCol: 1 });
   const roundTrip = GridModel.fromJSON(JSON.parse(JSON.stringify(grid.toJSON())));
   assert.deepEqual(roundTrip.rows.map((row) => row.map((cell) => cell.raw)), [["a", ""]]);
   assert.equal(roundTrip.merges.length, 1);
   assert.equal(roundTrip.charts.length, 1);
+  assert.equal(roundTrip.widths.c1, 200);
+  assert.equal(roundTrip.getRowHeight(0), 54);
+  assert.equal(roundTrip.getAlignment(0, 0), "center");
   assert.equal(roundTrip.showHeaders, false);
+  assert.equal(roundTrip.fitToWidth, false);
 });

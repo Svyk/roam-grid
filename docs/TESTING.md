@@ -11,7 +11,10 @@ The dependency-free Node suite covers formulas, cycles, reference rewrites,
 undo/redo, every destructive-merge invariant from grid-table issue #9,
 insertion/deletion/sorting boundaries, malformed metadata recovery, imports,
 exports, deterministic charts, native UID round trips, conflicts, and chunked
-manifest persistence.
+manifest persistence. Layout tests verify UID-backed row sizing through
+sort/delete/undo/redo, native metadata reloads, exact column widths, and
+manifest-only large-grid sizing saves. Alignment tests cover stable UID and
+merge-anchor behavior plus native and large-grid persistence.
 
 Performance fixtures verify a 5,000-cell formula pass and a 100,000 × 26
 manifest that loads only the requested visible chunk. The live smoke test is
@@ -20,11 +23,12 @@ opted in or changed.
 
 Current release acceptance:
 
-- 39 automated tests pass.
+- 43 automated tests pass.
 - The existing host-neutral Thymer Grid baseline remains green at 343/343; the
   Roam adapter suite is additive and the original project was not modified.
 - Native formulas and safe/blocked merges were exercised in Roam.
-- Header-label visibility persists per table.
+- Header-label visibility, row heights, column widths, alignment, and responsive
+  fit mode persist per table.
 - A 100 × 26 file-backed grid created, verified, edited one dirty chunk, and
   advanced its manifest pointer.
 - Developer-extension reload exposes the untouched native block structure.

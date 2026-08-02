@@ -1,5 +1,5 @@
-/* Roam Grid v0.1.0 | MIT | generated from src/extension.js */
-const VERSION = "0.1.0";
+/* Roam Grid v0.2.0 | MIT | generated from src/extension.js */
+const VERSION = "0.2.0";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -9,6 +9,10 @@ const MAX_NATIVE_MUTATIONS = 1200;
 const CHUNK_ROWS = 500;
 const DEFAULT_ROW_HEIGHT = 32;
 const DEFAULT_COL_WIDTH = 160;
+const MIN_ROW_HEIGHT = 22;
+const MAX_ROW_HEIGHT = 480;
+const MIN_COL_WIDTH = 56;
+const MAX_COL_WIDTH = 640;
 
 const runtime = {
   extensionAPI: null,
@@ -399,17 +403,20 @@ function normalizeCells(rows, width) {
 }
 
 export class GridModel {
-  constructor({ rows = [[]], tableUid = null, columnIds = [], merges = [], widths = {}, frozenRows = 1, frozenCols = 0, charts = [], showHeaders = true, revision = null } = {}) {
+  constructor({ rows = [[]], tableUid = null, columnIds = [], merges = [], widths = {}, rowHeights = {}, alignments = {}, frozenRows = 1, frozenCols = 0, charts = [], showHeaders = true, fitToWidth = true, revision = null } = {}) {
     const width = Math.max(1, columnIds.length, ...rows.map((row) => row.length));
     this.tableUid = tableUid;
     this.rows = normalizeCells(rows.length ? rows : [[]], width);
     this.columnIds = Array.from({ length: width }, (_, index) => columnIds[index] || makeLocalUid());
     this.merges = deepClone(merges);
     this.widths = { ...widths };
+    this.rowHeights = { ...rowHeights };
+    this.alignments = { ...alignments };
     this.frozenRows = clamp(Number(frozenRows) || 0, 0, this.rows.length);
     this.frozenCols = clamp(Number(frozenCols) || 0, 0, width);
     this.charts = deepClone(charts);
     this.showHeaders = showHeaders !== false;
+    this.fitToWidth = fitToWidth !== false;
     this.revision = revision;
     this.undoStack = [];
     this.redoStack = [];
@@ -422,11 +429,41 @@ export class GridModel {
   getCell(row, col) { return this.rows[row]?.[col] || null; }
   getRaw(row, col) { return this.getCell(row, col)?.raw ?? ""; }
   getValue(row, col, engine = null) { return (engine || new FormulaEngine(this, runtime.registries?.formulaFunctions || defaultFormulaFunctions())).evaluateCell(row, col); }
+  rowKey(row) { return this.rows[row]?.[0]?.uid || null; }
+  getRowHeight(row) {
+    const value = Number(this.rowHeights[this.rowKey(row)]);
+    return Number.isFinite(value) ? clamp(Math.round(value), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT) : null;
+  }
+  setRowHeight(row, height) {
+    const key = this.rowKey(row);
+    if (!key) throw new GridError("OUT_OF_BOUNDS", `Row ${row + 1} is outside the grid`);
+    if (height == null || height === "") delete this.rowHeights[key];
+    else {
+      const value = Number(height);
+      if (!Number.isFinite(value)) throw new GridError("ROW_HEIGHT", "Row height must be a number");
+      this.rowHeights[key] = clamp(Math.round(value), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT);
+    }
+  }
+  alignmentKey(row, col) {
+    const merge = this.mergeAt(row, col);
+    return this.getCell(merge?.row ?? row, merge?.col ?? col)?.uid || null;
+  }
+  getAlignment(row, col) {
+    const value = this.alignments[this.alignmentKey(row, col)];
+    return ["left", "center", "right"].includes(value) ? value : null;
+  }
+  setAlignment(row, col, alignment) {
+    const key = this.alignmentKey(row, col);
+    if (!key) throw new GridError("OUT_OF_BOUNDS", `Cell ${cellLabel(row, col)} is outside the grid`);
+    if (alignment == null || alignment === "auto") delete this.alignments[key];
+    else if (["left", "center", "right"].includes(alignment)) this.alignments[key] = alignment;
+    else throw new GridError("ALIGNMENT", `Unsupported alignment: ${alignment}`);
+  }
 
   snapshot() {
     return {
-      rows: deepClone(this.rows), columnIds: [...this.columnIds], merges: deepClone(this.merges), widths: { ...this.widths },
-      frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: deepClone(this.charts), showHeaders: this.showHeaders, revision: this.revision,
+      rows: deepClone(this.rows), columnIds: [...this.columnIds], merges: deepClone(this.merges), widths: { ...this.widths }, rowHeights: { ...this.rowHeights }, alignments: { ...this.alignments },
+      frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: deepClone(this.charts), showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, revision: this.revision,
     };
   }
 
@@ -435,10 +472,13 @@ export class GridModel {
     this.columnIds = [...snapshot.columnIds];
     this.merges = deepClone(snapshot.merges);
     this.widths = { ...snapshot.widths };
+    this.rowHeights = { ...(snapshot.rowHeights || {}) };
+    this.alignments = { ...(snapshot.alignments || {}) };
     this.frozenRows = snapshot.frozenRows;
     this.frozenCols = snapshot.frozenCols;
     this.charts = deepClone(snapshot.charts);
     this.showHeaders = snapshot.showHeaders !== false;
+    this.fitToWidth = snapshot.fitToWidth !== false;
     this.revision = snapshot.revision;
   }
 
@@ -502,6 +542,9 @@ export class GridModel {
       }
     }
     if (blocking.length) throw new GridError("MERGE_NONEMPTY", `Merge blocked by non-empty cells: ${blocking.join(", ")}`, { cells: blocking });
+    for (let row = value.startRow; row <= value.endRow; row += 1) for (let col = value.startCol; col <= value.endCol; col += 1) {
+      if (row !== value.startRow || col !== value.startCol) delete this.alignments[this.getCell(row, col).uid];
+    }
     const merge = { id: makeLocalUid(), row: value.startRow, col: value.startCol, rowSpan: value.endRow - value.startRow + 1, colSpan: value.endCol - value.startCol + 1 };
     this.merges.push(merge);
     return merge;
@@ -557,7 +600,12 @@ export class GridModel {
     if (this.rowCount - count < 1) throw new GridError("DELETE_ALL", "A grid must keep at least one row");
     const start = clamp(index, 0, this.rowCount - 1);
     const end = Math.min(this.rowCount - 1, start + count - 1);
+    const removedRows = this.rows.slice(start, end + 1);
+    const removedRowKeys = removedRows.map((row) => row[0]?.uid).filter(Boolean);
+    const removedCellKeys = removedRows.flat().map((cell) => cell.uid);
     this.rows.splice(start, end - start + 1);
+    for (const key of removedRowKeys) delete this.rowHeights[key];
+    for (const key of removedCellKeys) delete this.alignments[key];
     const next = [];
     for (const merge of this.merges) {
       const mStart = merge.row;
@@ -601,8 +649,10 @@ export class GridModel {
         this.rows[merge.row][survivingCol].raw = anchorRaw;
       }
     }
+    const removedCellKeys = this.rows.flatMap((row) => row.slice(start, end + 1).map((cell) => cell.uid));
     const removedIds = this.columnIds.splice(start, removed);
     for (const id of removedIds) delete this.widths[id];
+    for (const key of removedCellKeys) delete this.alignments[key];
     for (const row of this.rows) row.splice(start, removed);
     const next = [];
     for (const merge of this.merges) {
@@ -633,13 +683,21 @@ export class GridModel {
       if (rangesOverlap(source, mergeRange) && !(source.startRow <= mergeRange.startRow && source.endRow >= mergeRange.endRow && source.startCol <= mergeRange.startCol && source.endCol >= mergeRange.endCol)) throw new GridError("PARTIAL_MERGE_MOVE", "Move the entire merged region, not part of it");
     }
     const sourceCells = [];
-    for (let row = source.startRow; row <= source.endRow; row += 1) sourceCells.push(this.rows[row].slice(source.startCol, source.endCol + 1).map((cell) => ({ ...cell })));
+    const sourceAlignments = [];
+    for (let row = source.startRow; row <= source.endRow; row += 1) {
+      sourceCells.push(this.rows[row].slice(source.startCol, source.endCol + 1).map((cell) => ({ ...cell })));
+      sourceAlignments.push(Array.from({ length: width }, (_, col) => this.alignments[this.rows[row][source.startCol + col].uid] || null));
+    }
     const sourceMerges = this.merges.filter((merge) => rangeContains(source, merge.row, merge.col));
     this.merges = this.merges.filter((merge) => !sourceMerges.includes(merge) && !rangesOverlap(destination, { startRow: merge.row, endRow: merge.row + merge.rowSpan - 1, startCol: merge.col, endCol: merge.col + merge.colSpan - 1 }));
-    for (let row = 0; row < height; row += 1) for (let col = 0; col < width; col += 1) this.rows[source.startRow + row][source.startCol + col] = { uid: this.rows[source.startRow + row][source.startCol + col].uid, raw: "" };
+    for (let row = 0; row < height; row += 1) for (let col = 0; col < width; col += 1) {
+      const sourceCell = this.rows[source.startRow + row][source.startCol + col]; delete this.alignments[sourceCell.uid]; sourceCell.raw = "";
+    }
     for (let row = 0; row < height; row += 1) for (let col = 0; col < width; col += 1) {
       const destinationCell = this.rows[targetRow + row][targetCol + col];
       this.rows[targetRow + row][targetCol + col] = { uid: destinationCell.uid, raw: rewriteFormula(sourceCells[row][col].raw, targetRow - source.startRow, targetCol - source.startCol) };
+      delete this.alignments[destinationCell.uid];
+      if (sourceAlignments[row][col]) this.alignments[destinationCell.uid] = sourceAlignments[row][col];
     }
     for (const merge of sourceMerges) this.merges.push({ ...merge, row: merge.row + targetRow - source.startRow, col: merge.col + targetCol - source.startCol });
   }
@@ -687,7 +745,7 @@ export class GridModel {
   }
 
   toJSON() {
-    return { schema: "roam-grid", version: 1, tableUid: this.tableUid, rows: this.rows, columnIds: this.columnIds, merges: this.merges, widths: this.widths, frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: this.charts, showHeaders: this.showHeaders, revision: this.revision };
+    return { schema: "roam-grid", version: 1, tableUid: this.tableUid, rows: this.rows, columnIds: this.columnIds, merges: this.merges, widths: this.widths, rowHeights: this.rowHeights, alignments: this.alignments, frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: this.charts, showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, revision: this.revision };
   }
 
   static fromJSON(value) {
@@ -1053,13 +1111,13 @@ class MetadataStore {
   get(tableUid) {
     const value = this.entries.get(tableUid)?.value;
     if (!value) return null;
-    return { columnIds: value.columnIds || [], merges: value.merges || [], widths: value.widths || {}, frozenRows: value.frozenRows ?? 1, frozenCols: value.frozenCols ?? 0, charts: value.charts || [], showHeaders: value.showHeaders !== false };
+    return { columnIds: value.columnIds || [], merges: value.merges || [], widths: value.widths || {}, rowHeights: value.rowHeights || {}, alignments: value.alignments || {}, frozenRows: value.frozenRows ?? 1, frozenCols: value.frozenCols ?? 0, charts: value.charts || [], showHeaders: value.showHeaders !== false, fitToWidth: value.fitToWidth !== false };
   }
 
   has(tableUid) { return this.entries.has(tableUid); }
 
   async set(tableUid, model, mode = "native") {
-    const value = { schema: 1, mode, tableUid, columnIds: model.columnIds, merges: model.merges, widths: model.widths, frozenRows: model.frozenRows, frozenCols: model.frozenCols, charts: model.charts, showHeaders: model.showHeaders !== false, updatedAt: new Date().toISOString() };
+    const value = { schema: 1, mode, tableUid, columnIds: model.columnIds, merges: model.merges, widths: model.widths, rowHeights: model.rowHeights, alignments: model.alignments, frozenRows: model.frozenRows, frozenCols: model.frozenCols, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, updatedAt: new Date().toISOString() };
     const string = `${METADATA_PREFIX} ${JSON.stringify(value)}`;
     const entry = this.entries.get(tableUid);
     const blockUid = entry ? entry.blockUid : await createBlock(this.pageUid, string);
@@ -1161,9 +1219,18 @@ export class NativeTableAdapter {
     try {
       for (const row of currentRows) for (const cell of [...row].reverse()) await moveBlock(cell.uid, stagingUid, "last");
       const desiredUids = new Set();
-      for (const row of model.rows) for (const cell of row) {
+      for (let rowIndex = 0; rowIndex < model.rowCount; rowIndex += 1) for (let colIndex = 0; colIndex < model.colCount; colIndex += 1) {
+        const cell = model.rows[rowIndex][colIndex];
         const desired = cell.raw === "" ? " " : cell.raw;
-        if (cell.uid.startsWith("rg_") || !current.some((old) => old.uid === cell.uid)) cell.uid = await createBlock(stagingUid, desired);
+        if (cell.uid.startsWith("rg_") || !current.some((old) => old.uid === cell.uid)) {
+          const oldUid = cell.uid;
+          cell.uid = await createBlock(stagingUid, desired);
+          if (colIndex === 0 && Object.hasOwn(model.rowHeights, oldUid)) {
+            model.rowHeights[cell.uid] = model.rowHeights[oldUid];
+            delete model.rowHeights[oldUid];
+          }
+          if (Object.hasOwn(model.alignments, oldUid)) { model.alignments[cell.uid] = model.alignments[oldUid]; delete model.alignments[oldUid]; }
+        }
         else if (current.find((old) => old.uid === cell.uid)?.string !== desired) await updateBlock(cell.uid, desired);
         desiredUids.add(cell.uid);
       }
@@ -1200,6 +1267,40 @@ function rawRows(model) {
   return model.rows.map((row) => row.map((cell) => cell.raw));
 }
 
+function rowHeightsForManifest(model) {
+  const rowHeights = {};
+  for (let row = 0; row < model.rowCount; row += 1) {
+    const height = model.getRowHeight(row);
+    if (height != null) rowHeights[row] = height;
+  }
+  return rowHeights;
+}
+
+function applyManifestRowHeights(model, rowHeights = {}) {
+  for (const [row, height] of Object.entries(rowHeights)) {
+    const index = Number(row);
+    if (Number.isInteger(index) && index >= 0 && index < model.rowCount) model.setRowHeight(index, height);
+  }
+  return model;
+}
+
+function alignmentsForManifest(model) {
+  const alignments = {};
+  for (let row = 0; row < model.rowCount; row += 1) for (let col = 0; col < model.colCount; col += 1) {
+    const value = model.alignments[model.getCell(row, col).uid];
+    if (value) alignments[`${row}:${col}`] = value;
+  }
+  return alignments;
+}
+
+function applyManifestAlignments(model, alignments = {}) {
+  for (const [coordinate, alignment] of Object.entries(alignments)) {
+    const [row, col] = coordinate.split(":").map(Number);
+    if (Number.isInteger(row) && Number.isInteger(col) && model.inBounds(row, col)) model.setAlignment(row, col, alignment);
+  }
+  return model;
+}
+
 export class LargeGridStore {
   constructor(anchorUid, pointerUid = null) {
     this.anchorUid = anchorUid;
@@ -1230,6 +1331,9 @@ export class LargeGridStore {
 
   validateManifest(manifest) {
     if (!manifest || manifest.schema !== "roam-grid/manifest" || manifest.version !== 1 || !Number.isInteger(manifest.rowCount) || !Number.isInteger(manifest.colCount) || !Array.isArray(manifest.chunks)) throw new GridError("UNSUPPORTED_SCHEMA", "Unsupported or malformed large-grid manifest");
+    manifest.widths ||= {};
+    manifest.rowHeights ||= {};
+    manifest.alignments ||= {};
   }
 
   async seed(model) {
@@ -1242,8 +1346,8 @@ export class LargeGridStore {
     }
     const manifest = {
       schema: "roam-grid/manifest", version: 1, revision: cryptoId(), previous: null, createdAt: new Date().toISOString(),
-      rowCount: model.rowCount, colCount: model.colCount, columnIds: model.columnIds, widths: model.widths,
-      frozenRows: model.frozenRows, frozenCols: model.frozenCols, merges: model.merges, charts: model.charts, showHeaders: model.showHeaders !== false, chunks, retained: [],
+      rowCount: model.rowCount, colCount: model.colCount, columnIds: model.columnIds, widths: model.widths, rowHeights: rowHeightsForManifest(model), alignments: alignmentsForManifest(model),
+      frozenRows: model.frozenRows, frozenCols: model.frozenCols, merges: model.merges, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, chunks, retained: [],
     };
     const url = await uploadJson(manifest, `roam-grid-${this.anchorUid}-manifest.json`);
     const verified = await downloadJson(url);
@@ -1293,6 +1397,48 @@ export class LargeGridStore {
       for (let col = this.manifest.colCount; col < colCount; col += 1) this.manifest.columnIds.push(makeLocalUid());
       this.manifest.colCount = colCount; this.metadataDirty = true;
     }
+  }
+
+  rowHeight(row) {
+    const value = Number(this.manifest.rowHeights?.[row]);
+    return Number.isFinite(value) ? clamp(Math.round(value), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT) : DEFAULT_ROW_HEIGHT;
+  }
+
+  setRowHeight(row, height) {
+    if (!Number.isInteger(row) || row < 0 || row >= this.manifest.rowCount) throw new GridError("OUT_OF_BOUNDS", `Row ${row + 1} is outside the grid`);
+    this.manifest.rowHeights ||= {};
+    if (height == null || height === "") delete this.manifest.rowHeights[row];
+    else {
+      const value = Number(height);
+      if (!Number.isFinite(value)) throw new GridError("ROW_HEIGHT", "Row height must be a number");
+      this.manifest.rowHeights[row] = clamp(Math.round(value), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT);
+    }
+    this.metadataDirty = true;
+  }
+
+  setColumnWidth(col, width) {
+    const id = this.manifest.columnIds[col];
+    if (!id) throw new GridError("OUT_OF_BOUNDS", `Column ${columnLabel(col)} is outside the grid`);
+    this.manifest.widths ||= {};
+    if (width == null || width === "") delete this.manifest.widths[id];
+    else {
+      const value = Number(width);
+      if (!Number.isFinite(value)) throw new GridError("COLUMN_WIDTH", "Column width must be a number");
+      this.manifest.widths[id] = clamp(Math.round(value), MIN_COL_WIDTH, MAX_COL_WIDTH);
+    }
+    this.metadataDirty = true;
+  }
+
+  getAlignment(row, col) { return this.manifest.alignments?.[`${row}:${col}`] || null; }
+
+  setAlignment(row, col, alignment) {
+    if (row < 0 || col < 0 || row >= this.manifest.rowCount || col >= this.manifest.colCount) throw new GridError("OUT_OF_BOUNDS", `Cell ${cellLabel(row, col)} is outside the grid`);
+    const merge = this.mergeAt(row, col); const anchorRow = merge?.row ?? row; const anchorCol = merge?.col ?? col; const key = `${anchorRow}:${anchorCol}`;
+    this.manifest.alignments ||= {};
+    if (alignment == null || alignment === "auto") delete this.manifest.alignments[key];
+    else if (["left", "center", "right"].includes(alignment)) this.manifest.alignments[key] = alignment;
+    else throw new GridError("ALIGNMENT", `Unsupported alignment: ${alignment}`);
+    this.metadataDirty = true;
   }
 
   async setCell(row, col, raw) {
@@ -1372,7 +1518,7 @@ export class LargeGridStore {
   async saveAsCopy(newAnchorUid) {
     const rows = [];
     for (let start = 0; start < this.manifest.rowCount; start += CHUNK_ROWS) rows.push(...await this.getRows(start, Math.min(this.manifest.rowCount, start + CHUNK_ROWS)));
-    const model = new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false });
+    const model = applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false }), this.manifest.rowHeights), this.manifest.alignments);
     return new LargeGridStore(newAnchorUid).initialize(model);
   }
 
@@ -1380,7 +1526,7 @@ export class LargeGridStore {
     if (this.manifest.rowCount * this.manifest.colCount > limit) throw new GridError("MUTATION_BUDGET", "Large grid exceeds the safe native-table conversion budget");
     const rows = [];
     for (let start = 0; start < this.manifest.rowCount; start += CHUNK_ROWS) rows.push(...await this.getRows(start, Math.min(this.manifest.rowCount, start + CHUNK_ROWS)));
-    return new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false });
+    return applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false }), this.manifest.rowHeights), this.manifest.alignments);
   }
 }
 
@@ -1584,6 +1730,9 @@ export class GridView {
     this.saveTimer = null;
     this.dragSelecting = false;
     this.fillStart = null;
+    this.rowResizePreview = null;
+    this.columnResizePreview = null;
+    this.resizeCleanup = null;
     this.boundPaste = (event) => this.onPaste(event);
     this.boundKeydown = (event) => this.onKeydown(event);
     this.keyboardActive = false;
@@ -1631,10 +1780,11 @@ export class GridView {
     this.root.appendChild(this.toolbar());
     const viewport = document.createElement("div"); viewport.className = "rg-viewport";
     const grid = document.createElement("div"); grid.className = "rg-grid";
+    this.gridElement = grid;
     const offset = this.model.showHeaders ? 1 : 0;
     grid.classList.toggle("rg-grid--clean", !this.model.showHeaders);
-    grid.style.gridTemplateColumns = `${this.model.showHeaders ? "42px " : ""}${this.model.columnIds.map((id) => `${this.model.widths[id] || DEFAULT_COL_WIDTH}px`).join(" ")}`;
-    grid.style.gridTemplateRows = `${this.model.showHeaders ? "28px " : ""}repeat(${this.model.rowCount}, minmax(${DEFAULT_ROW_HEIGHT}px, auto))`;
+    this.applyGridTemplateColumns(grid);
+    this.applyGridTemplateRows(grid);
     if (this.model.showHeaders) {
       const corner = document.createElement("div"); corner.className = "rg-corner rg-header"; corner.style.gridArea = "1 / 1";
       grid.appendChild(corner);
@@ -1651,6 +1801,7 @@ export class GridView {
         grid.appendChild(cell);
         this.cells.set(`${row}:${col}`, cell);
       }
+      grid.appendChild(this.rowResizeHandle(row, offset));
     }
     viewport.appendChild(grid);
     this.root.appendChild(viewport);
@@ -1674,14 +1825,43 @@ export class GridView {
     header.addEventListener("dragstart", (event) => event.dataTransfer.setData("application/x-roam-grid-col", String(col)));
     header.addEventListener("dragover", (event) => event.preventDefault());
     header.addEventListener("drop", (event) => { const from = Number(event.dataTransfer.getData("application/x-roam-grid-col")); if (Number.isInteger(from)) this.commitMutation("Reorder column", () => this.model.reorderCols(from, col), true); });
-    resize.addEventListener("pointerdown", (event) => {
-      event.preventDefault(); event.stopPropagation();
-      const startX = event.clientX; const startWidth = this.model.widths[id] || DEFAULT_COL_WIDTH;
-      const move = (moveEvent) => { this.model.widths[id] = clamp(startWidth + moveEvent.clientX - startX, 56, 640); this.render(); };
-      const up = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.markChanged(true); };
-      document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
-    });
+    resize.addEventListener("pointerdown", (event) => this.startColumnResize(id, event));
+    resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.commitMutation("Auto-fit column", () => { delete this.model.widths[id]; }, true); });
     return header;
+  }
+
+  applyGridTemplateColumns(grid = this.gridElement) {
+    if (!grid) return;
+    const widths = this.model.columnIds.map((id) => this.columnResizePreview?.id === id ? this.columnResizePreview.width : this.model.widths[id] || DEFAULT_COL_WIDTH);
+    grid.style.width = this.model.fitToWidth ? "100%" : "max-content";
+    grid.style.gridTemplateColumns = `${this.model.showHeaders ? "42px " : ""}${widths.map((width) => this.model.fitToWidth ? `minmax(${MIN_COL_WIDTH}px, ${width}fr)` : `${width}px`).join(" ")}`;
+  }
+
+  applyGridTemplateRows(grid = this.gridElement) {
+    if (!grid) return;
+    const tracks = Array.from({ length: this.model.rowCount }, (_, row) => {
+      const height = this.rowResizePreview?.row === row ? this.rowResizePreview.height : this.model.getRowHeight(row);
+      return height == null ? `minmax(${DEFAULT_ROW_HEIGHT}px, auto)` : `${height}px`;
+    });
+    grid.style.gridTemplateRows = `${this.model.showHeaders ? "28px " : ""}${tracks.join(" ")}`;
+  }
+
+  startColumnResize(id, event) {
+    event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.();
+    const startX = event.clientX; const startWidth = this.model.widths[id] || DEFAULT_COL_WIDTH; let moved = false;
+    const move = (moveEvent) => {
+      moved = true;
+      this.columnResizePreview = { id, width: clamp(Math.round(startWidth + moveEvent.clientX - startX), MIN_COL_WIDTH, MAX_COL_WIDTH) };
+      this.applyGridTemplateColumns();
+    };
+    const up = () => {
+      const width = this.columnResizePreview?.width ?? startWidth;
+      cleanup(); this.columnResizePreview = null;
+      if (!moved) return;
+      this.commitMutation("Resize column", () => { this.model.widths[id] = width; }, true);
+    };
+    const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
+    this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
   }
 
   rowHeader(row) {
@@ -1693,10 +1873,42 @@ export class GridView {
     return header;
   }
 
+  rowResizeHandle(row, offset) {
+    const resize = document.createElement("span"); resize.className = "rg-row-resize"; resize.dataset.row = String(row);
+    resize.style.gridRow = String(row + 1 + offset); resize.style.gridColumn = "1 / -1";
+    resize.title = "Drag to resize row · double-click to auto-fit";
+    resize.addEventListener("pointerdown", (event) => this.startRowResize(row, event));
+    resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.commitMutation("Auto-fit row", () => this.model.setRowHeight(row, null), true); });
+    return resize;
+  }
+
+  startRowResize(row, event) {
+    event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.();
+    const offset = this.model.showHeaders ? 1 : 0;
+    const resolvedTracks = getComputedStyle(this.gridElement).gridTemplateRows.split(/\s+/);
+    const startHeight = Number.parseFloat(resolvedTracks[row + offset]) || this.model.getRowHeight(row) || DEFAULT_ROW_HEIGHT;
+    const startY = event.clientY; let moved = false;
+    const move = (moveEvent) => {
+      moved = true;
+      this.rowResizePreview = { row, height: clamp(Math.round(startHeight + moveEvent.clientY - startY), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT) };
+      this.applyGridTemplateRows();
+    };
+    const up = () => {
+      const height = this.rowResizePreview?.height ?? startHeight;
+      cleanup(); this.rowResizePreview = null;
+      if (!moved) return;
+      this.commitMutation("Resize row", () => this.model.setRowHeight(row, height), true);
+    };
+    const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
+    this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
+  }
+
   cellElement(row, col, merge, engine, offset = this.model.showHeaders ? 1 : 0) {
     const cell = document.createElement("div");
     cell.className = "rg-cell"; cell.dataset.row = String(row); cell.dataset.col = String(col); cell.tabIndex = -1;
     cell.classList.toggle("rg-cell--merged", Boolean(merge));
+    const alignment = this.model.getAlignment(row, col);
+    if (alignment) cell.classList.add(`rg-cell--align-${alignment}`);
     cell.style.gridRow = `${row + 1 + offset} / span ${merge?.rowSpan || 1}`; cell.style.gridColumn = `${col + 1 + offset} / span ${merge?.colSpan || 1}`;
     this.renderCellValue(cell, row, col, engine);
     cell.addEventListener("pointerdown", (event) => {
@@ -1900,7 +2112,19 @@ export class GridView {
       item("Insert row below", () => this.insertRow()), item("Insert column right", () => this.insertCol()),
       item("Delete selected rows", () => { const range = normalizeRange(this.selection); this.commitMutation("Delete rows", () => this.model.deleteRows(range.startRow, range.endRow - range.startRow + 1), true); }),
       item("Delete selected columns", () => { const range = normalizeRange(this.selection); this.commitMutation("Delete columns", () => this.model.deleteCols(range.startCol, range.endCol - range.startCol + 1), true); }),
+      item("Set selected row height…", () => this.setSelectedRowHeight()),
+      item("Compact selected rows", () => this.resizeSelectedRows(24)),
+      item("Auto-fit selected rows", () => this.resizeSelectedRows(null)),
+      item("Set selected column width…", () => this.setSelectedColumnWidth()),
+      item("Reset selected column widths", () => this.resizeSelectedColumns(null)),
+      item("Align left", () => this.alignSelection("left")),
+      item("Align center", () => this.alignSelection("center")),
+      item("Align right", () => this.alignSelection("right")),
+      item("Reset alignment", () => this.alignSelection(null)),
+      item("Copy Roam block reference", () => this.copyRoamReference(false)),
+      item("Copy table block reference", () => this.copyRoamReference(true)),
       item(this.model.showHeaders ? "Hide row/column labels" : "Show row/column labels", () => this.commitMutation("Toggle row and column labels", () => { this.model.showHeaders = !this.model.showHeaders; }, true)),
+      item(this.model.fitToWidth ? "Use fixed column widths" : "Fit table to window", () => this.commitMutation("Toggle fit to window", () => { this.model.fitToWidth = !this.model.fitToWidth; }, true)),
       item("Sort ascending", () => this.commitMutation("Sort rows", () => this.model.sortBy(this.selection.startCol, "asc"), true)),
       item("Sort descending", () => this.commitMutation("Sort rows", () => this.model.sortBy(this.selection.startCol, "desc"), true)),
       item("Copy to large grid", () => copyNativeToLarge(this.model))
@@ -1909,6 +2133,60 @@ export class GridView {
     const rect = anchor.getBoundingClientRect(); menu.style.left = `${x ?? rect.left}px`; menu.style.top = `${y ?? rect.bottom}px`;
     const close = (event) => { if (!menu.contains(event.target)) { menu.remove(); document.removeEventListener("pointerdown", close, true); } };
     setTimeout(() => document.addEventListener("pointerdown", close, true));
+  }
+
+  resizeSelectedRows(height) {
+    const range = normalizeRange(this.selection);
+    return this.commitMutation(height == null ? "Auto-fit rows" : "Resize rows", () => {
+      for (let row = range.startRow; row <= range.endRow; row += 1) this.model.setRowHeight(row, height);
+    }, true);
+  }
+
+  setSelectedRowHeight() {
+    const current = this.model.getRowHeight(this.selection.startRow) || DEFAULT_ROW_HEIGHT;
+    const value = globalThis.prompt?.(`Row height in pixels (${MIN_ROW_HEIGHT}–${MAX_ROW_HEIGHT})`, String(current));
+    if (value == null) return;
+    const height = Number(value);
+    if (!Number.isFinite(height)) return toast("Row height must be a number", "warning");
+    return this.resizeSelectedRows(height);
+  }
+
+  resizeSelectedColumns(width) {
+    const range = normalizeRange(this.selection);
+    return this.commitMutation(width == null ? "Auto-fit columns" : "Resize columns", () => {
+      for (let col = range.startCol; col <= range.endCol; col += 1) {
+        const id = this.model.columnIds[col];
+        if (width == null) delete this.model.widths[id];
+        else this.model.widths[id] = clamp(Math.round(width), MIN_COL_WIDTH, MAX_COL_WIDTH);
+      }
+    }, true);
+  }
+
+  setSelectedColumnWidth() {
+    const id = this.model.columnIds[this.selection.startCol];
+    const current = this.model.widths[id] || DEFAULT_COL_WIDTH;
+    const value = globalThis.prompt?.(`Column width in pixels (${MIN_COL_WIDTH}–${MAX_COL_WIDTH})`, String(current));
+    if (value == null) return;
+    const width = Number(value);
+    if (!Number.isFinite(width)) return toast("Column width must be a number", "warning");
+    return this.resizeSelectedColumns(width);
+  }
+
+  alignSelection(alignment) {
+    const range = normalizeRange(this.selection); const seen = new Set();
+    return this.commitMutation(`${alignment ? `Align ${alignment}` : "Reset alignment"}`, () => {
+      for (let row = range.startRow; row <= range.endRow; row += 1) for (let col = range.startCol; col <= range.endCol; col += 1) {
+        const key = this.model.alignmentKey(row, col); if (!key || seen.has(key)) continue; seen.add(key); this.model.setAlignment(row, col, alignment);
+      }
+    }, true);
+  }
+
+  copyRoamReference(table = false) {
+    const uid = table ? this.model.tableUid : this.model.alignmentKey(this.selection.startRow, this.selection.startCol);
+    if (!uid) return toast("This cell does not have a Roam block UID yet", "warning");
+    const copied = navigator.clipboard?.writeText(`((${uid}))`);
+    if (!copied) return toast("Clipboard access is unavailable", "warning");
+    copied.then(() => toast(`${table ? "Table" : "Cell"} block reference copied`, "success", 1600)).catch((error) => toast(`Copy failed: ${error.message}`, "danger"));
   }
 
   commitMutation(label, mutation, structural) {
@@ -1940,11 +2218,22 @@ export class GridView {
     if (this.disposed || this.savedVersion === this.changeVersion) return;
     const version = this.changeVersion;
     const payload = new GridModel({ ...this.model.snapshot(), tableUid: this.model.tableUid });
+    const pendingUids = payload.rows.map((row) => row.map((cell) => cell.uid));
     payload.baseFingerprint = this.model.baseFingerprint; payload.baseSnapshot = this.model.baseSnapshot;
     this.root.classList.add("rg-root--saving");
     try {
       const saved = await this.adapter.save(payload);
       this.savedVersion = version;
+      const uidMap = new Map();
+      for (let row = 0; row < Math.min(pendingUids.length, saved.rowCount); row += 1) for (let col = 0; col < Math.min(pendingUids[row].length, saved.colCount); col += 1) {
+        if (pendingUids[row][col] !== saved.rows[row][col].uid) uidMap.set(pendingUids[row][col], saved.rows[row][col].uid);
+      }
+      for (const row of this.model.rows) for (let col = 0; col < row.length; col += 1) {
+        const oldUid = row[col].uid; const newUid = uidMap.get(oldUid); if (!newUid) continue;
+        row[col].uid = newUid;
+        if (col === 0 && Object.hasOwn(this.model.rowHeights, oldUid)) { this.model.rowHeights[newUid] = this.model.rowHeights[oldUid]; delete this.model.rowHeights[oldUid]; }
+        if (Object.hasOwn(this.model.alignments, oldUid)) { this.model.alignments[newUid] = this.model.alignments[oldUid]; delete this.model.alignments[oldUid]; }
+      }
       this.model.baseFingerprint = saved.baseFingerprint; this.model.baseSnapshot = saved.baseSnapshot;
       this.adapter.model = this.model;
       if (version !== this.changeVersion) this.markChanged();
@@ -1959,7 +2248,7 @@ export class GridView {
   }
 
   dispose() {
-    this.disposed = true; clearTimeout(this.saveTimer); this.adapter.dispose?.();
+    this.disposed = true; clearTimeout(this.saveTimer); this.resizeCleanup?.(); this.adapter.dispose?.();
     globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true);
     document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true);
     document.removeEventListener("pointerup", this.boundPointerUp, true); this.root.remove(); this.nativeElement?.classList.remove("rg-native-hidden");
@@ -1999,6 +2288,7 @@ export class LargeGridView {
     this.selection = { startRow: 0, endRow: 0, startCol: 0, endCol: 0 }; this.anchor = { row: 0, col: 0 };
     this.root = document.createElement("section"); this.root.className = "rg-root rg-large-root"; this.root.tabIndex = 0;
     this.saveTimer = null; this.renderToken = 0; this.dragSelecting = false; this.boundUp = () => { this.dragSelecting = false; };
+    this.rowOffsets = null; this.rowMetricsKey = null; this.rowResizePreview = null; this.columnResizePreview = null; this.resizeCleanup = null;
     this.keyboardActive = false; this.boundDocumentPointerDown = (event) => { this.keyboardActive = this.root.contains(event.target); };
     this.boundWindowKeydown = (event) => { if (this.keyboardActive) this.onKeydown(event); };
     this.mount();
@@ -2006,7 +2296,7 @@ export class LargeGridView {
   mount() {
     this.markerElement?.classList.add("rg-large-marker-hidden"); this.host.appendChild(this.root);
     const toolbar = document.createElement("div"); toolbar.className = "rg-toolbar";
-    toolbar.append(button("Merge", "Safely merge selection", () => this.merge()), button("Unmerge", "Unmerge selection", () => this.unmerge()), button("Labels", "Show or hide row and column labels", () => this.toggleHeaders()), button("Save", "Commit dirty chunks", () => this.flush()), button("Export", "Export visible selection", () => this.exportSelection()), button("Native copy", "Copy to a native table when within the write budget", () => copyLargeToNative(this.store)));
+    toolbar.append(button("Merge", "Safely merge selection", () => this.merge()), button("Unmerge", "Unmerge selection", () => this.unmerge()), button("⇤", "Align selection left", () => this.alignSelection("left")), button("≡", "Center selection", () => this.alignSelection("center")), button("⇥", "Align selection right", () => this.alignSelection("right")), button("Labels", "Show or hide row and column labels", () => this.toggleHeaders()), button("Save", "Commit dirty chunks", () => this.flush()), button("Export", "Export visible selection", () => this.exportSelection()), button("Native copy", "Copy to a native table when within the write budget", () => copyLargeToNative(this.store)));
     this.status = document.createElement("span"); this.status.className = "rg-status"; toolbar.appendChild(this.status);
     this.viewport = document.createElement("div"); this.viewport.className = "rg-large-viewport";
     this.canvas = document.createElement("div"); this.canvas.className = "rg-large-canvas"; this.viewport.appendChild(this.canvas);
@@ -2015,32 +2305,52 @@ export class LargeGridView {
   }
   headerWidth() { return this.store.manifest.showHeaders === false ? 0 : 42; }
   headerHeight() { return this.store.manifest.showHeaders === false ? 0 : 28; }
-  totalWidth() { return this.headerWidth() + this.store.manifest.columnIds.reduce((sum, id) => sum + (this.store.manifest.widths[id] || DEFAULT_COL_WIDTH), 0); }
-  colLeft(col) { let left = this.headerWidth(); for (let index = 0; index < col; index += 1) left += this.store.manifest.widths[this.store.manifest.columnIds[index]] || DEFAULT_COL_WIDTH; return left; }
+  columnWidth(col) { const id = this.store.manifest.columnIds[col]; return this.columnResizePreview?.col === col ? this.columnResizePreview.width : this.store.manifest.widths[id] || DEFAULT_COL_WIDTH; }
+  totalWidth() { return this.headerWidth() + this.store.manifest.columnIds.reduce((sum, _id, col) => sum + this.columnWidth(col), 0); }
+  colLeft(col) { let left = this.headerWidth(); for (let index = 0; index < col; index += 1) left += this.columnWidth(index); return left; }
+  rebuildRowMetrics() {
+    const preview = this.rowResizePreview ? `${this.rowResizePreview.row}:${this.rowResizePreview.height}` : "";
+    const key = `${this.store.manifest.rowCount}:${preview}`;
+    if (key === this.rowMetricsKey) return;
+    this.rowOffsets = new Float64Array(this.store.manifest.rowCount + 1);
+    for (let row = 0; row < this.store.manifest.rowCount; row += 1) this.rowOffsets[row + 1] = this.rowOffsets[row] + (this.rowResizePreview?.row === row ? this.rowResizePreview.height : this.store.rowHeight(row));
+    this.rowMetricsKey = key;
+  }
+  rowTop(row) { this.rebuildRowMetrics(); return this.headerHeight() + this.rowOffsets[clamp(row, 0, this.store.manifest.rowCount)]; }
+  rowSpanHeight(row, span = 1) { this.rebuildRowMetrics(); return this.rowOffsets[Math.min(this.store.manifest.rowCount, row + span)] - this.rowOffsets[row]; }
+  rowAtOffset(offset) {
+    this.rebuildRowMetrics(); const target = Math.max(0, offset - this.headerHeight()); let low = 0; let high = this.store.manifest.rowCount;
+    while (low < high) { const middle = Math.floor((low + high) / 2); if (this.rowOffsets[middle + 1] <= target) low = middle + 1; else high = middle; }
+    return clamp(low, 0, Math.max(0, this.store.manifest.rowCount - 1));
+  }
   scheduleRender() { const token = ++this.renderToken; requestAnimationFrame(() => { if (token === this.renderToken) this.renderVisible(); }); }
   async renderVisible() {
     const { rowCount, colCount } = this.store.manifest; this.status.textContent = `${rowCount.toLocaleString()} × ${colCount}`;
     const headerHeight = this.headerHeight(); const headerWidth = this.headerWidth();
-    this.canvas.style.width = `${this.totalWidth()}px`; this.canvas.style.height = `${headerHeight + rowCount * DEFAULT_ROW_HEIGHT}px`;
-    const startRow = clamp(Math.floor((this.viewport.scrollTop - headerHeight) / DEFAULT_ROW_HEIGHT) - 8, 0, Math.max(0, rowCount - 1));
-    const endRow = clamp(Math.ceil((this.viewport.scrollTop + this.viewport.clientHeight - headerHeight) / DEFAULT_ROW_HEIGHT) + 8, 0, rowCount);
-    let startCol = 0; let x = headerWidth; while (startCol < colCount && x + (this.store.manifest.widths[this.store.manifest.columnIds[startCol]] || DEFAULT_COL_WIDTH) < this.viewport.scrollLeft) x += this.store.manifest.widths[this.store.manifest.columnIds[startCol++]] || DEFAULT_COL_WIDTH;
-    let endCol = startCol; let visibleWidth = x; while (endCol < colCount && visibleWidth < this.viewport.scrollLeft + this.viewport.clientWidth + DEFAULT_COL_WIDTH * 2) visibleWidth += this.store.manifest.widths[this.store.manifest.columnIds[endCol++]] || DEFAULT_COL_WIDTH;
+    this.rebuildRowMetrics(); this.canvas.style.width = `${this.totalWidth()}px`; this.canvas.style.height = `${headerHeight + this.rowOffsets[rowCount]}px`;
+    const startRow = clamp(this.rowAtOffset(this.viewport.scrollTop) - 8, 0, Math.max(0, rowCount - 1));
+    const endRow = clamp(this.rowAtOffset(this.viewport.scrollTop + this.viewport.clientHeight) + 9, 0, rowCount);
+    let startCol = 0; let x = headerWidth; while (startCol < colCount && x + this.columnWidth(startCol) < this.viewport.scrollLeft) x += this.columnWidth(startCol++);
+    let endCol = startCol; let visibleWidth = x; while (endCol < colCount && visibleWidth < this.viewport.scrollLeft + this.viewport.clientWidth + DEFAULT_COL_WIDTH * 2) visibleWidth += this.columnWidth(endCol++);
     startCol = Math.max(0, startCol - 1);
     const rows = await this.store.getRows(startRow, endRow); const token = this.renderToken;
     if (token !== this.renderToken) return;
     this.canvas.replaceChildren();
     if (this.store.manifest.showHeaders !== false) for (let col = startCol; col < endCol; col += 1) {
-      const header = document.createElement("div"); header.className = "rg-header rg-large-col-header"; header.textContent = columnLabel(col); header.style.left = `${this.colLeft(col)}px`; header.style.width = `${this.store.manifest.widths[this.store.manifest.columnIds[col]] || DEFAULT_COL_WIDTH}px`; this.canvas.appendChild(header);
+      const header = document.createElement("div"); header.className = "rg-header rg-large-col-header"; header.textContent = columnLabel(col); header.style.left = `${this.colLeft(col)}px`; header.style.width = `${this.columnWidth(col)}px`;
+      const resize = document.createElement("span"); resize.className = "rg-col-resize"; resize.title = "Drag to resize column · double-click to reset"; resize.addEventListener("pointerdown", (event) => this.startColumnResize(col, event)); resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.store.setColumnWidth(col, null); this.rowMetricsKey = null; this.scheduleSave(true); this.scheduleRender(); }); header.appendChild(resize); this.canvas.appendChild(header);
     }
     const engine = new AsyncFormulaEngine(this.store, runtime.registries.formulaFunctions);
     for (let row = startRow; row < endRow; row += 1) {
-      if (this.store.manifest.showHeaders !== false) { const rowHeader = document.createElement("div"); rowHeader.className = "rg-header rg-large-row-header"; rowHeader.textContent = String(row + 1); rowHeader.style.top = `${headerHeight + row * DEFAULT_ROW_HEIGHT}px`; this.canvas.appendChild(rowHeader); }
+      if (this.store.manifest.showHeaders !== false) {
+        const rowHeader = document.createElement("div"); rowHeader.className = "rg-header rg-large-row-header"; rowHeader.textContent = String(row + 1); rowHeader.style.top = `${this.rowTop(row)}px`; rowHeader.style.height = `${this.rowSpanHeight(row)}px`;
+        const resize = document.createElement("span"); resize.className = "rg-large-row-resize"; resize.title = "Drag to resize row · double-click to reset"; resize.addEventListener("pointerdown", (event) => this.startRowResize(row, event)); resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.store.setRowHeight(row, null); this.rowMetricsKey = null; this.scheduleSave(true); this.scheduleRender(); }); rowHeader.appendChild(resize); this.canvas.appendChild(rowHeader);
+      }
       for (let col = startCol; col < endCol; col += 1) {
         const merge = this.store.mergeAt(row, col); if (merge && (merge.row !== row || merge.col !== col)) continue;
-        const cell = document.createElement("div"); cell.className = "rg-cell rg-large-cell"; cell.classList.toggle("rg-cell--merged", Boolean(merge)); cell.dataset.row = String(row); cell.dataset.col = String(col); cell.style.left = `${this.colLeft(col)}px`; cell.style.top = `${headerHeight + row * DEFAULT_ROW_HEIGHT}px`;
-        let width = 0; for (let offset = 0; offset < (merge?.colSpan || 1); offset += 1) width += this.store.manifest.widths[this.store.manifest.columnIds[col + offset]] || DEFAULT_COL_WIDTH;
-        cell.style.width = `${width}px`; cell.style.height = `${DEFAULT_ROW_HEIGHT * (merge?.rowSpan || 1)}px`;
+        const cell = document.createElement("div"); cell.className = "rg-cell rg-large-cell"; cell.classList.toggle("rg-cell--merged", Boolean(merge)); const alignment = this.store.getAlignment(row, col); if (alignment) cell.classList.add(`rg-cell--align-${alignment}`); cell.dataset.row = String(row); cell.dataset.col = String(col); cell.style.left = `${this.colLeft(col)}px`; cell.style.top = `${this.rowTop(row)}px`;
+        let width = 0; for (let offset = 0; offset < (merge?.colSpan || 1); offset += 1) width += this.columnWidth(col + offset);
+        cell.style.width = `${width}px`; cell.style.height = `${this.rowSpanHeight(row, merge?.rowSpan || 1)}px`;
         const raw = rows[row - startRow]?.[col] ?? ""; if (raw.startsWith("=") && !raw.startsWith("==")) engine.evaluateCell(row, col).then((value) => { if (cell.isConnected) cell.textContent = String(value ?? ""); }); else if (raw) { try { roam().ui.components.renderString({ el: cell, string: raw }); } catch { cell.textContent = raw; } }
         if (rangeContains(this.selection, row, col)) cell.classList.add("rg-cell--selected");
         cell.addEventListener("pointerdown", (event) => { if (event.button !== 0) return; this.anchor = { row, col }; this.selection = { startRow: row, endRow: row, startCol: col, endCol: col }; this.dragSelecting = true; this.root.focus(); this.scheduleRender(); event.preventDefault(); });
@@ -2048,6 +2358,20 @@ export class LargeGridView {
         cell.addEventListener("dblclick", () => this.beginEdit(row, col, cell)); this.canvas.appendChild(cell);
       }
     }
+  }
+  startRowResize(row, event) {
+    event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.(); const startY = event.clientY; const startHeight = this.store.rowHeight(row); let moved = false;
+    const move = (moveEvent) => { moved = true; this.rowResizePreview = { row, height: clamp(Math.round(startHeight + moveEvent.clientY - startY), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT) }; this.rowMetricsKey = null; this.scheduleRender(); };
+    const up = () => { const height = this.rowResizePreview?.height ?? startHeight; cleanup(); this.rowResizePreview = null; if (!moved) return; this.store.setRowHeight(row, height); this.rowMetricsKey = null; this.scheduleSave(true); this.scheduleRender(); };
+    const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
+    this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
+  }
+  startColumnResize(col, event) {
+    event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.(); const startX = event.clientX; const startWidth = this.columnWidth(col); let moved = false;
+    const move = (moveEvent) => { moved = true; this.columnResizePreview = { col, width: clamp(Math.round(startWidth + moveEvent.clientX - startX), MIN_COL_WIDTH, MAX_COL_WIDTH) }; this.scheduleRender(); };
+    const up = () => { const width = this.columnResizePreview?.width ?? startWidth; cleanup(); this.columnResizePreview = null; if (!moved) return; this.store.setColumnWidth(col, width); this.scheduleSave(true); this.scheduleRender(); };
+    const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
+    this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
   }
   async beginEdit(row, col, cell, initial = null) {
     const raw = await this.store.getRaw(row, col); const input = document.createElement("textarea"); input.className = "rg-editor"; input.value = initial ?? raw; cell.replaceChildren(input); input.focus(); if (initial == null) input.select(); let done = false;
@@ -2063,7 +2387,7 @@ export class LargeGridView {
     if (moves[event.key]) { event.preventDefault(); const [dr, dc] = moves[event.key]; const row = clamp(this.selection.startRow + dr, 0, this.store.manifest.rowCount - 1); const col = clamp(this.selection.startCol + dc, 0, this.store.manifest.colCount - 1); this.selection = { startRow: row, endRow: row, startCol: col, endCol: col }; this.ensureVisible(row, col); this.scheduleRender(); return; }
     if (event.key.length === 1 && !command && !event.altKey) { event.preventDefault(); const cell = this.canvas.querySelector(`[data-row="${this.selection.startRow}"][data-col="${this.selection.startCol}"]`); if (cell) this.beginEdit(this.selection.startRow, this.selection.startCol, cell, event.key); }
   }
-  ensureVisible(row, col) { const top = this.headerHeight() + row * DEFAULT_ROW_HEIGHT; const left = this.colLeft(col); if (top < this.viewport.scrollTop + this.headerHeight()) this.viewport.scrollTop = top - this.headerHeight(); else if (top + DEFAULT_ROW_HEIGHT > this.viewport.scrollTop + this.viewport.clientHeight) this.viewport.scrollTop = top - this.viewport.clientHeight + DEFAULT_ROW_HEIGHT; if (left < this.viewport.scrollLeft + this.headerWidth()) this.viewport.scrollLeft = left - this.headerWidth(); else if (left + DEFAULT_COL_WIDTH > this.viewport.scrollLeft + this.viewport.clientWidth) this.viewport.scrollLeft = left - this.viewport.clientWidth + DEFAULT_COL_WIDTH; }
+  ensureVisible(row, col) { const top = this.rowTop(row); const height = this.rowSpanHeight(row); const left = this.colLeft(col); const width = this.columnWidth(col); if (top < this.viewport.scrollTop + this.headerHeight()) this.viewport.scrollTop = top - this.headerHeight(); else if (top + height > this.viewport.scrollTop + this.viewport.clientHeight) this.viewport.scrollTop = top - this.viewport.clientHeight + height; if (left < this.viewport.scrollLeft + this.headerWidth()) this.viewport.scrollLeft = left - this.headerWidth(); else if (left + width > this.viewport.scrollLeft + this.viewport.clientWidth) this.viewport.scrollLeft = left - this.viewport.clientWidth + width; }
   async copy() { const range = normalizeRange(this.selection); const rows = await this.store.getRows(range.startRow, range.endRow + 1); const text = rows.map((row) => row.slice(range.startCol, range.endCol + 1).map((value) => quoteDelimited(value, "\t")).join("\t")).join("\n"); navigator.clipboard?.writeText(text); }
   async onPaste(event) {
     const images = [...(event.clipboardData?.files || [])].filter((file) => file.type.startsWith("image/"));
@@ -2072,12 +2396,13 @@ export class LargeGridView {
   }
   async merge() { try { await this.store.merge(this.selection); this.scheduleSave(true); this.scheduleRender(); } catch (error) { toast(error.message, "danger"); } }
   unmerge() { if (!this.store.unmerge(this.selection.startRow, this.selection.startCol)) return toast("The active cell is not merged", "warning"); this.scheduleSave(true); this.scheduleRender(); }
+  alignSelection(alignment) { const range = normalizeRange(this.selection); for (let row = range.startRow; row <= range.endRow; row += 1) for (let col = range.startCol; col <= range.endCol; col += 1) this.store.setAlignment(row, col, alignment); this.scheduleSave(true); this.scheduleRender(); }
   toggleHeaders() { this.store.manifest.showHeaders = this.store.manifest.showHeaders === false; this.store.metadataDirty = true; this.scheduleSave(true); this.scheduleRender(); }
   scheduleSave(immediate = false) { clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flush(), immediate ? 0 : 500); }
   async flush() { clearTimeout(this.saveTimer); this.root.classList.add("rg-root--saving"); try { await this.store.commit(); toast("Large grid saved", "success", 1800); } catch (error) { toast(error.message, "danger", 8000); } finally { this.root.classList.remove("rg-root--saving"); } }
   async exportSelection() { const range = normalizeRange(this.selection); const rows = await this.store.getRows(range.startRow, range.endRow + 1); downloadText(rows.map((row) => row.slice(range.startCol, range.endCol + 1).map((value) => quoteDelimited(value, ",")).join(",")).join("\n"), "roam-grid-selection.csv", "text/csv"); }
   async applyPatch(patch) { const patches = Array.isArray(patch) ? patch : [patch]; for (const item of patches) { if (item.op !== "set") throw new GridError("PATCH", "Large-grid public patches currently support cell writes"); await this.store.setCell(item.row, item.col, item.value); } await this.store.commit(); this.scheduleRender(); return { manifest: deepClone(this.store.manifest) }; }
-  dispose() { clearTimeout(this.saveTimer); globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true); document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true); document.removeEventListener("pointerup", this.boundUp, true); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden"); }
+  dispose() { clearTimeout(this.saveTimer); this.resizeCleanup?.(); globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true); document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true); document.removeEventListener("pointerup", this.boundUp, true); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden"); }
 }
 
 function downloadText(text, filename, type = "text/plain") {
@@ -2107,7 +2432,11 @@ async function createNativeTableFromModel(model, afterUid = null) {
   }
   const adapter = new NativeTableAdapter(tableUid);
   const loaded = adapter.load();
-  loaded.columnIds = [...model.columnIds]; loaded.merges = deepClone(model.merges); loaded.widths = { ...model.widths }; loaded.frozenRows = model.frozenRows; loaded.frozenCols = model.frozenCols; loaded.charts = deepClone(model.charts); loaded.showHeaders = model.showHeaders !== false;
+  loaded.columnIds = [...model.columnIds]; loaded.merges = deepClone(model.merges); loaded.widths = { ...model.widths }; loaded.frozenRows = model.frozenRows; loaded.frozenCols = model.frozenCols; loaded.charts = deepClone(model.charts); loaded.showHeaders = model.showHeaders !== false; loaded.fitToWidth = model.fitToWidth !== false;
+  for (let row = 0; row < Math.min(model.rowCount, loaded.rowCount); row += 1) {
+    loaded.setRowHeight(row, model.getRowHeight(row));
+    for (let col = 0; col < Math.min(model.colCount, loaded.colCount); col += 1) loaded.setAlignment(row, col, model.getAlignment(row, col));
+  }
   await runtime.metadata.set(tableUid, loaded, "native");
   scheduleScan();
   return tableUid;
@@ -2230,7 +2559,12 @@ async function scanMounts() {
         const nativeElement = block.querySelector(".rm-table") || block.querySelector("table"); if (!nativeElement) continue;
         const adapter = new NativeTableAdapter(uid); const model = adapter.load(); const view = new GridView({ host: nativeElement.parentElement, model, adapter, nativeElement }); view.root.dataset.roamGridUid = uid; runtime.mounts.set(uid, view);
       }
-    } catch (error) { console.error("[roam-grid] Mount failed", uid, error); }
+    } catch (error) {
+      console.error("[roam-grid] Mount failed", uid, error);
+      block.querySelector(".rm-table,table")?.classList.remove("rg-native-hidden");
+      block.querySelector(".rg-root,.rg-large-root")?.remove();
+      toast(`Roam Grid could not enhance ${uid}: ${error.message}`, "danger", 10000);
+    }
     finally { mounting.delete(uid); }
   }
   for (const [uid, mount] of runtime.mounts) if (!runtime.metadata.has(uid)) { mount.dispose(); runtime.mounts.delete(uid); }

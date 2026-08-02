@@ -31,18 +31,26 @@ test("native tree parser accepts keyword-shaped Roam pull results", () => {
 });
 
 test("content-only native save updates changed block and metadata", async (t) => {
-  const tree = rawTree(); const updates = []; const metadataWrites = [];
+  const tree = rawTree(); const updates = []; const metadataWrites = []; let metadataValue = null;
   globalThis.window = { roamAlphaAPI: {
     q: () => [[tree]],
     data: { block: { update: async ({ block }) => { updates.push(block); const cell = tree.children[1].children[0]; cell.string = block.string; } } },
   } };
   t.after(() => { delete globalThis.window; });
-  const metadata = { get: () => null, set: async (...args) => metadataWrites.push(args) };
-  const adapter = new NativeTableAdapter("table0001", metadata); const model = adapter.load(); model.setRaw(1, 1, "42");
+  const metadata = { get: () => metadataValue, set: async (...args) => {
+    metadataWrites.push(args); const saved = args[1];
+    metadataValue = { columnIds: [...saved.columnIds], merges: structuredClone(saved.merges), widths: { ...saved.widths }, rowHeights: { ...saved.rowHeights }, alignments: { ...saved.alignments }, frozenRows: saved.frozenRows, frozenCols: saved.frozenCols, charts: structuredClone(saved.charts), showHeaders: saved.showHeaders, fitToWidth: saved.fitToWidth };
+  } };
+  const adapter = new NativeTableAdapter("table0001", metadata); const model = adapter.load(); model.setRaw(1, 1, "42"); model.widths[model.columnIds[0]] = 212; model.setRowHeight(1, 46); model.setAlignment(1, 1, "right"); model.fitToWidth = false;
   const saved = await adapter.save(model);
   assert.deepEqual(updates, [{ uid: "cell00002", string: "42" }]);
   assert.equal(metadataWrites.length, 1);
+  assert.equal(metadataWrites[0][1].widths[model.columnIds[0]], 212);
+  assert.equal(metadataWrites[0][1].getRowHeight(1), 46);
   assert.equal(saved.getRaw(1, 1), "42");
+  assert.equal(saved.getRowHeight(1), 46);
+  assert.equal(saved.getAlignment(1, 1), "right");
+  assert.equal(saved.fitToWidth, false);
 });
 
 test("native save detects an external edit before writing", async (t) => {
@@ -54,4 +62,3 @@ test("native save detects an external edit before writing", async (t) => {
   await assert.rejects(adapter.save(model), { code: "CONFLICT" });
   assert.equal(writes, 0);
 });
-
