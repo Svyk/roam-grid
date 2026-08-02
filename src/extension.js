@@ -1,8 +1,10 @@
-const VERSION = "0.2.3";
+const VERSION = "0.3.0";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
 const METADATA_PREFIX = "roam-grid/table::";
+const TEMPLATE_PAGE = "roam/grid/templates";
+const TEMPLATE_PREFIX = "roam-grid/template::";
 const MANIFEST_PREFIX = "roam-grid/manifest::";
 const MAX_NATIVE_MUTATIONS = 1200;
 const CHUNK_ROWS = 500;
@@ -17,6 +19,7 @@ const runtime = {
   extensionAPI: null,
   observer: null,
   metadata: null,
+  templates: null,
   mounts: new Map(),
   disposers: [],
   registries: null,
@@ -41,6 +44,29 @@ const cryptoId = () => {
   return Math.random().toString(36).slice(2, 14);
 };
 const cellLabel = (row, col) => `${columnLabel(col)}${row + 1}`;
+
+export function fittedTrackResize(widths, targetId, requestedWidth, minimum = MIN_COL_WIDTH) {
+  const ids = Object.keys(widths);
+  if (!ids.includes(targetId)) return { ...widths };
+  if (ids.length === 1) return { [targetId]: clamp(requestedWidth, minimum, MAX_COL_WIDTH) };
+  const total = ids.reduce((sum, id) => sum + Math.max(minimum, Number(widths[id]) || minimum), 0);
+  const target = clamp(requestedWidth, minimum, Math.max(minimum, total - minimum * (ids.length - 1)));
+  const result = { [targetId]: target };
+  let remaining = total - target;
+  let pending = ids.filter((id) => id !== targetId);
+  while (pending.length) {
+    const baseTotal = pending.reduce((sum, id) => sum + Math.max(minimum, Number(widths[id]) || minimum), 0);
+    const scale = baseTotal ? remaining / baseTotal : 1;
+    const pinned = pending.filter((id) => (Number(widths[id]) || minimum) * scale <= minimum);
+    if (!pinned.length) {
+      for (const id of pending) result[id] = (Number(widths[id]) || minimum) * scale;
+      break;
+    }
+    for (const id of pinned) { result[id] = minimum; remaining -= minimum; }
+    pending = pending.filter((id) => !pinned.includes(id));
+  }
+  return result;
+}
 
 export function columnLabel(index) {
   let value = index + 1;
@@ -402,7 +428,7 @@ function normalizeCells(rows, width) {
 }
 
 export class GridModel {
-  constructor({ rows = [[]], tableUid = null, columnIds = [], merges = [], widths = {}, rowHeights = {}, alignments = {}, headerColumns = [], headerRows = [], frozenRows = 1, frozenCols = 0, charts = [], showHeaders = true, fitToWidth = true, revision = null } = {}) {
+  constructor({ rows = [[]], tableUid = null, columnIds = [], merges = [], widths = {}, rowHeights = {}, alignments = {}, headerColumns = [], headerRows = [], frozenRows = 1, frozenCols = 0, charts = [], showHeaders = true, fitToWidth = true, colorFormulaCells = true, revision = null } = {}) {
     const width = Math.max(1, columnIds.length, ...rows.map((row) => row.length));
     this.tableUid = tableUid;
     this.rows = normalizeCells(rows.length ? rows : [[]], width);
@@ -419,6 +445,7 @@ export class GridModel {
     this.charts = deepClone(charts);
     this.showHeaders = showHeaders !== false;
     this.fitToWidth = fitToWidth !== false;
+    this.colorFormulaCells = colorFormulaCells !== false;
     this.revision = revision;
     this.undoStack = [];
     this.redoStack = [];
@@ -477,7 +504,7 @@ export class GridModel {
   snapshot() {
     return {
       rows: deepClone(this.rows), columnIds: [...this.columnIds], merges: deepClone(this.merges), widths: { ...this.widths }, rowHeights: { ...this.rowHeights }, alignments: { ...this.alignments }, headerColumns: [...this.headerColumns], headerRows: [...this.headerRows],
-      frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: deepClone(this.charts), showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, revision: this.revision,
+      frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: deepClone(this.charts), showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, colorFormulaCells: this.colorFormulaCells, revision: this.revision,
     };
   }
 
@@ -495,6 +522,7 @@ export class GridModel {
     this.charts = deepClone(snapshot.charts);
     this.showHeaders = snapshot.showHeaders !== false;
     this.fitToWidth = snapshot.fitToWidth !== false;
+    this.colorFormulaCells = snapshot.colorFormulaCells !== false;
     this.revision = snapshot.revision;
   }
 
@@ -763,7 +791,7 @@ export class GridModel {
   }
 
   toJSON() {
-    return { schema: "roam-grid", version: 1, tableUid: this.tableUid, rows: this.rows, columnIds: this.columnIds, merges: this.merges, widths: this.widths, rowHeights: this.rowHeights, alignments: this.alignments, headerColumns: this.headerColumns, headerRows: this.headerRows, frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: this.charts, showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, revision: this.revision };
+    return { schema: "roam-grid", version: 1, tableUid: this.tableUid, rows: this.rows, columnIds: this.columnIds, merges: this.merges, widths: this.widths, rowHeights: this.rowHeights, alignments: this.alignments, headerColumns: this.headerColumns, headerRows: this.headerRows, frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: this.charts, showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, colorFormulaCells: this.colorFormulaCells, revision: this.revision };
   }
 
   static fromJSON(value) {
@@ -1102,6 +1130,54 @@ export function nativeTreeToModel(tree, metadata = {}) {
   return model;
 }
 
+export function serializeTemplateModel(model, name = "Untitled grid") {
+  const value = {
+    schema: "roam-grid-template",
+    version: 1,
+    name: String(name).trim() || "Untitled grid",
+    rows: rawRows(model),
+    merges: deepClone(model.merges),
+    widths: model.columnIds.map((id) => model.widths[id] ?? null),
+    rowHeights: Array.from({ length: model.rowCount }, (_, row) => model.getRowHeight(row)),
+    alignments: Array.from({ length: model.rowCount }, (_, row) => Array.from({ length: model.colCount }, (_, col) => model.getAlignment(row, col))),
+    headerColumns: Array.from({ length: model.colCount }, (_, col) => col).filter((col) => model.isHeaderColumn(col)),
+    headerRows: Array.from({ length: model.rowCount }, (_, row) => row).filter((row) => model.isHeaderRow(row)),
+    frozenRows: model.frozenRows,
+    frozenCols: model.frozenCols,
+    charts: deepClone(model.charts),
+    showHeaders: model.showHeaders !== false,
+    fitToWidth: model.fitToWidth !== false,
+    colorFormulaCells: model.colorFormulaCells !== false,
+  };
+  return value;
+}
+
+export function templateModelFromValue(value) {
+  if (!value || value.schema !== "roam-grid-template" || value.version !== 1 || !Array.isArray(value.rows)) {
+    throw new GridError("TEMPLATE_FORMAT", "This saved grid template uses an unsupported format");
+  }
+  const model = new GridModel({
+    rows: deepClone(value.rows),
+    merges: deepClone(value.merges || []),
+    frozenRows: value.frozenRows ?? 1,
+    frozenCols: value.frozenCols ?? 0,
+    charts: deepClone(value.charts || []),
+    showHeaders: value.showHeaders !== false,
+    fitToWidth: value.fitToWidth !== false,
+    colorFormulaCells: value.colorFormulaCells !== false,
+  });
+  (value.widths || []).forEach((width, col) => {
+    if (model.columnIds[col] && Number.isFinite(width)) model.widths[model.columnIds[col]] = clamp(Math.round(width), MIN_COL_WIDTH, MAX_COL_WIDTH);
+  });
+  (value.rowHeights || []).forEach((height, row) => { if (row < model.rowCount && Number.isFinite(height)) model.setRowHeight(row, height); });
+  (value.alignments || []).forEach((alignments, row) => (alignments || []).forEach((alignment, col) => {
+    if (row < model.rowCount && col < model.colCount && alignment) model.setAlignment(row, col, alignment);
+  }));
+  for (const col of value.headerColumns || []) if (Number.isInteger(col) && col >= 0 && col < model.colCount) model.toggleHeaderColumn(col);
+  for (const row of value.headerRows || []) if (Number.isInteger(row) && row >= 0 && row < model.rowCount) model.toggleHeaderRow(row);
+  return model;
+}
+
 class MetadataStore {
   constructor() {
     this.pageUid = null;
@@ -1130,13 +1206,13 @@ class MetadataStore {
   get(tableUid) {
     const value = this.entries.get(tableUid)?.value;
     if (!value) return null;
-    return { columnIds: value.columnIds || [], merges: value.merges || [], widths: value.widths || {}, rowHeights: value.rowHeights || {}, alignments: value.alignments || {}, headerColumns: value.headerColumns || [], headerRows: value.headerRows || [], frozenRows: value.frozenRows ?? 1, frozenCols: value.frozenCols ?? 0, charts: value.charts || [], showHeaders: value.showHeaders !== false, fitToWidth: value.fitToWidth !== false };
+    return { columnIds: value.columnIds || [], merges: value.merges || [], widths: value.widths || {}, rowHeights: value.rowHeights || {}, alignments: value.alignments || {}, headerColumns: value.headerColumns || [], headerRows: value.headerRows || [], frozenRows: value.frozenRows ?? 1, frozenCols: value.frozenCols ?? 0, charts: value.charts || [], showHeaders: value.showHeaders !== false, fitToWidth: value.fitToWidth !== false, colorFormulaCells: value.colorFormulaCells !== false };
   }
 
   has(tableUid) { return this.entries.has(tableUid); }
 
   async set(tableUid, model, mode = "native") {
-    const value = { schema: 1, mode, tableUid, columnIds: model.columnIds, merges: model.merges, widths: model.widths, rowHeights: model.rowHeights, alignments: model.alignments, headerColumns: model.headerColumns, headerRows: model.headerRows, frozenRows: model.frozenRows, frozenCols: model.frozenCols, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, updatedAt: new Date().toISOString() };
+    const value = { schema: 1, mode, tableUid, columnIds: model.columnIds, merges: model.merges, widths: model.widths, rowHeights: model.rowHeights, alignments: model.alignments, headerColumns: model.headerColumns, headerRows: model.headerRows, frozenRows: model.frozenRows, frozenCols: model.frozenCols, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, colorFormulaCells: model.colorFormulaCells !== false, updatedAt: new Date().toISOString() };
     const string = `${METADATA_PREFIX} ${JSON.stringify(value)}`;
     const entry = this.entries.get(tableUid);
     const blockUid = entry ? entry.blockUid : await createBlock(this.pageUid, string);
@@ -1154,6 +1230,61 @@ class MetadataStore {
 
   async createStaging(tableUid) {
     return createBlock(this.pageUid, `roam-grid/staging:: ${tableUid}`);
+  }
+}
+
+class GridTemplateStore {
+  constructor() {
+    this.pageUid = null;
+    this.entries = new Map();
+  }
+
+  async initialize() {
+    this.pageUid = getPageUid(TEMPLATE_PAGE);
+    await this.reload();
+  }
+
+  async ensurePage() {
+    if (!this.pageUid) this.pageUid = getPageUid(TEMPLATE_PAGE) || await createPage(TEMPLATE_PAGE);
+    return this.pageUid;
+  }
+
+  async reload() {
+    this.entries.clear();
+    if (!this.pageUid) return;
+    const tree = getTree(this.pageUid);
+    for (const block of tree?.children || []) {
+      if (!block.string.startsWith(TEMPLATE_PREFIX)) continue;
+      try {
+        const value = JSON.parse(block.string.slice(TEMPLATE_PREFIX.length).trim());
+        if (value.schema !== "roam-grid-template" || value.version !== 1 || !value.name) throw new Error("Unsupported template record");
+        this.entries.set(String(value.name).toUpperCase(), { blockUid: block.uid, value });
+      } catch (error) {
+        console.warn("[roam-grid] Ignoring malformed saved template", block.uid, error);
+      }
+    }
+  }
+
+  list() { return [...this.entries.values()].map(({ value }) => value.name).sort((a, b) => a.localeCompare(b)); }
+
+  get(name) {
+    const value = this.entries.get(String(name).toUpperCase())?.value;
+    return value ? templateModelFromValue(deepClone(value)) : null;
+  }
+
+  async save(name, model) {
+    const cleanName = String(name || "").trim();
+    if (!cleanName) throw new GridError("TEMPLATE_NAME", "Give this grid template a name");
+    if (model.rowCount * model.colCount > MAX_NATIVE_MUTATIONS) throw new GridError("TEMPLATE_SIZE", "Saved templates must fit within the native-table write budget");
+    const value = { ...serializeTemplateModel(model, cleanName), updatedAt: new Date().toISOString() };
+    const string = `${TEMPLATE_PREFIX} ${JSON.stringify(value)}`;
+    const key = cleanName.toUpperCase();
+    const existing = this.entries.get(key);
+    const pageUid = await this.ensurePage();
+    const blockUid = existing ? existing.blockUid : await createBlock(pageUid, string);
+    if (existing) await updateBlock(blockUid, string);
+    this.entries.set(key, { blockUid, value });
+    return cleanName;
   }
 }
 
@@ -1192,7 +1323,7 @@ export class NativeTableAdapter {
     return this.watch;
   }
 
-  async save(model) {
+  async save(model, { saveMetadata = true } = {}) {
     return this.queue.run(async () => {
       const currentTree = getTree(this.tableUid);
       if (!currentTree) throw new GridError("TABLE_MISSING", "The source Roam table no longer exists");
@@ -1201,7 +1332,7 @@ export class NativeTableAdapter {
       this.saving = true;
       try {
         await this.persistModel(model, currentTree);
-        await this.metadataStore.set(this.tableUid, model);
+        if (saveMetadata) await this.metadataStore.set(this.tableUid, model);
         const reloaded = this.load();
         return reloaded;
       } catch (error) {
@@ -1353,6 +1484,7 @@ export class LargeGridStore {
     manifest.widths ||= {};
     manifest.rowHeights ||= {};
     manifest.alignments ||= {};
+    manifest.colorFormulaCells = manifest.colorFormulaCells !== false;
   }
 
   async seed(model) {
@@ -1366,7 +1498,7 @@ export class LargeGridStore {
     const manifest = {
       schema: "roam-grid/manifest", version: 1, revision: cryptoId(), previous: null, createdAt: new Date().toISOString(),
       rowCount: model.rowCount, colCount: model.colCount, columnIds: model.columnIds, widths: model.widths, rowHeights: rowHeightsForManifest(model), alignments: alignmentsForManifest(model),
-      frozenRows: model.frozenRows, frozenCols: model.frozenCols, merges: model.merges, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, chunks, retained: [],
+      frozenRows: model.frozenRows, frozenCols: model.frozenCols, merges: model.merges, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, colorFormulaCells: model.colorFormulaCells !== false, chunks, retained: [],
     };
     const url = await uploadJson(manifest, `roam-grid-${this.anchorUid}-manifest.json`);
     const verified = await downloadJson(url);
@@ -1537,7 +1669,7 @@ export class LargeGridStore {
   async saveAsCopy(newAnchorUid) {
     const rows = [];
     for (let start = 0; start < this.manifest.rowCount; start += CHUNK_ROWS) rows.push(...await this.getRows(start, Math.min(this.manifest.rowCount, start + CHUNK_ROWS)));
-    const model = applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false }), this.manifest.rowHeights), this.manifest.alignments);
+    const model = applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false, colorFormulaCells: this.manifest.colorFormulaCells !== false }), this.manifest.rowHeights), this.manifest.alignments);
     return new LargeGridStore(newAnchorUid).initialize(model);
   }
 
@@ -1545,7 +1677,7 @@ export class LargeGridStore {
     if (this.manifest.rowCount * this.manifest.colCount > limit) throw new GridError("MUTATION_BUDGET", "Large grid exceeds the safe native-table conversion budget");
     const rows = [];
     for (let start = 0; start < this.manifest.rowCount; start += CHUNK_ROWS) rows.push(...await this.getRows(start, Math.min(this.manifest.rowCount, start + CHUNK_ROWS)));
-    return applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false }), this.manifest.rowHeights), this.manifest.alignments);
+    return applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false, colorFormulaCells: this.manifest.colorFormulaCells !== false }), this.manifest.rowHeights), this.manifest.alignments);
   }
 }
 
@@ -1628,8 +1760,13 @@ function applyPatchToModel(model, patch, recordUndo = true) {
   return recordUndo ? model.transact("API patch", apply) : apply();
 }
 
+function patchChangesLayout(patch) {
+  return (Array.isArray(patch) ? patch : [patch]).some((item) => item.op !== "set");
+}
+
 function createPublicApi() {
   const registries = runtime.registries;
+  const templateNames = () => [...new Set([...registries.templates.keys(), ...(runtime.templates?.list() || [])])].sort((a, b) => a.localeCompare(b));
   return {
     version: VERSION,
     registerFormulaFunction: (name, fn) => registries.register(registries.formulaFunctions, name, fn),
@@ -1639,7 +1776,13 @@ function createPublicApi() {
     registerExporter: (name, exporter) => registries.register(registries.exporters, name, exporter),
     registerDataSource: (name, source) => registries.register(registries.dataSources, name, source),
     registerTemplate: (name, template) => registries.register(registries.templates, name, template),
-    listTemplates: () => [...registries.templates.keys()].sort(),
+    listTemplates: templateNames,
+    saveTemplate: async (name, tableUid = activeGridUid()) => {
+      const mount = tableUid ? runtime.mounts.get(tableUid) : null;
+      const model = mount instanceof GridView ? mount.model : tableUid && runtime.metadata.has(tableUid) ? new NativeTableAdapter(tableUid).load() : null;
+      if (!model) throw new GridError("TEMPLATE_SOURCE", "Focus an enhanced native grid before saving a template");
+      return runtime.templates.save(name, model);
+    },
     createFromTemplate: async (name) => createNativeTableFromModel(await resolveTemplateModel(name)),
     getTableModel: (tableUid) => {
       const mount = runtime.mounts.get(tableUid);
@@ -1653,7 +1796,7 @@ function createPublicApi() {
       const adapter = new NativeTableAdapter(tableUid);
       const model = adapter.load();
       applyPatchToModel(model, patch);
-      const saved = await adapter.save(model);
+      const saved = await adapter.save(model, { saveMetadata: patchChangesLayout(patch) });
       globalThis.window?.dispatchEvent(new CustomEvent("roam-grid:changed", { detail: { tableUid, patch } }));
       return saved.toJSON();
     },
@@ -1750,6 +1893,7 @@ export class GridView {
     this.changeVersion = 0;
     this.savedVersion = 0;
     this.saveTimer = null;
+    this.metadataDirty = false;
     this.dragSelecting = false;
     this.fillStart = null;
     this.rowResizePreview = null;
@@ -1859,11 +2003,12 @@ export class GridView {
   applyGridTemplateColumns(grid = this.gridElement) {
     if (!grid) return;
     const widths = this.model.columnIds.map((id) => {
-      if (this.columnResizePreview?.id === id) return this.columnResizePreview.width;
-      return this.columnResizePreview?.baseWidths?.[id] || this.model.widths[id] || DEFAULT_COL_WIDTH;
+      if (this.columnResizePreview?.widths?.[id] != null) return this.columnResizePreview.widths[id];
+      return this.model.widths[id] || DEFAULT_COL_WIDTH;
     });
-    grid.style.width = this.model.fitToWidth ? "100%" : "max-content";
-    grid.style.gridTemplateColumns = `${this.model.showHeaders ? "42px " : ""}${widths.map((width) => this.model.fitToWidth ? `minmax(${MIN_COL_WIDTH}px, ${width}fr)` : `${width}px`).join(" ")}`;
+    const previewing = Boolean(this.columnResizePreview);
+    grid.style.width = this.model.fitToWidth && !previewing ? "100%" : "max-content";
+    grid.style.gridTemplateColumns = `${this.model.showHeaders ? "42px " : ""}${widths.map((width) => previewing || !this.model.fitToWidth ? `${width}px` : `minmax(${MIN_COL_WIDTH}px, ${width}fr)`).join(" ")}`;
   }
 
   applyGridTemplateRows(grid = this.gridElement) {
@@ -1882,17 +2027,19 @@ export class GridView {
     const baseWidths = Object.fromEntries(this.model.columnIds.map((columnId, col) => [columnId, Number.parseFloat(resolvedTracks[col + offset]) || this.model.widths[columnId] || DEFAULT_COL_WIDTH]));
     const startX = event.clientX; const startWidth = baseWidths[id]; let moved = false;
     const move = (moveEvent) => {
-      moved = true;
-      this.columnResizePreview = { id, baseWidths: this.model.fitToWidth ? baseWidths : null, width: clamp(Math.round(startWidth + moveEvent.clientX - startX), MIN_COL_WIDTH, MAX_COL_WIDTH) };
+      const requested = clamp(Math.round(startWidth + moveEvent.clientX - startX), MIN_COL_WIDTH, MAX_COL_WIDTH);
+      moved ||= requested !== startWidth;
+      const widths = this.model.fitToWidth ? fittedTrackResize(baseWidths, id, requested) : { ...baseWidths, [id]: requested };
+      this.columnResizePreview = { id, widths };
       this.applyGridTemplateColumns();
     };
     const up = () => {
-      const width = this.columnResizePreview?.width ?? startWidth;
+      const widths = this.columnResizePreview?.widths || baseWidths;
       cleanup(); this.columnResizePreview = null;
       if (!moved) return;
       this.commitMutation("Resize column", () => {
-        if (this.model.fitToWidth) Object.assign(this.model.widths, baseWidths);
-        this.model.widths[id] = width;
+        if (this.model.fitToWidth) for (const columnId of this.model.columnIds) this.model.widths[columnId] = Math.round(widths[columnId]);
+        else this.model.widths[id] = Math.round(widths[id]);
       }, true);
     };
     const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
@@ -1974,6 +2121,9 @@ export class GridView {
   renderCellValue(cell, row, col, engine = new FormulaEngine(this.model, runtime.registries.formulaFunctions)) {
     cell.replaceChildren();
     const raw = this.model.getRaw(row, col); const value = engine.evaluateCell(row, col);
+    const formula = raw.startsWith("=") && !raw.startsWith("==");
+    cell.dataset.rgRaw = raw;
+    cell.classList.toggle("rg-cell--formula", formula && this.model.colorFormulaCells);
     for (const renderer of runtime.registries.cellRenderers.values()) {
       try {
         if (renderer.match?.({ raw, value, row, col, model: this.model })) {
@@ -1983,7 +2133,7 @@ export class GridView {
         }
       } catch (error) { console.warn("[roam-grid] Cell renderer failed", error); }
     }
-    if (raw.startsWith("=") && !raw.startsWith("==")) {
+    if (formula) {
       cell.textContent = String(value ?? ""); cell.classList.toggle("rg-cell--error", String(value).startsWith("#")); cell.title = raw;
     } else if (raw) {
       try { roam().ui.components.renderString({ el: cell, string: raw }); }
@@ -2171,11 +2321,13 @@ export class GridView {
     }
     const text = event.clipboardData?.getData("text/plain"); if (!text) return;
     event.preventDefault(); const matrix = parseDelimited(text, text.includes("\t") ? "\t" : detectDelimiter(text));
+    const width = Math.max(...matrix.map((row) => row.length));
+    const structural = this.selection.startRow + matrix.length > this.model.rowCount || this.selection.startCol + width > this.model.colCount;
     await this.commitMutation("Paste cells", () => {
       const neededRows = this.selection.startRow + matrix.length - this.model.rowCount; if (neededRows > 0) this.model.insertRows(this.model.rowCount, neededRows);
-      const width = Math.max(...matrix.map((row) => row.length)); const neededCols = this.selection.startCol + width - this.model.colCount; if (neededCols > 0) this.model.insertCols(this.model.colCount, neededCols);
+      const neededCols = this.selection.startCol + width - this.model.colCount; if (neededCols > 0) this.model.insertCols(this.model.colCount, neededCols);
       matrix.forEach((values, row) => values.forEach((value, col) => { if (!this.model.isCovered(this.selection.startRow + row, this.selection.startCol + col)) this.model.setRaw(this.selection.startRow + row, this.selection.startCol + col, value); }));
-    }, true);
+    }, structural);
   }
 
   clearSelection() {
@@ -2242,6 +2394,7 @@ export class GridView {
       item("Reset alignment", () => this.alignSelection(null)),
       item("Copy Roam block reference", () => this.copyRoamReference(false)),
       item("Copy table block reference", () => this.copyRoamReference(true)),
+      item(this.model.colorFormulaCells ? "Hide formula coloring" : "Color formula cells", () => this.commitMutation("Toggle formula coloring", () => { this.model.colorFormulaCells = !this.model.colorFormulaCells; }, true)),
       item(this.model.showHeaders ? "Hide row/column labels" : "Show row/column labels", () => this.commitMutation("Toggle row and column labels", () => { this.model.showHeaders = !this.model.showHeaders; }, true)),
       item(this.model.fitToWidth ? "Use fixed column widths" : "Fit table to window", () => this.commitMutation("Toggle fit to window", () => { this.model.fitToWidth = !this.model.fitToWidth; }, true)),
       item("Sort ascending", () => this.commitMutation("Sort rows", () => this.model.sortBy(this.selection.startCol, "asc"), true)),
@@ -2311,6 +2464,7 @@ export class GridView {
       item("Reset alignment", () => this.alignSelection(null)),
       item("Copy Roam block reference", () => this.copyRoamReference(false)),
       item("Copy table block reference", () => this.copyRoamReference(true)),
+      item(this.model.colorFormulaCells ? "Hide formula coloring" : "Color formula cells", () => this.commitMutation("Toggle formula coloring", () => { this.model.colorFormulaCells = !this.model.colorFormulaCells; }, true)),
       item(this.model.showHeaders ? "Hide row/column labels" : "Show row/column labels", () => this.commitMutation("Toggle row and column labels", () => { this.model.showHeaders = !this.model.showHeaders; }, true)),
       item(this.model.fitToWidth ? "Use fixed column widths" : "Fit table to window", () => this.commitMutation("Toggle fit to window", () => { this.model.fitToWidth = !this.model.fitToWidth; }, true)),
       item("Copy to large grid", () => copyNativeToLarge(this.model))
@@ -2400,14 +2554,18 @@ export class GridView {
 
   refreshValues() {
     const engine = new FormulaEngine(this.model, runtime.registries.formulaFunctions);
-    for (const [key, cell] of this.cells) { const [row, col] = key.split(":").map(Number); this.renderCellValue(cell, row, col, engine); }
+    for (const [key, cell] of this.cells) {
+      const [row, col] = key.split(":").map(Number); const raw = this.model.getRaw(row, col);
+      if (cell.dataset.rgRaw !== raw || raw.startsWith("=") && !raw.startsWith("==")) this.renderCellValue(cell, row, col, engine);
+    }
     this.updateSelection();
   }
 
-  markChanged(immediate = false) {
+  markChanged(layoutChanged = false) {
     this.changeVersion += 1;
+    this.metadataDirty ||= layoutChanged;
     clearTimeout(this.saveTimer);
-    this.saveTimer = setTimeout(() => this.flushSave(), immediate ? 0 : 220);
+    this.saveTimer = setTimeout(() => this.flushSave(), layoutChanged ? 0 : 220);
   }
 
   async flushSave() {
@@ -2416,9 +2574,10 @@ export class GridView {
     const payload = new GridModel({ ...this.model.snapshot(), tableUid: this.model.tableUid });
     const pendingUids = payload.rows.map((row) => row.map((cell) => cell.uid));
     payload.baseFingerprint = this.model.baseFingerprint; payload.baseSnapshot = this.model.baseSnapshot;
+    const saveMetadata = this.metadataDirty; this.metadataDirty = false;
     this.root.classList.add("rg-root--saving");
     try {
-      const saved = await this.adapter.save(payload);
+      const saved = await this.adapter.save(payload, { saveMetadata });
       this.savedVersion = version;
       const uidMap = new Map();
       for (let row = 0; row < Math.min(pendingUids.length, saved.rowCount); row += 1) for (let col = 0; col < Math.min(pendingUids[row].length, saved.colCount); col += 1) {
@@ -2432,15 +2591,19 @@ export class GridView {
       }
       this.model.baseFingerprint = saved.baseFingerprint; this.model.baseSnapshot = saved.baseSnapshot;
       this.adapter.model = this.model;
-      if (version !== this.changeVersion) this.markChanged();
+      if (version !== this.changeVersion) {
+        clearTimeout(this.saveTimer);
+        this.saveTimer = setTimeout(() => this.flushSave(), 220);
+      }
     } catch (error) {
+      this.metadataDirty ||= saveMetadata;
       toast(error.message, "danger", 8000);
       try { this.model = this.adapter.load(); this.changeVersion = this.savedVersion; this.render(); } catch { /* table may have disappeared */ }
     } finally { this.root.classList.remove("rg-root--saving"); }
   }
 
   applyPatch(patch) {
-    return this.commitMutation("External patch", () => applyPatchToModel(this.model, patch, false), true).then(() => this.model.toJSON());
+    return this.commitMutation("External patch", () => applyPatchToModel(this.model, patch, false), patchChangesLayout(patch)).then(() => this.model.toJSON());
   }
 
   dispose() {
@@ -2492,7 +2655,7 @@ export class LargeGridView {
   mount() {
     this.markerElement?.classList.add("rg-large-marker-hidden"); this.host.appendChild(this.root);
     const toolbar = document.createElement("div"); toolbar.className = "rg-toolbar";
-    toolbar.append(button("Merge", "Safely merge selection", () => this.merge()), button("Unmerge", "Unmerge selection", () => this.unmerge()), button("⇤", "Align selection left", () => this.alignSelection("left")), button("≡", "Center selection", () => this.alignSelection("center")), button("⇥", "Align selection right", () => this.alignSelection("right")), button("Labels", "Show or hide row and column labels", () => this.toggleHeaders()), button("Save", "Commit dirty chunks", () => this.flush()), button("Export", "Export visible selection", () => this.exportSelection()), button("Native copy", "Copy to a native table when within the write budget", () => copyLargeToNative(this.store)));
+    toolbar.append(button("Merge", "Safely merge selection", () => this.merge()), button("Unmerge", "Unmerge selection", () => this.unmerge()), button("⇤", "Align selection left", () => this.alignSelection("left")), button("≡", "Center selection", () => this.alignSelection("center")), button("⇥", "Align selection right", () => this.alignSelection("right")), button("fx", "Show or hide formula-cell coloring", () => this.toggleFormulaColors()), button("Labels", "Show or hide row and column labels", () => this.toggleHeaders()), button("Save", "Commit dirty chunks", () => this.flush()), button("Export", "Export visible selection", () => this.exportSelection()), button("Native copy", "Copy to a native table when within the write budget", () => copyLargeToNative(this.store)));
     this.status = document.createElement("span"); this.status.className = "rg-status"; toolbar.appendChild(this.status);
     this.viewport = document.createElement("div"); this.viewport.className = "rg-large-viewport";
     this.canvas = document.createElement("div"); this.canvas.className = "rg-large-canvas"; this.viewport.appendChild(this.canvas);
@@ -2547,7 +2710,7 @@ export class LargeGridView {
         const cell = document.createElement("div"); cell.className = "rg-cell rg-large-cell"; cell.classList.toggle("rg-cell--merged", Boolean(merge)); const alignment = this.store.getAlignment(row, col); if (alignment) cell.classList.add(`rg-cell--align-${alignment}`); cell.dataset.row = String(row); cell.dataset.col = String(col); cell.style.left = `${this.colLeft(col)}px`; cell.style.top = `${this.rowTop(row)}px`;
         let width = 0; for (let offset = 0; offset < (merge?.colSpan || 1); offset += 1) width += this.columnWidth(col + offset);
         cell.style.width = `${width}px`; cell.style.height = `${this.rowSpanHeight(row, merge?.rowSpan || 1)}px`;
-        const raw = rows[row - startRow]?.[col] ?? ""; if (raw.startsWith("=") && !raw.startsWith("==")) engine.evaluateCell(row, col).then((value) => { if (cell.isConnected) cell.textContent = String(value ?? ""); }); else if (raw) { try { roam().ui.components.renderString({ el: cell, string: raw }); } catch { cell.textContent = raw; } }
+        const raw = rows[row - startRow]?.[col] ?? ""; const formula = raw.startsWith("=") && !raw.startsWith("=="); cell.classList.toggle("rg-cell--formula", formula && this.store.manifest.colorFormulaCells !== false); if (formula) engine.evaluateCell(row, col).then((value) => { if (cell.isConnected) cell.textContent = String(value ?? ""); }); else if (raw) { try { roam().ui.components.renderString({ el: cell, string: raw }); } catch { cell.textContent = raw; } }
         if (rangeContains(this.selection, row, col)) cell.classList.add("rg-cell--selected");
         cell.addEventListener("pointerdown", (event) => { if (event.button !== 0) return; this.anchor = { row, col }; this.selection = { startRow: row, endRow: row, startCol: col, endCol: col }; this.dragSelecting = true; this.root.focus(); this.scheduleRender(); event.preventDefault(); });
         cell.addEventListener("pointerenter", () => { if (this.dragSelecting) { this.selection = normalizeRange({ startRow: this.anchor.row, endRow: row, startCol: this.anchor.col, endCol: col }); this.scheduleRender(); } });
@@ -2593,6 +2756,7 @@ export class LargeGridView {
   async merge() { try { await this.store.merge(this.selection); this.scheduleSave(true); this.scheduleRender(); } catch (error) { toast(error.message, "danger"); } }
   unmerge() { if (!this.store.unmerge(this.selection.startRow, this.selection.startCol)) return toast("The active cell is not merged", "warning"); this.scheduleSave(true); this.scheduleRender(); }
   alignSelection(alignment) { const range = normalizeRange(this.selection); for (let row = range.startRow; row <= range.endRow; row += 1) for (let col = range.startCol; col <= range.endCol; col += 1) this.store.setAlignment(row, col, alignment); this.scheduleSave(true); this.scheduleRender(); }
+  toggleFormulaColors() { this.store.manifest.colorFormulaCells = this.store.manifest.colorFormulaCells === false; this.store.metadataDirty = true; this.scheduleSave(true); this.scheduleRender(); }
   toggleHeaders() { this.store.manifest.showHeaders = this.store.manifest.showHeaders === false; this.store.metadataDirty = true; this.scheduleSave(true); this.scheduleRender(); }
   scheduleSave(immediate = false) { clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flush(), immediate ? 0 : 500); }
   async flush() { clearTimeout(this.saveTimer); this.root.classList.add("rg-root--saving"); try { await this.store.commit(); toast("Large grid saved", "success", 1800); } catch (error) { toast(error.message, "danger", 8000); } finally { this.root.classList.remove("rg-root--saving"); } }
@@ -2628,7 +2792,7 @@ async function createNativeTableFromModel(model, afterUid = null) {
   }
   const adapter = new NativeTableAdapter(tableUid);
   const loaded = adapter.load();
-  loaded.columnIds = [...model.columnIds]; loaded.merges = deepClone(model.merges); loaded.widths = { ...model.widths }; loaded.headerColumns = [...model.headerColumns]; loaded.frozenRows = model.frozenRows; loaded.frozenCols = model.frozenCols; loaded.charts = deepClone(model.charts); loaded.showHeaders = model.showHeaders !== false; loaded.fitToWidth = model.fitToWidth !== false;
+  loaded.columnIds = [...model.columnIds]; loaded.merges = deepClone(model.merges); loaded.widths = { ...model.widths }; loaded.headerColumns = [...model.headerColumns]; loaded.frozenRows = model.frozenRows; loaded.frozenCols = model.frozenCols; loaded.charts = deepClone(model.charts); loaded.showHeaders = model.showHeaders !== false; loaded.fitToWidth = model.fitToWidth !== false; loaded.colorFormulaCells = model.colorFormulaCells !== false;
   for (let row = 0; row < Math.min(model.rowCount, loaded.rowCount); row += 1) {
     loaded.setRowHeight(row, model.getRowHeight(row));
     if (model.isHeaderRow(row)) loaded.toggleHeaderRow(row);
@@ -2639,55 +2803,40 @@ async function createNativeTableFromModel(model, afterUid = null) {
   return tableUid;
 }
 
-export function mealPrepTemplateModel() {
-  const rows = [
-    ["**Meat + Pasta Meal Prep Calculator**", "", "", "", "", "", "", "", "", "", "", ""],
-    ["Meals", "5", "Replace the example price and nutrition values with the numbers from your package labels.", "", "", "", "", "", "", "", "", ""],
-    ["Ingredient", "Batch g", "$ / 100g", "kcal / 100g", "Protein / 100g", "Carbs / 100g", "Fat / 100g", "Batch cost", "Batch kcal", "Protein g", "Carbs g", "Fat g"],
-    ["Lean ground meat", "1000", "1.20", "200", "26", "0", "10", "=ROUND(B4*C4/100,2)", "=ROUND(B4*D4/100,0)", "=ROUND(B4*E4/100,1)", "=ROUND(B4*F4/100,1)", "=ROUND(B4*G4/100,1)"],
-    ["Dry pasta", "500", "0.35", "350", "12", "72", "1.5", "=ROUND(B5*C5/100,2)", "=ROUND(B5*D5/100,0)", "=ROUND(B5*E5/100,1)", "=ROUND(B5*F5/100,1)", "=ROUND(B5*G5/100,1)"],
-    ["Tomato sauce", "700", "0.45", "60", "2", "10", "1", "=ROUND(B6*C6/100,2)", "=ROUND(B6*D6/100,0)", "=ROUND(B6*E6/100,1)", "=ROUND(B6*F6/100,1)", "=ROUND(B6*G6/100,1)"],
-    ["Mixed vegetables", "500", "0.50", "50", "3", "8", "0.5", "=ROUND(B7*C7/100,2)", "=ROUND(B7*D7/100,0)", "=ROUND(B7*E7/100,1)", "=ROUND(B7*F7/100,1)", "=ROUND(B7*G7/100,1)"],
-    ["Olive oil", "30", "1.60", "884", "0", "0", "100", "=ROUND(B8*C8/100,2)", "=ROUND(B8*D8/100,0)", "=ROUND(B8*E8/100,1)", "=ROUND(B8*F8/100,1)", "=ROUND(B8*G8/100,1)"],
-    ["**BATCH TOTAL**", "", "", "", "", "", "", "=ROUND(SUM(H4:H8),2)", "=ROUND(SUM(I4:I8),0)", "=ROUND(SUM(J4:J8),1)", "=ROUND(SUM(K4:K8),1)", "=ROUND(SUM(L4:L8),1)"],
-    ["**PER MEAL**", "", "", "", "", "", "", "=ROUND(H9/$B$2,2)", "=ROUND(I9/$B$2,0)", "=ROUND(J9/$B$2,1)", "=ROUND(K9/$B$2,1)", "=ROUND(L9/$B$2,1)"],
-  ];
-  const model = new GridModel({ rows, frozenRows: 3, showHeaders: false, fitToWidth: true });
-  model.merge({ startRow: 0, endRow: 0, startCol: 0, endCol: 11 });
-  model.merge({ startRow: 1, endRow: 1, startCol: 2, endCol: 11 });
-  model.merge({ startRow: 8, endRow: 8, startCol: 0, endCol: 6 });
-  model.merge({ startRow: 9, endRow: 9, startCol: 0, endCol: 6 });
-  model.toggleHeaderRow(2);
-
-  [210, 82, 88, 98, 104, 98, 88, 100, 100, 96, 92, 86].forEach((width, col) => { model.widths[model.columnIds[col]] = width; });
-  [42, 44, 50, 34, 34, 34, 34, 34, 40, 42].forEach((height, row) => model.setRowHeight(row, height));
-  model.setAlignment(0, 0, "center");
-  model.setAlignment(1, 0, "right");
-  model.setAlignment(1, 1, "center");
-  model.setAlignment(1, 2, "left");
-  for (let col = 0; col < model.colCount; col += 1) model.setAlignment(2, col, "center");
-  for (let row = 3; row <= 7; row += 1) for (let col = 1; col < model.colCount; col += 1) model.setAlignment(row, col, "right");
-  for (const row of [8, 9]) {
-    model.setAlignment(row, 0, "center");
-    for (let col = 7; col < model.colCount; col += 1) model.setAlignment(row, col, "right");
-  }
-  return model;
-}
-
 async function resolveTemplateModel(name) {
   const normalized = String(name).toUpperCase();
   const template = runtime.registries?.templates.get(normalized);
-  if (!template) throw new GridError("TEMPLATE_NOT_FOUND", `Unknown Roam Grid template: ${name}`);
-  const value = typeof template === "function" ? await template() : template;
-  if (value instanceof GridModel) return new GridModel(value.snapshot());
-  if (value?.schema === "roam-grid") return GridModel.fromJSON(deepClone(value));
-  return new GridModel(deepClone(value));
+  if (template) {
+    const value = typeof template === "function" ? await template() : template;
+    if (value instanceof GridModel) return new GridModel(value.snapshot());
+    if (value?.schema === "roam-grid") return GridModel.fromJSON(deepClone(value));
+    if (value?.schema === "roam-grid-template") return templateModelFromValue(deepClone(value));
+    return new GridModel(deepClone(value));
+  }
+  const saved = runtime.templates?.get(name);
+  if (saved) return saved;
+  throw new GridError("TEMPLATE_NOT_FOUND", `Unknown Roam Grid template: ${name}`);
 }
 
-async function newMealPrepCalculator() {
+async function saveFocusedTemplate() {
   try {
-    await createNativeTableFromModel(await resolveTemplateModel("MEAT_PASTA_MEAL_PREP"));
-    toast("Created a Meat + Pasta meal-prep calculator. Replace the example inputs with your package-label values.", "success", 6500);
+    const mount = activeMount();
+    if (!(mount instanceof GridView)) throw new GridError("TEMPLATE_SOURCE", "Focus an enhanced native grid before saving a template");
+    const name = await showPrompt("Save grid template as", mount.model.getRaw(0, 0).replace(/[*_[\]]/g, "").slice(0, 80) || "My grid");
+    if (!name) return;
+    await runtime.templates.save(name, mount.model);
+    toast(`Saved “${name}” to [[${TEMPLATE_PAGE}]]`, "success", 5000);
+  } catch (error) { toast(error.message, "danger", 8000); }
+}
+
+async function newFromSavedTemplate() {
+  try {
+    const names = [...new Set([...runtime.registries.templates.keys(), ...runtime.templates.list()])].sort((a, b) => a.localeCompare(b));
+    if (!names.length) throw new GridError("TEMPLATE_EMPTY", "No grid templates are saved yet. Focus a grid and run “Save current grid as template” first.");
+    const name = await showChoice("Insert grid template", names.map((value, index) => ({ label: value, value, primary: index === 0 })));
+    if (!name) return;
+    await createNativeTableFromModel(await resolveTemplateModel(name));
+    toast(`Created grid from “${name}”`, "success", 4000);
   } catch (error) { toast(error.message, "danger", 8000); }
 }
 
@@ -2735,7 +2884,7 @@ async function restoreFocusedTable() {
 async function newLargeGrid() {
   try {
     const anchorUid = await insertNearFocus("{{[[roam/grid]]}}"); const store = await new LargeGridStore(anchorUid).initialize();
-    const metadataModel = new GridModel({ rows: [[""]], columnIds: store.manifest.columnIds, widths: store.manifest.widths, frozenRows: store.manifest.frozenRows, frozenCols: store.manifest.frozenCols, merges: store.manifest.merges, charts: store.manifest.charts, showHeaders: store.manifest.showHeaders !== false });
+    const metadataModel = new GridModel({ rows: [[""]], columnIds: store.manifest.columnIds, widths: store.manifest.widths, frozenRows: store.manifest.frozenRows, frozenCols: store.manifest.frozenCols, merges: store.manifest.merges, charts: store.manifest.charts, showHeaders: store.manifest.showHeaders !== false, colorFormulaCells: store.manifest.colorFormulaCells !== false });
     await runtime.metadata.set(anchorUid, metadataModel, "large"); scheduleScan(); toast("Created a 100 × 26 large grid.", "success");
   } catch (error) { toast(error.message, "danger", 8000); }
 }
@@ -2823,7 +2972,8 @@ function registerCommands(extensionAPI) {
   const commands = [
     ["Roam Grid: Enhance this table", enhanceFocusedTable],
     ["Roam Grid: Restore native table", restoreFocusedTable],
-    ["Roam Grid: New meal-prep calculator", newMealPrepCalculator],
+    ["Roam Grid: Save current grid as template", saveFocusedTemplate],
+    ["Roam Grid: New from saved template", newFromSavedTemplate],
     ["Roam Grid: New large grid", newLargeGrid],
     ["Roam Grid: Copy/convert table", convertFocusedGrid],
     ["Roam Grid: Import", importCommand],
@@ -2847,9 +2997,8 @@ async function initializeSettings(extensionAPI) {
 }
 
 async function onload({ extensionAPI }) {
-  runtime.extensionAPI = extensionAPI; runtime.registries = new RegistrySet(); runtime.metadata = new MetadataStore();
-  runtime.registries.register(runtime.registries.templates, "MEAT_PASTA_MEAL_PREP", mealPrepTemplateModel);
-  await runtime.metadata.initialize(); await initializeSettings(extensionAPI); registerCommands(extensionAPI);
+  runtime.extensionAPI = extensionAPI; runtime.registries = new RegistrySet(); runtime.metadata = new MetadataStore(); runtime.templates = new GridTemplateStore();
+  await runtime.metadata.initialize(); await runtime.templates.initialize(); await initializeSettings(extensionAPI); registerCommands(extensionAPI);
   const publicApi = createPublicApi(); globalThis.window.roamGrid = { ...(globalThis.window.roamGrid || {}), v1: publicApi };
   document.addEventListener("focusin", rememberFocusedUid, true);
   runtime.disposers.push(() => document.removeEventListener("focusin", rememberFocusedUid, true));
@@ -2864,7 +3013,7 @@ async function onunload() {
   for (const dispose of runtime.disposers.splice(0)) try { dispose(); } catch { /* no-op */ }
   document.querySelectorAll(".rg-toasts,.rg-dialog-overlay,.rg-context-menu").forEach((element) => element.remove());
   if (globalThis.window?.roamGrid?.v1?.version === VERSION) delete globalThis.window.roamGrid.v1;
-  runtime.extensionAPI = null; runtime.metadata = null; runtime.registries = null; runtime.lastFocusedUid = null;
+  runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null;
   console.info("[roam-grid] Unloaded");
 }
 

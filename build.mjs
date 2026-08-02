@@ -5,7 +5,7 @@ const root = resolve(import.meta.dirname);
 const source = resolve(root, "src/extension.js");
 const target = resolve(root, "extension.js");
 const deploy = resolve(root, "deploy");
-const banner = `/* Roam Grid v0.2.3 | MIT | generated from src/extension.js */\n`;
+const banner = `/* Roam Grid v0.3.0 | MIT | generated from src/extension.js */\n`;
 
 async function build() {
   const code = await readFile(source, "utf8");

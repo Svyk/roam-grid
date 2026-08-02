@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0
+
+- Fixed fit-to-window column dragging so the selected edge tracks the pointer in
+  pixels, adjacent tracks contract proportionally, and the resulting geometry
+  survives reload.
+- Stopped content-only edits and API patches from rewriting layout metadata;
+  unchanged rich Roam cells are no longer rerendered after every edit.
+- Added graph-owned reusable templates with **Save current grid as template** and
+  **New from saved template**. Templates live on `[[roam/grid/templates]]` and
+  preserve formulas, merges, sizing, alignment, and visual configuration.
+- Removed the personal meal-prep calculator from the public bundle; an existing
+  calculator can be saved privately as a reusable graph template instead.
+- Added Blueprint-aware formula-cell coloring, enabled by default and persisted
+  per table, with menu and large-grid toolbar toggles.
+- Preserved the smaller native-style grabbers and compact multi-range action
+  badge while separating their pointer targets from row/column resize grips.
+
 ## 0.2.3
 
 - Made native-style row and column grabbers visually smaller while retaining a

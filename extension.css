@@ -300,6 +300,16 @@ body.roam-body.dark .rg-root {
   background: var(--rg-header);
 }
 
+.rg-cell--formula {
+  color: color-mix(in srgb, var(--rg-active) 78%, var(--cl-text-color, #182026));
+  background: color-mix(in srgb, var(--rg-active) 7%, var(--rg-bg));
+  font-variant-numeric: tabular-nums;
+}
+
+.rg-cell--formula.rg-cell--selected {
+  background: color-mix(in srgb, var(--rg-active) 16%, var(--rg-bg));
+}
+
 .rg-native-pill-proxy {
   display: contents;
 }

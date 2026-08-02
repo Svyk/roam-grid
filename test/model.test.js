@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { FormulaEngine, GridError, GridModel, columnLabel, mealPrepTemplateModel, parseCellReference, rewriteFormula } from "../src/extension.js";
+import { FormulaEngine, GridError, GridModel, columnLabel, fittedTrackResize, parseCellReference, rewriteFormula, serializeTemplateModel, templateModelFromValue } from "../src/extension.js";
 
 const model = (rows, options = {}) => new GridModel({ rows, ...options });
 
@@ -9,6 +9,18 @@ test("column labels and references round trip", () => {
   assert.equal(columnLabel(25), "Z");
   assert.equal(columnLabel(26), "AA");
   assert.deepEqual(parseCellReference("$AA$12"), { row: 11, col: 26, absoluteCol: true, absoluteRow: true });
+});
+
+test("fit-to-window resize expands the dragged column while preserving total width", () => {
+  const resized = fittedTrackResize({ a: 200, b: 100, c: 100 }, "a", 260, 56);
+  assert.equal(resized.a, 260);
+  assert.ok(Math.abs(Object.values(resized).reduce((sum, width) => sum + width, 0) - 400) < 0.001);
+  assert.ok(resized.b >= 56);
+  assert.ok(resized.c >= 56);
+  const capped = fittedTrackResize({ a: 200, b: 100, c: 100 }, "a", 500, 56);
+  assert.equal(capped.a, 288);
+  assert.ok(Math.abs(capped.b - 56) < 0.001);
+  assert.ok(Math.abs(capped.c - 56) < 0.001);
 });
 
 test("formula engine handles arithmetic, ranges, strings, and functions", () => {
@@ -225,7 +237,7 @@ test("malformed merge metadata is dropped without touching raw data", () => {
 });
 
 test("JSON round trip preserves layout", () => {
-  const grid = model([[{ uid: "row-one", raw: "a" }, { uid: "cell-two", raw: "" }]], { columnIds: ["c1", "c2"], widths: { c1: 200 }, rowHeights: { "row-one": 54 }, alignments: { "row-one": "center" }, headerColumns: ["c1"], headerRows: ["row-one"], frozenRows: 1, charts: [{ id: "chart", type: "line" }], showHeaders: false, fitToWidth: false });
+  const grid = model([[{ uid: "row-one", raw: "a" }, { uid: "cell-two", raw: "" }]], { columnIds: ["c1", "c2"], widths: { c1: 200 }, rowHeights: { "row-one": 54 }, alignments: { "row-one": "center" }, headerColumns: ["c1"], headerRows: ["row-one"], frozenRows: 1, charts: [{ id: "chart", type: "line" }], showHeaders: false, fitToWidth: false, colorFormulaCells: false });
   grid.merge({ startRow: 0, endRow: 0, startCol: 0, endCol: 1 });
   const roundTrip = GridModel.fromJSON(JSON.parse(JSON.stringify(grid.toJSON())));
   assert.deepEqual(roundTrip.rows.map((row) => row.map((cell) => cell.raw)), [["a", ""]]);
@@ -238,16 +250,28 @@ test("JSON round trip preserves layout", () => {
   assert.equal(roundTrip.isHeaderRow(0), true);
   assert.equal(roundTrip.showHeaders, false);
   assert.equal(roundTrip.fitToWidth, false);
+  assert.equal(roundTrip.colorFormulaCells, false);
 });
 
-test("meal-prep template calculates batch and per-meal nutrition", () => {
-  const grid = mealPrepTemplateModel();
-  const values = new FormulaEngine(grid).evaluateAll();
-  assert.deepEqual([grid.rowCount, grid.colCount], [10, 12]);
-  assert.equal(grid.merges.length, 4);
-  assert.equal(grid.isHeaderRow(2), true);
-  assert.equal(grid.showHeaders, false);
-  assert.equal(grid.fitToWidth, true);
-  assert.deepEqual(values[8].slice(7), [19.88, 4685, 349, 470, 147]);
-  assert.deepEqual(values[9].slice(7), [3.98, 937, 69.8, 94, 29.4]);
+test("saved templates remap UID-backed layout by position", () => {
+  const grid = model([
+    [{ uid: "source-r1", raw: "Title" }, { uid: "source-r1c2", raw: "" }],
+    [{ uid: "source-r2", raw: "2" }, { uid: "source-r2c2", raw: "=A2*3" }],
+  ], { columnIds: ["source-c1", "source-c2"], showHeaders: false, fitToWidth: true, colorFormulaCells: false });
+  grid.merge({ startRow: 0, endRow: 0, startCol: 0, endCol: 1 });
+  grid.widths[grid.columnIds[0]] = 240;
+  grid.setRowHeight(1, 48);
+  grid.setAlignment(1, 1, "right");
+  grid.toggleHeaderRow(1);
+  const restored = templateModelFromValue(serializeTemplateModel(grid, "Calculator"));
+  assert.equal(restored.tableUid, null);
+  assert.notEqual(restored.rows[1][0].uid, "source-r2");
+  assert.deepEqual(restored.rows.map((row) => row.map((cell) => cell.raw)), [["Title", ""], ["2", "=A2*3"]]);
+  assert.equal(restored.merges.length, 1);
+  assert.equal(restored.widths[restored.columnIds[0]], 240);
+  assert.equal(restored.getRowHeight(1), 48);
+  assert.equal(restored.getAlignment(1, 1), "right");
+  assert.equal(restored.isHeaderRow(1), true);
+  assert.equal(restored.colorFormulaCells, false);
+  assert.equal(new FormulaEngine(restored).evaluateCell(1, 1), 6);
 });

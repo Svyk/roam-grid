@@ -4,7 +4,7 @@ Native-first advanced tables for Roam Research.
 
 ## Status
 
-Version 0.2 is a functional public-source beta and live demo. Native
+Version 0.3 is a functional public-source beta and live demo. Native
 opt-in tables, safe merges, core formulas, interactions, imports/exports,
 charts, chunked large-grid persistence, the public API, and clean fallback are
 implemented. Before a public Depot release, the project still needs the full
@@ -55,10 +55,11 @@ The extension deliberately does not use `roam/js`.
 ## Start
 
 - Focus an existing native table and run **Roam Grid: Enhance this table**.
-- Run **Roam Grid: New meal-prep calculator** for an editable Meat + Pasta
-  template that calculates batch cost and per-meal price, calories, protein,
-  carbs, and fat. Replace its illustrative price and nutrition inputs with the
-  values from your own package labels.
+- Focus any enhanced table and run **Roam Grid: Save current grid as template**.
+  Reinsert it later with **Roam Grid: New from saved template**. Saved templates
+  keep formulas, merges, sizing, alignment, headers, charts, and visual options
+  on `[[roam/grid/templates]]`; the public extension does not ship personal
+  recipe or meal-prep data.
 - Run **Roam Grid: New large grid** to insert a file-backed grid.
 - Enhanced-table metadata is stored on `[[roam/grid/metadata]]`; cell contents
   stay in their original Roam blocks.
@@ -74,6 +75,9 @@ The extension deliberately does not use `roam/js`.
   These grips remain available when A/B/C and row labels are hidden. On a
   merged cell they control the merge's outermost row or column. Double-click a
   resize edge to restore automatic sizing.
+- In fit-to-window mode, a dragged column now follows the pointer in pixels while
+  adjacent columns contract proportionally. The final proportions are persisted,
+  so the resized column stays the same after a developer-extension reload.
 - Row heights and column widths are stored per table. Row sizes follow their
   stable Roam row UID through sorting and reordering; both dimensions survive
   extension reloads, native/large-grid copies, and large-grid manifest saves.
@@ -93,6 +97,8 @@ The extension deliberately does not use `roam/js`.
   switch back to fixed widths and horizontal scrolling when preferred.
 - The same menu applies persistent left, center, or right alignment and copies
   either the active cell's or the whole table's native `((block reference))`.
+- Formula cells use a subtle blue Blueprint-aware treatment by default. Toggle
+  **Hide formula coloring** in the table menu; the choice persists per grid.
 - Copy/cut/paste understands matrices and TSV/CSV text. Pasting image files
   uploads them through Roam and stores ordinary `![](url)` markup in the cell.
 - Merged regions are one navigation stop. Partial-merge moves and destructive
@@ -109,8 +115,10 @@ count, and sparklines.
 
 `window.roamGrid.v1` exposes disposable registration methods for safe formula
 functions, renderers/editors, importers/exporters, data sources, and reusable
-templates, plus `listTemplates`, `createFromTemplate`, `getTableModel`, and
-transactional `applyPatch`. Cell editors return an input or
+templates, plus `listTemplates`, `saveTemplate`, `createFromTemplate`,
+`getTableModel`, and transactional `applyPatch`. Registered templates live only
+for the current extension session; `saveTemplate` writes a reusable graph-owned
+copy to `[[roam/grid/templates]]`. Cell editors return an input or
 textarea-like element whose `value` is committed through the normal transaction
 path. Registered formula functions
 receive evaluated values only; arbitrary JavaScript or `=elisp:` execution is
@@ -124,6 +132,11 @@ const dispose = window.roamGrid.v1.registerTemplate("MY_MEAL", () => ({
 await window.roamGrid.v1.createFromTemplate("MY_MEAL");
 dispose();
 ```
+
+Ordinary edits update only changed Roam cell blocks. Layout metadata is written
+only when layout actually changes, and rich text is rerendered only for changed
+or formula-dependent cells. This keeps typing responsive and avoids spending a
+second Roam mutation on every content edit.
 
 ## Showcase
 

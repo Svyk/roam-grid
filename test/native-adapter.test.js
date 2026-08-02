@@ -30,7 +30,7 @@ test("native tree parser accepts keyword-shaped Roam pull results", () => {
   assert.equal(model.getRaw(1, 1), "");
 });
 
-test("content-only native save updates changed block and metadata", async (t) => {
+test("native save updates changed content and requested layout metadata", async (t) => {
   const tree = rawTree(); const updates = []; const metadataWrites = []; let metadataValue = null;
   globalThis.window = { roamAlphaAPI: {
     q: () => [[tree]],
@@ -39,7 +39,7 @@ test("content-only native save updates changed block and metadata", async (t) =>
   t.after(() => { delete globalThis.window; });
   const metadata = { get: () => metadataValue, set: async (...args) => {
     metadataWrites.push(args); const saved = args[1];
-    metadataValue = { columnIds: [...saved.columnIds], merges: structuredClone(saved.merges), widths: { ...saved.widths }, rowHeights: { ...saved.rowHeights }, alignments: { ...saved.alignments }, headerColumns: [...saved.headerColumns], headerRows: [...saved.headerRows], frozenRows: saved.frozenRows, frozenCols: saved.frozenCols, charts: structuredClone(saved.charts), showHeaders: saved.showHeaders, fitToWidth: saved.fitToWidth };
+    metadataValue = { columnIds: [...saved.columnIds], merges: structuredClone(saved.merges), widths: { ...saved.widths }, rowHeights: { ...saved.rowHeights }, alignments: { ...saved.alignments }, headerColumns: [...saved.headerColumns], headerRows: [...saved.headerRows], frozenRows: saved.frozenRows, frozenCols: saved.frozenCols, charts: structuredClone(saved.charts), showHeaders: saved.showHeaders, fitToWidth: saved.fitToWidth, colorFormulaCells: saved.colorFormulaCells };
   } };
   const adapter = new NativeTableAdapter("table0001", metadata); const model = adapter.load(); model.setRaw(1, 1, "42"); model.widths[model.columnIds[0]] = 212; model.setRowHeight(1, 46); model.setAlignment(1, 1, "right"); model.toggleHeaderColumn(0); model.toggleHeaderRow(1); model.fitToWidth = false;
   const saved = await adapter.save(model);
@@ -53,6 +53,21 @@ test("content-only native save updates changed block and metadata", async (t) =>
   assert.equal(saved.isHeaderColumn(0), true);
   assert.equal(saved.isHeaderRow(1), true);
   assert.equal(saved.fitToWidth, false);
+});
+
+test("content-only native save does not spend a metadata mutation", async (t) => {
+  const tree = rawTree(); const updates = []; let metadataWrites = 0;
+  globalThis.window = { roamAlphaAPI: {
+    q: () => [[tree]],
+    data: { block: { update: async ({ block }) => { updates.push(block); tree.children[1].children[0].string = block.string; } } },
+  } };
+  t.after(() => { delete globalThis.window; });
+  const adapter = new NativeTableAdapter("table0001", { get: () => null, set: async () => { metadataWrites += 1; } });
+  const model = adapter.load(); model.setRaw(1, 1, "fast edit");
+  const saved = await adapter.save(model, { saveMetadata: false });
+  assert.deepEqual(updates, [{ uid: "cell00002", string: "fast edit" }]);
+  assert.equal(metadataWrites, 0);
+  assert.equal(saved.getRaw(1, 1), "fast edit");
 });
 
 test("native save detects an external edit before writing", async (t) => {
