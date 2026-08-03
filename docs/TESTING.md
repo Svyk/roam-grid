@@ -18,6 +18,25 @@ sort/delete/undo/redo, native metadata reloads, exact column widths, and
 manifest-only large-grid sizing saves. Alignment tests cover stable UID and
 merge-anchor behavior plus native and large-grid persistence.
 
+Editor and lightweight DOM tests cover the shared F2 editor, inline editing,
+IME-safe commit/cancel behavior, formula autocomplete, nested signature help,
+F4 reference locking, bounded formula highlighting, and native `[[page]]` /
+`((block))` completion. They also verify stale-search suppression, keyboard and
+pointer insertion, stable scalar rendering, connected rich-render hosts,
+official unmount cleanup, structural viewport swaps, and virtual-canvas
+teardown. Delta-selection coverage makes root queries and mounted-cell scans
+fail during movement, verifies that only the symmetric difference changes, and
+checks covered merge coordinates, merged-edge handles, range badges, and fill
+handles.
+
+Persistence tests cover dirty-UID coalescing, metadata-free scalar saves,
+self-watch suppression, non-overlapping external edits, same-cell and
+structural conflicts, partial-write rollback, and edits that arrive during an
+in-flight save. Native row-deletion fixtures verify that only removed row roots
+are staged, surviving chains are not moved, affected formulas are updated, and
+rollback attempts restore every staged row and formula while preserving a
+recoverable staging block if cleanup cannot safely complete.
+
 Performance fixtures verify a 5,000-cell formula pass and a 100,000 × 26
 manifest that loads only the requested visible chunk. The live smoke test is
 restricted to `[[roam-grid/dev]]` in `svy`; existing native tables are not
@@ -25,7 +44,9 @@ opted in or changed.
 
 Current release acceptance:
 
-- 51 automated tests pass.
+- 107 automated tests pass in the v0.5 release run. They exercise model,
+  adapter, persistence, editor, DOM, and rendering behavior without claiming
+  browser-frame performance.
 - The existing host-neutral Thymer Grid baseline remains green at 343/343; the
   Roam adapter suite is additive and the original project was not modified.
 - Native formulas and safe/blocked merges were exercised in Roam.

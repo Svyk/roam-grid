@@ -4,7 +4,7 @@ Native-first advanced tables for Roam Research.
 
 ## Status
 
-Version 0.4 is a functional public-source beta and live demo. Native
+Version 0.5.0 is a functional public-source beta and live demo. Native
 opt-in tables, safe merges, core formulas, interactions, imports/exports,
 charts, chunked large-grid persistence, the public API, and clean fallback are
 implemented. Before a public Depot release, the project still needs the full
@@ -32,7 +32,7 @@ folder again. Developer extensions remain local to each Roam client.
 
 For an immediate update after a push, wait for the GitHub Pages deployment and
 press the circular reload button beside this URL. Hover the grid-size badge to
-confirm the running version (for example, `Roam Grid v0.3.4`). Roam can reuse a
+confirm the running version (for example, `Roam Grid v0.5.0`). Roam can reuse a
 cached remote bundle during the same app session; if the badge still shows the
 older version, remove only this developer-extension URL and add the same URL
 again. The reinstall remounts the renderer and does not alter any table blocks,
@@ -42,6 +42,12 @@ The four public files at that URL are `README.md`, `extension.js`,
 `extension.css`, and `CHANGELOG.md`. `npm run build` assembles those exact files
 in `deploy/`, and GitHub Actions publishes that directory without any deploy
 keys or long-lived secrets.
+
+The release workflow is: run the tests and `npm run build`, push the release
+branch, wait for the GitHub Pages workflow to complete, then reload the same URL
+entry in Depot developer mode. No reinstall or graph migration is required for
+v0.5, and a reload preserves native cell blocks, table metadata, and large-grid
+manifests.
 
 ## Install for local development
 
@@ -75,7 +81,17 @@ The extension deliberately does not use `roam/js`.
 
 ## Interaction
 
-- Arrow keys navigate; typing, Enter, or F2 edits; Tab advances; Escape cancels.
+- Arrow keys navigate. Typing, Enter, and double-click keep the fast in-cell
+  editor; F2 opens the shared floating editor and focuses its textarea at the
+  end of the current value. The same floating editor is used by enhanced native
+  tables and large grids. Enter or Tab commits, while Escape closes the active
+  suggestion list first and then cancels the edit.
+- Type `[[` followed by text to search Roam pages, or `((` to search blocks,
+  from either the in-cell or F2 editor. Arrow keys choose a result; Enter, Tab,
+  or a click inserts complete native `[[page]]` or `((block UID))` syntax
+  without moving focus. Committed references use Roam's normal rich rendering,
+  so they remain clickable and participate in the graph like ordinary table
+  block content.
 - Drag across cells to select a rectangle. Drag headers to reorder, any vertical
   gridline or a selected cell's right edge to resize its column, and the
   selected cell's bottom edge or any horizontal boundary to resize its row.
@@ -111,16 +127,29 @@ The extension deliberately does not use `roam/js`.
 - Editing a formula opens a compact `fx` expression bar above the cell. Cell and
   range references are colored in the expression and outlined with the same
   colors in the grid. Click a cell while editing to insert its A1 reference;
-  Shift-click after a reference to extend it into a range.
+  Shift-click after a reference to extend it into a range without moving focus
+  away from the formula.
+- Formula assistance suggests functions after `=` or while a function name is
+  being typed. Arrow keys choose a suggestion; Enter, Tab, or a click inserts
+  it. Signature help shows the active function and argument, including inside
+  nested calls. Press F4 with the caret on a reference to cycle
+  `A1 → $A$1 → A$1 → $A1 → A1`; both ends of a selected range lock together.
 - Inserting or deleting a row/column rewrites formulas transactionally. Relative
   and `$`-absolute references follow structural moves, ranges expand or shrink,
   and `#REF!` appears only when the referenced cell or complete range was
   deleted. Inserting an item row directly above an adjacent total also expands
-  that total's range, which keeps saved calculators practical to modify.
+  that total's range, which keeps saved calculators practical to modify. A
+  native row deletion stages only the removed row roots and updates only formula
+  blocks whose text changed; surviving row chains are left in place, and a
+  failed save attempts to restore the staged rows and formula text before
+  reporting the error. If that restoration is interrupted too, Roam Grid keeps
+  the staging block rather than deleting the recoverable row data.
 - Copy/cut/paste understands matrices and TSV/CSV text. Pasting image files
   uploads them through Roam and stores ordinary `![](url)` markup in the cell.
 - Merged regions are one navigation stop. Partial-merge moves and destructive
-  merges are rejected with the blocking coordinates.
+  merges are rejected with the blocking coordinates. Enhanced rendering hides
+  internal cell seams so a merge reads as one surface, while its outer-right
+  and outer-bottom edges remain available for column and row resizing.
 
 ## Formats and charts
 
@@ -151,10 +180,40 @@ await window.roamGrid.v1.createFromTemplate("MY_MEAL");
 dispose();
 ```
 
-Ordinary edits update only changed Roam cell blocks. Layout metadata is written
-only when layout actually changes, and rich text is rerendered only for changed
-or formula-dependent cells. This keeps typing responsive and avoids spending a
-second Roam mutation on every content edit.
+Formula functions can optionally provide metadata for autocomplete and
+signature help. Existing two-argument registrations remain compatible. Built-in
+functions are known to be non-volatile; third-party functions default to
+`volatile: true` so dependency invalidation stays safe. Calling the returned
+disposer removes both the implementation and its assistant metadata.
+
+```js
+const disposeFormula = window.roamGrid.v1.registerFormulaFunction(
+  "MY_FN",
+  (value, fallback) => value ?? fallback,
+  {
+    parameters: ["value", "[fallback]"],
+    description: "Return a fallback for an empty value",
+    volatile: false,
+  },
+);
+
+disposeFormula();
+```
+
+Plain values are painted synchronously into stable cell-content elements, so a
+commit is visible without an empty frame. Roam's richer renderer is reserved for
+page links, block references, images, embeds, and other detected rich content.
+Formula and reverse-dependency caches repaint only changed results and their
+transitive dependents. Rich-rendered hosts remain connected during structural
+grid swaps and are explicitly unmounted before a native or virtualized surface
+is discarded.
+
+Ordinary edits travel through a coalesced content-only persistence lane: only
+dirty cell blocks are validated and updated, matching pull-watch events from the
+extension's own writes are consumed, and layout metadata is not rewritten.
+Non-conflicting external cell edits are merged; a same-cell or structural
+conflict uses the full repull/rollback path. Structural operations continue to
+use the serialized full reconciliation path.
 
 ## Showcase
 

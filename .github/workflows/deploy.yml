@@ -29,6 +29,8 @@ jobs:
         uses: actions/setup-node@v7
         with:
           node-version: 24
+      - name: Validate source and tests
+        run: npm run check
       - name: Build extension
         run: chmod +x build.sh && ./build.sh
       - name: Configure GitHub Pages

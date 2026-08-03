@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.5.0
+
+- Made plain-value commits visible synchronously in stable cell-content nodes,
+  with targeted formula-dependent repainting and rich Roam rendering only when
+  the changed value requires it.
+- Added a coalesced content-only persistence lane that updates dirty cell blocks
+  without rewriting layout metadata, suppresses matching self-watch events, and
+  falls back to full reconciliation for conflicts and structural changes.
+- Added one shared F2 floating editor for enhanced native and large grids, with
+  focused caret placement, persistent formula-reference highlighting, IME-safe
+  commit/cancel behavior, and click-to-insert references.
+- Added formula-function autocomplete, nested signature and active-argument
+  hints, and F4 reference locking through
+  `A1 → $A$1 → A$1 → $A1 → A1`, including range endpoints.
+- Extended `registerFormulaFunction(name, fn, options)` with disposable
+  `parameters`, `description`, and `volatile` metadata while preserving existing
+  two-argument registrations.
+- Removed internal grid lines from merged regions while retaining resize access
+  on their outer-right and outer-bottom edges and keeping selection controls
+  above the merged surface.
+- Added native Roam reference assistance while editing any cell: `[[` searches
+  pages, `((` searches blocks, keyboard or pointer selection inserts the
+  completed native syntax without stealing focus, and the committed result is
+  rendered through Roam's rich renderer.
+- Made native row deletion proportional to the actual change. Roam Grid stages
+  only the removed row roots, updates only formulas whose text changed, and
+  leaves surviving row chains in place; rollback restores staged rows, formulas,
+  and metadata when the API permits and retains recoverable staging data when a
+  restore itself cannot complete.
+- Kept rich-rendered cell hosts connected across structural swaps and explicitly
+  unmounted them before native-grid, virtual-canvas, or extension teardown, so
+  links and references do not disappear during refreshes.
+- Made native selection movement delta-based: only the previous and next cell
+  anchors change classes, while owned resize handles, grabbers, range overlays,
+  and fill handles are updated without a root query or unrelated-cell scan.
+- Documented the v0.5 build, GitHub Pages deployment, and Depot developer-mode
+  reload workflow; the release requires no persisted table-schema migration.
+
 ## 0.4.0
 
 - Added an Excel-like formula editing layer: the raw expression floats above the

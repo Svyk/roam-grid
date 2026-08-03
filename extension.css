@@ -168,7 +168,7 @@ body.roam-body.dark .rg-root {
 }
 
 .rg-column-resize-track {
-  z-index: 15;
+  z-index: 9;
   width: 13px;
   margin-right: -7px;
   justify-self: end;
@@ -192,7 +192,7 @@ body.roam-body.dark .rg-root {
 }
 
 .rg-row-resize {
-  z-index: 15;
+  z-index: 9;
   align-self: end;
   height: 7px;
   margin-bottom: -4px;
@@ -235,15 +235,30 @@ body.roam-body.dark .rg-root {
 }
 
 .rg-cell--merged {
+  z-index: 10;
   display: flex;
   align-items: center;
   justify-content: center;
   padding: 8px 10px;
+  background: var(--rg-bg);
   text-align: center;
 }
 
 .rg-cell--merged > * {
   max-width: 100%;
+}
+
+.rg-cell-content {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.rg-cell-content[hidden] {
+  display: none !important;
+}
+
+.rg-cell--editing > .rg-cell-content {
+  visibility: hidden;
 }
 
 .rg-cell--align-left { text-align: left; }
@@ -273,8 +288,12 @@ body.roam-body.dark .rg-root {
   background: var(--rg-selection);
 }
 
+.rg-cell--merged.rg-cell--selected {
+  background: color-mix(in srgb, var(--rg-active) 13%, var(--rg-bg));
+}
+
 .rg-cell--active {
-  z-index: 16;
+  z-index: 19;
   overflow: visible;
   box-shadow: inset 0 0 0 2px var(--rg-active);
 }
@@ -283,6 +302,10 @@ body.roam-body.dark .rg-root {
   z-index: auto;
   overflow: hidden;
   box-shadow: none;
+}
+
+.rg-root:not(.rg-root--interaction-active) .rg-cell--active.rg-cell--merged {
+  z-index: 10;
 }
 
 .rg-root:not(.rg-root--interaction-active) .rg-axis-grabber,
@@ -313,7 +336,7 @@ body.roam-body.dark .rg-root {
 }
 
 .rg-cell--formula-reference {
-  z-index: 14;
+  z-index: 18;
   background: color-mix(in srgb, var(--rg-reference-color) 10%, var(--rg-bg));
   box-shadow: inset 0 0 0 2px var(--rg-reference-color);
 }
@@ -328,7 +351,7 @@ body.roam-body.dark .rg-root {
 
 .rg-axis-grabber {
   position: absolute;
-  z-index: 19;
+  z-index: 22;
   display: grid;
   padding: 0;
   border: 1px solid var(--rg-bg);
@@ -385,7 +408,7 @@ body.roam-body.dark .rg-root {
 .rg-cell-width-resize,
 .rg-cell-height-resize {
   position: absolute;
-  z-index: 17;
+  z-index: 21;
   display: block;
   touch-action: none;
 }
@@ -408,7 +431,7 @@ body.roam-body.dark .rg-root {
 
 .rg-range-overlay {
   position: relative;
-  z-index: 16;
+  z-index: 20;
   min-width: 0;
   min-height: 0;
   box-shadow: inset 0 0 0 2px var(--rg-active);
@@ -419,7 +442,7 @@ body.roam-body.dark .rg-root {
   position: absolute;
   top: 3px;
   left: 3px;
-  z-index: 20;
+  z-index: 24;
   min-width: 0;
   min-height: 18px;
   padding: 1px 5px;
@@ -514,6 +537,114 @@ body.roam-body.dark .rg-root {
   pointer-events: none;
 }
 
+.rg-editor-popover {
+  align-items: flex-start;
+  pointer-events: auto;
+}
+
+.rg-editor-popover[hidden] {
+  display: none !important;
+}
+
+.rg-editor-popover-body {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.rg-floating-editor-input {
+  width: 100%;
+  min-height: 34px;
+  max-height: 180px;
+  padding: 5px 7px;
+  color: inherit;
+  background: color-mix(in srgb, var(--bc-main, #fff) 94%, var(--cl-blue, #2d72d2));
+  border: 1px solid color-mix(in srgb, var(--cl-blue, #2d72d2) 58%, var(--bc-menu, #c5cbd3));
+  border-radius: 3px;
+  outline: none;
+  resize: vertical;
+  font: 500 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.rg-floating-editor-input:focus {
+  border-color: var(--cl-blue, #2d72d2);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--cl-blue, #2d72d2) 45%, transparent);
+}
+
+.rg-formula-mirror {
+  padding: 2px 1px;
+  border-top: 1px solid color-mix(in srgb, var(--bc-menu, #c5cbd3) 65%, transparent);
+}
+
+.rg-formula-suggestions {
+  display: grid;
+  max-height: 190px;
+  padding: 3px;
+  overflow-y: auto;
+  background: var(--bc-main, #fff);
+  border: 1px solid var(--bc-menu, #c5cbd3);
+  border-radius: 4px;
+}
+
+.rg-formula-suggestions[hidden],
+.rg-formula-signature[hidden],
+.rg-formula-mirror[hidden],
+.rg-floating-editor-input[hidden] {
+  display: none !important;
+}
+
+.rg-formula-suggestion {
+  display: grid;
+  grid-template-columns: minmax(72px, auto) 1fr;
+  gap: 10px;
+  width: 100%;
+  padding: 5px 7px;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+  font: inherit;
+  cursor: pointer;
+}
+
+.rg-formula-suggestion > span {
+  color: var(--cl-gray-550, #5f6b7c);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rg-formula-suggestion:hover,
+.rg-formula-suggestion--active {
+  background: color-mix(in srgb, var(--cl-blue, #2d72d2) 13%, transparent);
+}
+
+.rg-formula-signature {
+  color: var(--cl-gray-550, #5f6b7c);
+  font: 500 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.rg-formula-signature > strong {
+  color: var(--cl-blue, #2d72d2);
+}
+
+.rg-formula-signature > small {
+  display: block;
+  margin-top: 3px;
+  color: var(--cl-gray-550, #5f6b7c);
+  font: 400 11px/1.35 var(--ff-main, inherit);
+}
+
+.rg-formula-argument--active {
+  color: inherit;
+  background: color-mix(in srgb, var(--cl-blue, #2d72d2) 16%, transparent);
+  border-radius: 2px;
+  font-weight: 750;
+}
+
 .bp3-dark .rg-formula-popover,
 body.roam-body.dark .rg-formula-popover {
   color: var(--cl-text-color, #f5f8fa);
@@ -548,7 +679,7 @@ body.roam-body.dark .rg-formula-popover {
   position: absolute;
   right: -3px;
   bottom: -3px;
-  z-index: 18;
+  z-index: 23;
   width: 8px;
   height: 8px;
   background: var(--rg-active);

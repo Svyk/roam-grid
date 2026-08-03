@@ -1,4 +1,4 @@
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -72,6 +72,7 @@ export function fittedTrackResize(widths, targetId, requestedWidth, minimum = MI
 }
 
 export function columnLabel(index) {
+  if (!Number.isSafeInteger(index) || index < 0) return "";
   let value = index + 1;
   let out = "";
   while (value > 0) {
@@ -86,9 +87,14 @@ export function parseCellReference(reference) {
   const match = /^\s*(\$?)([A-Z]+)(\$?)(\d+)\s*$/i.exec(reference);
   if (!match) return null;
   let col = 0;
-  for (const char of match[2].toUpperCase()) col = col * 26 + char.charCodeAt(0) - 64;
+  for (const char of match[2].toUpperCase()) {
+    col = col * 26 + char.charCodeAt(0) - 64;
+    if (!Number.isSafeInteger(col)) return null;
+  }
+  const row = Number(match[4]);
+  if (!Number.isSafeInteger(row) || row < 1) return null;
   return {
-    row: Number(match[4]) - 1,
+    row: row - 1,
     col: col - 1,
     absoluteCol: Boolean(match[1]),
     absoluteRow: Boolean(match[3]),
@@ -111,19 +117,181 @@ export function formulaReferences(raw) {
     }
     if (quoted) { index += 1; continue; }
     const previous = raw[index - 1] || "";
-    const match = /^(\$?[A-Z]+\$?\d+)(?::(\$?[A-Z]+\$?\d+))?/i.exec(raw.slice(index));
+    const match = /^(\$?[A-Z]+\$?\d+)(?:(\s*:\s*)(\$?[A-Z]+\$?\d+))?/i.exec(raw.slice(index));
     if (!match || /[A-Z0-9_.]/i.test(previous)) { index += 1; continue; }
     const next = raw[index + match[0].length] || "";
     if (/[A-Z0-9_.]/i.test(next)) { index += 1; continue; }
     const startRef = parseCellReference(match[1]);
-    const endRef = parseCellReference(match[2] || match[1]);
+    const endRef = parseCellReference(match[3] || match[1]);
     if (startRef && endRef) references.push({
       text: match[0], startIndex: index, endIndex: index + match[0].length,
+      startText: match[1], endText: match[3] || match[1], separator: match[2] || null,
       startRef, endRef, range: normalizeRange({ startRow: startRef.row, endRow: endRef.row, startCol: startRef.col, endCol: endRef.col }),
     });
     index += match[0].length;
   }
   return references;
+}
+
+function formulaPositionIsQuoted(raw, caret) {
+  let quoted = false;
+  for (let index = 1; index < caret; index += 1) {
+    if (raw[index] !== '"') continue;
+    if (quoted && raw[index + 1] === '"' && index + 1 < caret) { index += 1; continue; }
+    quoted = !quoted;
+  }
+  return quoted;
+}
+
+export function formulaAutocompleteContext(raw, caret = String(raw ?? "").length) {
+  if (typeof raw !== "string" || !raw.startsWith("=") || raw.startsWith("==")) return null;
+  const caretIndex = clamp(Number.isFinite(caret) ? caret : raw.length, 1, raw.length);
+  if (formulaPositionIsQuoted(raw, caretIndex)) return null;
+  let startIndex = caretIndex;
+  while (startIndex > 1 && /[A-Z0-9_.]/i.test(raw[startIndex - 1])) startIndex -= 1;
+  let endIndex = caretIndex;
+  while (endIndex < raw.length && /[A-Z0-9_.]/i.test(raw[endIndex])) endIndex += 1;
+  const token = raw.slice(startIndex, endIndex);
+  if (token && !/^[A-Z_][A-Z0-9_.]*$/i.test(token)) return null;
+  if (parseCellReference(token)) return null;
+  const query = raw.slice(startIndex, caretIndex).toUpperCase();
+  let boundaryIndex = startIndex - 1;
+  while (boundaryIndex >= 1 && /\s/.test(raw[boundaryIndex])) boundaryIndex -= 1;
+  const boundary = raw[boundaryIndex] || "";
+  if (!/[=(,+\-*/^&%<>]/.test(boundary)) return null;
+  let followingIndex = endIndex;
+  while (followingIndex < raw.length && /\s/.test(raw[followingIndex])) followingIndex += 1;
+  return { query, startIndex, endIndex, hasFollowingParenthesis: raw[followingIndex] === "(" };
+}
+
+function formulaCatalogEntries(catalog) {
+  const source = catalog?.formulaFunctionMetadata || catalog;
+  let entries;
+  if (source instanceof Map) entries = [...source.entries()];
+  else if (Array.isArray(source)) entries = source.map((value) => typeof value === "string" ? [value, {}] : [value?.name, value]);
+  else if (source && typeof source === "object") entries = Object.entries(source);
+  else entries = [];
+  const seen = new Set();
+  return entries.flatMap(([name, metadata]) => {
+    const normalized = String(name || "").toUpperCase();
+    if (!normalized || seen.has(normalized)) return [];
+    seen.add(normalized);
+    const value = metadata && typeof metadata === "object" && typeof metadata !== "function" ? metadata : {};
+    return [{
+      name: normalized,
+      parameters: Array.isArray(value.parameters) ? value.parameters.map(String) : [],
+      description: String(value.description || ""),
+      volatile: value.volatile !== false,
+    }];
+  });
+}
+
+function formulaNameScore(name, query) {
+  if (!query) return 100;
+  if (name === query) return 0;
+  if (name.startsWith(query)) return 10 + Math.min(20, name.length - query.length);
+  const segmentIndex = name.split(/[._]/).findIndex((segment) => segment.startsWith(query));
+  if (segmentIndex >= 0) return 35 + segmentIndex;
+  const contains = name.indexOf(query);
+  if (contains >= 0) return 50 + contains;
+  let queryIndex = 0; let gaps = 0; let lastMatch = -1;
+  for (let index = 0; index < name.length && queryIndex < query.length; index += 1) {
+    if (name[index] !== query[queryIndex]) continue;
+    if (lastMatch >= 0) gaps += index - lastMatch - 1;
+    lastMatch = index; queryIndex += 1;
+  }
+  return queryIndex === query.length ? 80 + gaps : Number.POSITIVE_INFINITY;
+}
+
+export function rankFormulaFunctions(query, catalog, limit = 8) {
+  const normalizedQuery = String(query || "").trim().toUpperCase();
+  const count = Math.max(0, Number.isFinite(limit) ? Math.floor(limit) : 8);
+  return formulaCatalogEntries(catalog)
+    .map((entry) => ({ ...entry, score: formulaNameScore(entry.name, normalizedQuery) }))
+    .filter((entry) => Number.isFinite(entry.score))
+    .sort((a, b) => a.score - b.score || a.name.localeCompare(b.name))
+    .slice(0, count);
+}
+
+export function activeFormulaCall(raw, caret = String(raw ?? "").length) {
+  if (typeof raw !== "string" || !raw.startsWith("=") || raw.startsWith("==")) return null;
+  const endIndex = clamp(Number.isFinite(caret) ? caret : raw.length, 1, raw.length);
+  const stack = [];
+  let quoted = false;
+  for (let index = 1; index < endIndex; index += 1) {
+    const char = raw[index];
+    if (char === '"') {
+      if (quoted && raw[index + 1] === '"' && index + 1 < endIndex) { index += 1; continue; }
+      quoted = !quoted; continue;
+    }
+    if (quoted) continue;
+    if (char === "(") {
+      let nameEnd = index;
+      while (nameEnd > 1 && /\s/.test(raw[nameEnd - 1])) nameEnd -= 1;
+      let nameStart = nameEnd;
+      while (nameStart > 1 && /[A-Z0-9_.]/i.test(raw[nameStart - 1])) nameStart -= 1;
+      const candidate = raw.slice(nameStart, nameEnd);
+      const validBoundary = nameStart === 1 || !/[A-Z0-9_.$]/i.test(raw[nameStart - 1]);
+      const name = validBoundary && /^[A-Z_][A-Z0-9_.]*$/i.test(candidate) ? candidate.toUpperCase() : null;
+      stack.push({ name, argumentIndex: 0, openIndex: index, callStartIndex: name ? nameStart : index });
+    } else if (char === ")") stack.pop();
+    else if (char === "," && stack.length) stack[stack.length - 1].argumentIndex += 1;
+  }
+  for (let index = stack.length - 1; index >= 0; index -= 1) if (stack[index].name) return { ...stack[index] };
+  return null;
+}
+
+function cycleCellReferenceLock(reference) {
+  const parsed = parseCellReference(reference);
+  if (!parsed) return reference;
+  if (!parsed.absoluteCol && !parsed.absoluteRow) { parsed.absoluteCol = true; parsed.absoluteRow = true; }
+  else if (parsed.absoluteCol && parsed.absoluteRow) parsed.absoluteCol = false;
+  else if (!parsed.absoluteCol && parsed.absoluteRow) { parsed.absoluteCol = true; parsed.absoluteRow = false; }
+  else parsed.absoluteCol = false;
+  return formatCellReference(parsed) || reference;
+}
+
+function cycleFormulaReferenceToken(token) {
+  if (!token.separator) return cycleCellReferenceLock(token.startText || token.text);
+  return `${cycleCellReferenceLock(token.startText)}${token.separator}${cycleCellReferenceLock(token.endText)}`;
+}
+
+export function cycleFormulaReferenceLocks(raw, selectionStart, selectionEnd = selectionStart) {
+  const source = String(raw ?? "");
+  const lower = clamp(Math.min(Number(selectionStart) || 0, Number(selectionEnd) || 0), 0, source.length);
+  const upper = clamp(Math.max(Number(selectionStart) || 0, Number(selectionEnd) || 0), 0, source.length);
+  const collapsed = lower === upper;
+  const targets = formulaReferences(source).filter((token) => collapsed
+    ? lower >= token.startIndex && lower <= token.endIndex
+    : token.startIndex < upper && token.endIndex > lower);
+  if (!targets.length) return { value: source, selectionStart: lower, selectionEnd: upper, changed: false, references: [] };
+
+  let value = ""; let cursor = 0; let delta = 0;
+  const replacements = [];
+  for (const token of targets) {
+    value += source.slice(cursor, token.startIndex);
+    const text = cycleFormulaReferenceToken(token);
+    const startIndex = token.startIndex + delta;
+    value += text;
+    replacements.push({ startIndex, endIndex: startIndex + text.length, text });
+    delta += text.length - token.text.length;
+    cursor = token.endIndex;
+  }
+  value += source.slice(cursor);
+
+  const mapOffset = (offset) => {
+    let shift = 0;
+    for (let index = 0; index < targets.length; index += 1) {
+      const token = targets[index]; const replacement = replacements[index];
+      if (offset < token.startIndex) break;
+      if (offset >= token.endIndex) { shift += replacement.text.length - token.text.length; continue; }
+      return replacement.startIndex + Math.min(offset - token.startIndex, replacement.text.length);
+    }
+    return offset + shift;
+  };
+  const nextStart = collapsed ? replacements[0].endIndex : mapOffset(lower);
+  const nextEnd = collapsed ? nextStart : mapOffset(upper);
+  return { value, selectionStart: nextStart, selectionEnd: nextEnd, changed: true, references: replacements };
 }
 
 function transformStructuralIndex(value, { index, insertCount = 0, deleteCount = 0 }) {
@@ -162,7 +330,7 @@ export function rewriteFormulaForStructure(raw, { axis, index, insertCount = 0, 
   let output = ""; let cursor = 0;
   for (const token of tokens) {
     output += raw.slice(cursor, token.startIndex);
-    if (token.text.includes(":")) {
+    if (token.separator) {
       const startValue = axis === "row" ? token.startRef.row : token.startRef.col;
       const endValue = axis === "row" ? token.endRef.row : token.endRef.col;
       const span = transformStructuralSpan(startValue, endValue, { index, insertCount, deleteCount, formulaIndex: axis === "row" ? formulaRow : formulaCol });
@@ -172,7 +340,7 @@ export function rewriteFormulaForStructure(raw, { axis, index, insertCount = 0, 
         const startCol = axis === "col" ? span[0] : token.startRef.col;
         const endRow = axis === "row" ? span[1] : token.endRef.row;
         const endCol = axis === "col" ? span[1] : token.endRef.col;
-        output += `${formatCellReference(token.startRef, startRow, startCol)}:${formatCellReference(token.endRef, endRow, endCol)}`;
+        output += `${formatCellReference(token.startRef, startRow, startCol)}${token.separator}${formatCellReference(token.endRef, endRow, endCol)}`;
       }
     } else {
       const value = axis === "row" ? token.startRef.row : token.startRef.col;
@@ -385,64 +553,150 @@ class FormulaParser {
   }
 }
 
-function defaultFormulaFunctions() {
+function defaultFormulaFunctionDefinitions() {
   const values = (args) => flatten(args).filter((value) => value !== "" && value != null);
   const numbers = (args) => values(args).map(numeric);
   return new Map(Object.entries({
-    SUM: (...args) => numbers(args).reduce((sum, value) => sum + value, 0),
-    AVERAGE: (...args) => { const list = numbers(args); return list.length ? list.reduce((a, b) => a + b, 0) / list.length : 0; },
-    AVG: (...args) => { const list = numbers(args); return list.length ? list.reduce((a, b) => a + b, 0) / list.length : 0; },
-    MIN: (...args) => Math.min(...numbers(args)),
-    MAX: (...args) => Math.max(...numbers(args)),
-    COUNT: (...args) => values(args).filter((value) => Number.isFinite(Number(value))).length,
-    COUNTA: (...args) => values(args).length,
-    IF: (condition, yes, no = false) => condition ? yes : no,
-    AND: (...args) => values(args).every(Boolean),
-    OR: (...args) => values(args).some(Boolean),
-    NOT: (value) => !value,
-    ABS: (value) => Math.abs(numeric(value)),
-    ROUND: (value, digits = 0) => { const factor = 10 ** numeric(digits); return Math.round(numeric(value) * factor) / factor; },
-    FLOOR: (value, significance = 1) => Math.floor(numeric(value) / numeric(significance)) * numeric(significance),
-    CEIL: (value, significance = 1) => Math.ceil(numeric(value) / numeric(significance)) * numeric(significance),
-    CEILING: (value, significance = 1) => Math.ceil(numeric(value) / numeric(significance)) * numeric(significance),
-    SQRT: (value) => Math.sqrt(numeric(value)),
-    POW: (value, power) => numeric(value) ** numeric(power),
-    POWER: (value, power) => numeric(value) ** numeric(power),
-    MOD: (value, divisor) => numeric(value) % numeric(divisor),
-    CONCAT: (...args) => flatten(args).join(""),
-    CONCATENATE: (...args) => flatten(args).join(""),
-    LEN: (value) => String(value ?? "").length,
-    LOWER: (value) => String(value ?? "").toLowerCase(),
-    UPPER: (value) => String(value ?? "").toUpperCase(),
-    TRIM: (value) => String(value ?? "").trim().replace(/\s+/g, " "),
-    LEFT: (value, count = 1) => String(value ?? "").slice(0, numeric(count)),
-    RIGHT: (value, count = 1) => String(value ?? "").slice(-numeric(count)),
-    MID: (value, start, count) => String(value ?? "").slice(numeric(start) - 1, numeric(start) - 1 + numeric(count)),
-    INDEX: (range, row, col = 1) => Array.isArray(range?.[0]) ? range[numeric(row) - 1]?.[numeric(col) - 1] ?? "" : flatten([range])[numeric(row) - 1] ?? "",
-    MATCH: (needle, range) => flatten([range]).findIndex((item) => item === needle) + 1,
+    SUM: { fn: (...args) => numbers(args).reduce((sum, value) => sum + value, 0), parameters: ["number1", "[number2, …]"], description: "Adds numbers and ranges." },
+    AVERAGE: { fn: (...args) => { const list = numbers(args); return list.length ? list.reduce((a, b) => a + b, 0) / list.length : 0; }, parameters: ["number1", "[number2, …]"], description: "Returns the arithmetic mean." },
+    AVG: { fn: (...args) => { const list = numbers(args); return list.length ? list.reduce((a, b) => a + b, 0) / list.length : 0; }, parameters: ["number1", "[number2, …]"], description: "Alias for AVERAGE." },
+    MIN: { fn: (...args) => Math.min(...numbers(args)), parameters: ["number1", "[number2, …]"], description: "Returns the smallest number." },
+    MAX: { fn: (...args) => Math.max(...numbers(args)), parameters: ["number1", "[number2, …]"], description: "Returns the largest number." },
+    COUNT: { fn: (...args) => values(args).filter((value) => Number.isFinite(Number(value))).length, parameters: ["value1", "[value2, …]"], description: "Counts numeric values." },
+    COUNTA: { fn: (...args) => values(args).length, parameters: ["value1", "[value2, …]"], description: "Counts non-empty values." },
+    IF: { fn: (condition, yes, no = false) => condition ? yes : no, parameters: ["condition", "value_if_true", "[value_if_false]"], description: "Returns one value when true and another when false." },
+    AND: { fn: (...args) => values(args).every(Boolean), parameters: ["condition1", "[condition2, …]"], description: "Returns true when every condition is true." },
+    OR: { fn: (...args) => values(args).some(Boolean), parameters: ["condition1", "[condition2, …]"], description: "Returns true when any condition is true." },
+    NOT: { fn: (value) => !value, parameters: ["condition"], description: "Reverses a logical value." },
+    ABS: { fn: (value) => Math.abs(numeric(value)), parameters: ["number"], description: "Returns the absolute value." },
+    ROUND: { fn: (value, digits = 0) => { const factor = 10 ** numeric(digits); return Math.round(numeric(value) * factor) / factor; }, parameters: ["number", "[digits]"], description: "Rounds a number to a number of digits." },
+    FLOOR: { fn: (value, significance = 1) => Math.floor(numeric(value) / numeric(significance)) * numeric(significance), parameters: ["number", "[significance]"], description: "Rounds a number down to a multiple." },
+    CEIL: { fn: (value, significance = 1) => Math.ceil(numeric(value) / numeric(significance)) * numeric(significance), parameters: ["number", "[significance]"], description: "Rounds a number up to a multiple." },
+    CEILING: { fn: (value, significance = 1) => Math.ceil(numeric(value) / numeric(significance)) * numeric(significance), parameters: ["number", "[significance]"], description: "Alias for CEIL." },
+    SQRT: { fn: (value) => Math.sqrt(numeric(value)), parameters: ["number"], description: "Returns the positive square root." },
+    POW: { fn: (value, power) => numeric(value) ** numeric(power), parameters: ["number", "power"], description: "Raises a number to a power." },
+    POWER: { fn: (value, power) => numeric(value) ** numeric(power), parameters: ["number", "power"], description: "Alias for POW." },
+    MOD: { fn: (value, divisor) => numeric(value) % numeric(divisor), parameters: ["number", "divisor"], description: "Returns the remainder after division." },
+    CONCAT: { fn: (...args) => flatten(args).join(""), parameters: ["value1", "[value2, …]"], description: "Joins values as text." },
+    CONCATENATE: { fn: (...args) => flatten(args).join(""), parameters: ["value1", "[value2, …]"], description: "Alias for CONCAT." },
+    LEN: { fn: (value) => String(value ?? "").length, parameters: ["text"], description: "Returns the number of characters." },
+    LOWER: { fn: (value) => String(value ?? "").toLowerCase(), parameters: ["text"], description: "Converts text to lowercase." },
+    UPPER: { fn: (value) => String(value ?? "").toUpperCase(), parameters: ["text"], description: "Converts text to uppercase." },
+    TRIM: { fn: (value) => String(value ?? "").trim().replace(/\s+/g, " "), parameters: ["text"], description: "Removes extra whitespace." },
+    LEFT: { fn: (value, count = 1) => String(value ?? "").slice(0, numeric(count)), parameters: ["text", "[count]"], description: "Returns characters from the start of text." },
+    RIGHT: { fn: (value, count = 1) => String(value ?? "").slice(-numeric(count)), parameters: ["text", "[count]"], description: "Returns characters from the end of text." },
+    MID: { fn: (value, start, count) => String(value ?? "").slice(numeric(start) - 1, numeric(start) - 1 + numeric(count)), parameters: ["text", "start", "count"], description: "Returns characters from the middle of text." },
+    INDEX: { fn: (range, row, col = 1) => Array.isArray(range?.[0]) ? range[numeric(row) - 1]?.[numeric(col) - 1] ?? "" : flatten([range])[numeric(row) - 1] ?? "", parameters: ["range", "row", "[column]"], description: "Returns a value at a range position." },
+    MATCH: { fn: (needle, range) => flatten([range]).findIndex((item) => item === needle) + 1, parameters: ["value", "range"], description: "Returns the one-based position of a value." },
   }));
 }
 
+function defaultFormulaFunctions(definitions = defaultFormulaFunctionDefinitions()) {
+  return new Map([...definitions].map(([name, definition]) => [name, definition.fn]));
+}
+
+function defaultFormulaFunctionMetadata(definitions = defaultFormulaFunctionDefinitions()) {
+  return new Map([...definitions].map(([name, definition]) => [name, {
+    parameters: [...definition.parameters],
+    description: definition.description,
+    volatile: false,
+  }]));
+}
+
+function formulaAstUsesVolatileFunction(node, metadata) {
+  if (!node || typeof node !== "object") return false;
+  if (node.type === "call" && metadata?.get(node.name)?.volatile !== false) return true;
+  if (node.type === "call") return node.args.some((argument) => formulaAstUsesVolatileFunction(argument, metadata));
+  if (node.type === "unary") return formulaAstUsesVolatileFunction(node.value, metadata);
+  if (node.type === "binary") return formulaAstUsesVolatileFunction(node.left, metadata) || formulaAstUsesVolatileFunction(node.right, metadata);
+  return false;
+}
+
+export class FormulaDependencyCache {
+  constructor(metadata = defaultFormulaFunctionMetadata()) {
+    this.metadata = metadata;
+    this.parsedFormulas = new Map();
+    this.dependencies = new Map();
+    this.reverseDependencies = new Map();
+    this.volatileFormulas = new Set();
+  }
+
+  forgetFormula(key) {
+    for (const source of this.dependencies.get(key) || []) {
+      const dependents = this.reverseDependencies.get(source);
+      dependents?.delete(key);
+      if (!dependents?.size) this.reverseDependencies.delete(source);
+    }
+    this.dependencies.delete(key);
+    this.parsedFormulas.delete(key);
+    this.volatileFormulas.delete(key);
+  }
+
+  formula(key, raw) {
+    const existing = this.parsedFormulas.get(key);
+    if (existing?.raw === raw) return existing;
+    this.forgetFormula(key);
+    let ast = null; let error = null;
+    try { ast = new FormulaParser(raw.slice(1)).parse(); } catch (cause) { error = cause; }
+    const record = { raw, ast, error };
+    this.parsedFormulas.set(key, record);
+    if (ast && formulaAstUsesVolatileFunction(ast, this.metadata)) this.volatileFormulas.add(key);
+    return record;
+  }
+
+  register(formulaKey, sourceKey) {
+    if (!this.dependencies.has(formulaKey)) this.dependencies.set(formulaKey, new Set());
+    if (!this.reverseDependencies.has(sourceKey)) this.reverseDependencies.set(sourceKey, new Set());
+    this.dependencies.get(formulaKey).add(sourceKey);
+    this.reverseDependencies.get(sourceKey).add(formulaKey);
+  }
+
+  affectedFrom(key, includeVolatile = true) {
+    const affected = new Set([key]);
+    const queue = [key];
+    if (includeVolatile) for (const volatileKey of this.volatileFormulas) {
+      if (affected.has(volatileKey)) continue;
+      affected.add(volatileKey); queue.push(volatileKey);
+    }
+    for (let index = 0; index < queue.length; index += 1) {
+      for (const dependent of this.reverseDependencies.get(queue[index]) || []) {
+        if (affected.has(dependent)) continue;
+        affected.add(dependent); queue.push(dependent);
+      }
+    }
+    return affected;
+  }
+}
+
 export class FormulaEngine {
-  constructor(model, functions = defaultFormulaFunctions()) {
+  constructor(model, functions = defaultFormulaFunctions(), metadata = defaultFormulaFunctionMetadata()) {
     this.model = model;
     this.functions = functions;
     this.cache = new Map();
     this.stack = new Set();
+    this.dependencyCache = new FormulaDependencyCache(metadata);
+    this.parsedFormulas = this.dependencyCache.parsedFormulas;
+    this.reverseDependencies = this.dependencyCache.reverseDependencies;
   }
 
   evaluateCell(row, col) {
     const key = `${row}:${col}`;
+    const raw = this.model.getRaw(row, col);
+    if (typeof raw !== "string" || !raw.startsWith("=") || raw.startsWith("==")) {
+      if (this.parsedFormulas.has(key)) { this.dependencyCache.forgetFormula(key); this.cache.delete(key); }
+      return raw;
+    }
+    const previousRaw = this.parsedFormulas.get(key)?.raw;
+    const parsed = this.dependencyCache.formula(key, raw);
+    if (previousRaw != null && previousRaw !== raw) this.cache.delete(key);
     if (this.cache.has(key)) return this.cache.get(key);
     if (this.stack.has(key)) return "#CYCLE!";
-    const raw = this.model.getRaw(row, col);
-    if (typeof raw !== "string" || !raw.startsWith("=") || raw.startsWith("==")) return raw;
     if (raw.includes("#REF!")) return "#REF!";
     this.stack.add(key);
     let result;
     try {
-      const ast = new FormulaParser(raw.slice(1)).parse();
-      result = this.evaluateNode(ast);
+      if (parsed.error) throw parsed.error;
+      result = this.evaluateNode(parsed.ast, key);
       if (typeof result === "number" && !Number.isFinite(result)) result = "#NUM!";
     } catch (error) {
       result = error?.code === "FORMULA_NAME" ? "#NAME?" : error?.code === "FORMULA_REF" ? "#REF!" : "#VALUE!";
@@ -453,11 +707,12 @@ export class FormulaEngine {
     return result;
   }
 
-  evaluateNode(node) {
+  evaluateNode(node, ownerKey = null) {
     if (node.type === "literal") return node.value;
     if (node.type === "ref") {
       const ref = parseCellReference(node.value);
       if (!ref || !this.model.inBounds(ref.row, ref.col)) throw new GridError("FORMULA_REF", "Invalid cell reference");
+      if (ownerKey) this.dependencyCache.register(ownerKey, `${ref.row}:${ref.col}`);
       return this.evaluateCell(ref.row, ref.col);
     }
     if (node.type === "range") {
@@ -468,15 +723,18 @@ export class FormulaEngine {
       const rows = [];
       for (let row = range.startRow; row <= range.endRow; row += 1) {
         const values = [];
-        for (let col = range.startCol; col <= range.endCol; col += 1) values.push(this.model.inBounds(row, col) ? this.evaluateCell(row, col) : "#REF!");
+        for (let col = range.startCol; col <= range.endCol; col += 1) {
+          if (ownerKey && this.model.inBounds(row, col)) this.dependencyCache.register(ownerKey, `${row}:${col}`);
+          values.push(this.model.inBounds(row, col) ? this.evaluateCell(row, col) : "#REF!");
+        }
         rows.push(values);
       }
       return rows;
     }
-    if (node.type === "unary") return node.op === "-" ? -numeric(this.evaluateNode(node.value)) : numeric(this.evaluateNode(node.value));
+    if (node.type === "unary") return node.op === "-" ? -numeric(this.evaluateNode(node.value, ownerKey)) : numeric(this.evaluateNode(node.value, ownerKey));
     if (node.type === "binary") {
-      const left = this.evaluateNode(node.left);
-      const right = this.evaluateNode(node.right);
+      const left = this.evaluateNode(node.left, ownerKey);
+      const right = this.evaluateNode(node.right, ownerKey);
       switch (node.op) {
         case "+": return numeric(left) + numeric(right);
         case "-": return numeric(left) - numeric(right);
@@ -497,7 +755,7 @@ export class FormulaEngine {
     if (node.type === "call") {
       const fn = this.functions.get(node.name);
       if (!fn) throw new GridError("FORMULA_NAME", `Unknown function ${node.name}`);
-      return fn(...node.args.map((arg) => this.evaluateNode(arg)));
+      return fn(...node.args.map((arg) => this.evaluateNode(arg, ownerKey)));
     }
     throw new GridError("FORMULA_PARSE", "Unknown formula expression");
   }
@@ -510,6 +768,14 @@ export class FormulaEngine {
       values.push(result);
     }
     return values;
+  }
+
+  invalidateCell(row, col) {
+    const key = `${row}:${col}`;
+    const affected = this.dependencyCache.affectedFrom(key);
+    for (const affectedKey of affected) this.cache.delete(affectedKey);
+    this.dependencyCache.forgetFormula(key);
+    return affected;
   }
 }
 
@@ -543,6 +809,9 @@ export class GridModel {
     this.revision = revision;
     this.undoStack = [];
     this.redoStack = [];
+    this.lastChangedCells = [];
+    this.lastChangedCellUids = [];
+    this.collectingChangedCells = null;
     this.validateMerges({ repair: true });
   }
 
@@ -622,16 +891,25 @@ export class GridModel {
 
   transact(label, mutation) {
     const before = this.snapshot();
+    const previousCollector = this.collectingChangedCells;
+    const changedCells = new Set();
+    this.collectingChangedCells = changedCells;
     try {
       const result = mutation(this);
       this.validateMerges();
       this.undoStack.push({ label, snapshot: before });
       if (this.undoStack.length > 100) this.undoStack.shift();
       this.redoStack.length = 0;
+      this.lastChangedCells = [...changedCells].map((key) => key.split(":").map(Number));
+      this.lastChangedCellUids = this.lastChangedCells.map(([row, col]) => this.getCell(row, col)?.uid).filter(Boolean);
       return result;
     } catch (error) {
       this.restore(before);
+      this.lastChangedCells = [];
+      this.lastChangedCellUids = [];
       throw error;
+    } finally {
+      this.collectingChangedCells = previousCollector;
     }
   }
 
@@ -663,13 +941,23 @@ export class GridModel {
   setRaw(row, col, raw) {
     if (!this.inBounds(row, col)) throw new GridError("OUT_OF_BOUNDS", `Cell ${cellLabel(row, col)} is outside the grid`);
     if (this.isCovered(row, col)) throw new GridError("MERGE_COVERED", `Cell ${cellLabel(row, col)} is covered by a merge`);
-    this.rows[row][col].raw = String(raw ?? "");
+    const value = String(raw ?? "");
+    if (this.rows[row][col].raw === value) return false;
+    this.rows[row][col].raw = value;
+    this.collectingChangedCells?.add(`${row}:${col}`);
+    return true;
   }
 
   rewriteStructuralFormulas(change) {
     for (let row = 0; row < this.rowCount; row += 1) for (let col = 0; col < this.colCount; col += 1) {
       const cell = this.rows[row][col];
-      if (cell.raw.startsWith("=") && !cell.raw.startsWith("==")) cell.raw = rewriteFormulaForStructure(cell.raw, { ...change, formulaRow: row, formulaCol: col });
+      if (cell.raw.startsWith("=") && !cell.raw.startsWith("==")) {
+        const rewritten = rewriteFormulaForStructure(cell.raw, { ...change, formulaRow: row, formulaCol: col });
+        if (rewritten !== cell.raw) {
+          cell.raw = rewritten;
+          this.collectingChangedCells?.add(`${row}:${col}`);
+        }
+      }
     }
   }
 
@@ -1127,9 +1415,11 @@ export function renderChartSvg(model, spec, width = 640, height = 240) {
   return `<svg class="rg-chart" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(spec.title || `${type} chart`)}"><title>${escapeHtml(spec.title || `${type} chart`)}</title>${body.join("")}</svg>`;
 }
 
-class RegistrySet {
+export class RegistrySet {
   constructor() {
-    this.formulaFunctions = defaultFormulaFunctions();
+    const formulaDefinitions = defaultFormulaFunctionDefinitions();
+    this.formulaFunctions = defaultFormulaFunctions(formulaDefinitions);
+    this.formulaFunctionMetadata = defaultFormulaFunctionMetadata(formulaDefinitions);
     this.cellRenderers = new Map();
     this.cellEditors = new Map();
     this.importers = new Map();
@@ -1143,6 +1433,27 @@ class RegistrySet {
     if (map.has(normalized)) throw new GridError("REGISTRY_DUPLICATE", `${key} is already registered`);
     map.set(normalized, value);
     return () => map.delete(normalized);
+  }
+
+  registerFormulaFunction(name, fn, options = {}) {
+    if (typeof fn !== "function") throw new GridError("REGISTRY_VALUE", `${name} must be a function`);
+    const normalized = String(name).toUpperCase();
+    if (this.formulaFunctions.has(normalized)) throw new GridError("REGISTRY_DUPLICATE", `${name} is already registered`);
+    const metadata = {
+      parameters: Array.isArray(options?.parameters) ? options.parameters.map(String) : [],
+      description: String(options?.description || ""),
+      volatile: options?.volatile !== false,
+    };
+    this.formulaFunctions.set(normalized, fn);
+    this.formulaFunctionMetadata.set(normalized, metadata);
+    let disposed = false;
+    return () => {
+      if (disposed) return false;
+      disposed = true;
+      const removed = this.formulaFunctions.delete(normalized);
+      this.formulaFunctionMetadata.delete(normalized);
+      return removed;
+    };
   }
 }
 
@@ -1224,6 +1535,91 @@ function tableCells(tree) {
     rows.push(cells);
   }
   return rows;
+}
+
+function nativeStoredRaw(value) { return String(value ?? "") === " " ? "" : String(value ?? ""); }
+function nativePersistedRaw(value) { return String(value ?? "") === "" ? " " : String(value ?? ""); }
+
+function nativeCellIndex(tree) {
+  const index = new Map();
+  for (const [row, cells] of tableCells(tree).entries()) for (const [col, cell] of cells.entries()) {
+    index.set(cell.uid, {
+      uid: cell.uid, raw: nativeStoredRaw(cell.string), row, col,
+      parentUid: col === 0 ? tree.uid : cells[col - 1].uid,
+      order: col === 0 ? row : 0,
+    });
+  }
+  return index;
+}
+
+function nativeStructureSignature(tree) {
+  return JSON.stringify(tableCells(tree).map((row) => row.map((cell) => cell.uid)));
+}
+
+function nativeTreeMatchesModel(tree, model) {
+  const rows = tableCells(tree);
+  return rows.length === model.rowCount && rows.every((row, rowIndex) => row.length === model.colCount && row.every((cell, col) => {
+    const desired = model.getCell(rowIndex, col);
+    return desired?.uid === cell.uid && desired.raw === nativeStoredRaw(cell.string);
+  }));
+}
+
+function sequenceIsSubsequence(values, expected) {
+  let index = 0;
+  for (const value of expected) if (value === values[index]) index += 1;
+  return index === values.length;
+}
+
+export function deferredStructuralConflict(baseTree, desiredModel, watchedTrees) {
+  if (!watchedTrees.length) return false;
+  const base = nativeCellIndex(baseTree); const desired = new Map(desiredModel.rows.flat().map((cell) => [cell.uid, cell.raw]));
+  const baseRoots = tableCells(baseTree).map((row) => row[0]?.uid); const desiredRoots = desiredModel.rows.map((row) => row[0]?.uid);
+  for (const tree of watchedTrees) {
+    for (const [uid, cell] of nativeCellIndex(tree)) {
+      if (!base.has(uid) && !desired.has(uid)) return true;
+      const allowed = new Set([base.get(uid)?.raw, desired.get(uid)]);
+      if (!allowed.has(cell.raw)) return true;
+    }
+    const roots = tableCells(tree).map((row) => row[0]?.uid);
+    if (!sequenceIsSubsequence(roots, baseRoots) && !sequenceIsSubsequence(roots, desiredRoots)) return true;
+  }
+  return false;
+}
+
+function patchTreeCellRaw(tree, uid, raw) {
+  const visit = (node) => {
+    if (node.uid === uid) { node.string = nativePersistedRaw(raw); return true; }
+    return (node.children || []).some(visit);
+  };
+  return visit(tree);
+}
+
+function immediateParentUid(block) {
+  const parents = block?.[":block/_children"] ?? block?.["block/_children"] ?? block?.parents ?? block?.[":block/parents"] ?? [];
+  const values = Array.isArray(parents) ? parents : [parents];
+  const parent = values[0];
+  return parent?.uid ?? parent?.[":block/uid"] ?? (typeof parent === "string" ? parent : null);
+}
+
+function pullNativeCell(uid) {
+  const api = roam();
+  const pull = api.data?.pull || api.pull;
+  let value = null;
+  if (pull) value = pull.call(api.data || api, "[:block/uid :block/string :block/order :edit/time {:block/_children [:block/uid]}]", [":block/uid", uid]);
+  else {
+    const safeUid = String(uid).replace(/["\\]/g, "");
+    value = api.q(`[:find (pull ?block [:block/uid :block/string :block/order :edit/time {:block/_children [:block/uid]}]) :where [?block :block/uid "${safeUid}"]]`)?.[0]?.[0];
+  }
+  if (!value) return null;
+  const actualUid = value.uid ?? value[":block/uid"];
+  if (actualUid !== uid) return null;
+  return {
+    uid: actualUid,
+    raw: nativeStoredRaw(value.string ?? value[":block/string"] ?? ""),
+    order: value.order ?? value[":block/order"] ?? null,
+    editTime: value.editTime ?? value[":edit/time"] ?? null,
+    parentUid: immediateParentUid(value),
+  };
 }
 
 export function nativeTreeToModel(tree, metadata = {}) {
@@ -1409,45 +1805,221 @@ export class NativeTableAdapter {
     this.queue = new MutationQueue();
     this.model = null;
     this.watch = null;
-    this.saving = false;
+    this.baseTree = null;
+    this.baseCells = new Map();
+    this.lastWatchTree = null;
+    this.selfWrites = new Map();
+    this.structuralSaving = false;
+    this.deferredStructuralWatches = [];
+    this.watchCallback = null;
   }
 
   load() {
     const tree = getTree(this.tableUid);
     if (!tree || !NATIVE_MARKER.test(tree.string)) throw new GridError("NOT_TABLE", "Focused block is not a native Roam table");
     this.model = nativeTreeToModel(tree, this.metadataStore.get(this.tableUid) || {});
+    this.adoptBaseTree(tree);
     return this.model;
   }
 
+  adoptBaseTree(tree) {
+    this.baseTree = deepClone(normalizeTree(tree));
+    this.baseCells = nativeCellIndex(this.baseTree);
+    this.lastWatchTree = deepClone(this.baseTree);
+    const fingerprint = treeFingerprint(this.baseTree);
+    if (this.model) {
+      this.model.baseFingerprint = fingerprint;
+      this.model.baseSnapshot ||= this.model.snapshot();
+    }
+  }
+
+  acceptExternalTree(tree, model = this.model, baseModel = model) {
+    this.model = model;
+    this.adoptBaseTree(tree);
+    if (this.model && baseModel) this.model.baseSnapshot = baseModel.snapshot();
+  }
+
+  getBaseRaw(uid) { return this.baseCells.get(uid)?.raw; }
+
+  getBaseAncestry(uid) {
+    const ancestry = []; let cell = this.baseCells.get(uid); const seen = new Set();
+    while (cell) {
+      if (seen.has(cell.uid)) return null;
+      seen.add(cell.uid); ancestry.push(cell);
+      if (cell.parentUid === this.tableUid) return ancestry;
+      cell = this.baseCells.get(cell.parentUid);
+    }
+    return null;
+  }
+
+  recordSelfWrite(uid, from, to) {
+    const now = Date.now();
+    const queue = (this.selfWrites.get(uid) || []).filter((item) => item.expires > now);
+    queue.push({ from, to, expires: now + 10_000 });
+    this.selfWrites.set(uid, queue);
+  }
+
+  consumeSelfWrite(uid, from, to) {
+    const now = Date.now();
+    const queue = (this.selfWrites.get(uid) || []).filter((item) => item.expires > now);
+    const start = queue.findIndex((item) => item.from === from || item.from == null);
+    let end = -1; let value = from;
+    for (let index = start; index >= 0 && index < queue.length; index += 1) {
+      const item = queue[index];
+      if (item.from != null && item.from !== value) break;
+      value = item.to;
+      if (value === to) { end = index; break; }
+    }
+    if (start < 0 || end < start) { if (queue.length) this.selfWrites.set(uid, queue); else this.selfWrites.delete(uid); return false; }
+    queue.splice(start, end - start + 1);
+    if (queue.length) this.selfWrites.set(uid, queue); else this.selfWrites.delete(uid);
+    return true;
+  }
+
   watchExternal(callback) {
+    this.watchCallback = callback;
     const pattern = "[:block/uid :block/string :block/order :edit/time {:block/children ...}]";
     const entity = `[:block/uid \"${this.tableUid}\"]`;
-    const handler = (_before, after) => { if (!this.saving) callback(nativeTreeToModel(normalizeTree(after), this.metadataStore.get(this.tableUid) || {})); };
+    const handler = (before, after) => {
+      const nextTree = normalizeTree(after);
+      if (!nextTree) return;
+      if (this.structuralSaving) { this.deferredStructuralWatches.push(nextTree); return; }
+      const previousTree = normalizeTree(before) || this.lastWatchTree || this.baseTree;
+      const structural = !previousTree || nativeStructureSignature(previousTree) !== nativeStructureSignature(nextTree);
+      const previous = previousTree ? nativeCellIndex(previousTree) : new Map();
+      const next = nativeCellIndex(nextTree);
+      const changes = [];
+      for (const [uid, cell] of next) {
+        const old = previous.get(uid);
+        if (old && old.raw !== cell.raw) changes.push({ uid, from: old.raw, raw: cell.raw, row: cell.row, col: cell.col });
+      }
+      const externalChanges = changes.filter((change) => !this.consumeSelfWrite(change.uid, change.from, change.raw));
+      this.lastWatchTree = deepClone(nextTree);
+      if (!structural && !externalChanges.length) return;
+      const model = nativeTreeToModel(nextTree, this.metadataStore.get(this.tableUid) || {});
+      callback(model, { type: structural ? "structural" : "content", structural, changes: externalChanges, tree: nextTree });
+    };
     roam().data.addPullWatch(pattern, entity, handler);
     this.watch = () => roam().data.removePullWatch(pattern, entity, handler);
     return this.watch;
+  }
+
+  normalizeContentChanges(changes) {
+    const values = changes instanceof Map ? [...changes.values()] : Array.isArray(changes) ? changes : Object.values(changes || {});
+    return values.map((change) => ({
+      uid: String(change.uid),
+      baseRaw: String(change.baseRaw ?? this.getBaseRaw(change.uid) ?? ""),
+      raw: String(change.raw ?? ""),
+      revision: Number(change.revision) || 0,
+    }));
+  }
+
+  patchBaseContent(changes) {
+    for (const change of changes) {
+      patchTreeCellRaw(this.baseTree, change.uid, change.raw);
+      const base = this.baseCells.get(change.uid); if (base) base.raw = change.raw;
+      if (this.model?.baseSnapshot?.rows) for (const row of this.model.baseSnapshot.rows) {
+        const cell = row.find((item) => item.uid === change.uid); if (cell) { cell.raw = change.raw; break; }
+      }
+    }
+    if (this.baseTree && this.model) this.model.baseFingerprint = treeFingerprint(this.baseTree);
+    this.lastWatchTree = deepClone(this.baseTree);
+  }
+
+  async saveContent(changes) {
+    const requested = this.normalizeContentChanges(changes);
+    return this.queue.run(async () => {
+      const desired = requested.filter((change) => change.raw !== change.baseRaw);
+      if (!desired.length) return { saved: [], skipped: requested.map((change) => change.uid) };
+      const validation = [];
+      const validatedCells = new Map();
+      for (const change of desired) {
+        const base = this.baseCells.get(change.uid);
+        if (!base) throw new GridError("STRUCTURAL_CONFLICT", `Cell ${change.uid} is no longer part of this table`);
+        const ancestry = this.getBaseAncestry(change.uid);
+        if (!ancestry) throw new GridError("STRUCTURAL_CONFLICT", `Cell ${change.uid} has an invalid cached ancestry`);
+        for (const expected of ancestry) {
+          let currentAncestor = validatedCells.get(expected.uid);
+          if (!currentAncestor) { currentAncestor = pullNativeCell(expected.uid); if (currentAncestor) validatedCells.set(expected.uid, currentAncestor); }
+          if (!currentAncestor || currentAncestor.parentUid !== expected.parentUid || Number(currentAncestor.order) !== Number(expected.order)) {
+            throw new GridError("STRUCTURAL_CONFLICT", "The table cell ancestry or order changed elsewhere. Reload before saving.");
+          }
+        }
+        const current = validatedCells.get(change.uid);
+        if (!current) throw new GridError("STRUCTURAL_CONFLICT", `Cell ${change.uid} no longer exists`);
+        if (current.raw !== change.baseRaw) throw new GridError("CONFLICT", "This cell changed elsewhere. Reload before saving.", { uid: change.uid, expected: change.baseRaw, actual: current.raw });
+        validation.push({ change, current });
+      }
+      const written = [];
+      try {
+        for (const item of validation) {
+          this.recordSelfWrite(item.change.uid, item.current.raw, item.change.raw);
+          try { await updateBlock(item.change.uid, nativePersistedRaw(item.change.raw)); }
+          catch (error) { this.consumeSelfWrite(item.change.uid, item.current.raw, item.change.raw); throw error; }
+          written.push(item);
+        }
+        this.patchBaseContent(validation.map((item) => item.change));
+        return { saved: validation.map((item) => ({ ...item.change })), skipped: [] };
+      } catch (error) {
+        for (const item of [...written].reverse()) {
+          try {
+            const current = pullNativeCell(item.change.uid);
+            if (current?.raw !== item.change.raw) continue;
+            this.recordSelfWrite(item.change.uid, item.change.raw, item.change.baseRaw);
+            await updateBlock(item.change.uid, nativePersistedRaw(item.change.baseRaw));
+          } catch (rollbackError) { console.error("[roam-grid] Content rollback failed", rollbackError); }
+        }
+        try {
+          const tree = getTree(this.tableUid);
+          if (tree) this.adoptBaseTree(tree);
+        } catch { /* preserve the last verified base when repull is unavailable */ }
+        throw error;
+      }
+    });
   }
 
   async save(model, { saveMetadata = true } = {}) {
     return this.queue.run(async () => {
       const currentTree = getTree(this.tableUid);
       if (!currentTree) throw new GridError("TABLE_MISSING", "The source Roam table no longer exists");
-      if (this.model?.baseFingerprint && treeFingerprint(currentTree) !== this.model.baseFingerprint) throw new GridError("CONFLICT", "The table changed elsewhere. Reload before saving.");
+      const expectedFingerprint = this.baseTree ? treeFingerprint(this.baseTree) : this.model?.baseFingerprint;
+      if (expectedFingerprint && treeFingerprint(currentTree) !== expectedFingerprint) throw new GridError("CONFLICT", "The table changed elsewhere. Reload before saving.");
       const before = this.model;
-      this.saving = true;
+      const metadataHadEntry = Boolean(this.metadataStore.has?.(this.tableUid) ?? this.metadataStore.get?.(this.tableUid));
+      this.structuralSaving = true;
+      this.deferredStructuralWatches = [];
+      let transaction = null; let metadataTouched = false;
       try {
-        await this.persistModel(model, currentTree);
-        if (saveMetadata) await this.metadataStore.set(this.tableUid, model);
+        transaction = await this.persistModel(model, currentTree);
+        if (saveMetadata) { metadataTouched = true; await this.metadataStore.set(this.tableUid, model); }
+        await transaction?.commit?.();
         const reloaded = this.load();
+        const watched = this.deferredStructuralWatches.slice();
+        const conflict = !nativeTreeMatchesModel(this.baseTree, model) || deferredStructuralConflict(currentTree, model, watched);
+        if (conflict && this.watchCallback) {
+          const tree = deepClone(this.baseTree); const callback = this.watchCallback;
+          setTimeout(() => callback(reloaded, { type: "structural", structural: true, conflict: true, changes: [], tree }), 0);
+        }
         return reloaded;
       } catch (error) {
         console.error("[roam-grid] Native save failed", error);
-        if (before?.baseSnapshot) {
-          try { await this.reconcile(new GridModel({ ...before.baseSnapshot, tableUid: this.tableUid }), getTree(this.tableUid), true); } catch (rollbackError) { console.error("[roam-grid] Rollback also failed", rollbackError); }
+        let rollbackComplete = false; let graphRestored = false;
+        if (transaction?.rollback) {
+          try { const result = await transaction.rollback(); rollbackComplete = result?.complete !== false; graphRestored = result?.graphRestored ?? rollbackComplete; } catch (rollbackError) { console.error("[roam-grid] Structural rollback also failed", rollbackError); }
+        } else if (error.rgRollbackAttempted) { rollbackComplete = error.rgRollbackComplete === true; graphRestored = error.rgRollbackGraphRestored ?? rollbackComplete; }
+        else if (before?.baseSnapshot) {
+          try { await this.reconcile(new GridModel({ ...before.baseSnapshot, tableUid: this.tableUid }), getTree(this.tableUid), true); rollbackComplete = true; graphRestored = true; } catch (rollbackError) { console.error("[roam-grid] Rollback also failed", rollbackError); }
+        }
+        if (metadataTouched && graphRestored) {
+          try {
+            if (metadataHadEntry && before?.baseSnapshot) await this.metadataStore.set(this.tableUid, new GridModel({ ...before.baseSnapshot, tableUid: this.tableUid }));
+            else if (this.metadataStore.remove) await this.metadataStore.remove(this.tableUid);
+          } catch (metadataError) { console.error("[roam-grid] Metadata rollback also failed", metadataError); }
         }
         throw error;
       } finally {
-        this.saving = false;
+        this.structuralSaving = false;
+        this.deferredStructuralWatches = [];
       }
     });
   }
@@ -1462,7 +2034,67 @@ export class NativeTableAdapter {
       for (const [uid, raw] of updates) await updateBlock(uid, raw);
       return;
     }
-    await this.reconcile(model, currentTree);
+    return this.persistDeletionOnly(model, currentTree) || this.reconcile(model, currentTree);
+  }
+
+  persistDeletionOnly(model, currentTree) {
+    const currentRows = tableCells(currentTree);
+    if (!currentRows.length || currentRows.length <= model.rowCount) return null;
+    if (currentRows.some((row) => row.length !== model.colCount) || model.rows.some((row) => row.length !== model.colCount)) return null;
+    const desiredRoots = model.rows.map((row) => row[0].uid);
+    const desiredRootSet = new Set(desiredRoots);
+    const survivors = currentRows.filter((row) => desiredRootSet.has(row[0].uid));
+    if (survivors.length !== model.rowCount || survivors.some((row, index) => row[0].uid !== desiredRoots[index])) return null;
+    for (let row = 0; row < survivors.length; row += 1) {
+      if (survivors[row].some((cell, col) => cell.uid !== model.rows[row][col].uid)) return null;
+    }
+    const removed = currentRows.map((row, index) => ({ row, index })).filter(({ row }) => !desiredRootSet.has(row[0].uid));
+    if (!removed.length) return null;
+    const removedIndexes = removed.map((item) => item.index);
+    if (removedIndexes.at(-1) - removedIndexes[0] + 1 !== removedIndexes.length) return null;
+    const updates = [];
+    for (let row = 0; row < survivors.length; row += 1) for (let col = 0; col < model.colCount; col += 1) {
+      const desired = model.getRaw(row, col); const current = nativeStoredRaw(survivors[row][col].string);
+      if (desired !== current) updates.push({ uid: survivors[row][col].uid, from: current, raw: desired });
+    }
+    const mutationEstimate = 2 + removed.length * 2 + updates.length * 2;
+    if (mutationEstimate > MAX_NATIVE_MUTATIONS) throw new GridError("MUTATION_BUDGET", `Row deletion requires about ${mutationEstimate} Roam writes; copy to a large grid instead`);
+    return this.createDeletionTransaction(removed, updates);
+  }
+
+  async createDeletionTransaction(removed, updates) {
+    const stagingUid = await this.metadataStore.createStaging(this.tableUid);
+    const appliedUpdates = []; const moved = []; let rollbackResult = null; let committed = false;
+    const rollback = async () => {
+      if (rollbackResult) return rollbackResult;
+      const errors = []; let moveFailed = false; let updateFailed = false; let cleanupFailed = false;
+      for (const item of [...moved].sort((a, b) => a.index - b.index)) {
+        try { await moveBlock(item.row[0].uid, this.tableUid, item.index); }
+        catch (error) { moveFailed = true; errors.push(error); }
+      }
+      for (const item of [...appliedUpdates].reverse()) {
+        try { await updateBlock(item.uid, nativePersistedRaw(item.from)); }
+        catch (error) { updateFailed = true; errors.push(error); }
+      }
+      if (!moveFailed) {
+        try { await deleteBlock(stagingUid); }
+        catch (error) { cleanupFailed = true; errors.push(error); }
+      }
+      rollbackResult = { complete: errors.length === 0, graphRestored: !moveFailed && !updateFailed, cleanupFailed, errors };
+      return rollbackResult;
+    };
+    try {
+      for (const item of updates) { await updateBlock(item.uid, nativePersistedRaw(item.raw)); appliedUpdates.push(item); }
+      for (const item of removed) { await moveBlock(item.row[0].uid, stagingUid, "last"); moved.push(item); }
+      return { commit: async () => { await deleteBlock(stagingUid); committed = true; }, rollback: () => committed ? Promise.resolve({ complete: false, errors: [new Error("Deletion was already committed")] }) : rollback() };
+    } catch (error) {
+      const result = await rollback();
+      error.rgRollbackAttempted = true;
+      error.rgRollbackComplete = result.complete;
+      error.rgRollbackGraphRestored = result.graphRestored;
+      if (result.errors.length) console.error("[roam-grid] Row deletion rollback incomplete", result.errors);
+      throw error;
+    }
   }
 
   async reconcile(model, currentTree, force = false) {
@@ -1500,7 +2132,7 @@ export class NativeTableAdapter {
     }
   }
 
-  dispose() { return this.watch?.(); }
+  dispose() { this.watchCallback = null; this.deferredStructuralWatches.length = 0; this.selfWrites.clear(); return this.watch?.(); }
 }
 
 function extractUrl(value) {
@@ -1874,7 +2506,7 @@ function createPublicApi() {
   const templateNames = () => [...new Set([...registries.templates.keys(), ...(runtime.templates?.list() || [])])].sort((a, b) => a.localeCompare(b));
   return {
     version: VERSION,
-    registerFormulaFunction: (name, fn) => registries.register(registries.formulaFunctions, name, fn),
+    registerFormulaFunction: (name, fn, options) => registries.registerFormulaFunction(name, fn, options),
     registerCellRenderer: (name, renderer) => registries.register(registries.cellRenderers, name, renderer),
     registerCellEditor: (name, editor) => registries.register(registries.cellEditors, name, editor),
     registerImporter: (name, importer) => registries.register(registries.importers, name, importer),
@@ -1982,6 +2614,501 @@ function selectionMatrix(model, selection) {
 
 function isMac() { return /Mac|iPhone|iPad/.test(globalThis.navigator?.platform || ""); }
 
+export function requiresRoamRichRender(raw) {
+  const value = String(raw ?? "");
+  if (!value) return false;
+  return value.includes("\n")
+    || /\[\[|\(\(|\{\{|::|https?:\/\/|mailto:|\bwww\./iu.test(value)
+    || /!\[[^\]]*\]\(|\[[^\]\n]+\]\([^\n)]*\)/u.test(value)
+    || /(?:^|\s)#(?:\[\[[^\]]+\]\]|[\p{L}\p{N}_/-]+)/u.test(value)
+    || /\*\*|__|~~|\^\^|`/u.test(value)
+    || /(?:^|[^\p{L}\p{N}])(?:\*[^*\n]+\*|_[^_\n]+_)(?![\p{L}\p{N}])/u.test(value)
+    || /(?:^|\n)\s*(?:#{1,6}\s|>\s|[-+*]\s|\d+\.\s)/u.test(value);
+}
+
+function ensureCellContent(cell) {
+  let content = cell.querySelector(":scope > .rg-cell-content");
+  if (!content) {
+    content = document.createElement("div");
+    content.className = "rg-cell-content";
+    cell.prepend(content);
+  }
+  return content;
+}
+
+function disposeRichHost(content, host) {
+  if (!host || host.__rgDisposed) return;
+  host.__rgDisposed = true;
+  try { globalThis.window?.roamAlphaAPI?.ui?.components?.unmountNode?.({ el: host }); } catch { /* host may not be Roam-owned */ }
+  host.remove();
+  content.__rgRichHosts?.delete(host);
+}
+
+function clearRichCellHosts(content, keep = null) {
+  for (const host of [...(content.__rgRichHosts || [])]) if (host !== keep) disposeRichHost(content, host);
+}
+
+export function releaseRichCellHosts(container) {
+  if (!container) return;
+  const contents = [];
+  if (container.matches?.(".rg-cell-content")) contents.push(container);
+  for (const content of container.querySelectorAll?.(".rg-cell-content") || []) contents.push(content);
+  for (const content of contents) clearRichCellHosts(content);
+}
+
+export function replaceGridViewportContents(viewport, nextGrid) {
+  const scrollLeft = viewport.scrollLeft; const scrollTop = viewport.scrollTop;
+  releaseRichCellHosts(viewport);
+  viewport.replaceChildren(nextGrid);
+  viewport.scrollLeft = scrollLeft; viewport.scrollTop = scrollTop;
+  return viewport;
+}
+
+function activateRichHost(content, host, token) {
+  if (content.dataset.rgRenderToken !== token || host.__rgDisposed || !host.isConnected) return disposeRichHost(content, host);
+  clearRichCellHosts(content, host);
+  for (const child of [...(content.childNodes || content.children || [])]) if (child !== host) child.remove();
+  host.hidden = false;
+  host.dataset.rgRichActive = "true";
+}
+
+export function paintRichCellContent(content, raw, token) {
+  const host = document.createElement("span");
+  host.className = "rg-rich-host";
+  host.hidden = true;
+  host.dataset.rgRenderToken = token;
+  content.__rgRichHosts ||= new Set();
+  content.__rgRichHosts.add(host);
+  content.appendChild(host);
+  const fallback = () => {
+    if (content.dataset.rgRenderToken !== token || host.__rgDisposed) return disposeRichHost(content, host);
+    host.textContent = raw;
+    activateRichHost(content, host, token);
+  };
+  const render = () => {
+    if (content.dataset.rgRenderToken !== token || host.__rgDisposed) return disposeRichHost(content, host);
+    if (!host.isConnected) return fallback();
+    try {
+      const result = roam().ui.components.renderString({ el: host, string: raw });
+      if (result && typeof result.then === "function") result.then(() => activateRichHost(content, host, token), fallback);
+      else activateRichHost(content, host, token);
+    } catch { fallback(); }
+  };
+  if (host.isConnected) render();
+  else (globalThis.queueMicrotask || ((callback) => Promise.resolve().then(callback)))(render);
+}
+
+export function renderStableCellContent(content, { raw = "", value = raw, formula = false, renderRich = null } = {}) {
+  const source = String(raw ?? "");
+  const text = String((formula ? value : source) ?? "");
+  const rich = !formula && requiresRoamRichRender(source);
+  const renderKey = `${rich ? "rich:" : "text:"}${rich ? source : text}`;
+  if (content.dataset.rgRenderKey === renderKey) return false;
+  const token = cryptoId();
+  content.dataset.rgRenderKey = renderKey;
+  content.dataset.rgRenderToken = token;
+  if (rich && typeof renderRich === "function") renderRich(content, source, token);
+  else {
+    clearRichCellHosts(content);
+    content.textContent = text;
+  }
+  return true;
+}
+
+function formulaReferenceColorMap(raw) {
+  const colors = new Map();
+  for (const reference of formulaReferences(raw)) {
+    const key = reference.text.toUpperCase();
+    if (!colors.has(key)) colors.set(key, FORMULA_REFERENCE_COLORS[colors.size % FORMULA_REFERENCE_COLORS.length]);
+  }
+  return colors;
+}
+
+function appendFormulaMirror(target, raw, colors = formulaReferenceColorMap(raw)) {
+  target.replaceChildren();
+  let cursor = 0;
+  for (const reference of formulaReferences(raw)) {
+    target.append(document.createTextNode(raw.slice(cursor, reference.startIndex)));
+    const token = document.createElement("span");
+    token.className = "rg-formula-token";
+    token.textContent = raw.slice(reference.startIndex, reference.endIndex);
+    token.style.color = colors.get(reference.text.toUpperCase());
+    target.appendChild(token);
+    cursor = reference.endIndex;
+  }
+  target.append(document.createTextNode(raw.slice(cursor)));
+}
+
+export function roamReferenceAutocompleteContext(raw, caret = String(raw ?? "").length) {
+  const source = String(raw ?? ""); const endIndex = clamp(Number.isFinite(caret) ? caret : source.length, 0, source.length);
+  const prefix = source.slice(0, endIndex);
+  const candidates = [
+    { type: "page", opener: "[[", closer: "]]", startIndex: prefix.lastIndexOf("[["), closeIndex: prefix.lastIndexOf("]]" ) },
+    { type: "block", opener: "((", closer: "))", startIndex: prefix.lastIndexOf("(("), closeIndex: prefix.lastIndexOf("))") },
+  ].filter((candidate) => candidate.startIndex >= 0 && candidate.closeIndex < candidate.startIndex)
+    .sort((a, b) => b.startIndex - a.startIndex);
+  const match = candidates[0]; if (!match) return null;
+  const queryStart = match.startIndex + match.opener.length; const query = source.slice(queryStart, endIndex);
+  if (query.includes("\n") || query.includes("\r")) return null;
+  const replaceEndIndex = source.slice(endIndex, endIndex + match.closer.length) === match.closer ? endIndex + match.closer.length : endIndex;
+  return { type: match.type, query, startIndex: match.startIndex, queryStart, endIndex, replaceEndIndex };
+}
+
+export async function searchRoamReferenceSuggestions(context, limit = 8, api = globalThis.window?.roamAlphaAPI) {
+  if (!context || !api?.data?.search) return [];
+  const query = String(context.query || "").trim(); if (!query) return [];
+  const boundedLimit = clamp(Math.floor(Number(limit) || 8), 1, 20);
+  const page = context.type === "page";
+  const results = await Promise.resolve(api.data.search({
+    "search-str": query,
+    "search-pages": page,
+    "search-blocks": !page,
+    "hide-code-blocks": !page,
+    limit: boundedLimit,
+    pull: page ? "[:node/title :block/uid]" : "[:block/string :block/uid]",
+  }));
+  return [...(results || [])].flatMap((result) => {
+    const uid = valueOf(result, "block.uid");
+    if (page) {
+      const title = valueOf(result, "node.title");
+      return title ? [{ kind: "roam-page", name: String(title), description: "Page", uid: uid ? String(uid) : null }] : [];
+    }
+    const raw = valueOf(result, "block.string");
+    if (!uid || raw == null) return [];
+    const label = String(raw).replace(/\s+/g, " ").trim();
+    return [{ kind: "roam-block", name: label.slice(0, 120) || "(empty block)", description: `Block · ${uid}`, uid: String(uid) }];
+  }).slice(0, boundedLimit);
+}
+
+export class GridEditorController {
+  constructor(view, { cellAt, dimensions, mountedCells = null, cellRange = null, searchReferences = searchRoamReferenceSuggestions, referenceSearchDelay = 90, onFinish, viewport }) {
+    this.view = view;
+    this.cellAt = cellAt;
+    this.dimensions = dimensions;
+    this.mountedCells = mountedCells || (() => view.cells?.values?.() || []);
+    this.cellRange = cellRange || ((cell) => {
+      const row = Number(cell.dataset.row); const col = Number(cell.dataset.col);
+      return { startRow: row, endRow: row, startCol: col, endCol: col };
+    });
+    this.onFinish = onFinish;
+    this.viewport = viewport;
+    this.searchReferences = searchReferences;
+    this.referenceSearchDelay = Math.max(0, Number(referenceSearchDelay) || 0);
+    this.referenceSearchTimer = null;
+    this.referenceSearchToken = 0;
+    this.referenceContext = null;
+    this.referenceContextKey = null;
+    this.suggestionKind = null;
+    this.state = null;
+    this.referenceCells = new Map();
+    this.frame = null;
+    this.suggestions = [];
+    this.suggestionIndex = 0;
+    this.popover = document.createElement("div");
+    this.popover.className = "rg-formula-popover rg-editor-popover";
+    this.popover.hidden = true;
+    this.address = document.createElement("span");
+    this.address.className = "rg-formula-address";
+    this.input = document.createElement("textarea");
+    this.input.className = "rg-floating-editor-input";
+    this.input.setAttribute("aria-label", "Edit cell value");
+    this.mirror = document.createElement("code");
+    this.mirror.className = "rg-formula-expression rg-formula-mirror";
+    this.suggestionList = document.createElement("div");
+    this.suggestionList.className = "rg-formula-suggestions";
+    this.signature = document.createElement("div");
+    this.signature.className = "rg-formula-signature";
+    const body = document.createElement("div");
+    body.className = "rg-editor-popover-body";
+    body.append(this.input, this.mirror, this.suggestionList, this.signature);
+    this.popover.append(this.address, body);
+    document.body.appendChild(this.popover);
+    this.boundReposition = () => this.position();
+    globalThis.window?.addEventListener("resize", this.boundReposition);
+    this.viewport?.addEventListener("scroll", this.boundReposition, { passive: true });
+    for (const type of ["keyup", "keypress", "beforeinput", "input", "compositionstart", "compositionend"]) {
+      this.input.addEventListener(type, (event) => event.stopPropagation());
+    }
+    this.input.addEventListener("compositionstart", () => { if (this.state) this.state.composing = true; });
+    this.input.addEventListener("compositionend", () => { if (this.state) this.state.composing = false; this.schedulePresentation(); });
+    this.input.addEventListener("input", () => { this.onEditorInput(); });
+    this.input.addEventListener("click", () => this.schedulePresentation());
+    this.input.addEventListener("select", () => this.schedulePresentation());
+    this.input.addEventListener("keydown", (event) => this.onKeydown(event));
+    this.input.addEventListener("blur", (event) => {
+      if (!this.state || this.popover.contains(event.relatedTarget)) return;
+      this.finish(true);
+    });
+  }
+
+  async start({ row, col, cell, raw, initial = null, floating = false, customEditor = null }) {
+    if (this.state) await this.finish(false);
+    const value = initial == null ? String(raw ?? "") : String(initial);
+    const editor = floating ? this.input : customEditor || document.createElement("textarea");
+    if (!floating) {
+      editor.classList.add("rg-editor");
+      cell.classList.add("rg-cell--editing");
+      cell.appendChild(editor);
+      for (const type of ["keyup", "keypress", "beforeinput", "input"]) editor.addEventListener(type, (event) => event.stopPropagation());
+    }
+    editor.value = value;
+    this.state = { row, col, cell, raw: String(raw ?? ""), editor, floating, composing: false, autocompleteClosed: false, referenceAutocompleteClosed: false, finished: false };
+    this.address.textContent = `fx  ${cellLabel(row, col)}`;
+    this.popover.hidden = !floating && !(value.startsWith("=") && !value.startsWith("=="));
+    this.popover.classList.toggle("rg-editor-popover--floating", floating);
+    this.input.hidden = !floating;
+    if (!floating) {
+      editor.addEventListener("keydown", (event) => this.onKeydown(event));
+      editor.addEventListener("compositionstart", () => { if (this.state) this.state.composing = true; });
+      editor.addEventListener("compositionend", () => { if (this.state) this.state.composing = false; this.schedulePresentation(); });
+      editor.addEventListener("input", () => { this.onEditorInput(); });
+      editor.addEventListener("click", () => this.schedulePresentation());
+      editor.addEventListener("select", () => this.schedulePresentation());
+      editor.addEventListener("blur", (event) => { if (!this.popover.contains(event.relatedTarget)) this.finish(true); });
+    }
+    editor.focus({ preventScroll: true });
+    if (typeof editor.setSelectionRange === "function") editor.setSelectionRange(value.length, value.length);
+    else editor.select?.();
+    this.schedulePresentation();
+    return editor;
+  }
+
+  currentEditor() { return this.state?.editor || null; }
+
+  onEditorInput() {
+    if (this.state) { this.state.autocompleteClosed = false; this.state.referenceAutocompleteClosed = false; }
+    clearTimeout(this.referenceSearchTimer); this.referenceSearchTimer = null; this.referenceSearchToken += 1; this.referenceContextKey = null;
+    this.schedulePresentation();
+  }
+
+  onKeydown(event) {
+    event.stopPropagation();
+    const state = this.state;
+    if (!state || state.composing || event.isComposing) return;
+    if (event.key === "F4") {
+      const result = cycleFormulaReferenceLocks(state.editor.value, state.editor.selectionStart, state.editor.selectionEnd);
+      if (result.changed) {
+        event.preventDefault();
+        state.editor.value = result.value;
+        state.editor.setSelectionRange(result.selectionStart, result.selectionEnd);
+        this.schedulePresentation();
+      }
+      return;
+    }
+    const hasSuggestions = !this.suggestionList.hidden && this.suggestions.length;
+    if (hasSuggestions && ["ArrowDown", "ArrowUp"].includes(event.key)) {
+      event.preventDefault();
+      this.suggestionIndex = (this.suggestionIndex + (event.key === "ArrowDown" ? 1 : -1) + this.suggestions.length) % this.suggestions.length;
+      this.paintSuggestions();
+      return;
+    }
+    if (hasSuggestions && ["Enter", "Tab"].includes(event.key)) {
+      event.preventDefault(); this.acceptSuggestion(this.suggestionIndex); return;
+    }
+    if (event.key === "Escape") {
+      event.preventDefault();
+      if (hasSuggestions) {
+        if (this.suggestionKind === "roam-reference") state.referenceAutocompleteClosed = true;
+        else state.autocompleteClosed = true;
+        this.suggestionList.hidden = true; return;
+      }
+      this.finish(false); return;
+    }
+    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); this.finish(true, [1, 0]); return; }
+    if (event.key === "Tab") { event.preventDefault(); this.finish(true, [0, event.shiftKey ? -1 : 1]); }
+  }
+
+  acceptSuggestion(index) {
+    if (this.suggestionKind === "roam-reference") return this.acceptReferenceSuggestion(index);
+    const state = this.state; const suggestion = this.suggestions[index]; const context = this.autocompleteContext;
+    if (!state || !suggestion || !context) return;
+    const suffix = context.hasFollowingParenthesis ? "" : "(";
+    state.editor.setRangeText(`${suggestion.name}${suffix}`, context.startIndex, context.endIndex, "end");
+    if (context.hasFollowingParenthesis) {
+      const caret = context.startIndex + suggestion.name.length + 1;
+      state.editor.setSelectionRange(caret, caret);
+    }
+    state.autocompleteClosed = true;
+    state.editor.focus({ preventScroll: true });
+    this.schedulePresentation();
+  }
+
+  acceptReferenceSuggestion(index) {
+    const state = this.state; const suggestion = this.suggestions[index]; const context = this.referenceContext;
+    if (!state || !suggestion || !context) return;
+    const replacement = suggestion.kind === "roam-page" ? `[[${suggestion.name}]]` : `((${suggestion.uid}))`;
+    state.editor.setRangeText(replacement, context.startIndex, context.replaceEndIndex ?? context.endIndex, "end");
+    state.referenceAutocompleteClosed = true;
+    clearTimeout(this.referenceSearchTimer); this.referenceSearchToken += 1;
+    this.suggestions = []; this.suggestionList.hidden = true;
+    state.editor.focus({ preventScroll: true });
+    this.schedulePresentation();
+  }
+
+  insertReference(row, col, event) {
+    const state = this.state; const editor = state?.editor;
+    if (!state || state.finished || !editor.value.startsWith("=") || editor.value.startsWith("==")) return false;
+    event.preventDefault(); event.stopPropagation();
+    const start = editor.selectionStart ?? editor.value.length; const end = editor.selectionEnd ?? start;
+    const prefix = editor.value.slice(0, start);
+    const reference = `${event.shiftKey && /\$?[A-Z]+\$?\d+$/i.test(prefix) ? ":" : ""}${cellLabel(row, col)}`;
+    editor.setRangeText(reference, start, end, "end");
+    editor.focus({ preventScroll: true });
+    this.schedulePresentation();
+    return true;
+  }
+
+  schedulePresentation() {
+    const schedule = globalThis.requestAnimationFrame || ((callback) => setTimeout(callback, 0));
+    if (this.frame != null) return;
+    this.frame = schedule(() => { this.frame = null; this.updatePresentation(); });
+  }
+
+  updatePresentation() {
+    const state = this.state;
+    if (!state) return this.clearPresentation();
+    const editor = state.editor; const raw = editor.value;
+    const formula = raw.startsWith("=") && !raw.startsWith("==");
+    const referenceContext = roamReferenceAutocompleteContext(raw, editor.selectionStart);
+    this.view.root.classList.toggle("rg-root--formula-editing", formula);
+    this.popover.hidden = !state.floating && !formula && !referenceContext;
+    this.mirror.hidden = !formula;
+    const colors = formulaReferenceColorMap(raw);
+    if (formula) appendFormulaMirror(this.mirror, raw, colors); else this.mirror.replaceChildren();
+    const desired = new Map();
+    if (formula) {
+      const references = formulaReferences(raw);
+      for (const cell of this.mountedCells()) {
+        const mountedRange = this.cellRange(cell);
+        const reference = references.find((item) => rangesOverlap(item.range, mountedRange));
+        if (!reference) continue;
+        const key = reference.text.toUpperCase(); desired.set(cell, { key, color: colors.get(key) });
+      }
+    }
+    for (const [cell] of this.referenceCells) if (!desired.has(cell)) {
+      cell.classList.remove("rg-cell--formula-reference"); cell.style.removeProperty("--rg-reference-color"); delete cell.dataset.rgFormulaReference;
+    }
+    for (const [cell, value] of desired) {
+      if (this.referenceCells.get(cell)?.key === value.key) continue;
+      cell.classList.add("rg-cell--formula-reference"); cell.style.setProperty("--rg-reference-color", value.color); cell.dataset.rgFormulaReference = value.key;
+    }
+    this.referenceCells = desired;
+    if (referenceContext) this.updateReferenceAutocomplete(referenceContext);
+    else { this.clearReferenceAutocomplete(); this.updateAutocomplete(formula); }
+    this.updateSignature(formula);
+    this.position();
+  }
+
+  updateAutocomplete(formula) {
+    const state = this.state; const editor = state?.editor;
+    const context = formula ? formulaAutocompleteContext(editor.value, editor.selectionStart) : null;
+    this.autocompleteContext = context;
+    const catalog = runtime.registries?.formulaFunctionMetadata || defaultFormulaFunctionMetadata();
+    this.suggestions = context && !state.autocompleteClosed ? rankFormulaFunctions(context.query, catalog) : [];
+    this.suggestionKind = this.suggestions.length ? "formula" : null;
+    this.suggestionIndex = clamp(this.suggestionIndex, 0, Math.max(0, this.suggestions.length - 1));
+    this.paintSuggestions();
+  }
+
+  updateReferenceAutocomplete(context) {
+    const state = this.state; if (!state) return;
+    const key = `${context.type}:${context.startIndex}:${context.endIndex}:${context.query}`;
+    if (this.referenceContextKey === key && (this.referenceSearchTimer != null || this.suggestionKind === "roam-reference")) return;
+    clearTimeout(this.referenceSearchTimer); const token = ++this.referenceSearchToken;
+    this.referenceContext = context; this.referenceContextKey = key; this.autocompleteContext = null;
+    this.suggestions = []; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.paintSuggestions();
+    if (state.referenceAutocompleteClosed || !context.query.trim()) return;
+    this.referenceSearchTimer = setTimeout(async () => {
+      this.referenceSearchTimer = null;
+      let results = [];
+      try { results = await this.searchReferences(context); } catch (error) { console.warn("[roam-grid] Reference search failed", error); }
+      if (token !== this.referenceSearchToken || !this.state || this.referenceContextKey !== key) return;
+      this.suggestions = results; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.paintSuggestions();
+      if (!this.state.floating) this.popover.hidden = !this.suggestions.length;
+      this.position();
+    }, this.referenceSearchDelay);
+  }
+
+  clearReferenceAutocomplete() {
+    clearTimeout(this.referenceSearchTimer); this.referenceSearchTimer = null; this.referenceSearchToken += 1;
+    this.referenceContext = null; this.referenceContextKey = null;
+    if (this.suggestionKind === "roam-reference") {
+      this.suggestions = []; this.suggestionKind = null; this.paintSuggestions();
+    }
+  }
+
+  paintSuggestions() {
+    this.suggestionList.replaceChildren();
+    this.suggestionList.hidden = !this.suggestions.length;
+    this.suggestions.forEach((suggestion, index) => {
+      const option = document.createElement("button"); option.type = "button"; option.className = "rg-formula-suggestion";
+      option.classList.toggle("rg-formula-suggestion--active", index === this.suggestionIndex);
+      const name = document.createElement("strong"); name.textContent = suggestion.name;
+      const detail = document.createElement("span"); detail.textContent = suggestion.description;
+      option.append(name, detail);
+      option.addEventListener("pointerdown", (event) => event.preventDefault());
+      option.addEventListener("click", () => this.acceptSuggestion(index));
+      this.suggestionList.appendChild(option);
+    });
+  }
+
+  updateSignature(formula) {
+    const state = this.state; const editor = state?.editor;
+    const call = formula ? activeFormulaCall(editor.value, editor.selectionStart) : null;
+    const catalog = runtime.registries?.formulaFunctionMetadata || defaultFormulaFunctionMetadata();
+    const metadata = call ? catalog.get(call.name) : null;
+    this.signature.replaceChildren(); this.signature.hidden = !metadata;
+    if (!metadata) return;
+    const lead = document.createElement("strong"); lead.textContent = `${call.name}(`; this.signature.appendChild(lead);
+    metadata.parameters.forEach((parameter, index) => {
+      if (index) this.signature.append(document.createTextNode(", "));
+      const item = document.createElement("span"); item.textContent = parameter; item.classList.toggle("rg-formula-argument--active", index === call.argumentIndex); this.signature.appendChild(item);
+    });
+    this.signature.append(document.createTextNode(")"));
+    if (metadata.description) { const description = document.createElement("small"); description.textContent = metadata.description; this.signature.appendChild(description); }
+  }
+
+  position() {
+    const state = this.state; if (!state || this.popover.hidden || !this.popover.isConnected) return;
+    const cell = this.cellAt(state.row, state.col) || state.cell; if (!cell?.isConnected) return;
+    state.cell = cell;
+    const rect = cell.getBoundingClientRect(); const viewportWidth = globalThis.innerWidth || document.documentElement.clientWidth || 1200;
+    const width = clamp(Math.max(rect.width, 360), 280, Math.min(680, viewportWidth - 16));
+    this.popover.style.width = `${width}px`;
+    const height = this.popover.getBoundingClientRect().height;
+    this.popover.style.left = `${clamp(rect.left, 8, Math.max(8, viewportWidth - width - 8))}px`;
+    this.popover.style.top = `${rect.top - height - 7 >= 8 ? rect.top - height - 7 : rect.bottom + 7}px`;
+  }
+
+  async finish(commit, movement = null) {
+    const state = this.state; if (!state || state.finished) return;
+    state.finished = true; this.state = null;
+    const value = state.editor.value;
+    if (!state.floating) { state.editor.remove(); state.cell.classList.remove("rg-cell--editing"); }
+    this.popover.hidden = true; this.clearPresentation();
+    await this.onFinish({ ...state, value, commit, movement });
+  }
+
+  clearPresentation() {
+    this.view.root.classList.remove("rg-root--formula-editing");
+    for (const [cell] of this.referenceCells) {
+      cell.classList.remove("rg-cell--formula-reference"); cell.style.removeProperty("--rg-reference-color"); delete cell.dataset.rgFormulaReference;
+    }
+    clearTimeout(this.referenceSearchTimer); this.referenceSearchTimer = null; this.referenceSearchToken += 1; this.referenceContext = null; this.referenceContextKey = null;
+    this.referenceCells.clear(); this.suggestions = []; this.suggestionKind = null; this.suggestionList.replaceChildren(); this.suggestionList.hidden = true; this.signature.replaceChildren(); this.signature.hidden = true;
+  }
+
+  dispose() {
+    if (this.state) {
+      const state = this.state; state.finished = true; this.state = null;
+      if (!state.floating) { state.editor.remove(); state.cell.classList.remove("rg-cell--editing"); }
+    }
+    globalThis.window?.removeEventListener("resize", this.boundReposition);
+    this.viewport?.removeEventListener("scroll", this.boundReposition);
+    this.clearPresentation(); this.popover.remove();
+  }
+}
+
 export class GridView {
   constructor({ host, model, adapter, nativeElement = null }) {
     this.host = host;
@@ -1999,18 +3126,25 @@ export class GridView {
     this.savedVersion = 0;
     this.saveTimer = null;
     this.metadataDirty = false;
+    this.dirtyCells = new Map();
+    this.editRevisions = new Map();
+    this.structuralPending = false;
+    this.contentSavePromise = null;
+    this.cellCoordinatesByUid = new Map();
     this.dragSelecting = false;
     this.fillStart = null;
     this.rowResizePreview = null;
     this.columnResizePreview = null;
     this.resizeCleanup = null;
-    this.formulaEdit = null;
-    this.formulaPopover = null;
+    this.editorController = null;
+    this.selectedCellElements = new Set();
+    this.activeCellElement = null;
+    this.selectionControls = new Set();
     this.boundPaste = (event) => this.onPaste(event);
     this.boundKeydown = (event) => this.onKeydown(event);
     this.keyboardActive = false;
     this.boundDocumentPointerDown = (event) => {
-      this.keyboardActive = this.root.contains(event.target);
+      this.keyboardActive = this.root.contains(event.target) || Boolean(this.editorController?.popover.contains(event.target));
       this.root.classList.toggle("rg-root--interaction-active", this.keyboardActive);
     };
     this.boundWindowKeydown = (event) => { if (this.keyboardActive) this.onKeydown(event); };
@@ -2026,11 +3160,35 @@ export class GridView {
     this.root.addEventListener("paste", this.boundPaste);
     document.addEventListener("pointerup", this.boundPointerUp, true);
     this.render();
-    this.adapter.watchExternal?.((model) => {
-      if (this.changeVersion !== this.savedVersion) return toast("Roam Grid detected an external edit; finish or reload before continuing.", "warning");
-      this.model = model;
-      this.render();
-    });
+    this.adapter.watchExternal?.((model, event = { type: "structural", structural: true, changes: [] }) => this.handleExternalChange(model, event));
+  }
+
+  handleExternalChange(externalModel, event) {
+    const localPending = this.structuralPending || this.dirtyCells.size > 0 || this.contentSavePromise;
+    if (event.structural || event.type === "structural") {
+      this.dirtyCells.clear(); this.structuralPending = false; this.metadataDirty = false;
+      clearTimeout(this.saveTimer); this.changeVersion = this.savedVersion;
+      this.model = externalModel; this.adapter.acceptExternalTree?.(event.tree, this.model); this.render();
+      if (localPending || event.conflict) toast("Roam Grid reloaded because the table structure changed elsewhere.", "warning");
+      return;
+    }
+    const conflicts = (event.changes || []).filter((change) => this.dirtyCells.has(change.uid));
+    if (conflicts.length) {
+      this.dirtyCells.clear(); this.structuralPending = false; clearTimeout(this.saveTimer); this.changeVersion = this.savedVersion;
+      this.model = externalModel; this.adapter.acceptExternalTree?.(event.tree, this.model); this.render();
+      toast("Roam Grid reloaded because this cell changed elsewhere.", "warning");
+      return;
+    }
+    const changed = [];
+    for (const change of event.changes || []) {
+      const coordinate = this.cellCoordinatesByUid.get(change.uid); if (!coordinate) continue;
+      const cell = this.model.getCell(coordinate.row, coordinate.col); if (!cell || cell.raw === change.raw) continue;
+      cell.raw = change.raw; changed.push([coordinate.row, coordinate.col]);
+    }
+    this.model.lastChangedCells = changed;
+    this.model.lastChangedCellUids = changed.map(([row, col]) => this.model.getCell(row, col)?.uid).filter(Boolean);
+    this.adapter.acceptExternalTree?.(event.tree, this.model, externalModel);
+    if (changed.length) this.refreshValues();
   }
 
   toolbar() {
@@ -2047,14 +3205,23 @@ export class GridView {
       button("⋯", "More grid actions", (event) => this.openMenu(event.currentTarget))
     );
     const status = document.createElement("span"); status.className = "rg-status"; status.textContent = `${this.model.rowCount} × ${this.model.colCount}`; status.setAttribute("aria-label", `Roam Grid v${VERSION} · ${this.model.rowCount} × ${this.model.colCount}`); status.title = `Roam Grid v${VERSION}`;
+    this.statusElement = status;
     toolbar.appendChild(status);
     return toolbar;
   }
 
   render() {
-    this.root.replaceChildren();
-    this.root.appendChild(this.toolbar());
-    const viewport = document.createElement("div"); viewport.className = "rg-viewport";
+    this.editorController?.dispose();
+    this.editorController = null;
+    this.clearSelectionPresentation();
+    if (!this.toolbarElement) { this.toolbarElement = this.toolbar(); this.root.appendChild(this.toolbarElement); }
+    else {
+      this.statusElement.textContent = `${this.model.rowCount} × ${this.model.colCount}`;
+      this.statusElement.setAttribute("aria-label", `Roam Grid v${VERSION} · ${this.model.rowCount} × ${this.model.colCount}`);
+    }
+    const viewport = this.viewport || (() => {
+      const element = document.createElement("div"); element.className = "rg-viewport"; this.root.appendChild(element); this.viewport = element; return element;
+    })();
     const grid = document.createElement("div"); grid.className = "rg-grid";
     this.gridElement = grid;
     const offset = this.model.showHeaders ? 1 : 0;
@@ -2067,7 +3234,9 @@ export class GridView {
       this.model.columnIds.forEach((id, col) => grid.appendChild(this.columnHeader(id, col)));
     }
     this.cells.clear();
-    const engine = new FormulaEngine(this.model, runtime.registries.formulaFunctions);
+    this.cellCoordinatesByUid.clear();
+    this.formulaEngine = new FormulaEngine(this.model, runtime.registries.formulaFunctions, runtime.registries.formulaFunctionMetadata);
+    const engine = this.formulaEngine;
     for (let row = 0; row < this.model.rowCount; row += 1) {
       if (this.model.showHeaders) grid.appendChild(this.rowHeader(row));
       for (let col = 0; col < this.model.colCount; col += 1) {
@@ -2076,12 +3245,32 @@ export class GridView {
         const cell = this.cellElement(row, col, merge, engine, offset);
         grid.appendChild(cell);
         this.cells.set(`${row}:${col}`, cell);
+        this.cellCoordinatesByUid.set(this.model.getCell(row, col).uid, { row, col });
       }
       grid.appendChild(this.rowResizeHandle(row, offset));
     }
     this.model.columnIds.forEach((id, col) => grid.appendChild(this.columnResizeHandle(id, col, offset)));
-    viewport.appendChild(grid);
-    this.root.appendChild(viewport);
+    replaceGridViewportContents(viewport, grid);
+    this.editorController = new GridEditorController(this, {
+      viewport,
+      dimensions: () => ({ rowCount: this.model.rowCount, colCount: this.model.colCount }),
+      cellAt: (row, col) => {
+        const merge = this.model.mergeAt(row, col);
+        return this.cells.get(`${merge?.row ?? row}:${merge?.col ?? col}`) || null;
+      },
+      mountedCells: () => this.cells.values(),
+      cellRange: (cell) => {
+        const row = Number(cell.dataset.row); const col = Number(cell.dataset.col); const merge = this.model.mergeAt(row, col);
+        return { startRow: row, endRow: row + (merge?.rowSpan || 1) - 1, startCol: col, endCol: col + (merge?.colSpan || 1) - 1 };
+      },
+      onFinish: async ({ row, col, cell, raw, value, commit, movement }) => {
+        if (commit && value !== this.model.getRaw(row, col)) this.commitMutation("Edit cell", () => this.model.setRaw(row, col, value), false);
+        else this.renderCellValue(cell, row, col);
+        if (movement) this.moveSelection(...movement);
+        this.root.focus({ preventScroll: true });
+      },
+    });
+    this.chartsElement?.remove(); this.chartsElement = null;
     if (this.model.charts.length) {
       const charts = document.createElement("div"); charts.className = "rg-charts";
       for (const spec of this.model.charts) {
@@ -2089,9 +3278,238 @@ export class GridView {
         const remove = button("×", "Remove chart", () => this.commitMutation("Remove chart", () => { this.model.charts = this.model.charts.filter((item) => item.id !== spec.id); }, true));
         chart.appendChild(remove); charts.appendChild(chart);
       }
-      this.root.appendChild(charts);
+      this.root.appendChild(charts); this.chartsElement = charts;
     }
     this.updateSelection();
+  }
+
+  rowDeletionLayoutFingerprint() {
+    return JSON.stringify({
+      columnIds: this.model.columnIds,
+      widths: this.model.widths,
+      headerColumns: this.model.headerColumns,
+      frozenCols: this.model.frozenCols,
+      showHeaders: this.model.showHeaders,
+      fitToWidth: this.model.fitToWidth,
+      colorFormulaCells: this.model.colorFormulaCells,
+      charts: this.model.charts,
+    });
+  }
+
+  captureRowDeletionContext() {
+    const uidAt = (row, col) => this.model.getCell(row, col)?.uid || null;
+    const dependencyUids = new Map();
+    const uidForFormulaKey = (key) => {
+      const [row, col] = String(key).split(":").map(Number);
+      return uidAt(row, col);
+    };
+    for (const [sourceKey, dependentKeys] of this.formulaEngine?.reverseDependencies || []) {
+      const sourceUid = uidForFormulaKey(sourceKey);
+      if (!sourceUid) continue;
+      const dependentUids = new Set([...dependentKeys].map(uidForFormulaKey).filter(Boolean));
+      if (dependentUids.size) dependencyUids.set(sourceUid, dependentUids);
+    }
+    const volatileFormulaUids = new Set(
+      [...(this.formulaEngine?.dependencyCache?.volatileFormulas || [])].map(uidForFormulaKey).filter(Boolean)
+    );
+    return {
+      viewport: this.viewport,
+      gridElement: this.gridElement,
+      scrollLeft: this.viewport?.scrollLeft || 0,
+      scrollTop: this.viewport?.scrollTop || 0,
+      rowUids: this.model.rows.map((row) => row.map((cell) => cell.uid)),
+      rawByUid: new Map(this.model.rows.flat().map((cell) => [cell.uid, cell.raw])),
+      layoutFingerprint: this.rowDeletionLayoutFingerprint(),
+      dependencyUids,
+      volatileFormulaUids,
+      selection: deepClone(this.selection),
+      anchor: { ...this.anchor },
+      selectionUids: {
+        start: uidAt(this.selection.startRow, this.selection.startCol),
+        end: uidAt(this.selection.endRow, this.selection.endCol),
+        anchor: uidAt(this.anchor.row, this.anchor.col),
+      },
+    };
+  }
+
+  positionCellElement(cell, row, col, offset = this.model.showHeaders ? 1 : 0) {
+    const merge = this.model.mergeAt(row, col);
+    cell.dataset.uid = this.model.getCell(row, col).uid;
+    cell.dataset.row = String(row);
+    cell.dataset.col = String(col);
+    cell.classList.toggle("rg-cell--merged", Boolean(merge));
+    cell.classList.toggle("rg-cell--header", this.model.isHeaderRow(row) || this.model.isHeaderColumn(col));
+    cell.classList.remove("rg-cell--align-left", "rg-cell--align-center", "rg-cell--align-right");
+    const alignment = this.model.getAlignment(row, col);
+    if (alignment) cell.classList.add(`rg-cell--align-${alignment}`);
+    cell.style.gridRow = `${row + 1 + offset} / span ${merge?.rowSpan || 1}`;
+    cell.style.gridColumn = `${col + 1 + offset} / span ${merge?.colSpan || 1}`;
+  }
+
+  hasCustomCellRenderers() { return Boolean(runtime.registries?.cellRenderers?.size); }
+
+  patchRowDeletion(context) {
+    if (!context || context.viewport !== this.viewport || context.gridElement !== this.gridElement || !this.viewport || !this.gridElement) return false;
+    if (this.editorController?.state || this.resizeCleanup || this.rowResizePreview || this.columnResizePreview || this.dragSelecting || this.fillStart) return false;
+    if (this.hasCustomCellRenderers()) return false;
+    if (this.model.charts.length || context.layoutFingerprint !== this.rowDeletionLayoutFingerprint()) return false;
+    const beforeRows = context.rowUids;
+    const afterRows = this.model.rows.map((row) => row.map((cell) => cell.uid));
+    if (beforeRows.length <= afterRows.length || !afterRows.length) return false;
+    if (beforeRows.some((row) => row.length !== this.model.colCount) || afterRows.some((row) => row.length !== this.model.colCount)) return false;
+
+    const beforeIndexes = new Map();
+    for (let row = 0; row < beforeRows.length; row += 1) {
+      const rowUid = beforeRows[row][0];
+      if (!rowUid || beforeIndexes.has(rowUid)) return false;
+      beforeIndexes.set(rowUid, row);
+    }
+    const survivingIndexes = [];
+    let previousIndex = -1;
+    for (const row of afterRows) {
+      const beforeIndex = beforeIndexes.get(row[0]);
+      if (!Number.isInteger(beforeIndex) || beforeIndex <= previousIndex) return false;
+      if (row.some((uid, col) => uid !== beforeRows[beforeIndex][col])) return false;
+      survivingIndexes.push(beforeIndex);
+      previousIndex = beforeIndex;
+    }
+    const survivingSet = new Set(survivingIndexes);
+    const removedIndexes = beforeRows.map((_, row) => row).filter((row) => !survivingSet.has(row));
+    if (removedIndexes.length !== beforeRows.length - afterRows.length) return false;
+    if (removedIndexes.some((row, index) => index && row !== removedIndexes[index - 1] + 1)) return false;
+
+    const changedUids = new Set(this.model.lastChangedCellUids || []);
+    const afterCoordinatesByUid = new Map();
+    for (let row = 0; row < this.model.rowCount; row += 1) for (let col = 0; col < this.model.colCount; col += 1) {
+      const cell = this.model.getCell(row, col);
+      const previousRaw = context.rawByUid.get(cell.uid);
+      if (previousRaw == null) return false;
+      if (cell.raw !== previousRaw && (!changedUids.has(cell.uid) || !cell.raw.startsWith("="))) return false;
+      afterCoordinatesByUid.set(cell.uid, { row, col });
+    }
+    if ([...changedUids].some((uid) => !afterCoordinatesByUid.has(uid))) return false;
+
+    const existingCellsByUid = new Map();
+    for (const cell of this.cells.values()) {
+      const uid = cell.dataset.uid;
+      if (!uid || existingCellsByUid.has(uid) || !this.gridElement.contains(cell)) return false;
+      existingCellsByUid.set(uid, cell);
+    }
+    const anchors = [];
+    for (let row = 0; row < this.model.rowCount; row += 1) for (let col = 0; col < this.model.colCount; col += 1) {
+      if (this.model.isCovered(row, col)) continue;
+      const uid = this.model.getCell(row, col).uid;
+      const cell = existingCellsByUid.get(uid);
+      if (!cell) return false;
+      anchors.push({ uid, row, col, cell });
+    }
+
+    const rowHeaders = new Map();
+    for (const header of this.gridElement.querySelectorAll(".rg-row-header")) {
+      if (!header.dataset.rowUid || rowHeaders.has(header.dataset.rowUid)) return false;
+      rowHeaders.set(header.dataset.rowUid, header);
+    }
+    const rowResizes = new Map();
+    for (const resize of this.gridElement.querySelectorAll(".rg-row-resize")) {
+      if (!resize.dataset.rowUid || rowResizes.has(resize.dataset.rowUid)) return false;
+      rowResizes.set(resize.dataset.rowUid, resize);
+    }
+    for (let row = 0; row < this.model.rowCount; row += 1) {
+      const rowUid = this.model.rowKey(row);
+      if ((this.model.showHeaders && !rowHeaders.has(rowUid)) || !rowResizes.has(rowUid)) return false;
+    }
+
+    const activeElement = globalThis.document?.activeElement;
+    const anchorUids = new Set(anchors.map(({ uid }) => uid));
+    for (const [uid, cell] of existingCellsByUid) {
+      if (anchorUids.has(uid)) continue;
+      releaseRichCellHosts(cell);
+      cell.remove();
+    }
+    const survivingRowUids = new Set(afterRows.map((row) => row[0]));
+    for (const [uid, header] of rowHeaders) if (!survivingRowUids.has(uid)) header.remove();
+    for (const [uid, resize] of rowResizes) if (!survivingRowUids.has(uid)) resize.remove();
+
+    const nextCells = new Map();
+    this.cellCoordinatesByUid.clear();
+    for (const { uid, row, col, cell } of anchors) {
+      this.positionCellElement(cell, row, col);
+      nextCells.set(`${row}:${col}`, cell);
+      this.cellCoordinatesByUid.set(uid, { row, col });
+    }
+    this.cells = nextCells;
+    for (let row = 0; row < this.model.rowCount; row += 1) {
+      const rowUid = this.model.rowKey(row);
+      const header = rowHeaders.get(rowUid);
+      if (header) {
+        header.dataset.row = String(row);
+        header.textContent = String(row + 1);
+        header.style.gridArea = `${row + 2} / 1`;
+      }
+      const resize = rowResizes.get(rowUid);
+      resize.dataset.row = String(row);
+      resize.style.gridRow = String(row + 1 + (this.model.showHeaders ? 1 : 0));
+    }
+    this.applyGridTemplateRows(this.gridElement);
+    this.statusElement.textContent = `${this.model.rowCount} × ${this.model.colCount}`;
+    this.statusElement.setAttribute("aria-label", `Roam Grid v${VERSION} · ${this.model.rowCount} × ${this.model.colCount}`);
+
+    const affectedUids = new Set([...changedUids, ...context.volatileFormulaUids]);
+    const queue = [...affectedUids];
+    for (let index = 0; index < queue.length; index += 1) {
+      for (const dependentUid of context.dependencyUids.get(queue[index]) || []) {
+        if (affectedUids.has(dependentUid)) continue;
+        affectedUids.add(dependentUid);
+        queue.push(dependentUid);
+      }
+    }
+    const engine = new FormulaEngine(
+      this.model,
+      runtime.registries?.formulaFunctions || defaultFormulaFunctions(),
+      runtime.registries?.formulaFunctionMetadata || defaultFormulaFunctionMetadata()
+    );
+    for (const [sourceUid, dependentUids] of context.dependencyUids) {
+      const source = afterCoordinatesByUid.get(sourceUid);
+      if (!source) continue;
+      const sourceKey = `${source.row}:${source.col}`;
+      for (const dependentUid of dependentUids) {
+        if (changedUids.has(dependentUid)) continue;
+        const dependent = afterCoordinatesByUid.get(dependentUid);
+        if (dependent) engine.dependencyCache.register(`${dependent.row}:${dependent.col}`, sourceKey);
+      }
+    }
+    for (const uid of context.volatileFormulaUids) {
+      const coordinate = afterCoordinatesByUid.get(uid);
+      if (coordinate) engine.dependencyCache.volatileFormulas.add(`${coordinate.row}:${coordinate.col}`);
+    }
+    this.formulaEngine = engine;
+    for (const uid of affectedUids) {
+      const coordinate = afterCoordinatesByUid.get(uid);
+      if (!coordinate || this.model.isCovered(coordinate.row, coordinate.col)) continue;
+      const raw = this.model.getRaw(coordinate.row, coordinate.col);
+      if (!raw.startsWith("=") || raw.startsWith("==")) continue;
+      const cell = nextCells.get(`${coordinate.row}:${coordinate.col}`);
+      const content = cell?.querySelector?.(":scope > .rg-cell-content") || cell?.querySelectorAll?.(".rg-cell-content")?.[0];
+      const value = engine.evaluateCell(coordinate.row, coordinate.col);
+      if (changedUids.has(uid) || content?.dataset.rgRenderKey !== `text:${String(value ?? "")}`) this.renderCellValue(cell, coordinate.row, coordinate.col, engine);
+    }
+
+    const resolveCoordinate = (uid, fallback) => {
+      const coordinate = uid ? afterCoordinatesByUid.get(uid) : null;
+      return coordinate || {
+        row: clamp(fallback.row, 0, this.model.rowCount - 1),
+        col: clamp(fallback.col, 0, this.model.colCount - 1),
+      };
+    };
+    const start = resolveCoordinate(context.selectionUids.start, { row: context.selection.startRow, col: context.selection.startCol });
+    const end = resolveCoordinate(context.selectionUids.end, { row: context.selection.endRow, col: context.selection.endCol });
+    this.selection = normalizeRange({ startRow: start.row, endRow: end.row, startCol: start.col, endCol: end.col });
+    this.anchor = resolveCoordinate(context.selectionUids.anchor, context.anchor);
+    this.updateSelection();
+    this.viewport.scrollLeft = context.scrollLeft;
+    this.viewport.scrollTop = context.scrollTop;
+    if (activeElement && !activeElement.isConnected) this.root.focus?.({ preventScroll: true });
+    return true;
   }
 
   columnHeader(id, col) {
@@ -2168,20 +3586,20 @@ export class GridView {
   }
 
   rowHeader(row) {
-    const header = document.createElement("div"); header.className = "rg-header rg-row-header"; header.style.gridArea = `${row + 2} / 1`; header.textContent = String(row + 1); header.dataset.row = String(row); header.draggable = true;
-    header.addEventListener("click", () => this.select({ startRow: row, endRow: row, startCol: 0, endCol: this.model.colCount - 1 }));
-    header.addEventListener("dragstart", (event) => event.dataTransfer.setData("application/x-roam-grid-row", String(row)));
+    const header = document.createElement("div"); header.className = "rg-header rg-row-header"; header.style.gridArea = `${row + 2} / 1`; header.textContent = String(row + 1); header.dataset.row = String(row); header.dataset.rowUid = this.model.rowKey(row); header.draggable = true;
+    header.addEventListener("click", () => { const current = Number(header.dataset.row); this.select({ startRow: current, endRow: current, startCol: 0, endCol: this.model.colCount - 1 }); });
+    header.addEventListener("dragstart", (event) => event.dataTransfer.setData("application/x-roam-grid-row", header.dataset.row));
     header.addEventListener("dragover", (event) => event.preventDefault());
-    header.addEventListener("drop", (event) => { const from = Number(event.dataTransfer.getData("application/x-roam-grid-row")); if (Number.isInteger(from)) this.commitMutation("Reorder row", () => this.model.reorderRows(from, row), true); });
+    header.addEventListener("drop", (event) => { const from = Number(event.dataTransfer.getData("application/x-roam-grid-row")); const current = Number(header.dataset.row); if (Number.isInteger(from)) this.commitMutation("Reorder row", () => this.model.reorderRows(from, current), true); });
     return header;
   }
 
   rowResizeHandle(row, offset) {
-    const resize = document.createElement("span"); resize.className = "rg-row-resize"; resize.dataset.row = String(row);
+    const resize = document.createElement("span"); resize.className = "rg-row-resize"; resize.dataset.row = String(row); resize.dataset.rowUid = this.model.rowKey(row);
     resize.style.gridRow = String(row + 1 + offset); resize.style.gridColumn = "1 / -1";
     resize.title = "Drag to resize row · double-click to auto-fit";
-    resize.addEventListener("pointerdown", (event) => this.startRowResize(row, event));
-    resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.commitMutation("Auto-fit row", () => this.model.setRowHeight(row, null), true); });
+    resize.addEventListener("pointerdown", (event) => this.startRowResize(Number(resize.dataset.row), event));
+    resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.commitMutation("Auto-fit row", () => this.model.setRowHeight(Number(resize.dataset.row), null), true); });
     return resize;
   }
 
@@ -2226,7 +3644,7 @@ export class GridView {
 
   cellElement(row, col, merge, engine, offset = this.model.showHeaders ? 1 : 0) {
     const cell = document.createElement("div");
-    cell.className = "rg-cell"; cell.dataset.row = String(row); cell.dataset.col = String(col); cell.tabIndex = -1;
+    cell.className = "rg-cell"; cell.dataset.row = String(row); cell.dataset.col = String(col); cell.dataset.uid = this.model.getCell(row, col).uid; cell.tabIndex = -1;
     cell.classList.toggle("rg-cell--merged", Boolean(merge));
     cell.classList.toggle("rg-cell--header", this.model.isHeaderRow(row) || this.model.isHeaderColumn(col));
     const alignment = this.model.getAlignment(row, col);
@@ -2234,54 +3652,57 @@ export class GridView {
     cell.style.gridRow = `${row + 1 + offset} / span ${merge?.rowSpan || 1}`; cell.style.gridColumn = `${col + 1 + offset} / span ${merge?.colSpan || 1}`;
     this.renderCellValue(cell, row, col, engine);
     cell.addEventListener("pointerdown", (event) => {
+      const currentRow = Number(cell.dataset.row); const currentCol = Number(cell.dataset.col); const currentMerge = this.model.mergeAt(currentRow, currentCol);
       if (event.button !== 0) return;
       if (event.target.closest?.(".rg-editor")) return;
-      if (this.insertFormulaReference(row, col, event)) return;
+      if (this.insertFormulaReference(currentRow, currentCol, event)) return;
       const rect = cell.getBoundingClientRect();
       const nearRightEdge = event.clientX >= rect.right - 12 && event.clientX <= rect.right + 1;
       const nearBottomEdge = event.clientY >= rect.bottom - 10 && event.clientY <= rect.bottom + 1;
       if (nearRightEdge && !nearBottomEdge) {
-        const edgeCol = col + (merge?.colSpan || 1) - 1;
+        const edgeCol = currentCol + (currentMerge?.colSpan || 1) - 1;
         this.startColumnResize(this.model.columnIds[edgeCol], event); return;
       }
       if (nearBottomEdge) {
-        const edgeRow = row + (merge?.rowSpan || 1) - 1;
+        const edgeRow = currentRow + (currentMerge?.rowSpan || 1) - 1;
         this.startRowResize(edgeRow, event); return;
       }
-      if (event.shiftKey) this.extendSelection(row, col); else { this.anchor = { row, col }; this.select({ startRow: row, endRow: row, startCol: col, endCol: col }); }
+      if (event.shiftKey) this.extendSelection(currentRow, currentCol); else { this.anchor = { row: currentRow, col: currentCol }; this.select({ startRow: currentRow, endRow: currentRow, startCol: currentCol, endCol: currentCol }); }
       this.dragSelecting = true; this.root.focus({ preventScroll: true }); event.preventDefault();
     });
-    cell.addEventListener("pointerenter", () => { if (this.dragSelecting) this.extendSelection(row, col); if (this.fillStart) this.fillTarget = { row, col }; });
-    cell.addEventListener("dblclick", () => this.beginEdit(row, col));
-    cell.addEventListener("contextmenu", (event) => { event.preventDefault(); if (!rangeContains(this.selection, row, col)) this.select({ startRow: row, endRow: row, startCol: col, endCol: col }); this.openMenu(cell, event.clientX, event.clientY); });
+    cell.addEventListener("pointerenter", () => { const currentRow = Number(cell.dataset.row); const currentCol = Number(cell.dataset.col); if (this.dragSelecting) this.extendSelection(currentRow, currentCol); if (this.fillStart) this.fillTarget = { row: currentRow, col: currentCol }; });
+    cell.addEventListener("dblclick", () => this.beginEdit(Number(cell.dataset.row), Number(cell.dataset.col)));
+    cell.addEventListener("contextmenu", (event) => { const currentRow = Number(cell.dataset.row); const currentCol = Number(cell.dataset.col); event.preventDefault(); if (!rangeContains(this.selection, currentRow, currentCol)) this.select({ startRow: currentRow, endRow: currentRow, startCol: currentCol, endCol: currentCol }); this.openMenu(cell, event.clientX, event.clientY); });
     cell.draggable = true;
-    cell.addEventListener("dragstart", (event) => { if (!rangeContains(this.selection, row, col)) this.select({ startRow: row, endRow: row, startCol: col, endCol: col }); event.dataTransfer.setData("application/x-roam-grid-range", JSON.stringify(this.selection)); });
+    cell.addEventListener("dragstart", (event) => { const currentRow = Number(cell.dataset.row); const currentCol = Number(cell.dataset.col); if (!rangeContains(this.selection, currentRow, currentCol)) this.select({ startRow: currentRow, endRow: currentRow, startCol: currentCol, endCol: currentCol }); event.dataTransfer.setData("application/x-roam-grid-range", JSON.stringify(this.selection)); });
     cell.addEventListener("dragover", (event) => { if (event.dataTransfer.types.includes("application/x-roam-grid-range")) event.preventDefault(); });
-    cell.addEventListener("drop", (event) => { const raw = event.dataTransfer.getData("application/x-roam-grid-range"); if (!raw) return; event.preventDefault(); const range = JSON.parse(raw); this.commitMutation("Move range", () => this.model.moveRange(range, row, col), true); });
+    cell.addEventListener("drop", (event) => { const raw = event.dataTransfer.getData("application/x-roam-grid-range"); if (!raw) return; event.preventDefault(); const range = JSON.parse(raw); this.commitMutation("Move range", () => this.model.moveRange(range, Number(cell.dataset.row), Number(cell.dataset.col)), true); });
     return cell;
   }
 
-  renderCellValue(cell, row, col, engine = new FormulaEngine(this.model, runtime.registries.formulaFunctions)) {
-    cell.replaceChildren();
+  renderCellValue(cell, row, col, engine = this.formulaEngine || new FormulaEngine(this.model, runtime.registries.formulaFunctions, runtime.registries.formulaFunctionMetadata)) {
     const raw = this.model.getRaw(row, col); const value = engine.evaluateCell(row, col);
     const formula = raw.startsWith("=") && !raw.startsWith("==");
+    const content = ensureCellContent(cell);
     cell.dataset.rgRaw = raw;
     cell.classList.toggle("rg-cell--formula", formula && this.model.colorFormulaCells);
-    for (const renderer of runtime.registries.cellRenderers.values()) {
+    cell.classList.toggle("rg-cell--error", formula && String(value).startsWith("#"));
+    cell.title = formula ? raw : "";
+    for (const [name, renderer] of runtime.registries.cellRenderers) {
       try {
         if (renderer.match?.({ raw, value, row, col, model: this.model })) {
+          const renderKey = JSON.stringify(["custom", name, raw, String(value ?? "")]);
+          if (content.dataset.rgRenderKey === renderKey) return;
+          content.dataset.rgRenderKey = renderKey;
+          content.dataset.rgRenderToken = cryptoId();
           const rendered = renderer.render({ raw, value, row, col, model: this.model });
-          if (rendered instanceof Node) cell.appendChild(rendered); else cell.innerHTML = String(rendered ?? "");
+          clearRichCellHosts(content);
+          if (rendered instanceof Node) content.replaceChildren(rendered); else content.innerHTML = String(rendered ?? "");
           return;
         }
       } catch (error) { console.warn("[roam-grid] Cell renderer failed", error); }
     }
-    if (formula) {
-      cell.textContent = String(value ?? ""); cell.classList.toggle("rg-cell--error", String(value).startsWith("#")); cell.title = raw;
-    } else if (raw) {
-      try { roam().ui.components.renderString({ el: cell, string: raw }); }
-      catch { cell.textContent = raw; }
-    }
+    renderStableCellContent(content, { raw, value, formula, renderRich: paintRichCellContent });
   }
 
   select(range) {
@@ -2292,20 +3713,48 @@ export class GridView {
 
   extendSelection(row, col) { this.select({ startRow: this.anchor.row, endRow: row, startCol: this.anchor.col, endCol: col }); }
 
+  clearSelectionControls() {
+    for (const control of this.selectionControls || []) control.remove();
+    this.selectionControls = new Set();
+  }
+
+  clearSelectionPresentation() {
+    for (const cell of this.selectedCellElements || []) cell.classList.remove("rg-cell--selected");
+    this.selectedCellElements = new Set();
+    this.activeCellElement?.classList.remove("rg-cell--active");
+    this.activeCellElement = null;
+    this.clearSelectionControls();
+  }
+
+  selectedAnchors(range) {
+    const selected = new Set();
+    for (let row = range.startRow; row <= range.endRow; row += 1) {
+      for (let col = range.startCol; col <= range.endCol; col += 1) {
+        const merge = this.model.mergeAt(row, col);
+        const cell = this.cells.get(`${merge?.row ?? row}:${merge?.col ?? col}`);
+        if (cell) selected.add(cell);
+      }
+    }
+    return selected;
+  }
+
   updateSelection() {
-    this.root.querySelectorAll(".rg-cell--selected,.rg-cell--active").forEach((cell) => cell.classList.remove("rg-cell--selected", "rg-cell--active"));
-    this.root.querySelectorAll(".rg-cell-width-resize,.rg-cell-height-resize,.rg-native-pill-proxy,.rg-range-overlay").forEach((handle) => handle.remove());
     const range = normalizeRange(this.selection);
     const multiple = range.startRow !== range.endRow || range.startCol !== range.endCol;
-    for (const cell of this.cells.values()) {
-      const row = Number(cell.dataset.row); const col = Number(cell.dataset.col);
-      const merge = this.model.mergeAt(row, col);
-      const selected = rangeContains(this.selection, row, col) || merge && rangesOverlap(this.selection, { startRow: merge.row, endRow: merge.row + merge.rowSpan - 1, startCol: merge.col, endCol: merge.col + merge.colSpan - 1 });
-      if (selected) cell.classList.add("rg-cell--selected");
-    }
+    const previousSelected = this.selectedCellElements || new Set();
+    const nextSelected = this.selectedAnchors(range);
+    for (const cell of previousSelected) if (!nextSelected.has(cell)) cell.classList.remove("rg-cell--selected");
+    for (const cell of nextSelected) if (!previousSelected.has(cell)) cell.classList.add("rg-cell--selected");
+    this.selectedCellElements = nextSelected;
     const activeMerge = this.model.mergeAt(this.selection.startRow, this.selection.startCol);
     const active = this.cells.get(`${activeMerge?.row ?? this.selection.startRow}:${activeMerge?.col ?? this.selection.startCol}`);
-    if (!multiple) active?.classList.add("rg-cell--active");
+    const nextActive = multiple ? null : active;
+    if (this.activeCellElement !== nextActive) {
+      this.activeCellElement?.classList.remove("rg-cell--active");
+      nextActive?.classList.add("rg-cell--active");
+      this.activeCellElement = nextActive;
+    }
+    this.clearSelectionControls();
     if (active && !multiple) {
       const anchorRow = activeMerge?.row ?? this.selection.startRow;
       const anchorCol = activeMerge?.col ?? this.selection.startCol;
@@ -2317,7 +3766,9 @@ export class GridView {
       const heightHandle = document.createElement("span"); heightHandle.className = "rg-cell-height-resize"; heightHandle.title = `Resize row ${edgeRow + 1}`;
       heightHandle.addEventListener("pointerdown", (event) => this.startRowResize(edgeRow, event));
       heightHandle.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.commitMutation("Auto-fit row", () => this.model.setRowHeight(edgeRow, null), true); });
-      active.append(widthHandle, heightHandle, this.axisGrabber("column", anchorCol), this.axisGrabber("row", anchorRow));
+      const columnGrabber = this.axisGrabber("column", anchorCol); const rowGrabber = this.axisGrabber("row", anchorRow);
+      active.append(widthHandle, heightHandle, columnGrabber, rowGrabber);
+      this.selectionControls = new Set([widthHandle, heightHandle, columnGrabber, rowGrabber]);
     }
     let rangeOverlay = null;
     if (multiple) {
@@ -2331,9 +3782,8 @@ export class GridView {
       badge.setAttribute("aria-label", badge.title);
       badge.addEventListener("pointerdown", (event) => { event.preventDefault(); event.stopPropagation(); });
       badge.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); this.openMenu(badge); });
-      rangeOverlay.appendChild(badge); this.gridElement.appendChild(rangeOverlay);
+      rangeOverlay.appendChild(badge); this.gridElement.appendChild(rangeOverlay); this.selectionControls.add(rangeOverlay);
     }
-    this.root.querySelector(".rg-fill-handle")?.remove();
     const endMerge = this.model.mergeAt(this.selection.endRow, this.selection.endCol);
     const end = this.cells.get(`${endMerge?.row ?? this.selection.endRow}:${endMerge?.col ?? this.selection.endCol}`);
     const fillParent = rangeOverlay || end;
@@ -2341,6 +3791,7 @@ export class GridView {
       const handle = document.createElement("span"); handle.className = "rg-fill-handle"; handle.title = "Drag to fill";
       handle.addEventListener("pointerdown", (event) => { event.preventDefault(); event.stopPropagation(); this.fillStart = deepClone(this.selection); this.fillTarget = { row: this.selection.endRow, col: this.selection.endCol }; });
       fillParent.appendChild(handle);
+      if (!rangeOverlay) this.selectionControls.add(handle);
     }
   }
 
@@ -2379,85 +3830,18 @@ export class GridView {
     this.selection = targetRange;
   }
 
-  clearFormulaEditPresentation() {
-    this.root.classList.remove("rg-root--formula-editing");
-    for (const cell of this.root.querySelectorAll(".rg-cell--formula-reference")) {
-      cell.classList.remove("rg-cell--formula-reference");
-      cell.style.removeProperty("--rg-reference-color");
-      delete cell.dataset.rgFormulaReference;
-    }
-    this.formulaPopover?.remove(); this.formulaPopover = null;
-  }
-
-  positionFormulaPopover(state = this.formulaEdit) {
-    if (!state || !this.formulaPopover?.isConnected || !state.cell.isConnected) return;
-    const rect = state.cell.getBoundingClientRect();
-    const viewportWidth = globalThis.innerWidth || document.documentElement.clientWidth || 1200;
-    const width = clamp(Math.max(rect.width, 330), 280, Math.min(640, viewportWidth - 16));
-    this.formulaPopover.style.width = `${width}px`;
-    const height = this.formulaPopover.getBoundingClientRect().height;
-    this.formulaPopover.style.left = `${clamp(rect.left, 8, Math.max(8, viewportWidth - width - 8))}px`;
-    this.formulaPopover.style.top = `${rect.top - height - 7 >= 8 ? rect.top - height - 7 : rect.bottom + 7}px`;
-  }
-
-  updateFormulaEditPresentation() {
-    const state = this.formulaEdit;
-    this.clearFormulaEditPresentation();
-    if (!state || !state.editor.value.startsWith("=") || state.editor.value.startsWith("==")) return;
-    this.root.classList.add("rg-root--formula-editing");
-    const raw = state.editor.value;
-    const references = formulaReferences(raw);
-    const colorByReference = new Map();
-    for (const reference of references) {
-      const key = reference.text.toUpperCase();
-      if (!colorByReference.has(key)) colorByReference.set(key, FORMULA_REFERENCE_COLORS[colorByReference.size % FORMULA_REFERENCE_COLORS.length]);
-      const color = colorByReference.get(key);
-      for (let row = Math.max(0, reference.range.startRow); row <= Math.min(this.model.rowCount - 1, reference.range.endRow); row += 1) {
-        for (let col = Math.max(0, reference.range.startCol); col <= Math.min(this.model.colCount - 1, reference.range.endCol); col += 1) {
-          const merge = this.model.mergeAt(row, col);
-          const cell = this.cells.get(`${merge?.row ?? row}:${merge?.col ?? col}`);
-          if (!cell || cell.dataset.rgFormulaReference) continue;
-          cell.dataset.rgFormulaReference = key;
-          cell.style.setProperty("--rg-reference-color", color);
-          cell.classList.add("rg-cell--formula-reference");
-        }
-      }
-    }
-    const popover = document.createElement("div"); popover.className = "rg-formula-popover"; popover.setAttribute("role", "status"); popover.setAttribute("aria-live", "polite");
-    const address = document.createElement("span"); address.className = "rg-formula-address"; address.textContent = `fx  ${cellLabel(state.row, state.col)}`;
-    const expression = document.createElement("code"); expression.className = "rg-formula-expression";
-    let cursor = 0;
-    for (const reference of references) {
-      expression.append(document.createTextNode(raw.slice(cursor, reference.startIndex)));
-      const token = document.createElement("span"); token.className = "rg-formula-token"; token.textContent = raw.slice(reference.startIndex, reference.endIndex); token.style.color = colorByReference.get(reference.text.toUpperCase());
-      expression.appendChild(token); cursor = reference.endIndex;
-    }
-    expression.append(document.createTextNode(raw.slice(cursor)));
-    popover.append(address, expression); document.body.appendChild(popover); this.formulaPopover = popover;
-    this.positionFormulaPopover(state);
-  }
-
   insertFormulaReference(row, col, event) {
-    const state = this.formulaEdit;
-    if (!state || state.finished || !state.editor.value.startsWith("=") || state.editor.value.startsWith("==")) return false;
-    event.preventDefault(); event.stopPropagation();
     const merge = this.model.mergeAt(row, col); row = merge?.row ?? row; col = merge?.col ?? col;
-    const editor = state.editor; const start = editor.selectionStart ?? editor.value.length; const end = editor.selectionEnd ?? start;
-    const prefix = editor.value.slice(0, start);
-    const reference = `${event.shiftKey && /\$?[A-Z]+\$?\d+$/i.test(prefix) ? ":" : ""}${cellLabel(row, col)}`;
-    editor.setRangeText(reference, start, end, "end"); editor.focus({ preventScroll: true });
-    this.updateFormulaEditPresentation();
-    return true;
+    return this.editorController?.insertReference(row, col, event) || false;
   }
 
-  beginEdit(row, col, initial = null) {
-    if (this.formulaEdit?.finish) this.formulaEdit.finish(false);
+  beginEdit(row, col, initial = null, floating = false) {
     const merge = this.model.mergeAt(row, col); row = merge?.row ?? row; col = merge?.col ?? col;
     const cell = this.cells.get(`${row}:${col}`); if (!cell) return;
-    const raw = initial == null ? this.model.getRaw(row, col) : initial;
+    const raw = this.model.getRaw(row, col);
     const context = { raw, row, col, model: this.model };
     let editor = null;
-    for (const registered of runtime.registries.cellEditors.values()) {
+    for (const registered of floating ? [] : runtime.registries.cellEditors.values()) {
       try {
         if (registered.match?.(context)) {
           const candidate = registered.create?.(context);
@@ -2465,38 +3849,7 @@ export class GridView {
         }
       } catch (error) { console.warn("[roam-grid] Cell editor failed", error); }
     }
-    if (!editor) editor = document.createElement("textarea");
-    editor.classList.add("rg-editor"); editor.value = raw;
-    cell.replaceChildren(editor); editor.focus();
-    if (raw.startsWith("=") && !raw.startsWith("==")) editor.setSelectionRange(raw.length, raw.length); else if (initial == null) editor.select();
-    let finished = false;
-    const state = { editor, cell, row, col, finished: false, finish: null, reposition: null };
-    this.formulaEdit = state;
-    const finish = (commit, movement = null) => {
-      if (finished) return; finished = true; state.finished = true;
-      const value = editor.value;
-      globalThis.window.removeEventListener("resize", state.reposition);
-      this.root.querySelector(".rg-viewport")?.removeEventListener("scroll", state.reposition);
-      this.clearFormulaEditPresentation();
-      if (this.formulaEdit === state) this.formulaEdit = null;
-      if (commit && value !== this.model.getRaw(row, col)) this.commitMutation("Edit cell", () => this.model.setRaw(row, col, value), false);
-      else this.renderCellValue(cell, row, col);
-      if (movement) this.moveSelection(...movement);
-      this.root.focus({ preventScroll: true });
-    };
-    state.finish = finish; state.reposition = () => this.positionFormulaPopover(state);
-    globalThis.window.addEventListener("resize", state.reposition);
-    this.root.querySelector(".rg-viewport")?.addEventListener("scroll", state.reposition);
-    this.updateFormulaEditPresentation();
-    editor.addEventListener("keydown", (event) => {
-      event.stopPropagation();
-      if (event.key === "Escape") { event.preventDefault(); finish(false); }
-      else if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); finish(true, [1, 0]); }
-      else if (event.key === "Tab") { event.preventDefault(); finish(true, [0, event.shiftKey ? -1 : 1]); }
-    });
-    for (const type of ["keyup", "keypress", "beforeinput"]) editor.addEventListener(type, (event) => event.stopPropagation());
-    editor.addEventListener("input", (event) => { event.stopPropagation(); this.updateFormulaEditPresentation(); });
-    editor.addEventListener("blur", () => finish(true));
+    return this.editorController?.start({ row, col, cell, raw, initial, floating, customEditor: editor });
   }
 
   onKeydown(event) {
@@ -2507,7 +3860,8 @@ export class GridView {
     if (command && event.key.toLowerCase() === "x") { event.preventDefault(); this.copy(true); return; }
     if (command && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? this.redo() : this.undo(); return; }
     if (command && event.shiftKey && event.key.toLowerCase() === "m") { event.preventDefault(); this.mergeSelection(); return; }
-    if (["Enter", "F2"].includes(event.key)) { event.preventDefault(); this.beginEdit(this.selection.startRow, this.selection.startCol); return; }
+    if (event.key === "Enter") { event.preventDefault(); this.beginEdit(this.selection.startRow, this.selection.startCol); return; }
+    if (event.key === "F2") { event.preventDefault(); this.beginEdit(this.selection.startRow, this.selection.startCol, null, true); return; }
     if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); this.clearSelection(); return; }
     if (event.altKey && event.key.startsWith("Arrow")) {
       event.preventDefault(); const [dr, dc] = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] }[event.key];
@@ -2574,7 +3928,7 @@ export class GridView {
     });
   }
   deleteAxis(type, index) {
-    return this.commitMutation(`Delete ${type}`, () => type === "row" ? this.model.deleteRows(index, 1) : this.model.deleteCols(index, 1), true).then((model) => {
+    return this.commitMutation(`Delete ${type}`, () => type === "row" ? this.model.deleteRows(index, 1) : this.model.deleteCols(index, 1), true, { rowDeletion: type === "row" }).then((model) => {
       if (!model) return;
       const row = clamp(type === "row" ? index : this.selection.startRow, 0, this.model.rowCount - 1);
       const col = clamp(type === "column" ? index : this.selection.startCol, 0, this.model.colCount - 1);
@@ -2608,7 +3962,7 @@ export class GridView {
     menu.append(
       item("Merge selection", () => this.mergeSelection()), item("Unmerge", () => this.unmergeSelection()),
       item("Insert row below", () => this.insertRow()), item("Insert column right", () => this.insertCol()),
-      item("Delete selected rows", () => { const range = normalizeRange(this.selection); this.commitMutation("Delete rows", () => this.model.deleteRows(range.startRow, range.endRow - range.startRow + 1), true); }),
+      item("Delete selected rows", () => { const range = normalizeRange(this.selection); this.commitMutation("Delete rows", () => this.model.deleteRows(range.startRow, range.endRow - range.startRow + 1), true, { rowDeletion: true }); }),
       item("Delete selected columns", () => { const range = normalizeRange(this.selection); this.commitMutation("Delete columns", () => this.model.deleteCols(range.startCol, range.endCol - range.startCol + 1), true); }),
       item("Set selected row height…", () => this.setSelectedRowHeight()),
       item("Compact selected rows", () => this.resizeSelectedRows(24)),
@@ -2768,10 +4122,17 @@ export class GridView {
     copied.then(() => toast(`${table ? "Table" : "Cell"} block reference copied`, "success", 1600)).catch((error) => toast(`Copy failed: ${error.message}`, "danger"));
   }
 
-  commitMutation(label, mutation, structural) {
+  commitMutation(label, mutation, structural, { rowDeletion = false } = {}) {
     try {
+      const rowDeletionContext = structural && rowDeletion ? this.captureRowDeletionContext() : null;
       this.model.transact(label, mutation);
-      if (structural) this.render(); else this.refreshValues();
+      if (!structural && !(this.model.lastChangedCells || []).length) return Promise.resolve(this.model);
+      if (structural) {
+        let patched = false;
+        try { patched = this.patchRowDeletion(rowDeletionContext); } catch (error) { console.warn("[roam-grid] Incremental row deletion failed; using a full render", error); }
+        if (!patched) this.render();
+      } else this.refreshValues();
+      if (!structural) this.queueChangedCells();
       this.markChanged(structural);
       globalThis.window?.dispatchEvent(new CustomEvent("roam-grid:changed", { detail: { tableUid: this.model.tableUid, label } }));
       return Promise.resolve(this.model);
@@ -2781,27 +4142,82 @@ export class GridView {
     }
   }
 
-  refreshValues() {
-    const engine = new FormulaEngine(this.model, runtime.registries.formulaFunctions);
-    for (const [key, cell] of this.cells) {
-      const [row, col] = key.split(":").map(Number); const raw = this.model.getRaw(row, col);
-      if (cell.dataset.rgRaw !== raw || raw.startsWith("=") && !raw.startsWith("==")) this.renderCellValue(cell, row, col, engine);
+  queueChangedCells() {
+    for (const [row, col] of this.model.lastChangedCells || []) {
+      const cell = this.model.getCell(row, col); if (!cell?.uid) continue;
+      const revision = (this.editRevisions.get(cell.uid) || 0) + 1;
+      this.editRevisions.set(cell.uid, revision);
+      const existing = this.dirtyCells.get(cell.uid);
+      const baseRaw = existing?.baseRaw ?? this.adapter.getBaseRaw?.(cell.uid) ?? cell.raw;
+      if (cell.raw === baseRaw) this.dirtyCells.delete(cell.uid);
+      else this.dirtyCells.set(cell.uid, { uid: cell.uid, baseRaw, raw: cell.raw, revision });
     }
-    this.updateSelection();
+  }
+
+  prunePersistenceUids() {
+    const valid = new Set(this.model.rows.flat().map((cell) => cell.uid));
+    for (const uid of this.dirtyCells.keys()) if (!valid.has(uid)) this.dirtyCells.delete(uid);
+    for (const uid of this.editRevisions.keys()) if (!valid.has(uid)) this.editRevisions.delete(uid);
+    for (const uid of this.cellCoordinatesByUid.keys()) if (!valid.has(uid)) this.cellCoordinatesByUid.delete(uid);
+  }
+
+  refreshValues() {
+    const changedCells = this.model.lastChangedCells || [];
+    if (!changedCells.length) return;
+    const engine = this.formulaEngine || (this.formulaEngine = new FormulaEngine(this.model, runtime.registries.formulaFunctions, runtime.registries.formulaFunctionMetadata));
+    const affected = new Set();
+    for (const [row, col] of changedCells) for (const key of engine.invalidateCell(row, col)) affected.add(key);
+    for (const key of affected) {
+      const cell = this.cells.get(key); if (!cell) continue;
+      const [row, col] = key.split(":").map(Number);
+      this.renderCellValue(cell, row, col, engine);
+    }
   }
 
   markChanged(layoutChanged = false) {
     this.changeVersion += 1;
-    this.metadataDirty ||= layoutChanged;
+    this.metadataDirty ||= layoutChanged; this.structuralPending ||= layoutChanged;
     clearTimeout(this.saveTimer);
-    this.saveTimer = setTimeout(() => this.flushSave(), layoutChanged ? 0 : 220);
+    if (!layoutChanged && !this.dirtyCells.size) { this.savedVersion = this.changeVersion; return; }
+    this.saveTimer = setTimeout(() => layoutChanged ? this.flushSave() : this.flushContentSave(), layoutChanged ? 0 : 220);
+  }
+
+
+  async flushContentSave() {
+    if (this.disposed || this.structuralPending || !this.dirtyCells.size) return;
+    if (this.contentSavePromise) return this.contentSavePromise;
+    const batch = new Map([...this.dirtyCells].map(([uid, change]) => [uid, { ...change }]));
+    const task = this.adapter.saveContent(batch);
+    this.contentSavePromise = task;
+    try {
+      const result = await task;
+      for (const saved of result.saved || []) {
+        const coordinate = this.cellCoordinatesByUid.get(saved.uid);
+        const currentRaw = coordinate ? this.model.getRaw(coordinate.row, coordinate.col) : null;
+        const revision = this.editRevisions.get(saved.uid) || saved.revision;
+        if (currentRaw == null || currentRaw === saved.raw) this.dirtyCells.delete(saved.uid);
+        else this.dirtyCells.set(saved.uid, { uid: saved.uid, baseRaw: saved.raw, raw: currentRaw, revision });
+      }
+      if (!this.dirtyCells.size && !this.structuralPending) this.savedVersion = this.changeVersion;
+    } catch (error) {
+      toast(error.message, "danger", 8000);
+      this.dirtyCells.clear(); this.structuralPending = false; this.metadataDirty = false;
+      try { this.model = this.adapter.load(); this.changeVersion = this.savedVersion; this.render(); } catch { /* table may have disappeared */ }
+    } finally {
+      if (this.contentSavePromise === task) this.contentSavePromise = null;
+      if (!this.disposed && !this.structuralPending && this.dirtyCells.size) {
+        clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flushContentSave(), 220);
+      }
+    }
   }
 
   async flushSave() {
-    if (this.disposed || this.savedVersion === this.changeVersion) return;
+    if (this.disposed || !this.structuralPending || this.savedVersion === this.changeVersion) return;
     const version = this.changeVersion;
     const payload = new GridModel({ ...this.model.snapshot(), tableUid: this.model.tableUid });
     const pendingUids = payload.rows.map((row) => row.map((cell) => cell.uid));
+    const payloadRawByUid = new Map(payload.rows.flat().map((cell) => [cell.uid, cell.raw]));
+    const payloadEditRevisions = new Map(this.editRevisions);
     payload.baseFingerprint = this.model.baseFingerprint; payload.baseSnapshot = this.model.baseSnapshot;
     const saveMetadata = this.metadataDirty; this.metadataDirty = false;
     this.root.classList.add("rg-root--saving");
@@ -2818,56 +4234,148 @@ export class GridView {
         if (col === 0 && Object.hasOwn(this.model.rowHeights, oldUid)) { this.model.rowHeights[newUid] = this.model.rowHeights[oldUid]; delete this.model.rowHeights[oldUid]; }
         if (Object.hasOwn(this.model.alignments, oldUid)) { this.model.alignments[newUid] = this.model.alignments[oldUid]; delete this.model.alignments[oldUid]; }
       }
+      for (const [oldUid, newUid] of uidMap) {
+        if (this.cellCoordinatesByUid.has(oldUid)) { this.cellCoordinatesByUid.set(newUid, this.cellCoordinatesByUid.get(oldUid)); this.cellCoordinatesByUid.delete(oldUid); }
+        if (this.dirtyCells.has(oldUid)) {
+          const dirty = this.dirtyCells.get(oldUid); this.dirtyCells.delete(oldUid); this.dirtyCells.set(newUid, { ...dirty, uid: newUid });
+        }
+        if (this.editRevisions.has(oldUid)) { this.editRevisions.set(newUid, this.editRevisions.get(oldUid)); this.editRevisions.delete(oldUid); }
+        if (payloadRawByUid.has(oldUid)) payloadRawByUid.set(newUid, payloadRawByUid.get(oldUid));
+        if (payloadEditRevisions.has(oldUid)) payloadEditRevisions.set(newUid, payloadEditRevisions.get(oldUid));
+      }
+      this.prunePersistenceUids();
       this.model.baseFingerprint = saved.baseFingerprint; this.model.baseSnapshot = saved.baseSnapshot;
       this.adapter.model = this.model;
+      for (const [uid, dirty] of [...this.dirtyCells]) {
+        const savedRevision = payloadEditRevisions.get(uid) || 0;
+        if (dirty.revision <= savedRevision && dirty.raw === payloadRawByUid.get(uid)) this.dirtyCells.delete(uid);
+        else if (payloadRawByUid.has(uid)) this.dirtyCells.set(uid, { ...dirty, baseRaw: payloadRawByUid.get(uid) });
+      }
+      this.structuralPending = false;
       if (version !== this.changeVersion) {
         clearTimeout(this.saveTimer);
-        this.saveTimer = setTimeout(() => this.flushSave(), 220);
+        this.saveTimer = setTimeout(() => this.structuralPending ? this.flushSave() : this.flushContentSave(), 220);
       }
     } catch (error) {
       this.metadataDirty ||= saveMetadata;
       toast(error.message, "danger", 8000);
+      this.dirtyCells.clear(); this.structuralPending = false;
       try { this.model = this.adapter.load(); this.changeVersion = this.savedVersion; this.render(); } catch { /* table may have disappeared */ }
     } finally { this.root.classList.remove("rg-root--saving"); }
   }
 
   applyPatch(patch) {
-    return this.commitMutation("External patch", () => applyPatchToModel(this.model, patch, false), patchChangesLayout(patch)).then(() => this.model.toJSON());
+    const patches = Array.isArray(patch) ? patch : [patch];
+    const rowDeletion = patches.length > 0 && patches.every((item) => item?.op === "deleteRows");
+    return this.commitMutation("External patch", () => applyPatchToModel(this.model, patch, false), patchChangesLayout(patch), { rowDeletion }).then(() => this.model.toJSON());
   }
 
   dispose() {
-    this.disposed = true; clearTimeout(this.saveTimer); this.resizeCleanup?.(); this.adapter.dispose?.();
-    this.formulaEdit?.finish?.(false); this.clearFormulaEditPresentation();
+    this.disposed = true; clearTimeout(this.saveTimer); this.dirtyCells.clear(); this.resizeCleanup?.(); this.adapter.dispose?.();
+    this.editorController?.dispose(); this.editorController = null;
+    this.clearSelectionPresentation();
     globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true);
     document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true);
-    document.removeEventListener("pointerup", this.boundPointerUp, true); this.root.remove(); this.nativeElement?.classList.remove("rg-native-hidden");
+    document.removeEventListener("pointerup", this.boundPointerUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.nativeElement?.classList.remove("rg-native-hidden");
   }
 }
 
-class AsyncFormulaEngine {
-  constructor(store, functions) { this.store = store; this.functions = functions; this.cache = new Map(); this.stack = new Set(); }
-  async evaluateCell(row, col) {
-    const key = `${row}:${col}`; if (this.cache.has(key)) return this.cache.get(key); if (this.stack.has(key)) return "#CYCLE!";
-    const raw = await this.store.getRaw(row, col); if (typeof raw !== "string" || !raw.startsWith("=") || raw.startsWith("==")) return raw;
-    if (raw.includes("#REF!")) return "#REF!";
-    this.stack.add(key); let result;
-    try { result = await this.evaluateNode(new FormulaParser(raw.slice(1)).parse()); }
-    catch (error) { result = error?.code === "FORMULA_NAME" ? "#NAME?" : error?.code === "FORMULA_REF" ? "#REF!" : "#VALUE!"; }
-    this.stack.delete(key); this.cache.set(key, result); return result;
+export class AsyncFormulaEngine {
+  constructor(store, functions = defaultFormulaFunctions(), metadata = defaultFormulaFunctionMetadata()) {
+    this.store = store;
+    this.functions = functions;
+    this.cache = new Map();
+    this.generations = new Map();
+    this.dependencyCache = new FormulaDependencyCache(metadata);
+    this.parsedFormulas = this.dependencyCache.parsedFormulas;
+    this.reverseDependencies = this.dependencyCache.reverseDependencies;
   }
-  async evaluateNode(node) {
-    if (node.type === "literal") return node.value;
-    if (node.type === "ref") { const ref = parseCellReference(node.value); if (!ref || ref.row >= this.store.manifest.rowCount || ref.col >= this.store.manifest.colCount) throw new GridError("FORMULA_REF", "Invalid reference"); return this.evaluateCell(ref.row, ref.col); }
-    if (node.type === "range") {
-      const start = parseCellReference(node.start); const end = parseCellReference(node.end); const range = normalizeRange({ startRow: start.row, endRow: end.row, startCol: start.col, endCol: end.col }); const values = [];
-      for (let row = range.startRow; row <= range.endRow; row += 1) { const line = []; for (let col = range.startCol; col <= range.endCol; col += 1) line.push(await this.evaluateCell(row, col)); values.push(line); } return values;
+
+  generation(key) { return this.generations.get(key) || 0; }
+
+  invalidateCell(row, col) {
+    const key = `${row}:${col}`;
+    const affected = this.dependencyCache.affectedFrom(key);
+    for (const affectedKey of affected) {
+      this.generations.set(affectedKey, this.generation(affectedKey) + 1);
+      this.cache.delete(affectedKey);
     }
-    if (node.type === "unary") { const value = await this.evaluateNode(node.value); return node.op === "-" ? -numeric(value) : numeric(value); }
+    this.dependencyCache.forgetFormula(key);
+    return affected;
+  }
+
+  async evaluateCell(row, col, path = new Set()) {
+    const key = `${row}:${col}`;
+    if (path.has(key)) return "#CYCLE!";
+    const raw = await this.store.getRaw(row, col);
+    if (typeof raw !== "string" || !raw.startsWith("=") || raw.startsWith("==")) {
+      if (this.parsedFormulas.has(key)) { this.dependencyCache.forgetFormula(key); this.cache.delete(key); }
+      return raw;
+    }
+    const previousRaw = this.parsedFormulas.get(key)?.raw;
+    const parsed = this.dependencyCache.formula(key, raw);
+    if (previousRaw != null && previousRaw !== raw) this.cache.delete(key);
+    if (this.cache.has(key)) {
+      const cached = this.cache.get(key); const pending = cached && typeof cached.then === "function";
+      if (!pending || path.size === 0) return await cached;
+    }
+    if (raw.includes("#REF!")) return "#REF!";
+    const generation = this.generation(key);
+    const nextPath = new Set(path); nextPath.add(key);
+    const calculation = (async () => {
+      try {
+        if (parsed.error) throw parsed.error;
+        const result = await this.evaluateNode(parsed.ast, key, nextPath, generation);
+        return typeof result === "number" && !Number.isFinite(result) ? "#NUM!" : result;
+      } catch (error) {
+        return error?.code === "FORMULA_NAME" ? "#NAME?" : error?.code === "FORMULA_REF" ? "#REF!" : "#VALUE!";
+      }
+    })();
+    const ownsCache = !this.cache.has(key);
+    if (ownsCache) this.cache.set(key, calculation);
+    const result = await calculation;
+    if (ownsCache && this.generation(key) === generation && this.cache.get(key) === calculation) this.cache.set(key, result);
+    else if (ownsCache && this.cache.get(key) === calculation) this.cache.delete(key);
+    return result;
+  }
+
+  registerDependency(ownerKey, sourceKey, ownerGeneration) {
+    if (this.generation(ownerKey) === ownerGeneration) this.dependencyCache.register(ownerKey, sourceKey);
+  }
+
+  async evaluateNode(node, ownerKey, path, ownerGeneration) {
+    if (node.type === "literal") return node.value;
+    if (node.type === "ref") {
+      const ref = parseCellReference(node.value);
+      if (!ref || ref.row >= this.store.manifest.rowCount || ref.col >= this.store.manifest.colCount) throw new GridError("FORMULA_REF", "Invalid reference");
+      this.registerDependency(ownerKey, `${ref.row}:${ref.col}`, ownerGeneration);
+      return this.evaluateCell(ref.row, ref.col, path);
+    }
+    if (node.type === "range") {
+      const start = parseCellReference(node.start); const end = parseCellReference(node.end);
+      if (!start || !end) throw new GridError("FORMULA_REF", "Invalid range");
+      const range = normalizeRange({ startRow: start.row, endRow: end.row, startCol: start.col, endCol: end.col }); const values = [];
+      for (let row = range.startRow; row <= range.endRow; row += 1) {
+        const line = [];
+        for (let col = range.startCol; col <= range.endCol; col += 1) {
+          if (row >= this.store.manifest.rowCount || col >= this.store.manifest.colCount) throw new GridError("FORMULA_REF", "Invalid range");
+          this.registerDependency(ownerKey, `${row}:${col}`, ownerGeneration);
+          line.push(await this.evaluateCell(row, col, path));
+        }
+        values.push(line);
+      }
+      return values;
+    }
+    if (node.type === "unary") { const value = await this.evaluateNode(node.value, ownerKey, path, ownerGeneration); return node.op === "-" ? -numeric(value) : numeric(value); }
     if (node.type === "binary") {
-      const left = await this.evaluateNode(node.left); const right = await this.evaluateNode(node.right);
+      const left = await this.evaluateNode(node.left, ownerKey, path, ownerGeneration); const right = await this.evaluateNode(node.right, ownerKey, path, ownerGeneration);
       return ({ "+": () => numeric(left) + numeric(right), "-": () => numeric(left) - numeric(right), "*": () => numeric(left) * numeric(right), "/": () => numeric(right) === 0 ? "#DIV/0!" : numeric(left) / numeric(right), "%": () => numeric(left) % numeric(right), "^": () => numeric(left) ** numeric(right), "&": () => `${left ?? ""}${right ?? ""}`, "=": () => left === right, "==": () => left === right, "!=": () => left !== right, "<>": () => left !== right, "<": () => left < right, ">": () => left > right, "<=": () => left <= right, ">=": () => left >= right })[node.op]?.() ?? "#VALUE!";
     }
-    if (node.type === "call") { const fn = this.functions.get(node.name); if (!fn) throw new GridError("FORMULA_NAME", `Unknown function ${node.name}`); const args = []; for (const arg of node.args) args.push(await this.evaluateNode(arg)); return fn(...args); }
+    if (node.type === "call") {
+      const fn = this.functions.get(node.name); if (!fn) throw new GridError("FORMULA_NAME", `Unknown function ${node.name}`);
+      const args = []; for (const argument of node.args) args.push(await this.evaluateNode(argument, ownerKey, path, ownerGeneration));
+      return fn(...args);
+    }
     throw new GridError("FORMULA_PARSE", "Unknown expression");
   }
 }
@@ -2877,9 +4385,11 @@ export class LargeGridView {
     this.host = host; this.store = store; this.markerElement = markerElement; this.model = null;
     this.selection = { startRow: 0, endRow: 0, startCol: 0, endCol: 0 }; this.anchor = { row: 0, col: 0 };
     this.root = document.createElement("section"); this.root.className = "rg-root rg-large-root"; this.root.tabIndex = 0;
+    this.cells = new Map(); this.cellValueTokens = new WeakMap(); this.editorController = null;
+    this.formulaEngine = new AsyncFormulaEngine(this.store, runtime.registries.formulaFunctions, runtime.registries.formulaFunctionMetadata);
     this.saveTimer = null; this.renderToken = 0; this.dragSelecting = false; this.boundUp = () => { this.dragSelecting = false; };
     this.rowOffsets = null; this.rowMetricsKey = null; this.rowResizePreview = null; this.columnResizePreview = null; this.resizeCleanup = null;
-    this.keyboardActive = false; this.boundDocumentPointerDown = (event) => { this.keyboardActive = this.root.contains(event.target); };
+    this.keyboardActive = false; this.boundDocumentPointerDown = (event) => { this.keyboardActive = this.root.contains(event.target) || Boolean(this.editorController?.popover.contains(event.target)); };
     this.boundWindowKeydown = (event) => { if (this.keyboardActive) this.onKeydown(event); };
     this.mount();
   }
@@ -2891,6 +4401,31 @@ export class LargeGridView {
     this.viewport = document.createElement("div"); this.viewport.className = "rg-large-viewport";
     this.canvas = document.createElement("div"); this.canvas.className = "rg-large-canvas"; this.viewport.appendChild(this.canvas);
     this.root.append(toolbar, this.viewport); globalThis.window.addEventListener("keydown", this.boundWindowKeydown, true); document.addEventListener("pointerdown", this.boundDocumentPointerDown, true); this.root.addEventListener("paste", (event) => this.onPaste(event));
+    this.editorController = new GridEditorController(this, {
+      viewport: this.viewport,
+      dimensions: () => ({ rowCount: this.store.manifest.rowCount, colCount: this.store.manifest.colCount }),
+      cellAt: (row, col) => {
+        const merge = this.store.mergeAt(row, col);
+        return this.cells.get(`${merge?.row ?? row}:${merge?.col ?? col}`) || null;
+      },
+      mountedCells: () => this.cells.values(),
+      cellRange: (cell) => {
+        const row = Number(cell.dataset.row); const col = Number(cell.dataset.col); const merge = this.store.mergeAt(row, col);
+        return { startRow: row, endRow: row + (merge?.rowSpan || 1) - 1, startCol: col, endCol: col + (merge?.colSpan || 1) - 1 };
+      },
+      onFinish: async ({ row, col, value, commit, movement }) => {
+        const previous = await this.store.getRaw(row, col);
+        let affected = new Set([`${row}:${col}`]);
+        if (commit && value !== previous) {
+          await this.store.setCell(row, col, value);
+          affected = this.formulaEngine.invalidateCell(row, col);
+          this.scheduleSave();
+        }
+        await this.repaintLargeCells(affected);
+        if (movement) this.moveLargeSelection(...movement);
+        this.root.focus({ preventScroll: true });
+      },
+    });
     this.viewport.addEventListener("scroll", () => this.scheduleRender()); document.addEventListener("pointerup", this.boundUp, true); this.scheduleRender();
   }
   headerWidth() { return this.store.manifest.showHeaders === false ? 0 : 42; }
@@ -2913,8 +4448,15 @@ export class LargeGridView {
     while (low < high) { const middle = Math.floor((low + high) / 2); if (this.rowOffsets[middle + 1] <= target) low = middle + 1; else high = middle; }
     return clamp(low, 0, Math.max(0, this.store.manifest.rowCount - 1));
   }
-  scheduleRender() { const token = ++this.renderToken; requestAnimationFrame(() => { if (token === this.renderToken) this.renderVisible(); }); }
-  async renderVisible() {
+  scheduleRender() {
+    const token = ++this.renderToken;
+    requestAnimationFrame(() => {
+      if (token !== this.renderToken) return;
+      void this.renderVisible(token).catch((error) => toast(`Large grid render failed: ${error.message}`, "danger", 8000));
+    });
+  }
+  async renderVisible(token = this.renderToken) {
+    if (this.editorController?.state && !this.editorController.state.floating) return;
     const { rowCount, colCount } = this.store.manifest; this.status.textContent = `${rowCount.toLocaleString()} × ${colCount}`;
     const headerHeight = this.headerHeight(); const headerWidth = this.headerWidth();
     this.rebuildRowMetrics(); this.canvas.style.width = `${this.totalWidth()}px`; this.canvas.style.height = `${headerHeight + this.rowOffsets[rowCount]}px`;
@@ -2923,14 +4465,14 @@ export class LargeGridView {
     let startCol = 0; let x = headerWidth; while (startCol < colCount && x + this.columnWidth(startCol) < this.viewport.scrollLeft) x += this.columnWidth(startCol++);
     let endCol = startCol; let visibleWidth = x; while (endCol < colCount && visibleWidth < this.viewport.scrollLeft + this.viewport.clientWidth + DEFAULT_COL_WIDTH * 2) visibleWidth += this.columnWidth(endCol++);
     startCol = Math.max(0, startCol - 1);
-    const rows = await this.store.getRows(startRow, endRow); const token = this.renderToken;
+    const rows = await this.store.getRows(startRow, endRow);
     if (token !== this.renderToken) return;
-    this.canvas.replaceChildren();
+    releaseRichCellHosts(this.canvas); this.canvas.replaceChildren(); this.cells.clear();
     if (this.store.manifest.showHeaders !== false) for (let col = startCol; col < endCol; col += 1) {
       const header = document.createElement("div"); header.className = "rg-header rg-large-col-header"; header.textContent = columnLabel(col); header.style.left = `${this.colLeft(col)}px`; header.style.width = `${this.columnWidth(col)}px`;
       const resize = document.createElement("span"); resize.className = "rg-col-resize"; resize.title = "Drag to resize column · double-click to reset"; resize.addEventListener("pointerdown", (event) => this.startColumnResize(col, event)); resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.store.setColumnWidth(col, null); this.rowMetricsKey = null; this.scheduleSave(true); this.scheduleRender(); }); header.appendChild(resize); this.canvas.appendChild(header);
     }
-    const engine = new AsyncFormulaEngine(this.store, runtime.registries.formulaFunctions);
+    const engine = this.formulaEngine;
     for (let row = startRow; row < endRow; row += 1) {
       if (this.store.manifest.showHeaders !== false) {
         const rowHeader = document.createElement("div"); rowHeader.className = "rg-header rg-large-row-header"; rowHeader.textContent = String(row + 1); rowHeader.style.top = `${this.rowTop(row)}px`; rowHeader.style.height = `${this.rowSpanHeight(row)}px`;
@@ -2941,14 +4483,67 @@ export class LargeGridView {
         const cell = document.createElement("div"); cell.className = "rg-cell rg-large-cell"; cell.classList.toggle("rg-cell--merged", Boolean(merge)); const alignment = this.store.getAlignment(row, col); if (alignment) cell.classList.add(`rg-cell--align-${alignment}`); cell.dataset.row = String(row); cell.dataset.col = String(col); cell.style.left = `${this.colLeft(col)}px`; cell.style.top = `${this.rowTop(row)}px`;
         let width = 0; for (let offset = 0; offset < (merge?.colSpan || 1); offset += 1) width += this.columnWidth(col + offset);
         cell.style.width = `${width}px`; cell.style.height = `${this.rowSpanHeight(row, merge?.rowSpan || 1)}px`;
-        const raw = rows[row - startRow]?.[col] ?? ""; const formula = raw.startsWith("=") && !raw.startsWith("=="); cell.classList.toggle("rg-cell--formula", formula && this.store.manifest.colorFormulaCells !== false); if (formula) engine.evaluateCell(row, col).then((value) => { if (cell.isConnected) cell.textContent = String(value ?? ""); }); else if (raw) { try { roam().ui.components.renderString({ el: cell, string: raw }); } catch { cell.textContent = raw; } }
+        const raw = rows[row - startRow]?.[col] ?? "";
+        void this.renderLargeCellValue(cell, raw, row, col, engine);
         if (rangeContains(this.selection, row, col)) cell.classList.add("rg-cell--selected");
-        cell.addEventListener("pointerdown", (event) => { if (event.button !== 0) return; this.anchor = { row, col }; this.selection = { startRow: row, endRow: row, startCol: col, endCol: col }; this.dragSelecting = true; this.root.focus(); this.scheduleRender(); event.preventDefault(); });
+        cell.addEventListener("pointerdown", (event) => { if (event.button !== 0) return; if (event.target.closest?.(".rg-editor")) return; const anchorMerge = this.store.mergeAt(row, col); const anchorRow = anchorMerge?.row ?? row; const anchorCol = anchorMerge?.col ?? col; if (this.editorController?.insertReference(anchorRow, anchorCol, event)) return; this.anchor = { row: anchorRow, col: anchorCol }; this.selection = { startRow: anchorRow, endRow: anchorRow, startCol: anchorCol, endCol: anchorCol }; this.dragSelecting = true; this.root.focus(); this.updateLargeSelection(); event.preventDefault(); });
         cell.addEventListener("pointerenter", () => { if (this.dragSelecting) { this.selection = normalizeRange({ startRow: this.anchor.row, endRow: row, startCol: this.anchor.col, endCol: col }); this.scheduleRender(); } });
-        cell.addEventListener("dblclick", () => this.beginEdit(row, col, cell)); this.canvas.appendChild(cell);
+        cell.addEventListener("dblclick", () => this.beginEdit(row, col, cell)); this.canvas.appendChild(cell); this.cells.set(`${row}:${col}`, cell);
       }
     }
+    this.editorController?.schedulePresentation();
   }
+
+  async renderLargeCellValue(cell, raw, row, col, engine = this.formulaEngine) {
+    const key = `${row}:${col}`; const token = (this.cellValueTokens.get(cell) || 0) + 1; this.cellValueTokens.set(cell, token);
+    const formula = raw.startsWith("=") && !raw.startsWith("=="); const content = ensureCellContent(cell);
+    cell.dataset.rgRaw = raw; cell.classList.toggle("rg-cell--formula", formula && this.store.manifest.colorFormulaCells !== false);
+    if (formula) {
+      const value = await engine.evaluateCell(row, col);
+      if (this.cellValueTokens.get(cell) !== token || this.cells.get(key) !== cell) return;
+      cell.classList.toggle("rg-cell--error", String(value).startsWith("#")); cell.title = raw;
+      renderStableCellContent(content, { raw, value, formula: true });
+    } else {
+      cell.classList.remove("rg-cell--error"); cell.title = "";
+      renderStableCellContent(content, { raw, renderRich: paintRichCellContent });
+    }
+  }
+
+  async repaintLargeCells(keys) {
+    await Promise.all([...keys].map(async (key) => {
+      const cell = this.cells.get(key); if (!cell) return;
+      const [row, col] = key.split(":").map(Number); const raw = await this.store.getRaw(row, col);
+      if (this.cells.get(key) === cell) await this.renderLargeCellValue(cell, raw, row, col);
+    }));
+  }
+
+  invalidateLargeCells(coordinates) {
+    const affected = new Set();
+    for (const [row, col] of coordinates) for (const key of this.formulaEngine.invalidateCell(row, col)) affected.add(key);
+    for (const key of affected) {
+      const cell = this.cells.get(key); if (cell) this.cellValueTokens.set(cell, (this.cellValueTokens.get(cell) || 0) + 1);
+    }
+    return affected;
+  }
+
+  updateLargeSelection() {
+    for (const cell of this.cells.values()) {
+      const row = Number(cell.dataset.row); const col = Number(cell.dataset.col);
+      const merge = this.store.mergeAt(row, col);
+      const selected = rangeContains(this.selection, row, col) || merge && rangesOverlap(this.selection, { startRow: merge.row, endRow: merge.row + merge.rowSpan - 1, startCol: merge.col, endCol: merge.col + merge.colSpan - 1 });
+      cell.classList.toggle("rg-cell--selected", Boolean(selected));
+    }
+  }
+
+  moveLargeSelection(dr, dc) {
+    const row = clamp(this.selection.startRow + dr, 0, this.store.manifest.rowCount - 1);
+    const col = clamp(this.selection.startCol + dc, 0, this.store.manifest.colCount - 1);
+    const merge = this.store.mergeAt(row, col); const targetRow = merge?.row ?? row; const targetCol = merge?.col ?? col;
+    this.anchor = { row: targetRow, col: targetCol };
+    this.selection = { startRow: targetRow, endRow: targetRow, startCol: targetCol, endCol: targetCol };
+    this.ensureVisible(targetRow, targetCol); this.updateLargeSelection();
+  }
+
   startRowResize(row, event) {
     event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.(); const startY = event.clientY; const startHeight = this.store.rowHeight(row); let moved = false;
     const move = (moveEvent) => { moved = true; this.rowResizePreview = { row, height: clamp(Math.round(startHeight + moveEvent.clientY - startY), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT) }; this.rowMetricsKey = null; this.scheduleRender(); };
@@ -2963,26 +4558,43 @@ export class LargeGridView {
     const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
     this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
   }
-  async beginEdit(row, col, cell, initial = null) {
-    const raw = await this.store.getRaw(row, col); const input = document.createElement("textarea"); input.className = "rg-editor"; input.value = initial ?? raw; cell.replaceChildren(input); input.focus(); if (initial == null) input.select(); let done = false;
-    const finish = async (commit) => { if (done) return; done = true; if (commit && input.value !== raw) { await this.store.setCell(row, col, input.value); this.scheduleSave(); } this.scheduleRender(); this.root.focus(); };
-    input.addEventListener("keydown", (event) => { event.stopPropagation(); if (event.key === "Escape") { event.preventDefault(); finish(false); } else if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); finish(true); } }); for (const type of ["keyup", "keypress", "beforeinput", "input"]) input.addEventListener(type, (event) => event.stopPropagation()); input.addEventListener("blur", () => finish(true));
+  async beginEdit(row, col, cell = this.cells.get(`${row}:${col}`), initial = null, floating = false) {
+    if (!cell) return;
+    const merge = this.store.mergeAt(row, col); row = merge?.row ?? row; col = merge?.col ?? col;
+    const raw = await this.store.getRaw(row, col);
+    return this.editorController?.start({ row, col, cell, raw, initial, floating });
   }
   onKeydown(event) {
     if (event.target.matches("textarea,input")) return; event.stopPropagation(); const command = event.metaKey || event.ctrlKey;
     if (command && event.key.toLowerCase() === "c") { event.preventDefault(); this.copy(); return; }
     if (command && event.shiftKey && event.key.toLowerCase() === "m") { event.preventDefault(); this.merge(); return; }
-    if (["Enter", "F2"].includes(event.key)) { event.preventDefault(); const cell = this.canvas.querySelector(`[data-row="${this.selection.startRow}"][data-col="${this.selection.startCol}"]`); if (cell) this.beginEdit(this.selection.startRow, this.selection.startCol, cell); return; }
+    if (event.key === "Enter") { event.preventDefault(); const cell = this.cells.get(`${this.selection.startRow}:${this.selection.startCol}`); if (cell) this.beginEdit(this.selection.startRow, this.selection.startCol, cell); return; }
+    if (event.key === "F2") { event.preventDefault(); const cell = this.cells.get(`${this.selection.startRow}:${this.selection.startCol}`); if (cell) this.beginEdit(this.selection.startRow, this.selection.startCol, cell, null, true); return; }
     const moves = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1], Tab: [0, event.shiftKey ? -1 : 1] };
-    if (moves[event.key]) { event.preventDefault(); const [dr, dc] = moves[event.key]; const row = clamp(this.selection.startRow + dr, 0, this.store.manifest.rowCount - 1); const col = clamp(this.selection.startCol + dc, 0, this.store.manifest.colCount - 1); this.selection = { startRow: row, endRow: row, startCol: col, endCol: col }; this.ensureVisible(row, col); this.scheduleRender(); return; }
-    if (event.key.length === 1 && !command && !event.altKey) { event.preventDefault(); const cell = this.canvas.querySelector(`[data-row="${this.selection.startRow}"][data-col="${this.selection.startCol}"]`); if (cell) this.beginEdit(this.selection.startRow, this.selection.startCol, cell, event.key); }
+    if (moves[event.key]) { event.preventDefault(); this.moveLargeSelection(...moves[event.key]); return; }
+    if (event.key.length === 1 && !command && !event.altKey) { event.preventDefault(); const cell = this.cells.get(`${this.selection.startRow}:${this.selection.startCol}`); if (cell) this.beginEdit(this.selection.startRow, this.selection.startCol, cell, event.key); }
   }
   ensureVisible(row, col) { const top = this.rowTop(row); const height = this.rowSpanHeight(row); const left = this.colLeft(col); const width = this.columnWidth(col); if (top < this.viewport.scrollTop + this.headerHeight()) this.viewport.scrollTop = top - this.headerHeight(); else if (top + height > this.viewport.scrollTop + this.viewport.clientHeight) this.viewport.scrollTop = top - this.viewport.clientHeight + height; if (left < this.viewport.scrollLeft + this.headerWidth()) this.viewport.scrollLeft = left - this.headerWidth(); else if (left + width > this.viewport.scrollLeft + this.viewport.clientWidth) this.viewport.scrollLeft = left - this.viewport.clientWidth + width; }
   async copy() { const range = normalizeRange(this.selection); const rows = await this.store.getRows(range.startRow, range.endRow + 1); const text = rows.map((row) => row.slice(range.startCol, range.endCol + 1).map((value) => quoteDelimited(value, "\t")).join("\t")).join("\n"); navigator.clipboard?.writeText(text); }
   async onPaste(event) {
     const images = [...(event.clipboardData?.files || [])].filter((file) => file.type.startsWith("image/"));
-    if (images.length) { event.preventDefault(); try { const embeds = []; for (const file of images) embeds.push(await roam().file.upload({ file, toast: { hide: true } })); await this.store.setCell(this.selection.startRow, this.selection.startCol, embeds.join(" ")); this.scheduleSave(); this.scheduleRender(); } catch (error) { toast(error.message, "danger"); } return; }
-    const text = event.clipboardData?.getData("text/plain"); if (!text) return; event.preventDefault(); const matrix = parseDelimited(text, text.includes("\t") ? "\t" : detectDelimiter(text)); await this.store.applyMatrix(this.selection.startRow, this.selection.startCol, matrix); this.scheduleSave(); this.scheduleRender();
+    if (images.length) {
+      event.preventDefault();
+      try {
+        const embeds = []; for (const file of images) embeds.push(await roam().file.upload({ file, toast: { hide: true } }));
+        const row = this.selection.startRow; const col = this.selection.startCol;
+        await this.store.setCell(row, col, embeds.join(" "));
+        await this.repaintLargeCells(this.invalidateLargeCells([[row, col]]));
+        this.scheduleSave();
+      } catch (error) { toast(error.message, "danger"); }
+      return;
+    }
+    const text = event.clipboardData?.getData("text/plain"); if (!text) return;
+    event.preventDefault(); const matrix = parseDelimited(text, text.includes("\t") ? "\t" : detectDelimiter(text));
+    const startRow = this.selection.startRow; const startCol = this.selection.startCol;
+    await this.store.applyMatrix(startRow, startCol, matrix);
+    const coordinates = matrix.flatMap((values, row) => values.map((_value, col) => [startRow + row, startCol + col]));
+    this.invalidateLargeCells(coordinates); this.scheduleSave(); this.scheduleRender();
   }
   async merge() { try { await this.store.merge(this.selection); this.scheduleSave(true); this.scheduleRender(); } catch (error) { toast(error.message, "danger"); } }
   unmerge() { if (!this.store.unmerge(this.selection.startRow, this.selection.startCol)) return toast("The active cell is not merged", "warning"); this.scheduleSave(true); this.scheduleRender(); }
@@ -2992,8 +4604,16 @@ export class LargeGridView {
   scheduleSave(immediate = false) { clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flush(), immediate ? 0 : 500); }
   async flush() { clearTimeout(this.saveTimer); this.root.classList.add("rg-root--saving"); try { await this.store.commit(); toast("Large grid saved", "success", 1800); } catch (error) { toast(error.message, "danger", 8000); } finally { this.root.classList.remove("rg-root--saving"); } }
   async exportSelection() { const range = normalizeRange(this.selection); const rows = await this.store.getRows(range.startRow, range.endRow + 1); downloadText(rows.map((row) => row.slice(range.startCol, range.endCol + 1).map((value) => quoteDelimited(value, ",")).join(",")).join("\n"), "roam-grid-selection.csv", "text/csv"); }
-  async applyPatch(patch) { const patches = Array.isArray(patch) ? patch : [patch]; for (const item of patches) { if (item.op !== "set") throw new GridError("PATCH", "Large-grid public patches currently support cell writes"); await this.store.setCell(item.row, item.col, item.value); } await this.store.commit(); this.scheduleRender(); return { manifest: deepClone(this.store.manifest) }; }
-  dispose() { clearTimeout(this.saveTimer); this.resizeCleanup?.(); globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true); document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true); document.removeEventListener("pointerup", this.boundUp, true); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden"); }
+  async applyPatch(patch) {
+    const patches = Array.isArray(patch) ? patch : [patch]; const coordinates = [];
+    for (const item of patches) {
+      if (item.op !== "set") throw new GridError("PATCH", "Large-grid public patches currently support cell writes");
+      await this.store.setCell(item.row, item.col, item.value); coordinates.push([item.row, item.col]);
+    }
+    this.invalidateLargeCells(coordinates); await this.store.commit(); this.scheduleRender();
+    return { manifest: deepClone(this.store.manifest) };
+  }
+  dispose() { clearTimeout(this.saveTimer); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true); document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden"); }
 }
 
 function downloadText(text, filename, type = "text/plain") {
