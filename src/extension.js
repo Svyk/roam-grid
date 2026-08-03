@@ -1,4 +1,4 @@
-const VERSION = "0.3.2";
+const VERSION = "0.3.3";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -2130,6 +2130,17 @@ export class GridView {
     this.renderCellValue(cell, row, col, engine);
     cell.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) return;
+      const rect = cell.getBoundingClientRect();
+      const nearRightEdge = event.clientX >= rect.right - 12 && event.clientX <= rect.right + 1;
+      const nearBottomEdge = event.clientY >= rect.bottom - 10 && event.clientY <= rect.bottom + 1;
+      if (nearRightEdge && !nearBottomEdge) {
+        const edgeCol = col + (merge?.colSpan || 1) - 1;
+        this.startColumnResize(this.model.columnIds[edgeCol], event); return;
+      }
+      if (nearBottomEdge) {
+        const edgeRow = row + (merge?.rowSpan || 1) - 1;
+        this.startRowResize(edgeRow, event); return;
+      }
       if (event.shiftKey) this.extendSelection(row, col); else { this.anchor = { row, col }; this.select({ startRow: row, endRow: row, startCol: col, endCol: col }); }
       this.dragSelecting = true; this.root.focus({ preventScroll: true }); event.preventDefault();
     });

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.3
+
+- Added cell-edge resize detection as a fallback beneath the transparent overlay,
+  so Electron hit-testing cannot turn a column-width drag into cell selection.
+
 ## 0.3.2
 
 - Made resize gestures capture their pointer and temporarily disable the active
