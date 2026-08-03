@@ -1,5 +1,5 @@
-/* Roam Grid v0.3.1 | MIT | generated from src/extension.js */
-const VERSION = "0.3.1";
+/* Roam Grid v0.3.2 | MIT | generated from src/extension.js */
+const VERSION = "0.3.2";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -2025,6 +2025,10 @@ export class GridView {
 
   startColumnResize(id, event) {
     event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.();
+    const pointerTarget = event.currentTarget; const dragCell = pointerTarget?.closest?.(".rg-cell");
+    if (dragCell) dragCell.draggable = false;
+    pointerTarget?.setPointerCapture?.(event.pointerId);
+    this.root.classList.add("rg-root--resizing");
     const offset = this.model.showHeaders ? 1 : 0;
     const resolvedTracks = getComputedStyle(this.gridElement).gridTemplateColumns.split(/\s+/);
     const baseWidths = Object.fromEntries(this.model.columnIds.map((columnId, col) => [columnId, Number.parseFloat(resolvedTracks[col + offset]) || this.model.widths[columnId] || DEFAULT_COL_WIDTH]));
@@ -2050,7 +2054,12 @@ export class GridView {
         else this.model.widths[id] = Math.round(widths[id]);
       }, true);
     };
-    const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
+    const cleanup = () => {
+      document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up);
+      try { pointerTarget?.releasePointerCapture?.(event.pointerId); } catch { /* already released */ }
+      if (dragCell) dragCell.draggable = true;
+      this.root.classList.remove("rg-root--resizing"); this.resizeCleanup = null;
+    };
     this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
   }
 
@@ -2083,6 +2092,10 @@ export class GridView {
 
   startRowResize(row, event) {
     event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.();
+    const pointerTarget = event.currentTarget; const dragCell = pointerTarget?.closest?.(".rg-cell");
+    if (dragCell) dragCell.draggable = false;
+    pointerTarget?.setPointerCapture?.(event.pointerId);
+    this.root.classList.add("rg-root--resizing");
     const offset = this.model.showHeaders ? 1 : 0;
     const resolvedTracks = getComputedStyle(this.gridElement).gridTemplateRows.split(/\s+/);
     const startHeight = Number.parseFloat(resolvedTracks[row + offset]) || this.model.getRowHeight(row) || DEFAULT_ROW_HEIGHT;
@@ -2098,7 +2111,12 @@ export class GridView {
       if (!moved) return;
       this.commitMutation("Resize row", () => this.model.setRowHeight(row, height), true);
     };
-    const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
+    const cleanup = () => {
+      document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up);
+      try { pointerTarget?.releasePointerCapture?.(event.pointerId); } catch { /* already released */ }
+      if (dragCell) dragCell.draggable = true;
+      this.root.classList.remove("rg-root--resizing"); this.resizeCleanup = null;
+    };
     this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
   }
 

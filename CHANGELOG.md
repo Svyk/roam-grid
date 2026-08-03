@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.2
+
+- Made resize gestures capture their pointer and temporarily disable the active
+  cell's HTML range drag, preventing column/range gesture competition.
+- Enlarged the invisible column-edge target while retaining the smaller visible
+  Roam-style grabbers.
+
 ## 0.3.1
 
 - Allowed a column to expand when every neighboring fit-to-window column is
