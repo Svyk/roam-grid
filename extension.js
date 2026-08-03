@@ -1,5 +1,5 @@
-/* Roam Grid v0.3.3 | MIT | generated from src/extension.js */
-const VERSION = "0.3.3";
+/* Roam Grid v0.3.4 | MIT | generated from src/extension.js */
+const VERSION = "0.3.4";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -1942,7 +1942,7 @@ export class GridView {
       button("Export", "Export this grid", () => exportCommand(this.model)),
       button("⋯", "More grid actions", (event) => this.openMenu(event.currentTarget))
     );
-    const status = document.createElement("span"); status.className = "rg-status"; status.textContent = `${this.model.rowCount} × ${this.model.colCount}`;
+    const status = document.createElement("span"); status.className = "rg-status"; status.textContent = `${this.model.rowCount} × ${this.model.colCount}`; status.setAttribute("aria-label", `Roam Grid v${VERSION} · ${this.model.rowCount} × ${this.model.colCount}`); status.title = `Roam Grid v${VERSION}`;
     toolbar.appendChild(status);
     return toolbar;
   }
@@ -2431,6 +2431,8 @@ export class GridView {
       item("Reset alignment", () => this.alignSelection(null)),
       item("Copy Roam block reference", () => this.copyRoamReference(false)),
       item("Copy table block reference", () => this.copyRoamReference(true)),
+      item("Save as grid template…", () => saveModelAsTemplate(this.model)),
+      item("Insert saved template after this grid…", () => newFromSavedTemplate()),
       item(this.model.colorFormulaCells ? "Hide formula coloring" : "Color formula cells", () => this.commitMutation("Toggle formula coloring", () => { this.model.colorFormulaCells = !this.model.colorFormulaCells; }, true)),
       item(this.model.showHeaders ? "Hide row/column labels" : "Show row/column labels", () => this.commitMutation("Toggle row and column labels", () => { this.model.showHeaders = !this.model.showHeaders; }, true)),
       item(this.model.fitToWidth ? "Use fixed column widths" : "Fit table to window", () => this.commitMutation("Toggle fit to window", () => { this.model.fitToWidth = !this.model.fitToWidth; }, true)),
@@ -2855,15 +2857,19 @@ async function resolveTemplateModel(name) {
   throw new GridError("TEMPLATE_NOT_FOUND", `Unknown Roam Grid template: ${name}`);
 }
 
-async function saveFocusedTemplate() {
+async function saveModelAsTemplate(model) {
   try {
-    const mount = activeMount();
-    if (!(mount instanceof GridView)) throw new GridError("TEMPLATE_SOURCE", "Focus an enhanced native grid before saving a template");
-    const name = await showPrompt("Save grid template as", mount.model.getRaw(0, 0).replace(/[*_[\]]/g, "").slice(0, 80) || "My grid");
+    const name = await showPrompt("Save grid template as", model.getRaw(0, 0).replace(/[*_[\]]/g, "").slice(0, 80) || "My grid");
     if (!name) return;
-    await runtime.templates.save(name, mount.model);
+    await runtime.templates.save(name, model);
     toast(`Saved “${name}” to [[${TEMPLATE_PAGE}]]`, "success", 5000);
   } catch (error) { toast(error.message, "danger", 8000); }
+}
+
+async function saveFocusedTemplate() {
+  const mount = activeMount();
+  if (!(mount instanceof GridView)) return toast("Focus an enhanced native grid before saving a template", "warning", 5000);
+  return saveModelAsTemplate(mount.model);
 }
 
 async function newFromSavedTemplate() {

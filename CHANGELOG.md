@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.4
+
+- Added save/insert template actions directly to the grid `⋯` menu so the
+  workflow does not depend on Roam's command-palette focus behavior.
+- Exposed the running extension version through the grid status accessibility
+  label and tooltip for reliable hosted-reload verification.
+
 ## 0.3.3
 
 - Added cell-edge resize detection as a fallback beneath the transparent overlay,
