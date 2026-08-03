@@ -8,7 +8,9 @@
   "scripts": {
     "build": "node build.mjs",
     "test": "node --test test/*.test.js",
-    "check": "node --check src/extension.js && npm test",
+    "scan:secrets": "node scripts/scan-secrets.mjs",
+    "verify:generated": "node scripts/verify-generated.mjs",
+    "check": "node --check src/extension.js && npm test && npm run scan:secrets && npm run verify:generated",
     "dev": "npm run build -- --watch"
   },
   "engines": {
