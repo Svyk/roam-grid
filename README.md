@@ -27,9 +27,16 @@ push to `main` or the current release branch. The extension root is:
 
 In Roam, open **Settings → Roam Depot → Developer Extensions**, choose
 **Load extension → URL**, and paste that root URL. URL extensions auto-start on
-later Roam launches and are downloaded again whenever Roam opens or developer
-extensions are reloaded, so a pushed build does not require choosing the local
+later Roam launches, so a pushed build does not require choosing the local
 folder again. Developer extensions remain local to each Roam client.
+
+For an immediate update after a push, wait for the GitHub Pages deployment and
+press the circular reload button beside this URL. Hover the grid-size badge to
+confirm the running version (for example, `Roam Grid v0.3.4`). Roam can reuse a
+cached remote bundle during the same app session; if the badge still shows the
+older version, remove only this developer-extension URL and add the same URL
+again. The reinstall remounts the renderer and does not alter any table blocks,
+saved templates, or `[[roam/grid/metadata]]`.
 
 The four public files at that URL are `README.md`, `extension.js`,
 `extension.css`, and `CHANGELOG.md`. `npm run build` assembles those exact files
