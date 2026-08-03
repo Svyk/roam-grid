@@ -312,6 +312,16 @@ body.roam-body.dark .rg-root {
   background: color-mix(in srgb, var(--rg-active) 16%, var(--rg-bg));
 }
 
+.rg-cell--formula-reference {
+  z-index: 14;
+  background: color-mix(in srgb, var(--rg-reference-color) 10%, var(--rg-bg));
+  box-shadow: inset 0 0 0 2px var(--rg-reference-color);
+}
+
+.rg-root--formula-editing .rg-cell:not(:has(.rg-editor)) {
+  cursor: cell;
+}
+
 .rg-native-pill-proxy {
   display: contents;
 }
@@ -485,6 +495,53 @@ body.roam-body.dark .rg-root {
   font: inherit;
   line-height: 1.45;
   user-select: text;
+}
+
+.rg-formula-popover {
+  position: fixed;
+  z-index: 10010;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-height: 34px;
+  padding: 7px 10px;
+  color: var(--cl-text-color, #182026);
+  background: var(--bc-main, #fff);
+  border: 1px solid var(--bc-menu, #c5cbd3);
+  border-top: 3px solid var(--cl-blue, #2d72d2);
+  border-radius: 4px;
+  box-shadow: 0 6px 20px rgb(17 20 24 / 24%);
+  pointer-events: none;
+}
+
+.bp3-dark .rg-formula-popover,
+body.roam-body.dark .rg-formula-popover {
+  color: var(--cl-text-color, #f5f8fa);
+  background: var(--bc-main, #293742);
+  border-color: #5f6b7c;
+}
+
+.rg-formula-address {
+  flex: 0 0 auto;
+  padding-top: 1px;
+  color: var(--cl-blue, #2d72d2);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.rg-formula-expression {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: inherit;
+  background: transparent;
+  font: 500 12px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.rg-formula-token {
+  font-weight: 750;
 }
 
 .rg-fill-handle {

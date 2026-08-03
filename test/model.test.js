@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { FormulaEngine, GridError, GridModel, columnLabel, fittedTrackResize, parseCellReference, rewriteFormula, serializeTemplateModel, templateModelFromValue } from "../src/extension.js";
+import { FormulaEngine, GridError, GridModel, columnLabel, fittedTrackResize, formulaReferences, parseCellReference, rewriteFormula, rewriteFormulaForStructure, serializeTemplateModel, templateModelFromValue } from "../src/extension.js";
 
 const model = (rows, options = {}) => new GridModel({ rows, ...options });
 
@@ -43,6 +43,66 @@ test("formula engine reports cycles, divide by zero, names, and references", () 
 test("formula rewrite preserves absolute axes", () => {
   assert.equal(rewriteFormula("=A1+$B1+C$2+$D$4", 2, 3), "=D3+$B3+F$2+$D$4");
   assert.equal(rewriteFormula("plain", 2, 3), "plain");
+});
+
+test("formula reference scanner returns ranges and ignores quoted text", () => {
+  const refs = formulaReferences('=SUM($A$1:B3)+C4+"D5"');
+  assert.deepEqual(refs.map((ref) => ref.text), ["$A$1:B3", "C4"]);
+  assert.deepEqual(refs[0].range, { startRow: 0, endRow: 2, startCol: 0, endCol: 1 });
+});
+
+test("structural insertion shifts absolute and relative references and expands ranges", () => {
+  assert.equal(
+    rewriteFormulaForStructure("=A1+$B$2+SUM(C3:C5)", { axis: "row", index: 1, insertCount: 1 }),
+    "=A1+$B$3+SUM(C4:C6)",
+  );
+  assert.equal(
+    rewriteFormulaForStructure("=A1+$B$2+SUM(C3:C5)", { axis: "col", index: 1, insertCount: 1 }),
+    "=A1+$C$2+SUM(D3:D5)",
+  );
+  assert.equal(
+    rewriteFormulaForStructure("=SUM(A1:A3)", { axis: "row", index: 2, insertCount: 2 }),
+    "=SUM(A1:A5)",
+  );
+});
+
+test("structural deletion shifts survivors, trims ranges, and marks deleted references", () => {
+  assert.equal(
+    rewriteFormulaForStructure("=A1+A2+A4+SUM(B2:B5)", { axis: "row", index: 1, deleteCount: 2 }),
+    "=A1+#REF!+A2+SUM(B2:B3)",
+  );
+  assert.equal(
+    rewriteFormulaForStructure("=SUM(A2:A3)", { axis: "row", index: 1, deleteCount: 2 }),
+    "=SUM(#REF!)",
+  );
+  assert.equal(
+    rewriteFormulaForStructure('="A2"&A2', { axis: "row", index: 1, deleteCount: 1 }),
+    '="A2"&#REF!',
+  );
+});
+
+test("grid row and column mutations rewrite every surviving formula atomically", () => {
+  const insertedRows = model([["1", "=A1"], ["2", ""]]);
+  insertedRows.insertRows(0, 1);
+  assert.equal(insertedRows.getRaw(1, 1), "=A2");
+
+  const adjacentTotal = model([["1"], ["2"], ["=SUM(A1:A2)"]]);
+  adjacentTotal.insertRows(2, 1);
+  assert.equal(adjacentTotal.getRaw(3, 0), "=SUM(A1:A3)");
+  assert.equal(new FormulaEngine(adjacentTotal).evaluateCell(3, 0), 3);
+
+  const deletedRows = model([["formula", "=A2+A4"], ["one", ""], ["two", ""], ["three", ""]]);
+  deletedRows.deleteRows(1, 2);
+  assert.equal(deletedRows.getRaw(0, 1), "=#REF!+A2");
+  assert.equal(new FormulaEngine(deletedRows).evaluateCell(0, 1), "#REF!");
+
+  const insertedCols = model([["1", "=A1"]]);
+  insertedCols.insertCols(0, 1);
+  assert.equal(insertedCols.getRaw(0, 2), "=B1");
+
+  const deletedCols = model([["1", "2", "3", "=A1+B1+C1"]]);
+  deletedCols.deleteCols(1, 1);
+  assert.equal(deletedCols.getRaw(0, 2), "=A1+#REF!+B1");
 });
 
 test("safe rectangular merge stores only structural coverage", () => {

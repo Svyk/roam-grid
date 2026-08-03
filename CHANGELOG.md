@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0
+
+- Added an Excel-like formula editing layer: the raw expression floats above the
+  edited cell, each reference token receives a stable color, and every referenced
+  cell or range is outlined in the matching color.
+- While a formula is open, clicking another cell inserts its A1 reference at the
+  caret; Shift-click after a reference extends it into a range.
+- Row and column insertion now shifts both relative and `$`-absolute references,
+  expands ranges inserted through their interior, and includes an adjacent new
+  item row when a total formula sits immediately below the range.
+- Row and column deletion now shifts surviving references, trims partially
+  overlapping ranges, and emits `#REF!` only when the referenced cell or entire
+  range was actually deleted. All formula and structural changes remain inside
+  the same undoable model transaction.
+
 ## 0.3.4
 
 - Added save/insert template actions directly to the grid `⋯` menu so the

@@ -4,7 +4,7 @@ Native-first advanced tables for Roam Research.
 
 ## Status
 
-Version 0.3 is a functional public-source beta and live demo. Native
+Version 0.4 is a functional public-source beta and live demo. Native
 opt-in tables, safe merges, core formulas, interactions, imports/exports,
 charts, chunked large-grid persistence, the public API, and clean fallback are
 implemented. Before a public Depot release, the project still needs the full
@@ -108,6 +108,15 @@ The extension deliberately does not use `roam/js`.
   either the active cell's or the whole table's native `((block reference))`.
 - Formula cells use a subtle blue Blueprint-aware treatment by default. Toggle
   **Hide formula coloring** in the table menu; the choice persists per grid.
+- Editing a formula opens a compact `fx` expression bar above the cell. Cell and
+  range references are colored in the expression and outlined with the same
+  colors in the grid. Click a cell while editing to insert its A1 reference;
+  Shift-click after a reference to extend it into a range.
+- Inserting or deleting a row/column rewrites formulas transactionally. Relative
+  and `$`-absolute references follow structural moves, ranges expand or shrink,
+  and `#REF!` appears only when the referenced cell or complete range was
+  deleted. Inserting an item row directly above an adjacent total also expands
+  that total's range, which keeps saved calculators practical to modify.
 - Copy/cut/paste understands matrices and TSV/CSV text. Pasting image files
   uploads them through Roam and stores ordinary `![](url)` markup in the cell.
 - Merged regions are one navigation stop. Partial-merge moves and destructive

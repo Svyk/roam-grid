@@ -7,7 +7,9 @@ npm test
 npm run check
 ```
 
-The dependency-free Node suite covers formulas, cycles, reference rewrites,
+The dependency-free Node suite covers formulas, cycles, copy/fill and
+structural reference rewrites (including absolute axes, adjacent totals,
+partial ranges, and `#REF!`),
 undo/redo, every destructive-merge invariant from grid-table issue #9,
 insertion/deletion/sorting boundaries, malformed metadata recovery, imports,
 exports, deterministic charts, native UID round trips, conflicts, and chunked
@@ -23,7 +25,7 @@ opted in or changed.
 
 Current release acceptance:
 
-- 43 automated tests pass.
+- 51 automated tests pass.
 - The existing host-neutral Thymer Grid baseline remains green at 343/343; the
   Roam adapter suite is additive and the original project was not modified.
 - Native formulas and safe/blocked merges were exercised in Roam.

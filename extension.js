@@ -1,5 +1,5 @@
-/* Roam Grid v0.3.4 | MIT | generated from src/extension.js */
-const VERSION = "0.3.4";
+/* Roam Grid v0.4.0 | MIT | generated from src/extension.js */
+const VERSION = "0.4.0";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -15,6 +15,7 @@ const MIN_ROW_HEIGHT = 22;
 const MAX_ROW_HEIGHT = 480;
 const MIN_COL_WIDTH = 56;
 const MAX_COL_WIDTH = 640;
+const FORMULA_REFERENCE_COLORS = ["#d9822b", "#8f398f", "#0f9960", "#106ba3", "#c23030", "#5c7080"];
 
 const runtime = {
   extensionAPI: null,
@@ -93,6 +94,96 @@ export function parseCellReference(reference) {
     absoluteCol: Boolean(match[1]),
     absoluteRow: Boolean(match[3]),
   };
+}
+
+function formatCellReference(reference, row = reference.row, col = reference.col) {
+  return `${reference.absoluteCol ? "$" : ""}${columnLabel(col)}${reference.absoluteRow ? "$" : ""}${row + 1}`;
+}
+
+export function formulaReferences(raw) {
+  if (typeof raw !== "string" || !raw.startsWith("=") || raw.startsWith("==")) return [];
+  const references = [];
+  let index = 1;
+  let quoted = false;
+  while (index < raw.length) {
+    if (raw[index] === '"') {
+      if (quoted && raw[index + 1] === '"') { index += 2; continue; }
+      quoted = !quoted; index += 1; continue;
+    }
+    if (quoted) { index += 1; continue; }
+    const previous = raw[index - 1] || "";
+    const match = /^(\$?[A-Z]+\$?\d+)(?::(\$?[A-Z]+\$?\d+))?/i.exec(raw.slice(index));
+    if (!match || /[A-Z0-9_.]/i.test(previous)) { index += 1; continue; }
+    const next = raw[index + match[0].length] || "";
+    if (/[A-Z0-9_.]/i.test(next)) { index += 1; continue; }
+    const startRef = parseCellReference(match[1]);
+    const endRef = parseCellReference(match[2] || match[1]);
+    if (startRef && endRef) references.push({
+      text: match[0], startIndex: index, endIndex: index + match[0].length,
+      startRef, endRef, range: normalizeRange({ startRow: startRef.row, endRow: endRef.row, startCol: startRef.col, endCol: endRef.col }),
+    });
+    index += match[0].length;
+  }
+  return references;
+}
+
+function transformStructuralIndex(value, { index, insertCount = 0, deleteCount = 0 }) {
+  if (insertCount) return value >= index ? value + insertCount : value;
+  const end = index + deleteCount - 1;
+  if (value < index) return value;
+  if (value > end) return value - deleteCount;
+  return null;
+}
+
+function transformStructuralSpan(start, end, change) {
+  const ascending = start <= end;
+  let low = Math.min(start, end);
+  let high = Math.max(start, end);
+  if (change.insertCount) {
+    if (change.index <= low) { low += change.insertCount; high += change.insertCount; }
+    else if (change.index <= high || change.index === high + 1 && change.formulaIndex === change.index) high += change.insertCount;
+  } else {
+    const deletedEnd = change.index + change.deleteCount - 1;
+    if (high < change.index) { /* unchanged */ }
+    else if (low > deletedEnd) { low -= change.deleteCount; high -= change.deleteCount; }
+    else if (low >= change.index && high <= deletedEnd) return null;
+    else {
+      const originalLow = low; const originalHigh = high;
+      low = originalLow < change.index ? originalLow : change.index;
+      high = originalHigh > deletedEnd ? originalHigh - change.deleteCount : change.index - 1;
+    }
+  }
+  return ascending ? [low, high] : [high, low];
+}
+
+export function rewriteFormulaForStructure(raw, { axis, index, insertCount = 0, deleteCount = 0, formulaRow = null, formulaCol = null }) {
+  if (!['row', 'col'].includes(axis) || (!insertCount && !deleteCount)) return raw;
+  const tokens = formulaReferences(raw);
+  if (!tokens.length) return raw;
+  let output = ""; let cursor = 0;
+  for (const token of tokens) {
+    output += raw.slice(cursor, token.startIndex);
+    if (token.text.includes(":")) {
+      const startValue = axis === "row" ? token.startRef.row : token.startRef.col;
+      const endValue = axis === "row" ? token.endRef.row : token.endRef.col;
+      const span = transformStructuralSpan(startValue, endValue, { index, insertCount, deleteCount, formulaIndex: axis === "row" ? formulaRow : formulaCol });
+      if (!span) output += "#REF!";
+      else {
+        const startRow = axis === "row" ? span[0] : token.startRef.row;
+        const startCol = axis === "col" ? span[0] : token.startRef.col;
+        const endRow = axis === "row" ? span[1] : token.endRef.row;
+        const endCol = axis === "col" ? span[1] : token.endRef.col;
+        output += `${formatCellReference(token.startRef, startRow, startCol)}:${formatCellReference(token.endRef, endRow, endCol)}`;
+      }
+    } else {
+      const value = axis === "row" ? token.startRef.row : token.startRef.col;
+      const next = transformStructuralIndex(value, { index, insertCount, deleteCount });
+      if (next == null) output += "#REF!";
+      else output += formatCellReference(token.startRef, axis === "row" ? next : token.startRef.row, axis === "col" ? next : token.startRef.col);
+    }
+    cursor = token.endIndex;
+  }
+  return output + raw.slice(cursor);
 }
 
 export function normalizeRange(range) {
@@ -347,6 +438,7 @@ export class FormulaEngine {
     if (this.stack.has(key)) return "#CYCLE!";
     const raw = this.model.getRaw(row, col);
     if (typeof raw !== "string" || !raw.startsWith("=") || raw.startsWith("==")) return raw;
+    if (raw.includes("#REF!")) return "#REF!";
     this.stack.add(key);
     let result;
     try {
@@ -575,6 +667,13 @@ export class GridModel {
     this.rows[row][col].raw = String(raw ?? "");
   }
 
+  rewriteStructuralFormulas(change) {
+    for (let row = 0; row < this.rowCount; row += 1) for (let col = 0; col < this.colCount; col += 1) {
+      const cell = this.rows[row][col];
+      if (cell.raw.startsWith("=") && !cell.raw.startsWith("==")) cell.raw = rewriteFormulaForStructure(cell.raw, { ...change, formulaRow: row, formulaCol: col });
+    }
+  }
+
   merge(range) {
     const value = normalizeRange(range);
     if (!this.inBounds(value.startRow, value.startCol) || !this.inBounds(value.endRow, value.endCol)) throw new GridError("OUT_OF_BOUNDS", "Merge range is outside the grid");
@@ -636,6 +735,7 @@ export class GridModel {
   insertRows(index, count = 1) {
     const at = clamp(index, 0, this.rowCount);
     const additions = Array.from({ length: count }, () => normalizeCells([[]], this.colCount)[0]);
+    this.rewriteStructuralFormulas({ axis: "row", index: at, insertCount: count });
     this.rows.splice(at, 0, ...additions);
     for (const merge of this.merges) {
       if (at <= merge.row) merge.row += count;
@@ -651,6 +751,7 @@ export class GridModel {
     const removedRowKeys = removedRows.map((row) => row[0]?.uid).filter(Boolean);
     const removedCellKeys = removedRows.flat().map((cell) => cell.uid);
     this.rows.splice(start, end - start + 1);
+    this.rewriteStructuralFormulas({ axis: "row", index: start, deleteCount: end - start + 1 });
     for (const key of removedRowKeys) delete this.rowHeights[key];
     this.headerRows = this.headerRows.filter((key) => !removedRowKeys.includes(key));
     for (const key of removedCellKeys) delete this.alignments[key];
@@ -675,6 +776,7 @@ export class GridModel {
   insertCols(index, count = 1) {
     const at = clamp(index, 0, this.colCount);
     const ids = Array.from({ length: count }, makeLocalUid);
+    this.rewriteStructuralFormulas({ axis: "col", index: at, insertCount: count });
     this.columnIds.splice(at, 0, ...ids);
     for (const row of this.rows) row.splice(at, 0, ...Array.from({ length: count }, () => ({ uid: makeLocalUid(), raw: "" })));
     for (const merge of this.merges) {
@@ -703,6 +805,7 @@ export class GridModel {
     this.headerColumns = this.headerColumns.filter((id) => !removedIds.includes(id));
     for (const key of removedCellKeys) delete this.alignments[key];
     for (const row of this.rows) row.splice(start, removed);
+    this.rewriteStructuralFormulas({ axis: "col", index: start, deleteCount: removed });
     const next = [];
     for (const merge of this.merges) {
       const oldStart = merge.col;
@@ -1902,6 +2005,8 @@ export class GridView {
     this.rowResizePreview = null;
     this.columnResizePreview = null;
     this.resizeCleanup = null;
+    this.formulaEdit = null;
+    this.formulaPopover = null;
     this.boundPaste = (event) => this.onPaste(event);
     this.boundKeydown = (event) => this.onKeydown(event);
     this.keyboardActive = false;
@@ -2131,6 +2236,8 @@ export class GridView {
     this.renderCellValue(cell, row, col, engine);
     cell.addEventListener("pointerdown", (event) => {
       if (event.button !== 0) return;
+      if (event.target.closest?.(".rg-editor")) return;
+      if (this.insertFormulaReference(row, col, event)) return;
       const rect = cell.getBoundingClientRect();
       const nearRightEdge = event.clientX >= rect.right - 12 && event.clientX <= rect.right + 1;
       const nearBottomEdge = event.clientY >= rect.bottom - 10 && event.clientY <= rect.bottom + 1;
@@ -2273,7 +2380,79 @@ export class GridView {
     this.selection = targetRange;
   }
 
+  clearFormulaEditPresentation() {
+    this.root.classList.remove("rg-root--formula-editing");
+    for (const cell of this.root.querySelectorAll(".rg-cell--formula-reference")) {
+      cell.classList.remove("rg-cell--formula-reference");
+      cell.style.removeProperty("--rg-reference-color");
+      delete cell.dataset.rgFormulaReference;
+    }
+    this.formulaPopover?.remove(); this.formulaPopover = null;
+  }
+
+  positionFormulaPopover(state = this.formulaEdit) {
+    if (!state || !this.formulaPopover?.isConnected || !state.cell.isConnected) return;
+    const rect = state.cell.getBoundingClientRect();
+    const viewportWidth = globalThis.innerWidth || document.documentElement.clientWidth || 1200;
+    const width = clamp(Math.max(rect.width, 330), 280, Math.min(640, viewportWidth - 16));
+    this.formulaPopover.style.width = `${width}px`;
+    const height = this.formulaPopover.getBoundingClientRect().height;
+    this.formulaPopover.style.left = `${clamp(rect.left, 8, Math.max(8, viewportWidth - width - 8))}px`;
+    this.formulaPopover.style.top = `${rect.top - height - 7 >= 8 ? rect.top - height - 7 : rect.bottom + 7}px`;
+  }
+
+  updateFormulaEditPresentation() {
+    const state = this.formulaEdit;
+    this.clearFormulaEditPresentation();
+    if (!state || !state.editor.value.startsWith("=") || state.editor.value.startsWith("==")) return;
+    this.root.classList.add("rg-root--formula-editing");
+    const raw = state.editor.value;
+    const references = formulaReferences(raw);
+    const colorByReference = new Map();
+    for (const reference of references) {
+      const key = reference.text.toUpperCase();
+      if (!colorByReference.has(key)) colorByReference.set(key, FORMULA_REFERENCE_COLORS[colorByReference.size % FORMULA_REFERENCE_COLORS.length]);
+      const color = colorByReference.get(key);
+      for (let row = Math.max(0, reference.range.startRow); row <= Math.min(this.model.rowCount - 1, reference.range.endRow); row += 1) {
+        for (let col = Math.max(0, reference.range.startCol); col <= Math.min(this.model.colCount - 1, reference.range.endCol); col += 1) {
+          const merge = this.model.mergeAt(row, col);
+          const cell = this.cells.get(`${merge?.row ?? row}:${merge?.col ?? col}`);
+          if (!cell || cell.dataset.rgFormulaReference) continue;
+          cell.dataset.rgFormulaReference = key;
+          cell.style.setProperty("--rg-reference-color", color);
+          cell.classList.add("rg-cell--formula-reference");
+        }
+      }
+    }
+    const popover = document.createElement("div"); popover.className = "rg-formula-popover"; popover.setAttribute("role", "status"); popover.setAttribute("aria-live", "polite");
+    const address = document.createElement("span"); address.className = "rg-formula-address"; address.textContent = `fx  ${cellLabel(state.row, state.col)}`;
+    const expression = document.createElement("code"); expression.className = "rg-formula-expression";
+    let cursor = 0;
+    for (const reference of references) {
+      expression.append(document.createTextNode(raw.slice(cursor, reference.startIndex)));
+      const token = document.createElement("span"); token.className = "rg-formula-token"; token.textContent = raw.slice(reference.startIndex, reference.endIndex); token.style.color = colorByReference.get(reference.text.toUpperCase());
+      expression.appendChild(token); cursor = reference.endIndex;
+    }
+    expression.append(document.createTextNode(raw.slice(cursor)));
+    popover.append(address, expression); document.body.appendChild(popover); this.formulaPopover = popover;
+    this.positionFormulaPopover(state);
+  }
+
+  insertFormulaReference(row, col, event) {
+    const state = this.formulaEdit;
+    if (!state || state.finished || !state.editor.value.startsWith("=") || state.editor.value.startsWith("==")) return false;
+    event.preventDefault(); event.stopPropagation();
+    const merge = this.model.mergeAt(row, col); row = merge?.row ?? row; col = merge?.col ?? col;
+    const editor = state.editor; const start = editor.selectionStart ?? editor.value.length; const end = editor.selectionEnd ?? start;
+    const prefix = editor.value.slice(0, start);
+    const reference = `${event.shiftKey && /\$?[A-Z]+\$?\d+$/i.test(prefix) ? ":" : ""}${cellLabel(row, col)}`;
+    editor.setRangeText(reference, start, end, "end"); editor.focus({ preventScroll: true });
+    this.updateFormulaEditPresentation();
+    return true;
+  }
+
   beginEdit(row, col, initial = null) {
+    if (this.formulaEdit?.finish) this.formulaEdit.finish(false);
     const merge = this.model.mergeAt(row, col); row = merge?.row ?? row; col = merge?.col ?? col;
     const cell = this.cells.get(`${row}:${col}`); if (!cell) return;
     const raw = initial == null ? this.model.getRaw(row, col) : initial;
@@ -2289,23 +2468,35 @@ export class GridView {
     }
     if (!editor) editor = document.createElement("textarea");
     editor.classList.add("rg-editor"); editor.value = raw;
-    cell.replaceChildren(editor); editor.focus(); if (initial == null) editor.select();
+    cell.replaceChildren(editor); editor.focus();
+    if (raw.startsWith("=") && !raw.startsWith("==")) editor.setSelectionRange(raw.length, raw.length); else if (initial == null) editor.select();
     let finished = false;
+    const state = { editor, cell, row, col, finished: false, finish: null, reposition: null };
+    this.formulaEdit = state;
     const finish = (commit, movement = null) => {
-      if (finished) return; finished = true;
+      if (finished) return; finished = true; state.finished = true;
       const value = editor.value;
+      globalThis.window.removeEventListener("resize", state.reposition);
+      this.root.querySelector(".rg-viewport")?.removeEventListener("scroll", state.reposition);
+      this.clearFormulaEditPresentation();
+      if (this.formulaEdit === state) this.formulaEdit = null;
       if (commit && value !== this.model.getRaw(row, col)) this.commitMutation("Edit cell", () => this.model.setRaw(row, col, value), false);
       else this.renderCellValue(cell, row, col);
       if (movement) this.moveSelection(...movement);
       this.root.focus({ preventScroll: true });
     };
+    state.finish = finish; state.reposition = () => this.positionFormulaPopover(state);
+    globalThis.window.addEventListener("resize", state.reposition);
+    this.root.querySelector(".rg-viewport")?.addEventListener("scroll", state.reposition);
+    this.updateFormulaEditPresentation();
     editor.addEventListener("keydown", (event) => {
       event.stopPropagation();
       if (event.key === "Escape") { event.preventDefault(); finish(false); }
       else if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); finish(true, [1, 0]); }
       else if (event.key === "Tab") { event.preventDefault(); finish(true, [0, event.shiftKey ? -1 : 1]); }
     });
-    for (const type of ["keyup", "keypress", "beforeinput", "input"]) editor.addEventListener(type, (event) => event.stopPropagation());
+    for (const type of ["keyup", "keypress", "beforeinput"]) editor.addEventListener(type, (event) => event.stopPropagation());
+    editor.addEventListener("input", (event) => { event.stopPropagation(); this.updateFormulaEditPresentation(); });
     editor.addEventListener("blur", () => finish(true));
   }
 
@@ -2647,6 +2838,7 @@ export class GridView {
 
   dispose() {
     this.disposed = true; clearTimeout(this.saveTimer); this.resizeCleanup?.(); this.adapter.dispose?.();
+    this.formulaEdit?.finish?.(false); this.clearFormulaEditPresentation();
     globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true);
     document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true);
     document.removeEventListener("pointerup", this.boundPointerUp, true); this.root.remove(); this.nativeElement?.classList.remove("rg-native-hidden");
@@ -2658,6 +2850,7 @@ class AsyncFormulaEngine {
   async evaluateCell(row, col) {
     const key = `${row}:${col}`; if (this.cache.has(key)) return this.cache.get(key); if (this.stack.has(key)) return "#CYCLE!";
     const raw = await this.store.getRaw(row, col); if (typeof raw !== "string" || !raw.startsWith("=") || raw.startsWith("==")) return raw;
+    if (raw.includes("#REF!")) return "#REF!";
     this.stack.add(key); let result;
     try { result = await this.evaluateNode(new FormulaParser(raw.slice(1)).parse()); }
     catch (error) { result = error?.code === "FORMULA_NAME" ? "#NAME?" : error?.code === "FORMULA_REF" ? "#REF!" : "#VALUE!"; }

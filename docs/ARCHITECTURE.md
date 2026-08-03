@@ -21,6 +21,13 @@ cell UIDs when reconciling structure, reloads after success, and rolls back then
 repulls after failure. Pull watches surface external edits without silently
 overwriting them.
 
+Formula reference transforms run inside the same model transaction as row and
+column insertion/deletion. Structural shifts apply to relative and absolute A1
+references alike; partial range deletion produces the contiguous surviving
+range, while a fully removed reference becomes explicit `#REF!`. Formula edit
+highlighting is presentation-only and never writes derived color state into
+Roam blocks or metadata.
+
 ## Merge contract
 
 A merge is a rectangle with one top-left anchor. Every covered raw cell must be
