@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.1
+
+- Suppressed late structural pull-watch echoes only when the full Roam
+  UID/order/content tree exactly matches the already-committed local model.
+  Row deletion therefore keeps its keyed DOM update and undo history instead
+  of being followed by a redundant full repaint. Divergent external edits
+  still take the conflict-and-repull path.
+
 ## 0.5.0
 
 - Made plain-value commits visible synchronously in stable cell-content nodes,

@@ -1,4 +1,4 @@
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -1523,6 +1523,21 @@ function treeFingerprint(tree) {
   return JSON.stringify(visit(tree));
 }
 
+// Unlike the native table signature, this intentionally includes every branch
+// and numeric order.  Pull watches can arrive after a structural transaction
+// settles, so this lets us recognize only the exact committed graph state we
+// wrote, without deriving that expectation from a subsequently-mutated model.
+function structuralEchoFingerprint(tree) {
+  const visit = (node) => [
+    String(node.uid ?? ""),
+    String(node.string ?? ""),
+    Number.isFinite(Number(node.order)) ? Number(node.order) : 0,
+    (node.children || []).map(visit),
+  ];
+  const normalized = normalizeTree(tree);
+  return normalized ? JSON.stringify(visit(normalized)) : null;
+}
+
 function tableCells(tree) {
   const rows = [];
   for (const rowNode of ordered(tree?.children || [])) {
@@ -1811,6 +1826,7 @@ export class NativeTableAdapter {
     this.selfWrites = new Map();
     this.structuralSaving = false;
     this.deferredStructuralWatches = [];
+    this.expectedStructuralTransitions = [];
     this.watchCallback = null;
   }
 
@@ -1876,6 +1892,32 @@ export class NativeTableAdapter {
     return true;
   }
 
+  pruneExpectedStructuralTransitions(now = Date.now()) {
+    this.expectedStructuralTransitions = this.expectedStructuralTransitions.filter((item) => item.expires > now);
+  }
+
+  recordExpectedStructuralTransition(beforeTree, afterTree, verifiedIntermediateTrees = []) {
+    const afterFingerprint = structuralEchoFingerprint(afterTree);
+    if (!afterFingerprint) return;
+    const now = Date.now(); this.pruneExpectedStructuralTransitions(now);
+    const beforeFingerprints = new Set([beforeTree, ...verifiedIntermediateTrees].map(structuralEchoFingerprint).filter(Boolean));
+    for (const beforeFingerprint of beforeFingerprints) {
+      if (this.expectedStructuralTransitions.some((item) => item.beforeFingerprint === beforeFingerprint && item.afterFingerprint === afterFingerprint)) continue;
+      this.expectedStructuralTransitions.push({ beforeFingerprint, afterFingerprint, expires: now + 10_000 });
+    }
+    if (this.expectedStructuralTransitions.length > 8) this.expectedStructuralTransitions.splice(0, this.expectedStructuralTransitions.length - 8);
+  }
+
+  consumeExpectedStructuralTransition(beforeTree, afterTree) {
+    const beforeFingerprint = structuralEchoFingerprint(beforeTree); const afterFingerprint = structuralEchoFingerprint(afterTree);
+    if (!beforeFingerprint || !afterFingerprint) return false;
+    this.pruneExpectedStructuralTransitions();
+    const index = this.expectedStructuralTransitions.findIndex((item) => item.beforeFingerprint === beforeFingerprint && item.afterFingerprint === afterFingerprint);
+    if (index < 0) return false;
+    this.expectedStructuralTransitions.splice(index, 1);
+    return true;
+  }
+
   watchExternal(callback) {
     this.watchCallback = callback;
     const pattern = "[:block/uid :block/string :block/order :edit/time {:block/children ...}]";
@@ -1895,6 +1937,12 @@ export class NativeTableAdapter {
       }
       const externalChanges = changes.filter((change) => !this.consumeSelfWrite(change.uid, change.from, change.raw));
       this.lastWatchTree = deepClone(nextTree);
+      // Roam may deliver a structural pull-watch after our save promise has
+      // resolved. Consume only the exact, short-lived before→after transition
+      // captured from the verified commit; never infer an echo from the mutable
+      // live model, which may already contain a newer local edit.
+      if (structural && this.consumeExpectedStructuralTransition(previousTree, nextTree)) return;
+      if (structural) this.expectedStructuralTransitions.length = 0;
       if (!structural && !externalChanges.length) return;
       const model = nativeTreeToModel(nextTree, this.metadataStore.get(this.tableUid) || {});
       callback(model, { type: structural ? "structural" : "content", structural, changes: externalChanges, tree: nextTree });
@@ -1996,6 +2044,7 @@ export class NativeTableAdapter {
         const reloaded = this.load();
         const watched = this.deferredStructuralWatches.slice();
         const conflict = !nativeTreeMatchesModel(this.baseTree, model) || deferredStructuralConflict(currentTree, model, watched);
+        if (!conflict) this.recordExpectedStructuralTransition(currentTree, this.baseTree, watched);
         if (conflict && this.watchCallback) {
           const tree = deepClone(this.baseTree); const callback = this.watchCallback;
           setTimeout(() => callback(reloaded, { type: "structural", structural: true, conflict: true, changes: [], tree }), 0);
@@ -2132,7 +2181,7 @@ export class NativeTableAdapter {
     }
   }
 
-  dispose() { this.watchCallback = null; this.deferredStructuralWatches.length = 0; this.selfWrites.clear(); return this.watch?.(); }
+  dispose() { this.watchCallback = null; this.deferredStructuralWatches.length = 0; this.expectedStructuralTransitions.length = 0; this.selfWrites.clear(); return this.watch?.(); }
 }
 
 function extractUrl(value) {

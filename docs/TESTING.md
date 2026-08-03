@@ -44,7 +44,7 @@ opted in or changed.
 
 Current release acceptance:
 
-- 107 automated tests pass in the v0.5 release run. They exercise model,
+- 111 automated tests pass in the v0.5 release run. They exercise model,
   adapter, persistence, editor, DOM, and rendering behavior without claiming
   browser-frame performance.
 - The existing host-neutral Thymer Grid baseline remains green at 343/343; the

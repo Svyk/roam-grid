@@ -246,6 +246,88 @@ test("own structural reorder intermediates are accepted but unexpected deferred 
   assert.equal(deferredStructuralConflict(base, desired, [empty, unexpected, final]), true);
 });
 
+test("a delayed committed structural echo keeps a newer local edit, DOM, and undo stack", async (t) => {
+  const before = makeTree(3, 2); const original = clone(before); const { calls, emit } = installApi(t, before); const staging = { uid: "staging01", children: [] };
+  installStagingBehavior(before, calls, staging);
+  const store = { get: () => null, set: async () => {}, createStaging: async () => staging.uid };
+  const adapter = new NativeTableAdapter(before.uid, store); const model = adapter.load();
+  model.transact("delete row", () => model.deleteRows(1, 1));
+  await adapter.save(model, { saveMetadata: false });
+  assert.equal(adapter.expectedStructuralTransitions.length, 1, "verified save captures one expected committed transition");
+  adapter.model = model; // GridView retains this local instance after flushSave.
+  const surviving = model.getCell(0, 0); model.transact("newer local edit", () => model.setRaw(0, 0, "newer-local"));
+  const undoDepth = model.undoStack.length; let renders = 0; let replacements = 0;
+  const view = {
+    model,
+    adapter: { acceptExternalTree: () => { replacements += 1; } },
+    dirtyCells: new Map([[surviving.uid, { uid: surviving.uid, baseRaw: "0:0", raw: "newer-local", revision: 1 }]]), structuralPending: false, contentSavePromise: null, metadataDirty: false, saveTimer: null,
+    changeVersion: 1, savedVersion: 0, cellCoordinatesByUid: new Map(), refreshValues() {}, render() { renders += 1; },
+  };
+  adapter.watchExternal((external, event) => {
+    replacements += 1;
+    GridView.prototype.handleExternalChange.call(view, external, event);
+  });
+
+  emit(original, before);
+
+  assert.equal(replacements, 0, "matching self echo never reaches the view");
+  assert.equal(renders, 0, "matching self echo does not repaint the grid");
+  assert.strictEqual(view.model, model, "the live model object is retained");
+  assert.equal(model.getRaw(0, 0), "newer-local", "the post-save local edit survives");
+  assert.equal(view.dirtyCells.get(surviving.uid).raw, "newer-local", "the pending local persistence entry survives");
+  assert.equal(model.undoStack.length, undoDepth, "local structural undo remains available");
+  assert.equal(model.undo(), true);
+  assert.equal(model.getRaw(0, 0), "0:0");
+  assert.equal(model.undo(), true); assert.equal(model.rowCount, 3);
+});
+
+test("a structural echo fingerprint rejects sibling, order, and content divergence", (t) => {
+  const before = makeTree(3, 2); const expected = clone(before); expected.children.splice(1, 1);
+  const { emit } = installApi(t, before); const adapter = new NativeTableAdapter(before.uid, metadata()); const model = adapter.load();
+  model.transact("delete row", () => model.deleteRows(1, 1));
+  const events = []; adapter.watchExternal((_external, event) => events.push(event));
+  const sibling = clone(expected); sibling.children[0].children.push({ uid: "side00001", string: "side branch", order: 1, children: [] });
+  const reordered = clone(expected); reordered.children[1].order = 77;
+  const changed = clone(expected); changed.children[0].children[0].string = "outside";
+
+  for (const divergent of [sibling, reordered, changed]) {
+    adapter.recordExpectedStructuralTransition(before, expected);
+    emit(before, divergent);
+  }
+
+  assert.equal(events.length, 3, "no divergent full tree is consumed as our echo");
+  assert.ok(events.every((event) => event.structural));
+  assert.equal(adapter.expectedStructuralTransitions.length, 0, "a genuine structural divergence clears stale transitions");
+});
+
+test("a genuine structural transition clears a stale echo before an external undo", (t) => {
+  const f0 = makeTree(3, 2); const f1 = clone(f0); f1.children.splice(1, 1);
+  const f2 = clone(f1); f2.children.push({ uid: "external01", string: "external row", order: 2, children: [{ uid: "external02", string: "external cell", order: 0, children: [] }] });
+  const { emit } = installApi(t, f0); const adapter = new NativeTableAdapter(f0.uid, metadata()); adapter.load();
+  const events = []; adapter.watchExternal((_external, event) => events.push(event));
+  adapter.recordExpectedStructuralTransition(f0, f1);
+
+  emit(f1, f2); // Real external F1→F2 is not our F0→F1 transition.
+  assert.equal(events.length, 1); assert.equal(adapter.expectedStructuralTransitions.length, 0);
+  emit(f2, f1); // An external undo must not consume the now-stale F0→F1 token.
+
+  assert.equal(events.length, 2);
+  assert.ok(events.every((event) => event.structural));
+});
+
+test("verified local structural intermediates may transition to the committed final tree", (t) => {
+  const f0 = makeTree(3, 2); const intermediate = clone(f0); intermediate.children.splice(2, 1);
+  const f1 = clone(intermediate); f1.children.splice(1, 1);
+  const { emit } = installApi(t, f0); const adapter = new NativeTableAdapter(f0.uid, metadata()); adapter.load();
+  let callbacks = 0; adapter.watchExternal(() => { callbacks += 1; });
+  adapter.recordExpectedStructuralTransition(f0, f1, [intermediate]);
+
+  emit(intermediate, f1);
+
+  assert.equal(callbacks, 0, "a verified local intermediate→final callback is consumed");
+  assert.equal(adapter.expectedStructuralTransitions.length, 1, "only the matching intermediate transition was consumed");
+});
+
 test("an unexpected deferred structural-window edit is surfaced after the verified reload", async (t) => {
   const tree = makeTree(); const harness = installApi(t, tree); const events = [];
   const store = {
