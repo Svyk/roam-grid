@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { FormulaEngine, GridEditorController, GridModel, GridView, paintRichCellContent, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents } from "../src/extension.js";
+import { FormulaEngine, GridEditorController, GridModel, GridView, paintRichCellContent, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, syncPortalThemeFromRoot } from "../src/extension.js";
 
 class MiniClassList {
   constructor() { this.values = new Set(); }
@@ -16,8 +16,9 @@ class MiniClassList {
 }
 
 class MiniStyle {
-  constructor() { this.values = new Map(); }
-  setProperty(name, value) { this.values.set(name, String(value)); }
+  constructor() { this.values = new Map(); this.writeCount = 0; }
+  setProperty(name, value) { this.values.set(name, String(value)); this.writeCount += 1; }
+  getPropertyValue(name) { return this.values.get(name) || ""; }
   removeProperty(name) { this.values.delete(name); }
 }
 
@@ -32,12 +33,14 @@ class MiniNode {
   set textContent(value) { this._text = String(value ?? ""); this.children = []; }
   get textContent() { return this.children.length ? this.children.map((child) => child.textContent).join("") : this._text; }
   get childNodes() { return this.children; }
+  get parentElement() { return this.parentNode?.tagName === "#TEXT" ? null : this.parentNode; }
   append(...nodes) { nodes.forEach((node) => this.appendChild(typeof node === "string" ? new MiniNode("#text", node) : node)); }
   appendChild(node) { if (node.parentNode) node.remove(); node.parentNode = this; this.children.push(node); return node; }
   replaceChildren(...nodes) { this.children.forEach((node) => { node.parentNode = null; }); this.children = []; this.append(...nodes); }
   remove() { if (!this.parentNode) return; this.parentNode.children = this.parentNode.children.filter((node) => node !== this); this.parentNode = null; }
   contains(node) { for (let current = node; current; current = current.parentNode) if (current === this) return true; return false; }
-  matches(selector) { return selector.startsWith(".") && this.classList.contains(selector.slice(1)); }
+  matches(selector) { return String(selector).split(",").some((part) => { const value = part.trim(); return value.startsWith(".") && this.classList.contains(value.slice(1)); }); }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
   querySelectorAll(selector) {
     const found = [];
     for (const child of this.children) { if (child.matches?.(selector)) found.push(child); found.push(...child.querySelectorAll(selector)); }
@@ -51,6 +54,8 @@ class MiniNode {
     return event;
   }
   setAttribute(name, value) { this[name] = String(value); }
+  getAttribute(name) { return this[name] == null ? null : String(this[name]); }
+  removeAttribute(name) { delete this[name]; }
   focus() { globalThis.document.activeElement = this; }
   setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; }
   setRangeText(text, start, end, mode) {
@@ -62,20 +67,24 @@ class MiniNode {
   get isConnected() { for (let current = this; current; current = current.parentNode) if (current === globalThis.document?.body) return true; return false; }
 }
 
-function installMiniDom() {
+function installMiniDom({ getStyle = null, MutationObserverClass = null, matchMedia = null } = {}) {
   const body = new MiniNode("body");
   const documentElement = { clientWidth: 1024 };
-  globalThis.document = { body, documentElement, activeElement: null, createElement: (name) => new MiniNode(name), createTextNode: (text) => new MiniNode("#text", text) };
+  globalThis.document = { body, documentElement, activeElement: null, createElement: (name) => new MiniNode(name), createTextNode: (text) => new MiniNode("#text", text), querySelector: (selector) => body.querySelector(selector) };
   globalThis.innerWidth = 1024;
   globalThis.window = { addEventListener() {}, removeEventListener() {}, dispatchEvent() {} };
+  if (getStyle) globalThis.getComputedStyle = getStyle; else delete globalThis.getComputedStyle;
+  if (MutationObserverClass) globalThis.MutationObserver = MutationObserverClass; else delete globalThis.MutationObserver;
+  if (matchMedia) globalThis.matchMedia = matchMedia; else delete globalThis.matchMedia;
   const frames = [];
   globalThis.requestAnimationFrame = (callback) => { frames.push(callback); return frames.length; };
+  globalThis.cancelAnimationFrame = () => {};
   return { body, flush: () => { while (frames.length) frames.shift()(); } };
 }
 
-function makeController(options = {}) {
-  const dom = installMiniDom();
-  const root = new MiniNode("section"); dom.body.appendChild(root);
+function makeController(options = {}, domOptions = {}) {
+  const dom = installMiniDom(domOptions);
+  const root = new MiniNode("section"); root.className = "rg-root"; dom.body.appendChild(root);
   const cells = new Map();
   for (let row = 0; row < 3; row += 1) for (let col = 0; col < 3; col += 1) {
     const cell = new MiniNode("div"); cell.dataset.row = String(row); cell.dataset.col = String(col); root.appendChild(cell); cells.set(`${row}:${col}`, cell);
@@ -102,8 +111,118 @@ test("F2-style floating editing owns one body textarea and focuses at caret end"
   assert.equal(editor.selectionStart, 5);
   assert.equal(editor.selectionEnd, 5);
   assert.equal(controller.popover.hidden, false);
+  assert.equal(controller.address.textContent, "A1");
+  assert.equal(controller.suggestionList.hidden, true);
+  assert.equal(editor.getAttribute("aria-expanded"), "false");
   await controller.finish(false);
   controller.dispose();
+});
+
+test("ordinary inline text has no assistant while inline formulas show fx and function help", async () => {
+  const { controller, cells, flush } = makeController();
+  let editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "ordinary text", floating: false });
+  flush();
+  assert.equal(controller.popover.hidden, true);
+  assert.equal(controller.popover.getAttribute("aria-hidden"), "true");
+  assert.equal(controller.address.textContent, "A1");
+  await controller.finish(false);
+
+  editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "=SU", floating: false });
+  flush();
+  assert.equal(controller.popover.hidden, false);
+  assert.equal(controller.address.textContent, "fx  A1");
+  assert.equal(controller.popover.dataset.mode, "formula");
+  assert.equal(controller.suggestionList.hidden, false);
+  assert.equal(controller.suggestionList.getAttribute("role"), "listbox");
+  assert.equal(editor.getAttribute("aria-expanded"), "true");
+  assert.equal(controller.suggestionList.children[0].getAttribute("role"), "option");
+  assert.equal(controller.suggestionList.children[0].getAttribute("aria-selected"), "true");
+  assert.equal(editor.getAttribute("aria-activedescendant"), controller.suggestionList.children[0].id);
+  controller.dispose();
+});
+
+test("portal palette copies resolved grid colors and skips unchanged writes", () => {
+  const { body } = installMiniDom();
+  const root = new MiniNode("section"); root.className = "rg-root";
+  const header = new MiniNode("div"); header.className = "rg-header";
+  const status = new MiniNode("div"); status.className = "rg-status";
+  root.append(header, status); body.appendChild(root);
+  const portal = new MiniNode("div"); body.appendChild(portal);
+  const style = (values) => ({ getPropertyValue: (name) => values[name] || "" });
+  const getStyle = (element) => element === root ? style({
+    "background-color": "rgb(31, 43, 52)", color: "rgb(245, 248, 250)", "border-top-color": "rgb(91, 103, 112)",
+    "--rg-active": "rgb(72, 175, 240)", "--rg-success": "rgb(15, 153, 96)", "--rg-warning": "rgb(217, 130, 43)", "--rg-danger": "rgb(219, 55, 55)",
+  }) : element === header ? style({ "background-color": "rgb(48, 64, 77)" }) : style({ color: "rgb(171, 179, 191)" });
+  const first = syncPortalThemeFromRoot(root, portal, getStyle);
+  assert.equal(first.changed, true);
+  assert.equal(portal.style.getPropertyValue("--rg-portal-bg"), "rgb(31, 43, 52)");
+  assert.equal(portal.style.getPropertyValue("--rg-portal-color"), "rgb(245, 248, 250)");
+  assert.equal(portal.style.getPropertyValue("--rg-portal-border"), "rgb(91, 103, 112)");
+  assert.equal(portal.style.getPropertyValue("--rg-portal-header"), "rgb(48, 64, 77)");
+  assert.equal(portal.style.getPropertyValue("--rg-portal-status"), "rgb(171, 179, 191)");
+  assert.equal(portal.classList.contains("rg-portal"), true);
+  const writes = portal.style.writeCount;
+  assert.equal(syncPortalThemeFromRoot(root, portal, getStyle).changed, false);
+  assert.equal(portal.style.writeCount, writes);
+});
+
+test("no-owner portals leave inline palette unset so Blueprint dark CSS remains authoritative", async () => {
+  const { body } = installMiniDom(); body.className = "bp3-dark";
+  const portal = new MiniNode("div"); body.appendChild(portal);
+  let computedReads = 0;
+  const result = syncPortalThemeFromRoot(null, portal, () => { computedReads += 1; return {}; });
+  assert.deepEqual(result.values, {});
+  assert.equal(result.changed, false);
+  assert.equal(computedReads, 0);
+  assert.equal(portal.classList.contains("rg-portal"), true);
+  assert.equal(portal.style.getPropertyValue("--rg-portal-bg"), "");
+  const css = await readFile(new URL("../extension.css", import.meta.url), "utf8");
+  assert.match(css, /body\.bp3-dark \.rg-portal/);
+  assert.match(css, /body\.rm-dark-theme \.rg-portal/);
+});
+
+test("persistent editor resyncs on host and OS theme changes, not input, and disposes listeners", async () => {
+  const observers = [];
+  class FakeMutationObserver {
+    constructor(callback) { this.callback = callback; this.disconnected = false; this.observed = []; observers.push(this); }
+    observe(node, options) { this.observed.push({ node, options }); }
+    disconnect() { this.disconnected = true; }
+  }
+  const schemeListeners = new Set(); let removedSchemeListeners = 0;
+  const colorSchemeQuery = {
+    addEventListener(type, listener) { if (type === "change") schemeListeners.add(listener); },
+    removeEventListener(type, listener) { if (type === "change" && schemeListeners.delete(listener)) removedSchemeListeners += 1; },
+  };
+  const matchMedia = (query) => { assert.equal(query, "(prefers-color-scheme: dark)"); return colorSchemeQuery; };
+  let dark = false; let computedReads = 0;
+  const getStyle = () => {
+    computedReads += 1;
+    const values = dark
+      ? { "background-color": "rgb(31, 43, 52)", color: "rgb(245, 248, 250)", "border-top-color": "rgb(91, 103, 112)" }
+      : { "background-color": "rgb(255, 255, 255)", color: "rgb(24, 32, 38)", "border-top-color": "rgb(197, 203, 211)" };
+    return { getPropertyValue: (name) => values[name] || "" };
+  };
+  const { controller, cells, flush } = makeController({}, { getStyle, MutationObserverClass: FakeMutationObserver, matchMedia });
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "plain", floating: true });
+  flush();
+  const readsAfterStart = computedReads;
+  editor.value = "plain typing"; editor.dispatch("input"); flush();
+  assert.equal(computedReads, readsAfterStart, "typing does not re-read computed theme styles");
+  dark = true; observers[0].callback([{ type: "attributes", attributeName: "class" }]); flush();
+  assert.ok(computedReads > readsAfterStart);
+  assert.equal(controller.popover.style.getPropertyValue("--rg-portal-bg"), "rgb(31, 43, 52)");
+  const schemeCallback = [...schemeListeners][0]; assert.equal(typeof schemeCallback, "function");
+  const readsBeforeSchemeChange = computedReads;
+  dark = false; schemeCallback({ matches: false }); flush();
+  assert.ok(computedReads > readsBeforeSchemeChange);
+  assert.equal(controller.popover.style.getPropertyValue("--rg-portal-bg"), "rgb(255, 255, 255)");
+  controller.dispose();
+  assert.equal(observers[0].disconnected, true);
+  assert.equal(removedSchemeListeners, 1); assert.equal(schemeListeners.size, 0);
+  const readsAfterDispose = computedReads;
+  observers[0].callback([{ type: "attributes", attributeName: "class" }]); flush();
+  schemeCallback({ matches: true }); flush();
+  assert.equal(computedReads, readsAfterDispose);
 });
 
 test("formula assistant highlights references, locks with F4, and closes suggestions before edit", async () => {
@@ -367,6 +486,45 @@ test("native selection movement updates only its delta and maps covered merge co
 
 const waitForSearch = () => new Promise((resolve) => setTimeout(resolve, 2));
 
+test("bare Roam reference openers do not flash an empty inline portal", async () => {
+  let searches = 0;
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async () => { searches += 1; return []; },
+  });
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "[[", floating: false });
+  flush(); await waitForSearch();
+  assert.equal(searches, 0);
+  assert.equal(controller.popover.hidden, true);
+  assert.equal(controller.suggestionList.hidden, true);
+  assert.equal(editor.getAttribute("aria-expanded"), "false");
+  editor.value = "(("; editor.setSelectionRange(2, 2); editor.dispatch("input"); flush(); await waitForSearch();
+  assert.equal(searches, 0);
+  assert.equal(controller.popover.hidden, true);
+  controller.dispose();
+});
+
+test("plain Roam reference queries open only after results and use a plain address", async () => {
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async () => [{ kind: "roam-page", name: "Project Alpha", description: "Page" }],
+  });
+  const editor = await controller.start({ row: 0, col: 1, cell: cells.get("0:1"), raw: "[[Proj", floating: false });
+  flush();
+  assert.equal(controller.popover.hidden, true, "pending search has no empty shell");
+  await waitForSearch();
+  assert.equal(controller.popover.hidden, false);
+  assert.equal(controller.address.textContent, "B1");
+  assert.equal(controller.popover.dataset.mode, "reference");
+  assert.equal(controller.suggestionKind, "roam-reference");
+  assert.equal(editor.getAttribute("aria-expanded"), "true");
+  controller.onKeydown({ key: "Escape", preventDefault() {}, stopPropagation() {}, isComposing: false });
+  assert.ok(controller.state); assert.equal(controller.suggestionList.hidden, true); assert.equal(controller.popover.hidden, true);
+  editor.dispatch("click"); flush();
+  assert.equal(controller.popover.hidden, true, "dismissed plain reference results stay closed until input changes");
+  controller.dispose();
+});
+
 test("Roam reference search ignores stale async results", async () => {
   const pending = [];
   const { controller, cells, flush } = makeController({
@@ -417,6 +575,9 @@ test("Roam reference suggestions take keyboard precedence and Escape closes them
   const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "=SUM(A1)+[[Pro", floating: true });
   flush(); await waitForSearch();
   assert.equal(controller.suggestionKind, "roam-reference");
+  assert.equal(controller.address.textContent, "fx  A1");
+  assert.equal(controller.suggestions.every((suggestion) => suggestion.kind === "roam-page"), true);
+  assert.equal(controller.popover.dataset.mode, "reference");
   controller.onKeydown({ key: "Escape", preventDefault() {}, stopPropagation() {}, isComposing: false });
   assert.ok(controller.state); assert.equal(controller.suggestionList.hidden, true);
   controller.onKeydown({ key: "Escape", preventDefault() {}, stopPropagation() {}, isComposing: false }); await Promise.resolve();

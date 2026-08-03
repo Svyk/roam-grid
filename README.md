@@ -4,7 +4,7 @@ Native-first advanced tables for Roam Research.
 
 ## Status
 
-Version 0.5.1 is a functional public-source beta and live demo. Native
+Version 0.5.2 is a functional public-source beta and live demo. Native
 opt-in tables, safe merges, core formulas, interactions, imports/exports,
 charts, chunked large-grid persistence, the public API, and clean fallback are
 implemented. Before a public Depot release, the project still needs the full
@@ -32,7 +32,7 @@ folder again. Developer extensions remain local to each Roam client.
 
 For an immediate update after a push, wait for the GitHub Pages deployment and
 press the circular reload button beside this URL. Hover the grid-size badge to
-confirm the running version (for example, `Roam Grid v0.5.1`). Roam can reuse a
+confirm the running version (for example, `Roam Grid v0.5.2`). Roam can reuse a
 cached remote bundle during the same app session; if the badge still shows the
 older version, remove only this developer-extension URL and add the same URL
 again. The reinstall remounts the renderer and does not alter any table blocks,
@@ -92,6 +92,11 @@ The extension deliberately does not use `roam/js`.
   without moving focus. Committed references use Roam's normal rich rendering,
   so they remain clickable and participate in the graph like ordinary table
   block content.
+- The assistant is contextual: ordinary text never opens a menu, formulas use
+  the `fx` label and function help, and page/block completion appears only once
+  a non-empty `[[query` or `((query` has results. The editor and every menu or
+  dialog inherit the table's resolved Blueprint light/dark palette even though
+  those surfaces are mounted outside the grid.
 - Drag across cells to select a rectangle. Drag headers to reorder, any vertical
   gridline or a selected cell's right edge to resize its column, and the
   selected cell's bottom edge or any horizontal boundary to resize its row.

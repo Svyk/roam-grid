@@ -12,6 +12,9 @@
   --rg-muted: var(--cl-gray-550, #5f6b7c);
   --rg-selection: color-mix(in srgb, var(--rg-active) 13%, transparent);
   --rg-active: var(--cl-blue, #2d72d2);
+  --rg-success: #087f5b;
+  --rg-warning: #a15c00;
+  --rg-danger: #b42318;
   position: relative;
   width: 100%;
   max-width: 1200px;
@@ -37,6 +40,48 @@ body.roam-body.dark .rg-root {
   --rg-toolbar: var(--bc-main, #293742);
   --rg-muted: #abb3bf;
   --rg-active: #48aff0;
+}
+
+/* Body-mounted UI cannot inherit a theme scoped inside .roam-app. The runtime
+   copies the owning grid's resolved palette into these component-only tokens. */
+.rg-portal {
+  --rg-portal-bg: #ffffff;
+  --rg-portal-color: #182026;
+  --rg-portal-border: #c5cbd3;
+  --rg-portal-header: #f6f7f9;
+  --rg-portal-muted: #5f6b7c;
+  --rg-portal-active: #2d72d2;
+  --rg-portal-status: #5f6b7c;
+  --rg-portal-success: #087f5b;
+  --rg-portal-warning: #a15c00;
+  --rg-portal-danger: #b42318;
+}
+
+/* Narrow safety net for dark modes that are global rather than app-scoped. */
+:root.bp3-dark .rg-portal,
+body.bp3-dark .rg-portal,
+body.rm-dark-theme .rg-portal,
+.rm-dark-theme > .rg-portal,
+body.roam-body.dark .rg-portal {
+  --rg-portal-bg: #293742;
+  --rg-portal-color: #f5f8fa;
+  --rg-portal-border: #5f6b7c;
+  --rg-portal-header: #30404d;
+  --rg-portal-muted: #abb3bf;
+  --rg-portal-active: #48aff0;
+  --rg-portal-status: #abb3bf;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.bp3-light) .rg-portal {
+    --rg-portal-bg: #293742;
+    --rg-portal-color: #f5f8fa;
+    --rg-portal-border: #5f6b7c;
+    --rg-portal-header: #30404d;
+    --rg-portal-muted: #abb3bf;
+    --rg-portal-active: #48aff0;
+    --rg-portal-status: #abb3bf;
+  }
 }
 
 .rg-root:focus-within {
@@ -528,10 +573,10 @@ body.roam-body.dark .rg-root {
   gap: 10px;
   min-height: 34px;
   padding: 7px 10px;
-  color: var(--cl-text-color, #182026);
-  background: var(--bc-main, #fff);
-  border: 1px solid var(--bc-menu, #c5cbd3);
-  border-top: 3px solid var(--cl-blue, #2d72d2);
+  color: var(--rg-portal-color, #182026);
+  background: var(--rg-portal-bg, #fff);
+  border: 1px solid var(--rg-portal-border, #c5cbd3);
+  border-top: 3px solid var(--rg-portal-active, #2d72d2);
   border-radius: 4px;
   box-shadow: 0 6px 20px rgb(17 20 24 / 24%);
   pointer-events: none;
@@ -559,9 +604,9 @@ body.roam-body.dark .rg-root {
   min-height: 34px;
   max-height: 180px;
   padding: 5px 7px;
-  color: inherit;
-  background: color-mix(in srgb, var(--bc-main, #fff) 94%, var(--cl-blue, #2d72d2));
-  border: 1px solid color-mix(in srgb, var(--cl-blue, #2d72d2) 58%, var(--bc-menu, #c5cbd3));
+  color: var(--rg-portal-color, inherit);
+  background: color-mix(in srgb, var(--rg-portal-bg, #fff) 94%, var(--rg-portal-active, #2d72d2));
+  border: 1px solid color-mix(in srgb, var(--rg-portal-active, #2d72d2) 58%, var(--rg-portal-border, #c5cbd3));
   border-radius: 3px;
   outline: none;
   resize: vertical;
@@ -569,13 +614,13 @@ body.roam-body.dark .rg-root {
 }
 
 .rg-floating-editor-input:focus {
-  border-color: var(--cl-blue, #2d72d2);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--cl-blue, #2d72d2) 45%, transparent);
+  border-color: var(--rg-portal-active, #2d72d2);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--rg-portal-active, #2d72d2) 45%, transparent);
 }
 
 .rg-formula-mirror {
   padding: 2px 1px;
-  border-top: 1px solid color-mix(in srgb, var(--bc-menu, #c5cbd3) 65%, transparent);
+  border-top: 1px solid color-mix(in srgb, var(--rg-portal-border, #c5cbd3) 65%, transparent);
 }
 
 .rg-formula-suggestions {
@@ -583,8 +628,9 @@ body.roam-body.dark .rg-root {
   max-height: 190px;
   padding: 3px;
   overflow-y: auto;
-  background: var(--bc-main, #fff);
-  border: 1px solid var(--bc-menu, #c5cbd3);
+  color: var(--rg-portal-color, inherit);
+  background: var(--rg-portal-bg, #fff);
+  border: 1px solid var(--rg-portal-border, #c5cbd3);
   border-radius: 4px;
 }
 
@@ -611,7 +657,7 @@ body.roam-body.dark .rg-root {
 }
 
 .rg-formula-suggestion > span {
-  color: var(--cl-gray-550, #5f6b7c);
+  color: var(--rg-portal-muted, #5f6b7c);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -619,43 +665,36 @@ body.roam-body.dark .rg-root {
 
 .rg-formula-suggestion:hover,
 .rg-formula-suggestion--active {
-  background: color-mix(in srgb, var(--cl-blue, #2d72d2) 13%, transparent);
+  background: color-mix(in srgb, var(--rg-portal-active, #2d72d2) 13%, transparent);
 }
 
 .rg-formula-signature {
-  color: var(--cl-gray-550, #5f6b7c);
+  color: var(--rg-portal-muted, #5f6b7c);
   font: 500 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
 .rg-formula-signature > strong {
-  color: var(--cl-blue, #2d72d2);
+  color: var(--rg-portal-active, #2d72d2);
 }
 
 .rg-formula-signature > small {
   display: block;
   margin-top: 3px;
-  color: var(--cl-gray-550, #5f6b7c);
+  color: var(--rg-portal-muted, #5f6b7c);
   font: 400 11px/1.35 var(--ff-main, inherit);
 }
 
 .rg-formula-argument--active {
   color: inherit;
-  background: color-mix(in srgb, var(--cl-blue, #2d72d2) 16%, transparent);
+  background: color-mix(in srgb, var(--rg-portal-active, #2d72d2) 16%, transparent);
   border-radius: 2px;
   font-weight: 750;
-}
-
-.bp3-dark .rg-formula-popover,
-body.roam-body.dark .rg-formula-popover {
-  color: var(--cl-text-color, #f5f8fa);
-  background: var(--bc-main, #293742);
-  border-color: #5f6b7c;
 }
 
 .rg-formula-address {
   flex: 0 0 auto;
   padding-top: 1px;
-  color: var(--cl-blue, #2d72d2);
+  color: var(--rg-portal-active, #2d72d2);
   font-size: 11px;
   font-weight: 700;
   white-space: nowrap;
@@ -731,8 +770,9 @@ body.roam-body.dark .rg-formula-popover {
   max-height: min(70vh, 540px);
   padding: 5px;
   overflow-y: auto;
-  background: var(--bc-main, #fff);
-  border: 1px solid rgb(0 0 0 / 16%);
+  color: var(--rg-portal-color, #182026);
+  background: var(--rg-portal-bg, #fff);
+  border: 1px solid var(--rg-portal-border, #c5cbd3);
   border-radius: 6px;
   box-shadow: 0 8px 24px rgb(0 0 0 / 18%);
   list-style: none;
@@ -744,6 +784,7 @@ body.roam-body.dark .rg-formula-popover {
   gap: 9px;
   width: 100%;
   padding: 6px 9px;
+  color: inherit;
   text-align: left;
   background: transparent;
   border: 0;
@@ -751,7 +792,7 @@ body.roam-body.dark .rg-formula-popover {
 }
 
 .rg-context-menu .bp3-menu-item:hover {
-  background: rgb(91 141 239 / 14%);
+  background: color-mix(in srgb, var(--rg-portal-active, #2d72d2) 14%, transparent);
 }
 
 .rg-axis-menu {
@@ -766,13 +807,13 @@ body.roam-body.dark .rg-formula-popover {
   height: 1px;
   margin: 5px 4px;
   padding: 0;
-  background: color-mix(in srgb, var(--rg-border-strong, var(--bc-menu, #c5cbd3)) 70%, transparent);
+  background: color-mix(in srgb, var(--rg-portal-border, #c5cbd3) 70%, transparent);
   border: 0;
 }
 
 .rg-menu-section {
   padding: 5px 9px 3px;
-  color: var(--cl-gray-500, #738091);
+  color: var(--rg-portal-muted, #738091);
   font-size: 10px;
   font-weight: 700;
   letter-spacing: .08em;
@@ -780,7 +821,7 @@ body.roam-body.dark .rg-formula-popover {
 
 .rg-context-menu .bp3-icon {
   flex: 0 0 16px;
-  color: var(--cl-gray-550, #5f6b7c);
+  color: var(--rg-portal-muted, #5f6b7c);
 }
 
 .rg-menu-item-label {
@@ -792,7 +833,7 @@ body.roam-body.dark .rg-formula-popover {
   flex: 0 0 31px;
   width: 31px;
   height: 18px;
-  background: color-mix(in srgb, var(--rg-muted, var(--cl-gray-550, #5f6b7c)) 28%, transparent);
+  background: color-mix(in srgb, var(--rg-portal-muted, #5f6b7c) 28%, transparent);
   border-radius: 10px;
 }
 
@@ -803,14 +844,14 @@ body.roam-body.dark .rg-formula-popover {
   left: 2px;
   width: 14px;
   height: 14px;
-  background: var(--rg-bg, var(--bc-main, #fff));
+  background: var(--rg-portal-bg, #fff);
   border-radius: 50%;
   box-shadow: 0 1px 2px rgb(17 20 24 / 30%);
   transition: transform 100ms ease;
 }
 
 .rg-menu-switch--on {
-  background: var(--rg-active, var(--cl-blue, #2d72d2));
+  background: var(--rg-portal-active, #2d72d2);
 }
 
 .rg-menu-switch--on::after {
@@ -857,14 +898,31 @@ body.roam-body.dark .rg-formula-popover {
   width: min(500px, 100%);
   margin: 0;
   padding: 18px;
-  color: inherit;
-  background: var(--bc-main, #fff);
+  color: var(--rg-portal-color, #182026);
+  background: var(--rg-portal-bg, #fff);
+  border: 1px solid var(--rg-portal-border, #c5cbd3);
   border-radius: 8px;
 }
 
 .rg-dialog-input {
   width: 100%;
   margin: 10px 0 16px;
+  color: var(--rg-portal-color, #182026);
+  background: var(--rg-portal-bg, #fff);
+  border-color: var(--rg-portal-border, #c5cbd3);
+}
+
+.rg-dialog .rg-button.bp3-button {
+  color: var(--rg-portal-color, #182026);
+}
+
+.rg-dialog .rg-button.bp3-button:hover {
+  background: var(--rg-portal-header, #f6f7f9);
+}
+
+.rg-dialog .rg-button.bp3-intent-primary {
+  color: #fff;
+  background: var(--rg-portal-active, #2d72d2);
 }
 
 .rg-dialog-footer,

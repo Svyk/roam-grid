@@ -1,5 +1,5 @@
-/* Roam Grid v0.5.1 | MIT | generated from src/extension.js */
-const VERSION = "0.5.1";
+/* Roam Grid v0.5.2 | MIT | generated from src/extension.js */
+const VERSION = "0.5.2";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -2617,19 +2617,139 @@ function button(label, title, action, className = "") {
   return element;
 }
 
-function showPrompt(title, value = "") {
+const PORTAL_THEME_FALLBACKS = Object.freeze({
+  "--rg-portal-bg": "#ffffff",
+  "--rg-portal-color": "#182026",
+  "--rg-portal-border": "#c5cbd3",
+  "--rg-portal-header": "#f6f7f9",
+  "--rg-portal-muted": "#5f6b7c",
+  "--rg-portal-active": "#2d72d2",
+  "--rg-portal-status": "#5f6b7c",
+  "--rg-portal-success": "#087f5b",
+  "--rg-portal-warning": "#a15c00",
+  "--rg-portal-danger": "#b42318",
+});
+
+function styleValue(style, property, fallback = "") {
+  if (!style) return fallback;
+  const direct = typeof style.getPropertyValue === "function" ? style.getPropertyValue(property) : "";
+  if (String(direct || "").trim()) return String(direct).trim();
+  const camel = property.replace(/-([a-z])/g, (_match, letter) => letter.toUpperCase());
+  return String(style[camel] || fallback || "").trim();
+}
+
+function computedStyleOf(element, getStyle) {
+  if (!element || typeof getStyle !== "function") return null;
+  try { return getStyle(element); } catch { return null; }
+}
+
+/**
+ * Copies the owning grid's resolved palette onto a body-mounted Roam Grid portal.
+ * The inline custom properties deliberately scope theme compatibility to our own UI.
+ */
+export function syncPortalThemeFromRoot(ownerRoot, portal, getStyle = globalThis.getComputedStyle) {
+  if (!portal?.style) return { changed: false, values: { ...PORTAL_THEME_FALLBACKS } };
+  const root = ownerRoot?.classList?.contains?.("rg-root") ? ownerRoot : ownerRoot?.closest?.(".rg-root") || null;
+  portal.classList?.add?.("rg-portal");
+  if (!root) {
+    const previous = portal.__rgPortalPalette || {};
+    let changed = false;
+    for (const property of Object.keys(previous)) {
+      portal.style.removeProperty?.(property); changed = true;
+    }
+    portal.__rgPortalPalette = {};
+    return { changed, values: {} };
+  }
+  const rootStyle = computedStyleOf(root, getStyle);
+  const headerStyle = computedStyleOf(root?.querySelector?.(".rg-header, .rg-toolbar"), getStyle);
+  const statusStyle = computedStyleOf(root?.querySelector?.(".rg-status"), getStyle);
+  const values = {
+    "--rg-portal-bg": styleValue(rootStyle, "background-color", styleValue(rootStyle, "--rg-bg", PORTAL_THEME_FALLBACKS["--rg-portal-bg"])),
+    "--rg-portal-color": styleValue(rootStyle, "color", PORTAL_THEME_FALLBACKS["--rg-portal-color"]),
+    "--rg-portal-border": styleValue(rootStyle, "border-top-color", styleValue(rootStyle, "border-color", styleValue(rootStyle, "--rg-border", PORTAL_THEME_FALLBACKS["--rg-portal-border"]))),
+    "--rg-portal-header": styleValue(headerStyle, "background-color", styleValue(rootStyle, "--rg-header", PORTAL_THEME_FALLBACKS["--rg-portal-header"])),
+    "--rg-portal-muted": styleValue(statusStyle, "color", styleValue(rootStyle, "--rg-muted", PORTAL_THEME_FALLBACKS["--rg-portal-muted"])),
+    "--rg-portal-active": styleValue(rootStyle, "--rg-active", PORTAL_THEME_FALLBACKS["--rg-portal-active"]),
+    "--rg-portal-status": styleValue(statusStyle, "color", styleValue(rootStyle, "--rg-muted", PORTAL_THEME_FALLBACKS["--rg-portal-status"])),
+    "--rg-portal-success": styleValue(rootStyle, "--rg-success", PORTAL_THEME_FALLBACKS["--rg-portal-success"]),
+    "--rg-portal-warning": styleValue(rootStyle, "--rg-warning", PORTAL_THEME_FALLBACKS["--rg-portal-warning"]),
+    "--rg-portal-danger": styleValue(rootStyle, "--rg-danger", PORTAL_THEME_FALLBACKS["--rg-portal-danger"]),
+  };
+  const previous = portal.__rgPortalPalette || {};
+  let changed = false;
+  for (const [property, value] of Object.entries(values)) {
+    if (previous[property] === value) continue;
+    portal.style.setProperty(property, value); changed = true;
+  }
+  portal.__rgPortalPalette = values;
+  return { changed, values };
+}
+
+/** Creates one cached theme bridge and observes grid ancestry plus OS color-scheme changes. */
+export function createPortalThemeBridge(ownerRoot, portal, {
+  getStyle = globalThis.getComputedStyle,
+  MutationObserverClass = globalThis.MutationObserver,
+  matchMedia = globalThis.matchMedia,
+} = {}) {
+  let disposed = false; let frame = null;
+  const sync = () => disposed ? { changed: false, values: portal?.__rgPortalPalette || { ...PORTAL_THEME_FALLBACKS } } : syncPortalThemeFromRoot(ownerRoot, portal, getStyle);
+  const schedule = () => {
+    if (disposed || frame != null) return;
+    const requestFrame = globalThis.requestAnimationFrame || ((callback) => setTimeout(callback, 0));
+    frame = requestFrame(() => { frame = null; sync(); });
+  };
+  let observer = null;
+  if (typeof MutationObserverClass === "function") {
+    observer = new MutationObserverClass(schedule);
+    const seen = new Set();
+    for (let node = ownerRoot; node && !seen.has(node); node = node.parentElement || node.parentNode) {
+      seen.add(node);
+      try { observer.observe(node, { attributes: true, attributeFilter: ["class", "style"] }); } catch { /* MiniDOM or detached ancestor */ }
+    }
+  }
+  let colorSchemeQuery = null;
+  if (typeof matchMedia === "function") {
+    try {
+      colorSchemeQuery = matchMedia.call(globalThis, "(prefers-color-scheme: dark)");
+      if (typeof colorSchemeQuery?.addEventListener === "function") colorSchemeQuery.addEventListener("change", schedule);
+      else colorSchemeQuery?.addListener?.(schedule);
+    } catch { colorSchemeQuery = null; }
+  }
+  sync();
+  return {
+    sync,
+    dispose() {
+      if (disposed) return;
+      disposed = true; observer?.disconnect?.(); observer = null;
+      if (typeof colorSchemeQuery?.removeEventListener === "function") colorSchemeQuery.removeEventListener("change", schedule);
+      else colorSchemeQuery?.removeListener?.(schedule);
+      colorSchemeQuery = null;
+      if (frame != null && typeof globalThis.cancelAnimationFrame === "function") globalThis.cancelAnimationFrame(frame);
+      frame = null;
+    },
+  };
+}
+
+function portalOwnerRoot(explicitRoot = null) {
+  return explicitRoot || activeMount()?.root || document.querySelector?.(".rg-root:focus-within") || document.querySelector?.(".rg-root") || null;
+}
+
+function showPrompt(title, value = "", ownerRoot = null) {
   return new Promise((resolve) => {
     const overlay = document.createElement("div");
     overlay.className = "rg-dialog-overlay";
     const dialog = document.createElement("form");
     dialog.className = "bp3-dialog rg-dialog";
+    dialog.setAttribute("role", "dialog"); dialog.setAttribute("aria-modal", "true");
     const heading = document.createElement("h4"); heading.className = "bp3-heading"; heading.textContent = title;
     const input = document.createElement("input"); input.className = "bp3-input rg-dialog-input"; input.value = value;
     const footer = document.createElement("div"); footer.className = "rg-dialog-footer";
     const cancel = button("Cancel", "Cancel", () => finish(null));
     const accept = button("OK", "Accept", () => finish(input.value), "bp3-intent-primary");
     footer.append(cancel, accept); dialog.append(heading, input, footer); overlay.appendChild(dialog); document.body.appendChild(overlay);
-    const finish = (result) => { overlay.remove(); document.removeEventListener("keydown", onKey, true); resolve(result); };
+    const theme = createPortalThemeBridge(portalOwnerRoot(ownerRoot), overlay);
+    const finish = (result) => { theme.dispose(); overlay.remove(); document.removeEventListener("keydown", onKey, true); resolve(result); };
+    overlay.__rgDismiss = () => finish(null);
     const onKey = (event) => { if (event.key === "Escape") { event.preventDefault(); finish(null); } };
     dialog.addEventListener("submit", (event) => { event.preventDefault(); finish(input.value); });
     overlay.addEventListener("mousedown", (event) => { if (event.target === overlay) finish(null); });
@@ -2638,13 +2758,16 @@ function showPrompt(title, value = "") {
   });
 }
 
-function showChoice(title, choices) {
+function showChoice(title, choices, ownerRoot = null) {
   return new Promise((resolve) => {
     const overlay = document.createElement("div"); overlay.className = "rg-dialog-overlay";
     const dialog = document.createElement("div"); dialog.className = "bp3-dialog rg-dialog";
+    dialog.setAttribute("role", "dialog"); dialog.setAttribute("aria-modal", "true");
     const heading = document.createElement("h4"); heading.className = "bp3-heading"; heading.textContent = title;
     const list = document.createElement("div"); list.className = "rg-choice-list";
-    const finish = (value) => { overlay.remove(); resolve(value); };
+    const theme = createPortalThemeBridge(portalOwnerRoot(ownerRoot), overlay);
+    const finish = (value) => { theme.dispose(); overlay.remove(); resolve(value); };
+    overlay.__rgDismiss = () => finish(null);
     for (const choice of choices) list.appendChild(button(choice.label, choice.description || choice.label, () => finish(choice.value), choice.primary ? "bp3-intent-primary" : ""));
     dialog.append(heading, list); overlay.appendChild(dialog); document.body.appendChild(overlay);
     overlay.addEventListener("mousedown", (event) => { if (event.target === overlay) finish(null); });
@@ -2857,6 +2980,7 @@ export class GridEditorController {
     this.popover = document.createElement("div");
     this.popover.className = "rg-formula-popover rg-editor-popover";
     this.popover.hidden = true;
+    this.popover.setAttribute("aria-hidden", "true");
     this.address = document.createElement("span");
     this.address.className = "rg-formula-address";
     this.input = document.createElement("textarea");
@@ -2864,15 +2988,28 @@ export class GridEditorController {
     this.input.setAttribute("aria-label", "Edit cell value");
     this.mirror = document.createElement("code");
     this.mirror.className = "rg-formula-expression rg-formula-mirror";
+    this.mirror.setAttribute("aria-hidden", "true");
     this.suggestionList = document.createElement("div");
     this.suggestionList.className = "rg-formula-suggestions";
+    this.suggestionList.id = `rg-editor-list-${cryptoId()}`;
+    this.suggestionList.setAttribute("role", "listbox");
+    this.suggestionList.setAttribute("aria-label", "Cell editing suggestions");
+    this.suggestionList.setAttribute("aria-hidden", "true");
     this.signature = document.createElement("div");
     this.signature.className = "rg-formula-signature";
+    this.signature.setAttribute("role", "status");
+    this.signature.setAttribute("aria-live", "polite");
+    this.signature.setAttribute("aria-hidden", "true");
+    this.input.setAttribute("role", "combobox");
+    this.input.setAttribute("aria-autocomplete", "list");
+    this.input.setAttribute("aria-controls", this.suggestionList.id);
+    this.input.setAttribute("aria-expanded", "false");
     const body = document.createElement("div");
     body.className = "rg-editor-popover-body";
     body.append(this.input, this.mirror, this.suggestionList, this.signature);
     this.popover.append(this.address, body);
     document.body.appendChild(this.popover);
+    this.portalTheme = createPortalThemeBridge(this.view.root, this.popover);
     this.boundReposition = () => this.position();
     globalThis.window?.addEventListener("resize", this.boundReposition);
     this.viewport?.addEventListener("scroll", this.boundReposition, { passive: true });
@@ -2903,10 +3040,16 @@ export class GridEditorController {
     }
     editor.value = value;
     this.state = { row, col, cell, raw: String(raw ?? ""), editor, floating, composing: false, autocompleteClosed: false, referenceAutocompleteClosed: false, finished: false };
-    this.address.textContent = `fx  ${cellLabel(row, col)}`;
-    this.popover.hidden = !floating && !(value.startsWith("=") && !value.startsWith("=="));
+    const formula = value.startsWith("=") && !value.startsWith("==");
+    this.address.textContent = `${formula ? "fx  " : ""}${cellLabel(row, col)}`;
+    this.setPopoverHidden(!floating && !formula);
     this.popover.classList.toggle("rg-editor-popover--floating", floating);
     this.input.hidden = !floating;
+    editor.setAttribute("role", "combobox");
+    editor.setAttribute("aria-autocomplete", "list");
+    editor.setAttribute("aria-controls", this.suggestionList.id);
+    editor.setAttribute("aria-expanded", "false");
+    this.portalTheme.sync();
     if (!floating) {
       editor.addEventListener("keydown", (event) => this.onKeydown(event));
       editor.addEventListener("compositionstart", () => { if (this.state) this.state.composing = true; });
@@ -2924,6 +3067,11 @@ export class GridEditorController {
   }
 
   currentEditor() { return this.state?.editor || null; }
+
+  setPopoverHidden(hidden) {
+    this.popover.hidden = Boolean(hidden);
+    this.popover.setAttribute("aria-hidden", String(Boolean(hidden)));
+  }
 
   onEditorInput() {
     if (this.state) { this.state.autocompleteClosed = false; this.state.referenceAutocompleteClosed = false; }
@@ -2960,7 +3108,10 @@ export class GridEditorController {
       if (hasSuggestions) {
         if (this.suggestionKind === "roam-reference") state.referenceAutocompleteClosed = true;
         else state.autocompleteClosed = true;
-        this.suggestionList.hidden = true; return;
+        this.suggestionList.hidden = true; this.suggestionList.setAttribute("aria-hidden", "true");
+        state.editor.setAttribute("aria-expanded", "false"); state.editor.removeAttribute?.("aria-activedescendant");
+        if (!state.floating && !(state.editor.value.startsWith("=") && !state.editor.value.startsWith("=="))) this.setPopoverHidden(true);
+        return;
       }
       this.finish(false); return;
     }
@@ -2990,7 +3141,8 @@ export class GridEditorController {
     state.editor.setRangeText(replacement, context.startIndex, context.replaceEndIndex ?? context.endIndex, "end");
     state.referenceAutocompleteClosed = true;
     clearTimeout(this.referenceSearchTimer); this.referenceSearchToken += 1;
-    this.suggestions = []; this.suggestionList.hidden = true;
+    this.suggestions = []; this.suggestionList.hidden = true; this.suggestionList.setAttribute("aria-hidden", "true");
+    state.editor.setAttribute("aria-expanded", "false"); state.editor.removeAttribute?.("aria-activedescendant");
     state.editor.focus({ preventScroll: true });
     this.schedulePresentation();
   }
@@ -3021,8 +3173,14 @@ export class GridEditorController {
     const formula = raw.startsWith("=") && !raw.startsWith("==");
     const referenceContext = roamReferenceAutocompleteContext(raw, editor.selectionStart);
     this.view.root.classList.toggle("rg-root--formula-editing", formula);
-    this.popover.hidden = !state.floating && !formula && !referenceContext;
+    const mode = referenceContext ? "reference" : formula ? "formula" : "plain";
+    this.popover.dataset.mode = mode;
+    this.popover.classList.toggle("rg-editor-popover--formula", formula);
+    this.popover.classList.toggle("rg-editor-popover--reference", Boolean(referenceContext));
+    this.popover.classList.toggle("rg-editor-popover--plain", !formula && !referenceContext);
+    this.address.textContent = `${formula ? "fx  " : ""}${cellLabel(state.row, state.col)}`;
     this.mirror.hidden = !formula;
+    this.mirror.setAttribute("aria-hidden", String(!formula));
     const colors = formulaReferenceColorMap(raw);
     if (formula) appendFormulaMirror(this.mirror, raw, colors); else this.mirror.replaceChildren();
     const desired = new Map();
@@ -3046,6 +3204,8 @@ export class GridEditorController {
     if (referenceContext) this.updateReferenceAutocomplete(referenceContext);
     else { this.clearReferenceAutocomplete(); this.updateAutocomplete(formula); }
     this.updateSignature(formula);
+    const hasReferenceResults = Boolean(referenceContext && !state.referenceAutocompleteClosed && !this.suggestionList.hidden && this.suggestionKind === "roam-reference" && this.suggestions.length);
+    this.setPopoverHidden(!state.floating && !formula && !hasReferenceResults);
     this.position();
   }
 
@@ -3074,7 +3234,7 @@ export class GridEditorController {
       try { results = await this.searchReferences(context); } catch (error) { console.warn("[roam-grid] Reference search failed", error); }
       if (token !== this.referenceSearchToken || !this.state || this.referenceContextKey !== key) return;
       this.suggestions = results; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.paintSuggestions();
-      if (!this.state.floating) this.popover.hidden = !this.suggestions.length;
+      if (!this.state.floating) this.setPopoverHidden(!this.suggestions.length && !(this.state.editor.value.startsWith("=") && !this.state.editor.value.startsWith("==")));
       this.position();
     }, this.referenceSearchDelay);
   }
@@ -3090,8 +3250,14 @@ export class GridEditorController {
   paintSuggestions() {
     this.suggestionList.replaceChildren();
     this.suggestionList.hidden = !this.suggestions.length;
+    this.suggestionList.setAttribute("aria-hidden", String(!this.suggestions.length));
+    const editor = this.currentEditor();
+    editor?.setAttribute?.("aria-expanded", String(Boolean(this.suggestions.length)));
     this.suggestions.forEach((suggestion, index) => {
       const option = document.createElement("button"); option.type = "button"; option.className = "rg-formula-suggestion";
+      option.id = `${this.suggestionList.id}-option-${index}`;
+      option.setAttribute("role", "option");
+      option.setAttribute("aria-selected", String(index === this.suggestionIndex));
       option.classList.toggle("rg-formula-suggestion--active", index === this.suggestionIndex);
       const name = document.createElement("strong"); name.textContent = suggestion.name;
       const detail = document.createElement("span"); detail.textContent = suggestion.description;
@@ -3100,6 +3266,10 @@ export class GridEditorController {
       option.addEventListener("click", () => this.acceptSuggestion(index));
       this.suggestionList.appendChild(option);
     });
+    if (editor) {
+      if (this.suggestions.length) editor.setAttribute("aria-activedescendant", `${this.suggestionList.id}-option-${this.suggestionIndex}`);
+      else editor.removeAttribute?.("aria-activedescendant");
+    }
   }
 
   updateSignature(formula) {
@@ -3107,7 +3277,7 @@ export class GridEditorController {
     const call = formula ? activeFormulaCall(editor.value, editor.selectionStart) : null;
     const catalog = runtime.registries?.formulaFunctionMetadata || defaultFormulaFunctionMetadata();
     const metadata = call ? catalog.get(call.name) : null;
-    this.signature.replaceChildren(); this.signature.hidden = !metadata;
+    this.signature.replaceChildren(); this.signature.hidden = !metadata; this.signature.setAttribute("aria-hidden", String(!metadata));
     if (!metadata) return;
     const lead = document.createElement("strong"); lead.textContent = `${call.name}(`; this.signature.appendChild(lead);
     metadata.parameters.forEach((parameter, index) => {
@@ -3135,7 +3305,7 @@ export class GridEditorController {
     state.finished = true; this.state = null;
     const value = state.editor.value;
     if (!state.floating) { state.editor.remove(); state.cell.classList.remove("rg-cell--editing"); }
-    this.popover.hidden = true; this.clearPresentation();
+    this.setPopoverHidden(true); this.clearPresentation();
     await this.onFinish({ ...state, value, commit, movement });
   }
 
@@ -3145,7 +3315,10 @@ export class GridEditorController {
       cell.classList.remove("rg-cell--formula-reference"); cell.style.removeProperty("--rg-reference-color"); delete cell.dataset.rgFormulaReference;
     }
     clearTimeout(this.referenceSearchTimer); this.referenceSearchTimer = null; this.referenceSearchToken += 1; this.referenceContext = null; this.referenceContextKey = null;
-    this.referenceCells.clear(); this.suggestions = []; this.suggestionKind = null; this.suggestionList.replaceChildren(); this.suggestionList.hidden = true; this.signature.replaceChildren(); this.signature.hidden = true;
+    this.referenceCells.clear(); this.suggestions = []; this.suggestionKind = null; this.suggestionList.replaceChildren(); this.suggestionList.hidden = true; this.suggestionList.setAttribute("aria-hidden", "true");
+    this.input.setAttribute("aria-expanded", "false"); this.input.removeAttribute?.("aria-activedescendant");
+    this.currentEditor()?.setAttribute?.("aria-expanded", "false"); this.currentEditor()?.removeAttribute?.("aria-activedescendant");
+    this.signature.replaceChildren(); this.signature.hidden = true; this.signature.setAttribute("aria-hidden", "true");
   }
 
   dispose() {
@@ -3155,6 +3328,7 @@ export class GridEditorController {
     }
     globalThis.window?.removeEventListener("resize", this.boundReposition);
     this.viewport?.removeEventListener("scroll", this.boundReposition);
+    this.portalTheme?.dispose(); this.portalTheme = null;
     this.clearPresentation(); this.popover.remove();
   }
 }
@@ -4006,8 +4180,17 @@ export class GridView {
   openMenu(anchor, x = null, y = null) {
     const existing = document.querySelector(".rg-context-menu"); existing?.__rgDismiss?.(); existing?.remove();
     const menu = document.createElement("div"); menu.className = "bp3-menu rg-context-menu";
+    let theme = null;
+    const timers = new Set();
+    const later = (callback, delay = 0) => {
+      const timer = setTimeout(() => { timers.delete(timer); if (!closed) callback(); }, delay);
+      timers.add(timer); return timer;
+    };
     let closed = false;
-    const dismiss = () => { if (closed) return; closed = true; menu.remove(); document.removeEventListener("pointerdown", close, true); };
+    const dismiss = () => {
+      if (closed) return; closed = true; for (const timer of timers) clearTimeout(timer); timers.clear();
+      theme?.dispose(); menu.remove(); document.removeEventListener("pointerdown", close, true);
+    };
     const item = (label, action) => { const element = button(label, label, () => { dismiss(); action(); }); element.className = "bp3-menu-item"; return element; };
     menu.append(
       item("Merge selection", () => this.mergeSelection()), item("Unmerge", () => this.unmergeSelection()),
@@ -4036,9 +4219,10 @@ export class GridView {
     );
     menu.__rgDismiss = dismiss;
     document.body.appendChild(menu);
+    theme = createPortalThemeBridge(this.root, menu);
     const rect = anchor.getBoundingClientRect(); menu.style.left = `${x ?? rect.left}px`; menu.style.top = `${y ?? rect.bottom}px`;
     const close = (event) => { if (!menu.contains(event.target)) dismiss(); };
-    setTimeout(() => document.addEventListener("pointerdown", close, true));
+    later(() => document.addEventListener("pointerdown", close, true));
   }
 
   openAxisMenu(type, index, anchor) {
@@ -4046,9 +4230,16 @@ export class GridView {
     document.querySelectorAll(".rg-axis-grabber.bp3-popover-open").forEach((grip) => grip.classList.remove("bp3-popover-open"));
     anchor.classList.add("bp3-popover-open");
     const menu = document.createElement("ul"); menu.className = "bp3-menu rg-context-menu rg-axis-menu"; menu.dataset.axis = type; menu.dataset.index = String(index);
+    let theme = null;
+    const timers = new Set();
+    const later = (callback, delay = 0) => {
+      const timer = setTimeout(() => { timers.delete(timer); if (!closed) callback(); }, delay);
+      timers.add(timer); return timer;
+    };
     let closed = false;
     const dismiss = () => {
-      if (closed) return; closed = true; menu.remove(); anchor.classList.remove("bp3-popover-open");
+      if (closed) return; closed = true; for (const timer of timers) clearTimeout(timer); timers.clear();
+      theme?.dispose(); menu.remove(); anchor.classList.remove("bp3-popover-open");
       document.removeEventListener("pointerdown", closeOutside, true); document.removeEventListener("keydown", closeOnEscape, true);
     };
     const closeOutside = (event) => { if (!menu.contains(event.target) && event.target !== anchor) dismiss(); };
@@ -4104,6 +4295,7 @@ export class GridView {
     );
     menu.__rgDismiss = dismiss;
     document.body.appendChild(menu);
+    theme = createPortalThemeBridge(this.root, menu);
     const position = () => {
       if (!menu.isConnected) return;
       const rect = anchor.getBoundingClientRect(); const bounds = menu.getBoundingClientRect();
@@ -4114,8 +4306,8 @@ export class GridView {
       menu.style.visibility = "visible";
     };
     menu.style.visibility = "hidden"; position();
-    setTimeout(() => { position(); document.addEventListener("pointerdown", closeOutside, true); document.addEventListener("keydown", closeOnEscape, true); }, 0);
-    setTimeout(position, 80);
+    later(() => { position(); document.addEventListener("pointerdown", closeOutside, true); document.addEventListener("keydown", closeOnEscape, true); });
+    later(position, 80);
   }
 
   resizeSelectedRows(height) {
@@ -4916,7 +5108,9 @@ async function onunload() {
   clearTimeout(scanTimer); runtime.observer?.disconnect(); runtime.observer = null;
   for (const mount of runtime.mounts.values()) mount.dispose(); runtime.mounts.clear();
   for (const dispose of runtime.disposers.splice(0)) try { dispose(); } catch { /* no-op */ }
-  document.querySelectorAll(".rg-toasts,.rg-dialog-overlay,.rg-context-menu").forEach((element) => element.remove());
+  document.querySelectorAll(".rg-toasts,.rg-dialog-overlay,.rg-context-menu").forEach((element) => {
+    if (element.__rgDismiss) element.__rgDismiss(); else element.remove();
+  });
   if (globalThis.window?.roamGrid?.v1?.version === VERSION) delete globalThis.window.roamGrid.v1;
   runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null;
   console.info("[roam-grid] Unloaded");

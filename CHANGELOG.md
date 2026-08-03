@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.2
+
+- Added a Roam Grid-owned portal palette so the F2 editor, formula and Roam
+  reference suggestions, context menus, and dialogs inherit the active grid's
+  resolved light/dark colors even though those surfaces mount under `body`.
+- Matched Blueprint's contextual editing model: ordinary inline text shows no
+  assistant, formulas show `fx` assistance after `=`, and native page/block
+  completion appears only for non-empty `[[query` or `((query` searches.
+- Added explicit combobox/listbox state and theme-change synchronization for the
+  persistent editor without adding a per-keystroke computed-style read.
+
 ## 0.5.1
 
 - Suppressed late structural pull-watch echoes only when the full Roam

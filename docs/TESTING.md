@@ -29,6 +29,14 @@ fail during movement, verifies that only the symmetric difference changes, and
 checks covered merge coordinates, merged-edge handles, range badges, and fill
 handles.
 
+Portal-theme tests verify that the F2 editor, formula and Roam-reference
+suggestions, context menus, axis menus, and dialogs receive the grid's resolved
+light/dark palette even though they mount under `body`. The editor tests also
+cover contextual assistant visibility: ordinary text has no menu, bare `[[` or
+`((` has no empty shell, non-empty reference queries show native Roam results,
+and formulas expose function suggestions and signature help. Combobox,
+listbox, option, active-descendant, and selected-option state are asserted.
+
 Persistence tests cover dirty-UID coalescing, metadata-free scalar saves,
 self-watch suppression, non-overlapping external edits, same-cell and
 structural conflicts, partial-write rollback, and edits that arrive during an
@@ -44,7 +52,7 @@ opted in or changed.
 
 Current release acceptance:
 
-- 111 automated tests pass in the v0.5 release run. They exercise model,
+- All 117 automated tests pass in the v0.5.2 release run. They exercise model,
   adapter, persistence, editor, DOM, and rendering behavior without claiming
   browser-frame performance.
 - The existing host-neutral Thymer Grid baseline remains green at 343/343; the
@@ -55,6 +63,8 @@ Current release acceptance:
 - A 100 × 26 file-backed grid created, verified, edited one dirty chunk, and
   advanced its manifest pointer.
 - Developer-extension reload exposes the untouched native block structure.
+- In both Blueprint light and dark modes, every Roam Grid-owned portal matches
+  the table palette; no graph-global Blueprint selector is overridden.
 
 Remaining public-release gates:
 
