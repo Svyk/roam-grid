@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { FormulaEngine, GridEditorController, GridModel, GridView, findNativeCellReferenceCount, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, syncPortalThemeFromRoot } from "../src/extension.js";
+import { FormulaEngine, GridEditorController, GridModel, GridView, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, queryBlockReferenceSources, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, syncPortalThemeFromRoot } from "../src/extension.js";
 
 class MiniClassList {
   constructor() { this.values = new Set(); }
@@ -624,31 +624,49 @@ test("native-style cell reference counts update without replacing stable content
   assert.equal(cell.children[0], content); assert.equal(content.textContent, "Source");
 });
 
-test("cell reference clicks bridge to the closest hidden native count", () => {
-  installMiniDom();
-  const host = new MiniNode("div");
-  const nativeTable = new MiniNode("div"); nativeTable.className = "rm-table";
-  const sourceBlock = new MiniNode("div"); sourceBlock.className = "roam-block-container";
-  const sourceInput = new MiniNode("textarea"); sourceInput.id = "block-input-source-cell";
-  const sourceCount = new MiniNode("span"); sourceCount.className = "rm-block-ref-count";
-  let nativeClicks = 0; sourceCount.click = () => { nativeClicks += 1; };
-  sourceBlock.append(sourceInput, sourceCount); nativeTable.appendChild(sourceBlock); host.appendChild(nativeTable);
+test("reference source query deduplicates and sorts Roam blocks", () => {
+  const api = { q: (_query, uid) => {
+    assert.equal(uid, "source-cell");
+    return [["z-source", "Later", "Z Page"], ["a-source", "First", "A Page"], ["a-source", "Duplicate", "A Page"]];
+  } };
+  assert.deepEqual(queryBlockReferenceSources("source-cell", api), [
+    { uid: "a-source", string: "First", pageTitle: "A Page" },
+    { uid: "z-source", string: "Later", pageTitle: "Z Page" },
+  ]);
+});
 
-  const otherBlock = new MiniNode("div"); otherBlock.className = "roam-block-container";
-  const otherInput = new MiniNode("textarea"); otherInput.id = "block-input-other-cell";
-  const otherCount = new MiniNode("span"); otherCount.className = "rm-block-ref-count";
-  otherBlock.append(otherInput, otherCount); nativeTable.appendChild(otherBlock);
+test("cell reference clicks toggle a local native-rendered references panel", async () => {
+  const { body } = installMiniDom();
+  const root = new MiniNode("section"); root.className = "rg-root"; body.appendChild(root);
+  const cell = new MiniNode("div"); cell.className = "rg-cell"; root.appendChild(cell);
+  const badge = new MiniNode("button"); badge.className = "rg-cell-reference-count"; cell.appendChild(badge);
+  let sidebarCalls = 0; const rendered = [];
+  globalThis.window.roamAlphaAPI = {
+    q: () => [["reference-1", "A referencing ((source-cell)) block", "roam-grid/dev"]],
+    ui: {
+      components: { renderBlock: ({ uid, el }) => { rendered.push(uid); el.textContent = "Rendered by Roam"; } },
+      mainWindow: { openBlock() {} },
+      rightSidebar: { addWindow: () => { sidebarCalls += 1; } },
+    },
+  };
+  const model = new GridModel({ rows: [[{ uid: "source-cell", raw: "Source · King Arthur Baking" }]] });
+  const view = Object.assign(Object.create(GridView.prototype), {
+    model, root, inlineReferencesUid: null, inlineReferencesPanel: null, inlineReferenceDisposers: new Set(),
+    cells: new Map([["0:0", cell]]), cellCoordinatesByUid: new Map([["source-cell", { row: 0, col: 0 }]]),
+  });
 
-  const gridRoot = new MiniNode("section"); gridRoot.className = "rg-root";
-  const gridCarrier = new MiniNode("div"); gridCarrier.dataset.uid = "source-cell";
-  const gridCount = new MiniNode("button"); gridCount.className = "rm-block-ref-count";
-  gridCarrier.appendChild(gridCount); gridRoot.appendChild(gridCarrier); host.appendChild(gridRoot);
-
-  assert.equal(findNativeCellReferenceCount("source-cell", [nativeTable, host, gridRoot], gridRoot), sourceCount);
-  const view = Object.assign(Object.create(GridView.prototype), { nativeElement: nativeTable, host, root: gridRoot });
-  nativeTable.closest = () => host;
   assert.equal(view.openCellReferences("source-cell"), true);
-  assert.equal(nativeClicks, 1);
+  await Promise.resolve();
+  const panel = root.querySelector(".rg-inline-references");
+  assert.ok(panel); assert.equal(panel.querySelector(".rg-inline-references-title").textContent, "References to: Source · King Arthur Baking");
+  assert.equal(panel.querySelector(".rg-inline-reference-breadcrumb").textContent, "roam-grid/dev  ›");
+  assert.equal(panel.querySelector(".rg-inline-reference-block").textContent, "Rendered by Roam");
+  assert.deepEqual(rendered, ["reference-1"]); assert.equal(sidebarCalls, 0);
+  assert.equal(badge.getAttribute("aria-expanded"), "true");
+
+  assert.equal(view.openCellReferences("source-cell"), true);
+  assert.equal(root.querySelector(".rg-inline-references"), null);
+  assert.equal(badge.getAttribute("aria-expanded"), "false");
 });
 
 const waitForSearch = () => new Promise((resolve) => setTimeout(resolve, 2));

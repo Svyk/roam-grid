@@ -359,6 +359,107 @@ body.roam-body.dark .rg-portal {
   outline-offset: 0;
 }
 
+.rg-inline-references {
+  color: var(--rg-color, inherit);
+  background: color-mix(in srgb, var(--rg-header) 54%, var(--rg-bg));
+  border-top: 1px solid var(--rg-border);
+}
+
+.rg-inline-references-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 5px 8px 5px 11px;
+  color: var(--rg-muted);
+}
+
+.rg-inline-references-title {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rg-inline-references-count {
+  flex: 0 0 auto;
+  min-width: 18px;
+  padding: 1px 5px;
+  color: var(--rg-color, inherit);
+  background: color-mix(in srgb, var(--rg-border) 38%, transparent);
+  border-radius: 10px;
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+}
+
+.rg-inline-references-close.bp3-button {
+  flex: 0 0 auto;
+  min-width: 25px;
+  min-height: 25px;
+  margin-left: auto;
+  padding: 0 6px;
+  color: var(--rg-muted);
+}
+
+.rg-inline-references-list {
+  border-top: 1px solid color-mix(in srgb, var(--rg-border) 72%, transparent);
+}
+
+.rg-inline-reference-item {
+  padding: 6px 10px 8px;
+  background: var(--rg-bg);
+}
+
+.rg-inline-reference-item + .rg-inline-reference-item {
+  border-top: 1px solid var(--rg-border);
+}
+
+.rg-inline-reference-breadcrumb {
+  display: block;
+  max-width: 100%;
+  margin: 0 0 3px 15px;
+  padding: 1px 3px;
+  overflow: hidden;
+  color: var(--rg-muted);
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.35;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.rg-inline-reference-breadcrumb:hover,
+.rg-inline-reference-breadcrumb:focus-visible {
+  color: var(--rg-active);
+  background: color-mix(in srgb, var(--rg-active) 9%, transparent);
+  outline: none;
+}
+
+.rg-inline-reference-block {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.rg-inline-reference-block > .roam-block-container,
+.rg-inline-reference-block > .rm-block-main {
+  margin: 0;
+}
+
+.rg-inline-references-empty {
+  padding: 10px 12px;
+  color: var(--rg-muted);
+  background: var(--rg-bg);
+  font-size: 12px;
+}
+
 .rg-cell--align-left { text-align: left; }
 .rg-cell--align-center { text-align: center; }
 .rg-cell--align-right { text-align: right; }

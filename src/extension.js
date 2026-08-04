@@ -1,4 +1,4 @@
-const VERSION = "0.8.1";
+const VERSION = "0.8.2";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -3332,59 +3332,29 @@ export function queryBlockReferenceCounts(uids, api = roam()) {
   return counts;
 }
 
-function domDescendants(root) {
-  const values = [];
-  const pending = root ? [root] : [];
-  while (pending.length) {
-    const node = pending.pop();
-    if (!node || values.includes(node)) continue;
-    values.push(node);
-    const children = [...(node.children || [])];
-    for (let index = children.length - 1; index >= 0; index -= 1) pending.push(children[index]);
-  }
-  return values;
-}
-
-function elementOwnsBlockUid(element, uid) {
-  if (!element) return false;
-  const dataUid = element.dataset?.uid || element.getAttribute?.("data-uid") || "";
-  const id = element.id || element.getAttribute?.("id") || "";
-  return String(dataUid) === uid || String(id).endsWith(uid);
-}
-
-function domTreeDistance(first, second) {
-  const firstAncestors = new Map();
-  let depth = 0;
-  for (let node = first; node; node = node.parentElement || node.parentNode) firstAncestors.set(node, depth++);
-  depth = 0;
-  for (let node = second; node; node = node.parentElement || node.parentNode) {
-    if (firstAncestors.has(node)) return depth + firstAncestors.get(node);
-    depth += 1;
-  }
-  return Number.POSITIVE_INFINITY;
-}
-
-export function findNativeCellReferenceCount(uid, roots = [], excludedRoot = null) {
+export function queryBlockReferenceSources(uid, api = roam()) {
   const targetUid = String(uid || "");
-  if (!targetUid) return null;
-  let best = null;
-  let bestDistance = Number.POSITIVE_INFINITY;
-  const seenNodes = new Set();
-  for (const root of roots || []) {
-    const nodes = domDescendants(root).filter((node) => {
-      if (seenNodes.has(node)) return false;
-      seenNodes.add(node);
-      return true;
+  if (!targetUid || typeof api?.q !== "function") return [];
+  const rows = api.q(`[:find ?sourceUid ?sourceString ?pageTitle
+    :in $ ?targetUid
+    :where
+      [?target :block/uid ?targetUid]
+      [?source :block/refs ?target]
+      [?source :block/uid ?sourceUid]
+      [?source :block/string ?sourceString]
+      [?source :block/page ?page]
+      [?page :node/title ?pageTitle]]`, targetUid) || [];
+  const unique = new Map();
+  for (const row of rows) {
+    const sourceUid = String(row?.[0] || "");
+    if (!sourceUid || unique.has(sourceUid)) continue;
+    unique.set(sourceUid, {
+      uid: sourceUid,
+      string: String(row?.[1] || ""),
+      pageTitle: String(row?.[2] || ""),
     });
-    const carriers = nodes.filter((node) => elementOwnsBlockUid(node, targetUid));
-    if (!carriers.length) continue;
-    const counts = nodes.filter((node) => node.classList?.contains?.("rm-block-ref-count") && !excludedRoot?.contains?.(node));
-    for (const count of counts) for (const carrier of carriers) {
-      const distance = domTreeDistance(count, carrier);
-      if (distance < bestDistance) { best = count; bestDistance = distance; }
-    }
   }
-  return best;
+  return [...unique.values()].sort((first, second) => first.pageTitle.localeCompare(second.pageTitle) || first.uid.localeCompare(second.uid));
 }
 
 function isMac() { return /Mac|iPhone|iPad/.test(globalThis.navigator?.platform || ""); }
@@ -4107,6 +4077,9 @@ export class GridView {
     this.resizeCleanup = null;
     this.editorController = null;
     this.referenceCounts = session?.referenceCounts || new Map();
+    this.inlineReferencesUid = null;
+    this.inlineReferencesPanel = null;
+    this.inlineReferenceDisposers = new Set();
     this.selectedCellElements = new Set();
     this.activeCellElement = null;
     this.selectionControls = new Set();
@@ -4721,6 +4694,9 @@ export class GridView {
     badge.textContent = String(count);
     badge.title = "Click for references";
     badge.setAttribute("aria-label", `${count} linked reference${count === 1 ? "" : "s"}. Click to toggle references`);
+    badge.setAttribute("aria-expanded", String(this.inlineReferencesUid === uid));
+    if (this.inlineReferencesUid === uid && this.inlineReferencesPanel?.id) badge.setAttribute("aria-controls", this.inlineReferencesPanel.id);
+    else badge.removeAttribute("aria-controls");
   }
 
   updateReferenceCountBadges(uids = this.referenceCounts?.keys?.() || []) {
@@ -4731,22 +4707,90 @@ export class GridView {
     }
   }
 
-  openCellReferences(uid) {
-    const nativeBlock = this.nativeElement?.closest?.(".roam-block-container, .rm-block-main, .rm-block-text") || null;
-    const nativeCount = findNativeCellReferenceCount(uid, [this.nativeElement, nativeBlock, this.host], this.root);
-    if (nativeCount) {
-      try {
-        if (typeof nativeCount.click === "function") nativeCount.click();
-        else nativeCount.dispatchEvent?.(new MouseEvent("click", { bubbles: true, cancelable: true, view: globalThis.window }));
-        return true;
-      } catch (error) { console.warn("[roam-grid] Native reference panel bridge failed", error); }
+  referenceBadge(uid) {
+    const coordinate = this.cellCoordinatesByUid.get(uid);
+    return coordinate ? this.cells.get(`${coordinate.row}:${coordinate.col}`)?.querySelector?.(".rg-cell-reference-count") || null : null;
+  }
+
+  closeInlineReferences() {
+    const previousUid = this.inlineReferencesUid;
+    for (const dispose of this.inlineReferenceDisposers) {
+      try { dispose(); } catch { /* Roam may already have unmounted the block */ }
     }
+    this.inlineReferenceDisposers.clear();
+    this.inlineReferencesPanel?.remove();
+    this.inlineReferencesPanel = null;
+    this.inlineReferencesUid = null;
+    const badge = previousUid ? this.referenceBadge(previousUid) : null;
+    badge?.setAttribute("aria-expanded", "false");
+    badge?.removeAttribute("aria-controls");
+    return Boolean(previousUid);
+  }
+
+  renderReferenceSource(source, host) {
+    const api = roam();
+    const fallback = () => {
+      if (this.inlineReferencesPanel && !this.inlineReferencesPanel.contains?.(host)) return;
+      host.textContent = source.string;
+      try {
+        const result = api.ui?.components?.renderString?.({ el: host, string: source.string });
+        if (typeof result === "function") this.inlineReferenceDisposers.add(result);
+      } catch { /* readable plain text already exists */ }
+    };
     try {
-      const result = roam().ui?.rightSidebar?.addWindow?.({ window: { type: "block", "block-uid": uid } });
-      if (result?.catch) result.catch((error) => toast(`Could not open referenced cell: ${error.message}`, "danger"));
-      if (result !== undefined) return result;
-      return roam().ui?.mainWindow?.openBlock?.({ block: { uid } });
-    } catch (error) { return toast(`Could not open referenced cell: ${error.message}`, "danger"); }
+      const result = api.ui?.components?.renderBlock?.({ uid: source.uid, el: host });
+      if (typeof result === "function") this.inlineReferenceDisposers.add(result);
+      else if (typeof result?.dispose === "function") this.inlineReferenceDisposers.add(() => result.dispose());
+      else if (result && typeof result.then === "function") result.then((resolved) => {
+        if (typeof resolved !== "function") return;
+        if (this.inlineReferencesPanel?.contains?.(host)) this.inlineReferenceDisposers.add(resolved);
+        else resolved();
+      }, fallback);
+      else if (result === undefined && !api.ui?.components?.renderBlock) fallback();
+    } catch { fallback(); }
+  }
+
+  openCellReferences(uid) {
+    if (this.inlineReferencesUid === uid) { this.closeInlineReferences(); return true; }
+    this.closeInlineReferences();
+    const sources = queryBlockReferenceSources(uid);
+    const coordinate = this.cellCoordinatesByUid.get(uid);
+    const raw = coordinate ? this.model.getRaw(coordinate.row, coordinate.col) : "Referenced cell";
+    const panel = document.createElement("section");
+    panel.className = "rg-inline-references";
+    panel.id = `rg-inline-references-${String(uid).replace(/[^A-Za-z0-9_-]/g, "")}-${cryptoId()}`;
+    panel.dataset.uid = uid;
+    panel.setAttribute("aria-label", `References to ${String(raw).replace(/\s+/g, " ").trim() || "this cell"}`);
+    const header = document.createElement("div"); header.className = "rg-inline-references-header";
+    const title = document.createElement("span"); title.className = "rg-inline-references-title";
+    const label = String(raw).replace(/\s+/g, " ").trim() || "(empty cell)";
+    title.textContent = `References to: ${label}`;
+    const count = document.createElement("span"); count.className = "rg-inline-references-count"; count.textContent = String(sources.length);
+    const close = button("×", "Close references", () => this.closeInlineReferences(), "rg-inline-references-close");
+    header.append(title, count, close); panel.appendChild(header);
+    const list = document.createElement("div"); list.className = "rg-inline-references-list"; panel.appendChild(list);
+    if (!sources.length) {
+      const empty = document.createElement("div"); empty.className = "rg-inline-references-empty"; empty.textContent = "No linked references found."; list.appendChild(empty);
+    } else for (const source of sources) {
+      const item = document.createElement("article"); item.className = "rg-inline-reference-item"; item.dataset.uid = source.uid;
+      const breadcrumb = document.createElement("button"); breadcrumb.type = "button"; breadcrumb.className = "rg-inline-reference-breadcrumb";
+      breadcrumb.textContent = `${source.pageTitle || "Roam"}  ›`;
+      breadcrumb.title = "Open referencing block";
+      breadcrumb.addEventListener("click", () => roam().ui?.mainWindow?.openBlock?.({ block: { uid: source.uid } }));
+      const block = document.createElement("div"); block.className = "rg-inline-reference-block";
+      item.append(breadcrumb, block); list.appendChild(item);
+      (globalThis.queueMicrotask || ((callback) => Promise.resolve().then(callback)))(() => {
+        if (this.inlineReferencesPanel === panel && panel.contains?.(block)) this.renderReferenceSource(source, block);
+      });
+    }
+    this.inlineReferencesUid = uid;
+    this.inlineReferencesPanel = panel;
+    this.root.appendChild(panel);
+    const badge = this.referenceBadge(uid);
+    badge?.setAttribute("aria-expanded", "true");
+    badge?.setAttribute("aria-controls", panel.id);
+    panel.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
+    return true;
   }
 
   select(range) {
@@ -5366,6 +5410,7 @@ export class GridView {
   dispose({ releaseNative = true } = {}) {
     this.disposed = true; clearTimeout(this.saveTimer); this.dirtyCells.clear(); this.resizeCleanup?.(); if (!this.session) this.adapter.dispose?.();
     this.editorController?.dispose(); this.editorController = null;
+    this.closeInlineReferences();
     this.clearSelectionPresentation();
     globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true);
     document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true);

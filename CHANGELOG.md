@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.2
+
+- Replaced the hidden-native-count bridge with a view-local inline references
+  section. Clicking an enhanced cell's superscript count now opens beneath the
+  exact grid instance that was clicked, including referenced and inline grids;
+  clicking it again closes the section.
+- Kept referenced blocks native by mounting them with Roam's block component,
+  while adding a compact page breadcrumb, reference count, close control, and
+  extension-scoped light/dark styling around the native content.
+- Removed the right-sidebar fallback, so a missing hidden native control can no
+  longer turn a reference-count click into an unrelated Block Outline window.
+- Added coverage for source-query normalization, local toggle behavior, native
+  block rendering, and the guarantee that the right sidebar is not invoked.
+
 ## 0.8.1
 
 - Made enhanced-cell reference counts delegate to the closest hidden native
