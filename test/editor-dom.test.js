@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { FormulaEngine, GridEditorController, GridModel, GridView, paintRichCellContent, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, syncPortalThemeFromRoot } from "../src/extension.js";
+import { FormulaEngine, GridEditorController, GridModel, GridView, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, syncPortalThemeFromRoot } from "../src/extension.js";
 
 class MiniClassList {
   constructor() { this.values = new Set(); }
@@ -259,11 +259,95 @@ test("formula assistant highlights references, locks with F4, and closes suggest
 
   editor.value = "=su"; editor.setSelectionRange(3, 3); editor.dispatch("input"); flush();
   assert.equal(controller.suggestionList.hidden, false);
+  let suggestionPrevented = false;
+  controller.onKeydown({ key: "ArrowDown", preventDefault() { suggestionPrevented = true; }, stopPropagation() {}, isComposing: false });
+  assert.equal(suggestionPrevented, true);
+  assert.equal(editor.value, "=su", "function autocomplete keeps arrow-key precedence while a name is being typed");
   controller.onKeydown({ key: "Escape", preventDefault() {}, stopPropagation() {}, isComposing: false });
   assert.ok(controller.state, "first Escape only dismisses autocomplete");
   controller.onKeydown({ key: "Escape", preventDefault() {}, stopPropagation() {}, isComposing: false });
   assert.equal(controller.state, null);
   assert.equal(finishes.at(-1).commit, false);
+  controller.dispose();
+});
+
+test("formula point mode builds a calculation with arrows, operators, and Enter", async () => {
+  const revealed = [];
+  const { controller, cells, flush, finishes } = makeController({
+    revealReference: (row, col) => revealed.push([row, col]),
+  });
+  const inlineEditor = await controller.start({ row: 0, col: 2, cell: cells.get("0:2"), raw: "", initial: "=", floating: false });
+  flush();
+
+  let prevented = false;
+  controller.onKeydown({ key: "ArrowLeft", shiftKey: false, preventDefault() { prevented = true; }, stopPropagation() {}, isComposing: false });
+  flush();
+  assert.equal(prevented, true);
+  assert.equal(inlineEditor.parentNode, null, "keyboard pointing promotes the draft out of the virtualizable cell");
+  assert.equal(controller.currentEditor(), controller.input);
+  assert.equal(globalThis.document.activeElement, controller.input);
+  assert.equal(controller.input.value, "=B1");
+  assert.deepEqual(revealed, [[0, 1]]);
+  assert.equal(cells.get("0:1").classList.contains("rg-cell--formula-reference"), true);
+  assert.equal(controller.pointHint.hidden, false);
+
+  controller.input.value += "+";
+  controller.input.setSelectionRange(controller.input.value.length, controller.input.value.length);
+  controller.input.dispatch("input");
+  flush();
+  controller.onKeydown({ key: "ArrowDown", shiftKey: false, preventDefault() {}, stopPropagation() {}, isComposing: false });
+  flush();
+  assert.equal(controller.input.value, "=B1+B2");
+  assert.deepEqual(revealed, [[0, 1], [1, 1]]);
+  assert.equal(cells.get("0:1").classList.contains("rg-cell--formula-reference"), true);
+  assert.equal(cells.get("1:1").classList.contains("rg-cell--formula-reference"), true);
+
+  controller.onKeydown({ key: "Enter", shiftKey: false, preventDefault() {}, stopPropagation() {}, isComposing: false });
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(finishes.at(-1).commit, true);
+  assert.equal(finishes.at(-1).value, "=B1+B2");
+  assert.deepEqual(finishes.at(-1).movement, [1, 0]);
+  controller.dispose();
+});
+
+test("formula point mode extends locked ranges and leaves ordinary caret arrows alone", async () => {
+  assert.equal(formulaCanPointReference("=", 1), true);
+  assert.equal(formulaCanPointReference("=SUM(", 5), true);
+  assert.equal(formulaCanPointReference("=A1+", 4), true);
+  assert.equal(formulaCanPointReference("=A1+2", 5), false);
+  assert.equal(formulaCanPointReference('="text"', 7), false);
+  const mergeAt = (row, col) => row === 0 && [1, 2].includes(col) ? { row: 0, col: 1, rowSpan: 1, colSpan: 2 } : null;
+  assert.deepEqual(moveFormulaReferenceCoordinate({ row: 0, col: 0 }, [0, 1], { rowCount: 1, colCount: 4 }, mergeAt), { row: 0, col: 1 });
+  assert.deepEqual(moveFormulaReferenceCoordinate({ row: 0, col: 1 }, [0, 1], { rowCount: 1, colCount: 4 }, mergeAt), { row: 0, col: 3 });
+  assert.deepEqual(moveFormulaReferenceCoordinate({ row: 0, col: 2 }, [0, -1], { rowCount: 1, colCount: 4 }, mergeAt), { row: 0, col: 0 });
+
+  const { controller, cells, flush } = makeController();
+  await controller.start({ row: 0, col: 2, cell: cells.get("0:2"), raw: "=", floating: true });
+  controller.onKeydown({ key: "ArrowLeft", shiftKey: false, preventDefault() {}, stopPropagation() {}, isComposing: false });
+  flush();
+  controller.onKeydown({ key: "ArrowDown", shiftKey: true, preventDefault() {}, stopPropagation() {}, isComposing: false });
+  flush();
+  assert.equal(controller.input.value, "=B1:B2");
+
+  controller.onKeydown({ key: "F4", preventDefault() {}, stopPropagation() {}, isComposing: false });
+  flush();
+  assert.equal(controller.input.value, "=$B$1:$B$2");
+  controller.onKeydown({ key: "ArrowDown", shiftKey: true, preventDefault() {}, stopPropagation() {}, isComposing: false });
+  flush();
+  assert.equal(controller.input.value, "=$B$1:$B$3");
+  controller.input.value += "+C1";
+  controller.input.setSelectionRange(controller.input.value.length - 1, controller.input.value.length - 1);
+  controller.input.dispatch("click");
+  let caretPrevented = false;
+  controller.onKeydown({ key: "ArrowLeft", shiftKey: false, preventDefault() { caretPrevented = true; }, stopPropagation() {}, isComposing: false });
+  assert.equal(caretPrevented, false, "clicking outside the pointed token returns arrows to caret editing");
+
+  await controller.finish(false);
+  await controller.start({ row: 0, col: 2, cell: cells.get("0:2"), raw: "=B1+2", floating: true });
+  let prevented = false;
+  controller.onKeydown({ key: "ArrowLeft", shiftKey: false, preventDefault() { prevented = true; }, stopPropagation() {}, isComposing: false });
+  assert.equal(prevented, false);
+  assert.equal(controller.input.value, "=B1+2");
   controller.dispose();
 });
 
@@ -640,4 +724,6 @@ test("native and large views route Enter inline and F2 floating without legacy e
   assert.match(source, /releaseRichCellHosts\(this\.canvas\);\s*this\.canvas\.replaceChildren\(\)/);
   assert.ok((source.match(/releaseRichCellHosts\(this\.root\);\s*this\.root\.remove\(\)/g) || []).length >= 2);
   assert.doesNotMatch(source, /this\.formulaEdit|this\.formulaPopover/);
+  assert.equal((source.match(/navigateReference:/g) || []).length, 2);
+  assert.equal((source.match(/revealReference:/g) || []).length, 2);
 });

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.0
+
+- Added Excel-style keyboard point mode for formulas. After `=` or an operator,
+  arrow keys select and insert a cell reference, subsequent arrows move that
+  reference, and typing another operator starts the next reference from the
+  previously selected cell.
+- Added Shift+Arrow range construction while point mode is active. F4 preserves
+  its existing lock cycle and applies the chosen absolute/relative axes as the
+  keyboard-selected cell or range moves.
+- Promoted an inline formula draft to the shared floating `fx` editor only when
+  keyboard point mode begins. This keeps focus authoritative and allows the
+  virtualized large grid to scroll and repaint referenced cells without losing
+  the result-cell draft.
+- Reused merge-anchor normalization, colored reference outlines, autocomplete,
+  signature help, Enter/Tab commit, and Escape cancellation across enhanced
+  native and large-grid modes. Ordinary caret arrows remain untouched when the
+  formula is not waiting for a reference.
+- Added DOM regression coverage for operator-separated keyboard formulas,
+  point-mode focus promotion, Shift+Arrow ranges, F4-locked range movement,
+  ordinary caret behavior, and both grid navigation adapters.
+
 ## 0.6.0
 
 - Added a graph-scoped pre-paint guard for enhanced table UIDs and replaced the

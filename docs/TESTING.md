@@ -20,7 +20,8 @@ merge-anchor behavior plus native and large-grid persistence.
 
 Editor and lightweight DOM tests cover the shared F2 editor, inline editing,
 IME-safe commit/cancel behavior, formula autocomplete, nested signature help,
-F4 reference locking, bounded formula highlighting, and native `[[page]]` /
+Excel-style arrow-key point mode, Shift+Arrow ranges, F4 reference locking,
+bounded formula highlighting, and native `[[page]]` /
 `((block))` completion. They also verify stale-search suppression, keyboard and
 pointer insertion, stable scalar rendering, connected rich-render hosts,
 official unmount cleanup, structural viewport swaps, and virtual-canvas
@@ -56,9 +57,9 @@ manifest that loads only the requested visible chunk. The live smoke test is
 restricted to `[[roam-grid/dev]]` in `svy`; existing native tables are not
 opted in or changed.
 
-Current v0.6 release acceptance:
+Current v0.7 release acceptance:
 
-- All 127 automated tests pass in the v0.6.0 release run. They exercise model,
+- All 129 automated tests pass in the v0.7.0 release run. They exercise model,
   adapter, persistence, editor, DOM, and rendering behavior without claiming
   browser-frame performance.
 - The existing host-neutral Thymer Grid baseline remains green at 343/343; the

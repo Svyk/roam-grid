@@ -653,6 +653,7 @@ body.roam-body.dark .rg-portal {
 
 .rg-formula-suggestions[hidden],
 .rg-formula-signature[hidden],
+.rg-formula-point-hint[hidden],
 .rg-formula-mirror[hidden],
 .rg-floating-editor-input[hidden] {
   display: none !important;
@@ -688,6 +689,11 @@ body.roam-body.dark .rg-portal {
 .rg-formula-signature {
   color: var(--rg-portal-muted, #5f6b7c);
   font: 500 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.rg-formula-point-hint {
+  color: var(--rg-portal-muted, #5f6b7c);
+  font: 500 10px/1.35 var(--ff-main, inherit);
 }
 
 .rg-formula-signature > strong {

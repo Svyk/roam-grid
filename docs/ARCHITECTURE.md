@@ -26,7 +26,11 @@ column insertion/deletion. Structural shifts apply to relative and absolute A1
 references alike; partial range deletion produces the contiguous surviving
 range, while a fully removed reference becomes explicit `#REF!`. Formula edit
 highlighting is presentation-only and never writes derived color state into
-Roam blocks or metadata.
+Roam blocks or metadata. Keyboard point mode is part of the same shared editor:
+when a formula is waiting for an operand, arrows insert or move one transient A1
+token, Shift+Arrow extends its range, and F4 changes its lock mask. Beginning
+point mode promotes an inline draft to the persistent floating editor so a
+large-grid canvas may virtualize and scroll without owning the draft DOM.
 
 ### Discovery, sessions, and references
 

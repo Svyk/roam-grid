@@ -4,7 +4,7 @@ Native-first advanced tables for Roam Research.
 
 ## Status
 
-Version 0.6.0 is a functional public-source beta and live demo. Native
+Version 0.7.0 is a functional public-source beta and live demo. Native
 opt-in tables, safe merges, core formulas, interactions, imports/exports,
 charts, chunked large-grid persistence, the public API, and clean fallback are
 implemented. Before a public Depot release, the project still needs the full
@@ -32,7 +32,7 @@ folder again. Developer extensions remain local to each Roam client.
 
 For an immediate update after a push, wait for the GitHub Pages deployment and
 press the circular reload button beside this URL. Hover the grid-size badge to
-confirm the running version (for example, `Roam Grid v0.6.0`). Roam can reuse a
+confirm the running version (for example, `Roam Grid v0.7.0`). Roam can reuse a
 cached remote bundle during the same app session; if the badge still shows the
 older version, remove only this developer-extension URL and add the same URL
 again. The reinstall remounts the renderer and does not alter any table blocks,
@@ -139,6 +139,13 @@ The extension deliberately does not use `roam/js`.
   colors in the grid. Click a cell while editing to insert its A1 reference;
   Shift-click after a reference to extend it into a range without moving focus
   away from the formula.
+- Formula point mode also supports an Excel-style keyboard-only flow. Type `=`,
+  use the arrow keys to choose a cell, type an operator such as `+`, then use the
+  arrows again to choose the next cell. The chosen A1 reference is inserted or
+  moved in place; Shift+Arrow extends it into a range, Enter commits, and Escape
+  cancels. Point mode promotes the draft to the floating `fx` bar so focus stays
+  stable while the grid scrolls. Arrow keys retain ordinary caret behavior when
+  the formula is not currently waiting for a reference.
 - Formula assistance suggests functions after `=` or while a function name is
   being typed. Arrow keys choose a suggestion; Enter, Tab, or a click inserts
   it. Signature help shows the active function and argument, including inside

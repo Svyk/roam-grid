@@ -1,5 +1,5 @@
-/* Roam Grid v0.6.0 | MIT | generated from src/extension.js */
-const VERSION = "0.6.0";
+/* Roam Grid v0.7.0 | MIT | generated from src/extension.js */
+const VERSION = "0.7.0";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -208,6 +208,41 @@ export function formulaAutocompleteContext(raw, caret = String(raw ?? "").length
   let followingIndex = endIndex;
   while (followingIndex < raw.length && /\s/.test(raw[followingIndex])) followingIndex += 1;
   return { query, startIndex, endIndex, hasFollowingParenthesis: raw[followingIndex] === "(" };
+}
+
+export function formulaCanPointReference(raw, caret = String(raw ?? "").length) {
+  if (typeof raw !== "string" || !raw.startsWith("=") || raw.startsWith("==")) return false;
+  const caretIndex = clamp(Number.isFinite(caret) ? caret : raw.length, 1, raw.length);
+  if (formulaPositionIsQuoted(raw, caretIndex)) return false;
+  const prefix = raw.slice(1, caretIndex).trimEnd();
+  if (!prefix) return true;
+  return /[=(,:+\-*/^&%<>]$/.test(prefix);
+}
+
+function formatCoordinateLike(row, col, template = "") {
+  const locks = parseCellReference(template);
+  return formatCellReference({
+    row,
+    col,
+    absoluteCol: Boolean(locks?.absoluteCol),
+    absoluteRow: Boolean(locks?.absoluteRow),
+  });
+}
+
+export function moveFormulaReferenceCoordinate(base, movement, dimensions, mergeAt = () => null) {
+  const rowCount = Math.max(1, Number(dimensions?.rowCount) || 1);
+  const colCount = Math.max(1, Number(dimensions?.colCount) || 1);
+  const fromRow = clamp(Number(base?.row) || 0, 0, rowCount - 1);
+  const fromCol = clamp(Number(base?.col) || 0, 0, colCount - 1);
+  const dr = Number(movement?.[0]) || 0;
+  const dc = Number(movement?.[1]) || 0;
+  const source = mergeAt(fromRow, fromCol);
+  let row = source ? (dr > 0 ? source.row + source.rowSpan : dr < 0 ? source.row - 1 : source.row) : fromRow + dr;
+  let col = source ? (dc > 0 ? source.col + source.colSpan : dc < 0 ? source.col - 1 : source.col) : fromCol + dc;
+  row = clamp(row, 0, rowCount - 1);
+  col = clamp(col, 0, colCount - 1);
+  const target = mergeAt(row, col);
+  return { row: target?.row ?? row, col: target?.col ?? col };
 }
 
 function formulaCatalogEntries(catalog) {
@@ -3402,7 +3437,7 @@ export async function searchRoamReferenceSuggestions(context, limit = 8, api = g
 }
 
 export class GridEditorController {
-  constructor(view, { cellAt, dimensions, mountedCells = null, cellRange = null, searchReferences = searchRoamReferenceSuggestions, referenceSearchDelay = 90, onFinish, viewport }) {
+  constructor(view, { cellAt, dimensions, mountedCells = null, cellRange = null, navigateReference = null, revealReference = null, searchReferences = searchRoamReferenceSuggestions, referenceSearchDelay = 90, onFinish, viewport }) {
     this.view = view;
     this.cellAt = cellAt;
     this.dimensions = dimensions;
@@ -3411,6 +3446,8 @@ export class GridEditorController {
       const row = Number(cell.dataset.row); const col = Number(cell.dataset.col);
       return { startRow: row, endRow: row, startCol: col, endCol: col };
     });
+    this.navigateReference = navigateReference || ((base, movement, dimensions) => moveFormulaReferenceCoordinate(base, movement, dimensions));
+    this.revealReference = revealReference || ((row, col) => this.cellAt(row, col)?.scrollIntoView?.({ block: "nearest", inline: "nearest" }));
     this.onFinish = onFinish;
     this.viewport = viewport;
     this.searchReferences = searchReferences;
@@ -3448,13 +3485,18 @@ export class GridEditorController {
     this.signature.setAttribute("role", "status");
     this.signature.setAttribute("aria-live", "polite");
     this.signature.setAttribute("aria-hidden", "true");
+    this.pointHint = document.createElement("div");
+    this.pointHint.className = "rg-formula-point-hint";
+    this.pointHint.textContent = "Arrow keys pick a cell · Shift+Arrow makes a range · Enter finishes";
+    this.pointHint.setAttribute("role", "status");
+    this.pointHint.setAttribute("aria-hidden", "true");
     this.input.setAttribute("role", "combobox");
     this.input.setAttribute("aria-autocomplete", "list");
     this.input.setAttribute("aria-controls", this.suggestionList.id);
     this.input.setAttribute("aria-expanded", "false");
     const body = document.createElement("div");
     body.className = "rg-editor-popover-body";
-    body.append(this.input, this.mirror, this.suggestionList, this.signature);
+    body.append(this.input, this.mirror, this.suggestionList, this.pointHint, this.signature);
     this.popover.append(this.address, body);
     document.body.appendChild(this.popover);
     this.portalTheme = createPortalThemeBridge(this.view.root, this.popover);
@@ -3467,11 +3509,11 @@ export class GridEditorController {
     this.input.addEventListener("compositionstart", () => { if (this.state) this.state.composing = true; });
     this.input.addEventListener("compositionend", () => { if (this.state) this.state.composing = false; this.schedulePresentation(); });
     this.input.addEventListener("input", () => { this.onEditorInput(); });
-    this.input.addEventListener("click", () => this.schedulePresentation());
-    this.input.addEventListener("select", () => this.schedulePresentation());
+    this.input.addEventListener("click", () => this.onEditorSelection());
+    this.input.addEventListener("select", () => this.onEditorSelection());
     this.input.addEventListener("keydown", (event) => this.onKeydown(event));
     this.input.addEventListener("blur", (event) => {
-      if (!this.state || this.popover.contains(event.relatedTarget)) return;
+      if (!this.state || this.state.transitioning || this.popover.contains(event.relatedTarget)) return;
       this.finish(true);
     });
   }
@@ -3487,7 +3529,7 @@ export class GridEditorController {
       for (const type of ["keyup", "keypress", "beforeinput", "input"]) editor.addEventListener(type, (event) => event.stopPropagation());
     }
     editor.value = value;
-    this.state = { row, col, cell, raw: String(raw ?? ""), editor, floating, composing: false, autocompleteClosed: false, referenceAutocompleteClosed: false, finished: false };
+    this.state = { row, col, cell, raw: String(raw ?? ""), editor, floating, composing: false, autocompleteClosed: false, referenceAutocompleteClosed: false, keyboardReference: null, keyboardCursor: null, transitioning: false, finished: false };
     const formula = value.startsWith("=") && !value.startsWith("==");
     this.address.textContent = `${formula ? "fx  " : ""}${cellLabel(row, col)}`;
     this.setPopoverHidden(!floating && !formula);
@@ -3503,9 +3545,9 @@ export class GridEditorController {
       editor.addEventListener("compositionstart", () => { if (this.state) this.state.composing = true; });
       editor.addEventListener("compositionend", () => { if (this.state) this.state.composing = false; this.schedulePresentation(); });
       editor.addEventListener("input", () => { this.onEditorInput(); });
-      editor.addEventListener("click", () => this.schedulePresentation());
-      editor.addEventListener("select", () => this.schedulePresentation());
-      editor.addEventListener("blur", (event) => { if (!this.popover.contains(event.relatedTarget)) this.finish(true); });
+      editor.addEventListener("click", () => this.onEditorSelection());
+      editor.addEventListener("select", () => this.onEditorSelection());
+      editor.addEventListener("blur", (event) => { if (!this.state?.transitioning && !this.popover.contains(event.relatedTarget)) this.finish(true); });
     }
     editor.focus({ preventScroll: true });
     if (typeof editor.setSelectionRange === "function") editor.setSelectionRange(value.length, value.length);
@@ -3522,8 +3564,24 @@ export class GridEditorController {
   }
 
   onEditorInput() {
-    if (this.state) { this.state.autocompleteClosed = false; this.state.referenceAutocompleteClosed = false; }
+    if (this.state) {
+      this.state.autocompleteClosed = false;
+      this.state.referenceAutocompleteClosed = false;
+      this.state.keyboardReference = null;
+      if (!this.state.editor.value.startsWith("=") || this.state.editor.value.startsWith("==")) this.state.keyboardCursor = null;
+    }
     clearTimeout(this.referenceSearchTimer); this.referenceSearchTimer = null; this.referenceSearchToken += 1; this.referenceContextKey = null;
+    this.schedulePresentation();
+  }
+
+  onEditorSelection() {
+    const state = this.state; const active = state?.keyboardReference; const editor = state?.editor;
+    if (state && active && editor) {
+      const lower = Math.min(editor.selectionStart ?? 0, editor.selectionEnd ?? 0);
+      const upper = Math.max(editor.selectionStart ?? 0, editor.selectionEnd ?? 0);
+      const inside = lower >= active.startIndex && upper <= active.endIndex;
+      if (!inside) { state.keyboardReference = null; state.keyboardCursor = null; }
+    }
     this.schedulePresentation();
   }
 
@@ -3537,8 +3595,13 @@ export class GridEditorController {
         event.preventDefault();
         state.editor.value = result.value;
         state.editor.setSelectionRange(result.selectionStart, result.selectionEnd);
+        this.syncKeyboardReferenceToken();
         this.schedulePresentation();
       }
+      return;
+    }
+    if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key) && this.moveKeyboardReference(event.key, event.shiftKey)) {
+      event.preventDefault();
       return;
     }
     const hasSuggestions = !this.suggestionList.hidden && this.suggestions.length;
@@ -3603,7 +3666,104 @@ export class GridEditorController {
     const prefix = editor.value.slice(0, start);
     const reference = `${event.shiftKey && /\$?[A-Z]+\$?\d+$/i.test(prefix) ? ":" : ""}${cellLabel(row, col)}`;
     editor.setRangeText(reference, start, end, "end");
+    state.keyboardCursor = { row, col };
+    this.activateKeyboardReferenceAtCaret({ row, col });
     editor.focus({ preventScroll: true });
+    this.schedulePresentation();
+    return true;
+  }
+
+  promoteToFloating() {
+    const state = this.state;
+    if (!state || state.floating) return state?.editor || null;
+    const inlineEditor = state.editor;
+    const value = inlineEditor.value;
+    const selectionStart = inlineEditor.selectionStart ?? value.length;
+    const selectionEnd = inlineEditor.selectionEnd ?? selectionStart;
+    state.transitioning = true;
+    state.floating = true;
+    state.editor = this.input;
+    this.input.value = value;
+    this.input.hidden = false;
+    this.popover.classList.add("rg-editor-popover--floating");
+    this.setPopoverHidden(false);
+    this.portalTheme.sync();
+    this.input.focus({ preventScroll: true });
+    this.input.setSelectionRange(selectionStart, selectionEnd);
+    inlineEditor.remove();
+    state.cell.classList.remove("rg-cell--editing");
+    state.transitioning = false;
+    this.position();
+    return this.input;
+  }
+
+  referenceTokenAtCaret() {
+    const state = this.state; const editor = state?.editor;
+    if (!state || !editor) return null;
+    const caret = editor.selectionStart ?? editor.value.length;
+    return formulaReferences(editor.value).find((token) => caret >= token.startIndex && caret <= token.endIndex) || null;
+  }
+
+  activateKeyboardReferenceAtCaret(fallback = null) {
+    const state = this.state; const token = this.referenceTokenAtCaret();
+    if (!state || !token) return null;
+    const current = fallback || { row: token.endRef.row, col: token.endRef.col };
+    state.keyboardReference = {
+      startIndex: token.startIndex,
+      endIndex: token.endIndex,
+      anchor: { row: token.startRef.row, col: token.startRef.col },
+      current: { row: current.row, col: current.col },
+    };
+    state.keyboardCursor = { row: current.row, col: current.col };
+    return { active: state.keyboardReference, token };
+  }
+
+  syncKeyboardReferenceToken() {
+    const state = this.state; const active = state?.keyboardReference;
+    if (!state || !active) return null;
+    const editor = state.editor; const caret = editor.selectionStart ?? active.endIndex;
+    const token = formulaReferences(editor.value).find((item) =>
+      (caret >= item.startIndex && caret <= item.endIndex)
+      || (item.startIndex <= active.startIndex && item.endIndex >= active.startIndex));
+    if (!token) { state.keyboardReference = null; return null; }
+    active.startIndex = token.startIndex; active.endIndex = token.endIndex;
+    return { active, token };
+  }
+
+  moveKeyboardReference(key, extend = false) {
+    const state = this.state; const editor = state?.editor;
+    if (!state || !editor || !editor.value.startsWith("=") || editor.value.startsWith("==")) return false;
+    const activeToken = this.syncKeyboardReferenceToken();
+    const caret = editor.selectionStart ?? editor.value.length;
+    if (!activeToken && !formulaCanPointReference(editor.value, caret)) return false;
+    const movement = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] }[key];
+    if (!movement) return false;
+
+    const pointEditor = this.promoteToFloating();
+    const synced = this.syncKeyboardReferenceToken() || activeToken;
+    const active = synced?.active || null;
+    const token = synced?.token || null;
+    const dimensions = this.dimensions();
+    const base = active?.current || state.keyboardCursor || { row: state.row, col: state.col };
+    const destination = this.navigateReference(base, movement, dimensions) || base;
+    const row = clamp(destination.row, 0, Math.max(0, dimensions.rowCount - 1));
+    const col = clamp(destination.col, 0, Math.max(0, dimensions.colCount - 1));
+
+    const startIndex = active?.startIndex ?? pointEditor.selectionStart ?? pointEditor.value.length;
+    const endIndex = active?.endIndex ?? pointEditor.selectionEnd ?? startIndex;
+    const anchor = extend && active ? active.anchor : { row, col };
+    const startTemplate = token?.startText || "";
+    const endTemplate = token?.endText || startTemplate;
+    const reference = extend && active
+      ? `${formatCoordinateLike(anchor.row, anchor.col, startTemplate)}:${formatCoordinateLike(row, col, endTemplate)}`
+      : formatCoordinateLike(row, col, startTemplate);
+    pointEditor.setRangeText(reference, startIndex, endIndex, "end");
+    state.keyboardReference = { startIndex, endIndex: startIndex + reference.length, anchor, current: { row, col } };
+    state.keyboardCursor = { row, col };
+    state.autocompleteClosed = true;
+    state.referenceAutocompleteClosed = true;
+    pointEditor.focus({ preventScroll: true });
+    try { this.revealReference(row, col); } catch { /* reference remains valid even when a virtual view is between paints */ }
     this.schedulePresentation();
     return true;
   }
@@ -3626,6 +3786,10 @@ export class GridEditorController {
     this.popover.classList.toggle("rg-editor-popover--formula", formula);
     this.popover.classList.toggle("rg-editor-popover--reference", Boolean(referenceContext));
     this.popover.classList.toggle("rg-editor-popover--plain", !formula && !referenceContext);
+    const pointReady = Boolean(formula && (state.keyboardReference || formulaCanPointReference(raw, editor.selectionStart)));
+    this.view.root.classList.toggle("rg-root--formula-pointing", pointReady);
+    this.pointHint.hidden = !pointReady;
+    this.pointHint.setAttribute("aria-hidden", String(!pointReady));
     this.address.textContent = `${formula ? "fx  " : ""}${cellLabel(state.row, state.col)}`;
     this.mirror.hidden = !formula;
     this.mirror.setAttribute("aria-hidden", String(!formula));
@@ -3759,6 +3923,7 @@ export class GridEditorController {
 
   clearPresentation() {
     this.view.root.classList.remove("rg-root--formula-editing");
+    this.view.root.classList.remove("rg-root--formula-pointing");
     for (const [cell] of this.referenceCells) {
       cell.classList.remove("rg-cell--formula-reference"); cell.style.removeProperty("--rg-reference-color"); delete cell.dataset.rgFormulaReference;
     }
@@ -3767,6 +3932,7 @@ export class GridEditorController {
     this.input.setAttribute("aria-expanded", "false"); this.input.removeAttribute?.("aria-activedescendant");
     this.currentEditor()?.setAttribute?.("aria-expanded", "false"); this.currentEditor()?.removeAttribute?.("aria-activedescendant");
     this.signature.replaceChildren(); this.signature.hidden = true; this.signature.setAttribute("aria-hidden", "true");
+    this.pointHint.hidden = true; this.pointHint.setAttribute("aria-hidden", "true");
   }
 
   dispose() {
@@ -3961,6 +4127,8 @@ export class GridView {
         const row = Number(cell.dataset.row); const col = Number(cell.dataset.col); const merge = this.model.mergeAt(row, col);
         return { startRow: row, endRow: row + (merge?.rowSpan || 1) - 1, startCol: col, endCol: col + (merge?.colSpan || 1) - 1 };
       },
+      navigateReference: (base, movement, dimensions) => moveFormulaReferenceCoordinate(base, movement, dimensions, (row, col) => this.model.mergeAt(row, col)),
+      revealReference: (row, col) => this.cells.get(`${row}:${col}`)?.scrollIntoView?.({ block: "nearest", inline: "nearest" }),
       onFinish: async ({ row, col, cell, raw, value, commit, movement }) => {
         if (commit && value !== this.model.getRaw(row, col)) this.commitMutation("Edit cell", () => this.model.setRaw(row, col, value), false);
         else this.renderCellValue(cell, row, col);
@@ -5150,6 +5318,11 @@ export class LargeGridView {
       cellRange: (cell) => {
         const row = Number(cell.dataset.row); const col = Number(cell.dataset.col); const merge = this.store.mergeAt(row, col);
         return { startRow: row, endRow: row + (merge?.rowSpan || 1) - 1, startCol: col, endCol: col + (merge?.colSpan || 1) - 1 };
+      },
+      navigateReference: (base, movement, dimensions) => moveFormulaReferenceCoordinate(base, movement, dimensions, (row, col) => this.store.mergeAt(row, col)),
+      revealReference: (row, col) => {
+        this.ensureVisible(row, col);
+        this.scheduleRender();
       },
       onFinish: async ({ row, col, value, commit, movement }) => {
         const previous = await this.store.getRaw(row, col);
