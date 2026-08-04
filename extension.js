@@ -4730,8 +4730,10 @@ export class GridView {
 
   renderReferenceSource(source, host) {
     const api = roam();
+    const unmount = api.ui?.components?.unmountNode;
+    if (typeof unmount === "function") this.inlineReferenceDisposers.add(() => unmount({ el: host }));
     const fallback = () => {
-      if (this.inlineReferencesPanel && !this.inlineReferencesPanel.contains?.(host)) return;
+      if (!this.inlineReferencesPanel?.contains?.(host)) return;
       host.textContent = source.string;
       try {
         const result = api.ui?.components?.renderString?.({ el: host, string: source.string });
@@ -4754,7 +4756,9 @@ export class GridView {
   openCellReferences(uid) {
     if (this.inlineReferencesUid === uid) { this.closeInlineReferences(); return true; }
     this.closeInlineReferences();
-    const sources = queryBlockReferenceSources(uid);
+    let sources;
+    try { sources = queryBlockReferenceSources(uid); }
+    catch (error) { toast(`Could not load cell references: ${error.message}`, "danger"); return false; }
     const coordinate = this.cellCoordinatesByUid.get(uid);
     const raw = coordinate ? this.model.getRaw(coordinate.row, coordinate.col) : "Referenced cell";
     const panel = document.createElement("section");

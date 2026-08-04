@@ -640,11 +640,14 @@ test("cell reference clicks toggle a local native-rendered references panel", as
   const root = new MiniNode("section"); root.className = "rg-root"; body.appendChild(root);
   const cell = new MiniNode("div"); cell.className = "rg-cell"; root.appendChild(cell);
   const badge = new MiniNode("button"); badge.className = "rg-cell-reference-count"; cell.appendChild(badge);
-  let sidebarCalls = 0; const rendered = [];
+  let sidebarCalls = 0; let unmountCalls = 0; const rendered = [];
   globalThis.window.roamAlphaAPI = {
     q: () => [["reference-1", "A referencing ((source-cell)) block", "roam-grid/dev"]],
     ui: {
-      components: { renderBlock: ({ uid, el }) => { rendered.push(uid); el.textContent = "Rendered by Roam"; } },
+      components: {
+        renderBlock: ({ uid, el }) => { rendered.push(uid); el.textContent = "Rendered by Roam"; },
+        unmountNode: ({ el }) => { assert.equal(el.classList.contains("rg-inline-reference-block"), true); unmountCalls += 1; },
+      },
       mainWindow: { openBlock() {} },
       rightSidebar: { addWindow: () => { sidebarCalls += 1; } },
     },
@@ -667,6 +670,7 @@ test("cell reference clicks toggle a local native-rendered references panel", as
   assert.equal(view.openCellReferences("source-cell"), true);
   assert.equal(root.querySelector(".rg-inline-references"), null);
   assert.equal(badge.getAttribute("aria-expanded"), "false");
+  assert.equal(unmountCalls, 1);
 });
 
 const waitForSearch = () => new Promise((resolve) => setTimeout(resolve, 2));
