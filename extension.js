@@ -1,5 +1,5 @@
-/* Roam Grid v0.8.0 | MIT | generated from src/extension.js */
-const VERSION = "0.8.0";
+/* Roam Grid v0.8.1 | MIT | generated from src/extension.js */
+const VERSION = "0.8.1";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -3333,6 +3333,61 @@ export function queryBlockReferenceCounts(uids, api = roam()) {
   return counts;
 }
 
+function domDescendants(root) {
+  const values = [];
+  const pending = root ? [root] : [];
+  while (pending.length) {
+    const node = pending.pop();
+    if (!node || values.includes(node)) continue;
+    values.push(node);
+    const children = [...(node.children || [])];
+    for (let index = children.length - 1; index >= 0; index -= 1) pending.push(children[index]);
+  }
+  return values;
+}
+
+function elementOwnsBlockUid(element, uid) {
+  if (!element) return false;
+  const dataUid = element.dataset?.uid || element.getAttribute?.("data-uid") || "";
+  const id = element.id || element.getAttribute?.("id") || "";
+  return String(dataUid) === uid || String(id).endsWith(uid);
+}
+
+function domTreeDistance(first, second) {
+  const firstAncestors = new Map();
+  let depth = 0;
+  for (let node = first; node; node = node.parentElement || node.parentNode) firstAncestors.set(node, depth++);
+  depth = 0;
+  for (let node = second; node; node = node.parentElement || node.parentNode) {
+    if (firstAncestors.has(node)) return depth + firstAncestors.get(node);
+    depth += 1;
+  }
+  return Number.POSITIVE_INFINITY;
+}
+
+export function findNativeCellReferenceCount(uid, roots = [], excludedRoot = null) {
+  const targetUid = String(uid || "");
+  if (!targetUid) return null;
+  let best = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  const seenNodes = new Set();
+  for (const root of roots || []) {
+    const nodes = domDescendants(root).filter((node) => {
+      if (seenNodes.has(node)) return false;
+      seenNodes.add(node);
+      return true;
+    });
+    const carriers = nodes.filter((node) => elementOwnsBlockUid(node, targetUid));
+    if (!carriers.length) continue;
+    const counts = nodes.filter((node) => node.classList?.contains?.("rm-block-ref-count") && !excludedRoot?.contains?.(node));
+    for (const count of counts) for (const carrier of carriers) {
+      const distance = domTreeDistance(count, carrier);
+      if (distance < bestDistance) { best = count; bestDistance = distance; }
+    }
+  }
+  return best;
+}
+
 function isMac() { return /Mac|iPhone|iPad/.test(globalThis.navigator?.platform || ""); }
 
 export function requiresRoamRichRender(raw) {
@@ -4658,13 +4713,15 @@ export class GridView {
       badge = document.createElement("button");
       badge.type = "button";
       badge.className = "rg-cell-reference-count";
+      badge.dataset.rgReferenceUid = uid;
       badge.addEventListener("pointerdown", (event) => { event.preventDefault(); event.stopPropagation(); });
       badge.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); this.openCellReferences(uid); });
       cell.appendChild(badge);
     }
+    badge.dataset.rgReferenceUid = uid;
     badge.textContent = String(count);
-    badge.title = `${count} linked reference${count === 1 ? "" : "s"} · open cell`;
-    badge.setAttribute("aria-label", badge.title);
+    badge.title = "Click for references";
+    badge.setAttribute("aria-label", `${count} linked reference${count === 1 ? "" : "s"}. Click to toggle references`);
   }
 
   updateReferenceCountBadges(uids = this.referenceCounts?.keys?.() || []) {
@@ -4676,9 +4733,15 @@ export class GridView {
   }
 
   openCellReferences(uid) {
-    const nativeCount = [...(document.querySelectorAll?.(`[id$="${cssAttributeValue(uid)}"] .rm-block-ref-count`) || [])]
-      .find((element) => !this.root.contains(element));
-    if (nativeCount?.click) { nativeCount.click(); return; }
+    const nativeBlock = this.nativeElement?.closest?.(".roam-block-container, .rm-block-main, .rm-block-text") || null;
+    const nativeCount = findNativeCellReferenceCount(uid, [this.nativeElement, nativeBlock, this.host], this.root);
+    if (nativeCount) {
+      try {
+        if (typeof nativeCount.click === "function") nativeCount.click();
+        else nativeCount.dispatchEvent?.(new MouseEvent("click", { bubbles: true, cancelable: true, view: globalThis.window }));
+        return true;
+      } catch (error) { console.warn("[roam-grid] Native reference panel bridge failed", error); }
+    }
     try {
       const result = roam().ui?.rightSidebar?.addWindow?.({ window: { type: "block", "block-uid": uid } });
       if (result?.catch) result.catch((error) => toast(`Could not open referenced cell: ${error.message}`, "danger"));

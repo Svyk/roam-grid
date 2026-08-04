@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.1
+
+- Made enhanced-cell reference counts delegate to the closest hidden native
+  Roam count control. Clicking a count now toggles Roam's inline references
+  beneath the table instead of opening a right-sidebar Block Outline.
+- Matched Roam's subdued superscript presentation, native tooltip, hover/focus
+  treatment, and forgiving hit target without interfering with cell selection.
+- Added regression coverage for sibling UID/count DOM layouts, selecting the
+  correct cell among multiple native counts, and excluding Roam Grid's own badge.
+
 ## 0.8.0
 
 - Added **Copy selected cells as block references** to range and axis menus.

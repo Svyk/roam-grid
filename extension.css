@@ -330,26 +330,33 @@ body.roam-body.dark .rg-portal {
 }
 
 .rg-cell-reference-count {
-  display: inline;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 9px;
+  min-height: 12px;
   margin: 0 0 0 1px;
-  padding: 0;
-  color: var(--rg-active);
+  padding: 0 2px;
+  color: var(--rg-muted);
   background: transparent;
   border: 0;
-  border-radius: 2px;
+  border-radius: 3px;
   font: inherit;
-  font-size: 0.68em;
-  font-weight: 600;
+  font-size: 0.64em;
+  font-weight: 500;
   line-height: 1;
   vertical-align: super;
   cursor: pointer;
+  opacity: 0.86;
 }
 
 .rg-cell-reference-count:hover,
 .rg-cell-reference-count:focus-visible {
-  color: color-mix(in srgb, var(--rg-active) 78%, var(--rg-color));
-  text-decoration: underline;
-  outline: none;
+  color: var(--rg-active);
+  background: color-mix(in srgb, var(--rg-active) 10%, transparent);
+  opacity: 1;
+  outline: 1px solid color-mix(in srgb, var(--rg-active) 34%, transparent);
+  outline-offset: 0;
 }
 
 .rg-cell--align-left { text-align: left; }

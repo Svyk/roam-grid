@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { FormulaEngine, GridEditorController, GridModel, GridView, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, syncPortalThemeFromRoot } from "../src/extension.js";
+import { FormulaEngine, GridEditorController, GridModel, GridView, findNativeCellReferenceCount, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, syncPortalThemeFromRoot } from "../src/extension.js";
 
 class MiniClassList {
   constructor() { this.values = new Set(); }
@@ -614,13 +614,41 @@ test("native-style cell reference counts update without replacing stable content
 
   view.updateReferenceCountBadges(new Set(["source-cell"]));
   const badge = cell.querySelector(".rg-cell-reference-count");
-  assert.ok(badge); assert.equal(badge.textContent, "1"); assert.match(badge.title, /1 linked reference/);
+  assert.ok(badge); assert.equal(badge.textContent, "1"); assert.equal(badge.title, "Click for references");
+  assert.equal(badge.getAttribute("aria-label"), "1 linked reference. Click to toggle references");
   assert.equal(cell.children[0], content); assert.equal(content.textContent, "Source");
   badge.dispatch("click"); assert.equal(opened, "source-cell");
 
   view.referenceCounts.set("source-cell", 0); view.updateReferenceCountBadges(new Set(["source-cell"]));
   assert.equal(cell.querySelector(".rg-cell-reference-count"), null);
   assert.equal(cell.children[0], content); assert.equal(content.textContent, "Source");
+});
+
+test("cell reference clicks bridge to the closest hidden native count", () => {
+  installMiniDom();
+  const host = new MiniNode("div");
+  const nativeTable = new MiniNode("div"); nativeTable.className = "rm-table";
+  const sourceBlock = new MiniNode("div"); sourceBlock.className = "roam-block-container";
+  const sourceInput = new MiniNode("textarea"); sourceInput.id = "block-input-source-cell";
+  const sourceCount = new MiniNode("span"); sourceCount.className = "rm-block-ref-count";
+  let nativeClicks = 0; sourceCount.click = () => { nativeClicks += 1; };
+  sourceBlock.append(sourceInput, sourceCount); nativeTable.appendChild(sourceBlock); host.appendChild(nativeTable);
+
+  const otherBlock = new MiniNode("div"); otherBlock.className = "roam-block-container";
+  const otherInput = new MiniNode("textarea"); otherInput.id = "block-input-other-cell";
+  const otherCount = new MiniNode("span"); otherCount.className = "rm-block-ref-count";
+  otherBlock.append(otherInput, otherCount); nativeTable.appendChild(otherBlock);
+
+  const gridRoot = new MiniNode("section"); gridRoot.className = "rg-root";
+  const gridCarrier = new MiniNode("div"); gridCarrier.dataset.uid = "source-cell";
+  const gridCount = new MiniNode("button"); gridCount.className = "rm-block-ref-count";
+  gridCarrier.appendChild(gridCount); gridRoot.appendChild(gridCarrier); host.appendChild(gridRoot);
+
+  assert.equal(findNativeCellReferenceCount("source-cell", [nativeTable, host, gridRoot], gridRoot), sourceCount);
+  const view = Object.assign(Object.create(GridView.prototype), { nativeElement: nativeTable, host, root: gridRoot });
+  nativeTable.closest = () => host;
+  assert.equal(view.openCellReferences("source-cell"), true);
+  assert.equal(nativeClicks, 1);
 });
 
 const waitForSearch = () => new Promise((resolve) => setTimeout(resolve, 2));
