@@ -4,7 +4,7 @@ Native-first advanced tables for Roam Research.
 
 ## Status
 
-Version 0.7.0 is a functional public-source beta and live demo. Native
+Version 0.8.0 is a functional public-source beta and live demo. Native
 opt-in tables, safe merges, core formulas, interactions, imports/exports,
 charts, chunked large-grid persistence, the public API, and clean fallback are
 implemented. Before a public Depot release, the project still needs the full
@@ -32,7 +32,7 @@ folder again. Developer extensions remain local to each Roam client.
 
 For an immediate update after a push, wait for the GitHub Pages deployment and
 press the circular reload button beside this URL. Hover the grid-size badge to
-confirm the running version (for example, `Roam Grid v0.7.0`). Roam can reuse a
+confirm the running version (for example, `Roam Grid v0.8.0`). Roam can reuse a
 cached remote bundle during the same app session; if the badge still shows the
 older version, remove only this developer-extension URL and add the same URL
 again. The reinstall remounts the renderer and does not alter any table blocks,
@@ -126,12 +126,20 @@ The extension deliberately does not use `roam/js`.
   to write through `window.roamGrid.v1`.
 - Selecting a rectangular range replaces the single-cell grabbers with one
   outlined selection and a compact `rows × columns` badge. Click the badge for
-  range actions; drag the bottom-right square to fill.
+  range actions; drag the bottom-right square to fill. Choose **Copy selected
+  cells as block references** to copy a TSV-shaped matrix of live native
+  `((uid))` references. Paste it into another native or enhanced table to reuse
+  the selected range without duplicating its content. Merged anchors are copied
+  once and their covered coordinates remain blank.
 - Tables fit the available Roam pane by default, preserving saved column-width
   ratios so every stage stays visible in a smaller window. The `⋯` menu can
   switch back to fixed widths and horizontal scrolling when preferred.
 - The same menu applies persistent left, center, or right alignment and copies
   either the active cell's or the whole table's native `((block reference))`.
+- A cell referenced elsewhere in the graph shows Roam's familiar superscript
+  linked-reference count beside its rendered content. Counts are batched once
+  per table session after paint and shared by source and referenced grid views,
+  so they do not enter the typing or rich-render path.
 - Formula cells use a subtle blue Blueprint-aware treatment by default. Toggle
   **Hide formula coloring** in the table menu; the choice persists per grid.
 - Editing a formula opens a compact `fx` expression bar above the cell. Cell and

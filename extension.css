@@ -311,8 +311,10 @@ body.roam-body.dark .rg-portal {
 }
 
 .rg-cell-content {
+  display: inline-block;
   min-width: 0;
   max-width: 100%;
+  vertical-align: baseline;
 }
 
 .rg-cell-content[hidden] {
@@ -321,6 +323,33 @@ body.roam-body.dark .rg-portal {
 
 .rg-cell--editing > .rg-cell-content {
   visibility: hidden;
+}
+
+.rg-cell--editing > .rg-cell-reference-count {
+  visibility: hidden;
+}
+
+.rg-cell-reference-count {
+  display: inline;
+  margin: 0 0 0 1px;
+  padding: 0;
+  color: var(--rg-active);
+  background: transparent;
+  border: 0;
+  border-radius: 2px;
+  font: inherit;
+  font-size: 0.68em;
+  font-weight: 600;
+  line-height: 1;
+  vertical-align: super;
+  cursor: pointer;
+}
+
+.rg-cell-reference-count:hover,
+.rg-cell-reference-count:focus-visible {
+  color: color-mix(in srgb, var(--rg-active) 78%, var(--rg-color));
+  text-decoration: underline;
+  outline: none;
 }
 
 .rg-cell--align-left { text-align: left; }

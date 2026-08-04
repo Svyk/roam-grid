@@ -599,6 +599,30 @@ test("native selection movement updates only its delta and maps covered merge co
   assert.equal(unrelatedMutations, 0);
 });
 
+test("native-style cell reference counts update without replacing stable content", () => {
+  const { body } = installMiniDom();
+  const model = new GridModel({ rows: [[{ uid: "source-cell", raw: "Source" }]] });
+  const root = new MiniNode("section"); const cell = new MiniNode("div"); cell.className = "rg-cell";
+  const content = new MiniNode("div"); content.className = "rg-cell-content"; content.textContent = "Source";
+  cell.appendChild(content); root.appendChild(cell); body.appendChild(root);
+  let opened = null;
+  const view = Object.assign(Object.create(GridView.prototype), {
+    model, root, referenceCounts: new Map([["source-cell", 1]]),
+    cells: new Map([["0:0", cell]]), cellCoordinatesByUid: new Map([["source-cell", { row: 0, col: 0 }]]),
+    openCellReferences: (uid) => { opened = uid; },
+  });
+
+  view.updateReferenceCountBadges(new Set(["source-cell"]));
+  const badge = cell.querySelector(".rg-cell-reference-count");
+  assert.ok(badge); assert.equal(badge.textContent, "1"); assert.match(badge.title, /1 linked reference/);
+  assert.equal(cell.children[0], content); assert.equal(content.textContent, "Source");
+  badge.dispatch("click"); assert.equal(opened, "source-cell");
+
+  view.referenceCounts.set("source-cell", 0); view.updateReferenceCountBadges(new Set(["source-cell"]));
+  assert.equal(cell.querySelector(".rg-cell-reference-count"), null);
+  assert.equal(cell.children[0], content); assert.equal(content.textContent, "Source");
+});
+
 const waitForSearch = () => new Promise((resolve) => setTimeout(resolve, 2));
 
 test("bare Roam reference openers do not flash an empty inline portal", async () => {

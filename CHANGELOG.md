@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.8.0
+
+- Added **Copy selected cells as block references** to range and axis menus.
+  The clipboard receives a rectangular TSV matrix of the selected cells'
+  native `((uid))` references, ready to paste into another Roam table as a live
+  referenced range rather than a text copy.
+- Preserved merged-cell semantics while copying references: the merge anchor is
+  emitted once and covered coordinates remain blank.
+- Added native-style superscript linked-reference counts to enhanced cells,
+  including ordinary rich-link cells such as a recipe source. Counts are loaded
+  in one batched Datalog query per shared table session after the grid paints.
+- Refresh reference counts after content saves and rendered block-reference DOM
+  changes without replacing stable cell content, repainting the grid, or adding
+  work to the keystroke commit path.
+- Added model and DOM coverage for live range-reference matrices, pending UIDs,
+  batched count queries, zero-count cleanup, badge clicks, and stable content.
+
 ## 0.7.0
 
 - Added Excel-style keyboard point mode for formulas. After `=` or an operator,

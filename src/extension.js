@@ -1,4 +1,4 @@
-const VERSION = "0.7.0";
+const VERSION = "0.8.0";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -2284,6 +2284,9 @@ export class NativeGridSession {
     this.editRevisions = new Map();
     this.structuralPending = false;
     this.contentSavePromise = null;
+    this.referenceCounts = new Map();
+    this.referenceCountFrame = null;
+    this.referenceCountTimer = null;
     this.disposed = false;
     this.stopWatch = this.adapter.watchExternal?.((nextModel, event) => this.handleExternalChange(nextModel, event));
   }
@@ -2291,6 +2294,7 @@ export class NativeGridSession {
   addView(view) {
     clearTimeout(this.idleTimer); this.idleTimer = null;
     view.session = this; view.model = this.model; view.adapter = this.adapter;
+    view.referenceCounts = this.referenceCounts;
     this.views.add(view);
     return view;
   }
@@ -2321,6 +2325,37 @@ export class NativeGridSession {
   editorFinished(view) { if (this.activeEditorView === view) this.activeEditorView = null; }
 
   setSaving(value) { for (const view of this.views) view.root?.classList?.toggle("rg-root--saving", value); }
+
+  scheduleReferenceCountRefresh() {
+    if (this.disposed || this.referenceCountFrame != null || this.referenceCountTimer != null) return;
+    const afterPaint = () => {
+      this.referenceCountFrame = null;
+      this.referenceCountTimer = setTimeout(() => {
+        this.referenceCountTimer = null;
+        this.refreshReferenceCounts();
+      }, 0);
+    };
+    if (typeof globalThis.requestAnimationFrame === "function") this.referenceCountFrame = globalThis.requestAnimationFrame(afterPaint);
+    else this.referenceCountTimer = setTimeout(() => { this.referenceCountTimer = null; this.refreshReferenceCounts(); }, 0);
+  }
+
+  refreshReferenceCounts() {
+    if (this.disposed) return this.referenceCounts;
+    const uids = this.model.rows.flat().map((cell) => cell.uid).filter(Boolean);
+    let next;
+    try { next = queryBlockReferenceCounts(uids); }
+    catch (error) { console.warn("[roam-grid] Could not refresh cell reference counts", error); return this.referenceCounts; }
+    const changed = new Set();
+    for (const uid of new Set([...this.referenceCounts.keys(), ...next.keys()])) {
+      if ((this.referenceCounts.get(uid) || 0) !== (next.get(uid) || 0)) changed.add(uid);
+    }
+    this.referenceCounts = next;
+    for (const view of this.views) {
+      view.referenceCounts = next;
+      if (changed.size) view.updateReferenceCountBadges(changed);
+    }
+    return next;
+  }
 
   replaceModel(model, { render = true } = {}) {
     this.model = model; this.adapter.model = model;
@@ -2405,6 +2440,7 @@ export class NativeGridSession {
         if (currentRaw == null || currentRaw === saved.raw) this.dirtyCells.delete(saved.uid);
         else this.dirtyCells.set(saved.uid, { uid: saved.uid, baseRaw: saved.raw, raw: currentRaw, revision });
       }
+      this.scheduleReferenceCountRefresh();
       if (!this.dirtyCells.size && !this.structuralPending) this.savedVersion = this.changeVersion;
     } catch (error) {
       toast(error.message, "danger", 8000);
@@ -2506,6 +2542,8 @@ export class NativeGridSession {
   dispose() {
     if (this.disposed) return;
     this.disposed = true; clearTimeout(this.saveTimer); clearTimeout(this.idleTimer);
+    clearTimeout(this.referenceCountTimer);
+    if (this.referenceCountFrame != null) globalThis.cancelAnimationFrame?.(this.referenceCountFrame);
     this.adapter.dispose?.(); this.stopWatch = null; this.views.clear(); this.activeEditorView = null; this.dirtyCells.clear();
   }
 }
@@ -3259,6 +3297,41 @@ function selectionMatrix(model, selection) {
   return rows;
 }
 
+export function selectionBlockReferenceMatrix(model, selection) {
+  const range = normalizeRange(selection);
+  const rows = [];
+  for (let row = range.startRow; row <= range.endRow; row += 1) {
+    const values = [];
+    for (let col = range.startCol; col <= range.endCol; col += 1) {
+      if (model.isCovered(row, col)) { values.push(""); continue; }
+      const uid = model.getCell(row, col)?.uid;
+      if (!uid || String(uid).startsWith("rg_")) {
+        throw new GridError("REFERENCE_PENDING", `Cell ${cellLabel(row, col)} does not have a persisted Roam UID yet`);
+      }
+      values.push(`((${uid}))`);
+    }
+    rows.push(values);
+  }
+  return rows;
+}
+
+export function selectionBlockReferenceText(model, selection) {
+  return selectionBlockReferenceMatrix(model, selection).map((row) => row.join("\t")).join("\n");
+}
+
+export function queryBlockReferenceCounts(uids, api = roam()) {
+  const unique = [...new Set((uids || []).map(String).filter((uid) => uid && !uid.startsWith("rg_")))];
+  const counts = new Map(unique.map((uid) => [uid, 0]));
+  if (!unique.length || typeof api?.q !== "function") return counts;
+  const rows = api.q(`[:find ?uid (count ?source)
+    :in $ [?uid ...]
+    :where
+      [?target :block/uid ?uid]
+      [?source :block/refs ?target]]`, unique) || [];
+  for (const [uid, count] of rows) if (counts.has(String(uid))) counts.set(String(uid), Math.max(0, Number(count) || 0));
+  return counts;
+}
+
 function isMac() { return /Mac|iPhone|iPad/.test(globalThis.navigator?.platform || ""); }
 
 export function requiresRoamRichRender(raw) {
@@ -3978,6 +4051,7 @@ export class GridView {
     this.columnResizePreview = null;
     this.resizeCleanup = null;
     this.editorController = null;
+    this.referenceCounts = session?.referenceCounts || new Map();
     this.selectedCellElements = new Set();
     this.activeCellElement = null;
     this.selectionControls = new Set();
@@ -4147,6 +4221,7 @@ export class GridView {
       this.root.appendChild(charts); this.chartsElement = charts;
     }
     this.updateSelection();
+    this.session?.scheduleReferenceCountRefresh();
   }
 
   rowDeletionLayoutFingerprint() {
@@ -4564,11 +4639,51 @@ export class GridView {
           const rendered = renderer.render({ raw, value, row, col, model: this.model });
           clearRichCellHosts(content);
           if (rendered instanceof Node) content.replaceChildren(rendered); else content.innerHTML = String(rendered ?? "");
+          this.updateCellReferenceCount(cell, this.model.getCell(row, col)?.uid);
           return;
         }
       } catch (error) { console.warn("[roam-grid] Cell renderer failed", error); }
     }
     renderStableCellContent(content, { raw, value, formula, renderRich: paintRichCellContent });
+    this.updateCellReferenceCount(cell, this.model.getCell(row, col)?.uid);
+  }
+
+  updateCellReferenceCount(cell, uid) {
+    if (!cell || !uid) return;
+    const count = Math.max(0, Number(this.referenceCounts?.get(uid)) || 0);
+    let badge = cell.querySelector?.(".rg-cell-reference-count") || null;
+    if (!count) { badge?.remove(); return; }
+    if (!badge) {
+      badge = document.createElement("button");
+      badge.type = "button";
+      badge.className = "rg-cell-reference-count";
+      badge.addEventListener("pointerdown", (event) => { event.preventDefault(); event.stopPropagation(); });
+      badge.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); this.openCellReferences(uid); });
+      cell.appendChild(badge);
+    }
+    badge.textContent = String(count);
+    badge.title = `${count} linked reference${count === 1 ? "" : "s"} · open cell`;
+    badge.setAttribute("aria-label", badge.title);
+  }
+
+  updateReferenceCountBadges(uids = this.referenceCounts?.keys?.() || []) {
+    for (const uid of uids) {
+      const coordinate = this.cellCoordinatesByUid.get(uid);
+      if (!coordinate || this.model.isCovered(coordinate.row, coordinate.col)) continue;
+      this.updateCellReferenceCount(this.cells.get(`${coordinate.row}:${coordinate.col}`), uid);
+    }
+  }
+
+  openCellReferences(uid) {
+    const nativeCount = [...(document.querySelectorAll?.(`[id$="${cssAttributeValue(uid)}"] .rm-block-ref-count`) || [])]
+      .find((element) => !this.root.contains(element));
+    if (nativeCount?.click) { nativeCount.click(); return; }
+    try {
+      const result = roam().ui?.rightSidebar?.addWindow?.({ window: { type: "block", "block-uid": uid } });
+      if (result?.catch) result.catch((error) => toast(`Could not open referenced cell: ${error.message}`, "danger"));
+      if (result !== undefined) return result;
+      return roam().ui?.mainWindow?.openBlock?.({ block: { uid } });
+    } catch (error) { return toast(`Could not open referenced cell: ${error.message}`, "danger"); }
   }
 
   select(range) {
@@ -4865,6 +4980,7 @@ export class GridView {
       item("Align right", () => this.alignSelection("right")),
       item("Reset alignment", () => this.alignSelection(null)),
       item("Copy Roam block reference", () => this.copyRoamReference(false)),
+      item("Copy selected cells as block references", () => this.copyRoamReferences()),
       item("Copy table block reference", () => this.copyRoamReference(true)),
       item("Save as grid template…", () => saveModelAsTemplate(this.model)),
       item("Insert saved template after this grid…", () => newFromSavedTemplate()),
@@ -4945,6 +5061,7 @@ export class GridView {
       item("Align right", () => this.alignSelection("right")),
       item("Reset alignment", () => this.alignSelection(null)),
       item("Copy Roam block reference", () => this.copyRoamReference(false)),
+      item("Copy selected cells as block references", () => this.copyRoamReferences()),
       item("Copy table block reference", () => this.copyRoamReference(true)),
       item(this.model.colorFormulaCells ? "Hide formula coloring" : "Color formula cells", () => this.commitMutation("Toggle formula coloring", () => { this.model.colorFormulaCells = !this.model.colorFormulaCells; }, true)),
       item(this.model.showHeaders ? "Hide row/column labels" : "Show row/column labels", () => this.commitMutation("Toggle row and column labels", () => { this.model.showHeaders = !this.model.showHeaders; }, true)),
@@ -5020,6 +5137,17 @@ export class GridView {
     const copied = navigator.clipboard?.writeText(`((${uid}))`);
     if (!copied) return toast("Clipboard access is unavailable", "warning");
     copied.then(() => toast(`${table ? "Table" : "Cell"} block reference copied`, "success", 1600)).catch((error) => toast(`Copy failed: ${error.message}`, "danger"));
+  }
+
+  copyRoamReferences() {
+    let text;
+    try { text = selectionBlockReferenceText(this.model, this.selection); }
+    catch (error) { return toast(error.message, "warning"); }
+    const copied = navigator.clipboard?.writeText(text);
+    if (!copied) return toast("Clipboard access is unavailable", "warning");
+    const range = normalizeRange(this.selection);
+    const rows = range.endRow - range.startRow + 1; const cols = range.endCol - range.startCol + 1;
+    copied.then(() => toast(`${rows} × ${cols} live cell references copied`, "success", 1800)).catch((error) => toast(`Copy failed: ${error.message}`, "danger"));
   }
 
   commitMutation(label, mutation, structural, { rowDeletion = false } = {}) {
@@ -5809,8 +5937,20 @@ function scheduleScan(root = document) {
   queueMicrotask(() => { runtime.scanQueued = false; scanMounts(); });
 }
 
+function containsRenderedBlockReference(node) {
+  return Boolean(node?.nodeType === 1 && (node.matches?.(".rm-block-ref") || node.querySelector?.(".rm-block-ref")));
+}
+
 function handleDomMutations(records) {
-  for (const record of records || []) for (const node of record.addedNodes || []) if (node.nodeType === 1) scheduleScan(node);
+  let referencesChanged = false;
+  for (const record of records || []) {
+    for (const node of record.addedNodes || []) if (node.nodeType === 1) {
+      referencesChanged ||= containsRenderedBlockReference(node);
+      scheduleScan(node);
+    }
+    for (const node of record.removedNodes || []) referencesChanged ||= containsRenderedBlockReference(node);
+  }
+  if (referencesChanged) for (const session of runtime.sessions.values()) session.scheduleReferenceCountRefresh();
   if (!(records || []).some((record) => record.addedNodes?.length)) scheduleScan(document);
 }
 

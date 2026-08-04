@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { FormulaEngine, GridError, GridModel, columnLabel, fittedTrackResize, formulaReferences, parseCellReference, rewriteFormula, rewriteFormulaForStructure, serializeTemplateModel, templateModelFromValue } from "../src/extension.js";
+import { FormulaEngine, GridError, GridModel, columnLabel, fittedTrackResize, formulaReferences, parseCellReference, queryBlockReferenceCounts, rewriteFormula, rewriteFormulaForStructure, selectionBlockReferenceMatrix, selectionBlockReferenceText, serializeTemplateModel, templateModelFromValue } from "../src/extension.js";
 
 const model = (rows, options = {}) => new GridModel({ rows, ...options });
 
@@ -140,6 +140,33 @@ test("covered coordinates are empty in formulas and flat values", () => {
   const grid = model([["10", "", "", "=SUM(A1:C1)"]]);
   grid.merge({ startRow: 0, endRow: 0, startCol: 0, endCol: 2 });
   assert.equal(new FormulaEngine(grid).evaluateCell(0, 3), 10);
+});
+
+test("selected cells copy as a rectangular matrix of live Roam block references", () => {
+  const grid = model([
+    [{ uid: "cell-a", raw: "Anchor" }, { uid: "cell-b", raw: "" }, { uid: "cell-c", raw: "Tail" }],
+    [{ uid: "cell-d", raw: "One" }, { uid: "cell-e", raw: "Two" }, { uid: "cell-f", raw: "Three" }],
+  ]);
+  grid.merge({ startRow: 0, endRow: 0, startCol: 0, endCol: 1 });
+  const selection = { startRow: 0, endRow: 1, startCol: 0, endCol: 2 };
+  assert.deepEqual(selectionBlockReferenceMatrix(grid, selection), [
+    ["((cell-a))", "", "((cell-c))"],
+    ["((cell-d))", "((cell-e))", "((cell-f))"],
+  ]);
+  assert.equal(selectionBlockReferenceText(grid, selection), "((cell-a))\t\t((cell-c))\n((cell-d))\t((cell-e))\t((cell-f))");
+  assert.throws(() => selectionBlockReferenceText(model([[""]]), { startRow: 0, endRow: 0, startCol: 0, endCol: 0 }), { code: "REFERENCE_PENDING" });
+});
+
+test("block-reference counts use one batched Roam query and preserve zeroes", () => {
+  let calls = 0;
+  const api = { q: (query, uids) => {
+    calls += 1;
+    assert.match(query, /:in \$ \[\?uid \.\.\.\]/);
+    assert.deepEqual(uids, ["cell-a", "cell-b"]);
+    return [["cell-a", 2]];
+  } };
+  assert.deepEqual([...queryBlockReferenceCounts(["cell-a", "cell-b", "cell-a", "rg_pending"], api)], [["cell-a", 2], ["cell-b", 0]]);
+  assert.equal(calls, 1);
 });
 
 test("row insertion shifts or expands merges", () => {
