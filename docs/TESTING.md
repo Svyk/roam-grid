@@ -36,6 +36,12 @@ cover contextual assistant visibility: ordinary text has no menu, bare `[[` or
 `((` has no empty shell, non-empty reference queries show native Roam results,
 and formulas expose function suggestions and signature help. Combobox,
 listbox, option, active-descendant, and selected-option state are asserted.
+Mounting tests cover the graph-scoped enhanced-UID cache, synchronous guard
+generation, canonical and referenced UID resolution, stale-cache release,
+source-absent references, one adapter/watch per shared session, cross-view
+repaints and editor handoff, responsive reference controls, and clean native
+fallback. Theme performance tests also fail if a cached view or editor portal
+performs a first-mount computed-style read.
 
 Persistence tests cover dirty-UID coalescing, metadata-free scalar saves,
 self-watch suppression, non-overlapping external edits, same-cell and
@@ -50,9 +56,9 @@ manifest that loads only the requested visible chunk. The live smoke test is
 restricted to `[[roam-grid/dev]]` in `svy`; existing native tables are not
 opted in or changed.
 
-Current release acceptance:
+Current v0.6 release acceptance:
 
-- All 117 automated tests pass in the v0.5.2 release run. They exercise model,
+- All 127 automated tests pass in the v0.6.0 release run. They exercise model,
   adapter, persistence, editor, DOM, and rendering behavior without claiming
   browser-frame performance.
 - The existing host-neutral Thymer Grid baseline remains green at 343/343; the
@@ -65,6 +71,14 @@ Current release acceptance:
 - Developer-extension reload exposes the untouched native block structure.
 - In both Blueprint light and dark modes, every Roam Grid-owned portal matches
   the table palette; no graph-global Blueprint selector is overridden.
+- The reported meal-prep table rendered as an editable enhanced grid inside its
+  block reference while the source block was absent from the page. The Source
+  control opened the canonical block, and canonical/reference instances shared
+  one session.
+- Twenty rapid source/reference back-and-forward transitions were sampled over
+  59 animation frames: zero visible native-table frames, zero duplicate roots,
+  and no layout collapse. The first-mount viewport and portal theme paths now
+  have explicit zero-layout-read regression tests.
 
 Remaining public-release gates:
 

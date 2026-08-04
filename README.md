@@ -4,7 +4,7 @@ Native-first advanced tables for Roam Research.
 
 ## Status
 
-Version 0.5.2 is a functional public-source beta and live demo. Native
+Version 0.6.0 is a functional public-source beta and live demo. Native
 opt-in tables, safe merges, core formulas, interactions, imports/exports,
 charts, chunked large-grid persistence, the public API, and clean fallback are
 implemented. Before a public Depot release, the project still needs the full
@@ -21,9 +21,9 @@ large datasets.
 ## Install from the auto-updating URL
 
 The public repository deploys a Roam-ready build to GitHub Pages after every
-push to `main` or the current release branch. The extension root is:
+push to `main`. The extension root is:
 
-`https://svyk.github.io/roam-grid`
+[`https://svyk.github.io/roam-grid/`](https://svyk.github.io/roam-grid/)
 
 In Roam, open **Settings → Roam Depot → Developer Extensions**, choose
 **Load extension → URL**, and paste that root URL. URL extensions auto-start on
@@ -32,7 +32,7 @@ folder again. Developer extensions remain local to each Roam client.
 
 For an immediate update after a push, wait for the GitHub Pages deployment and
 press the circular reload button beside this URL. Hover the grid-size badge to
-confirm the running version (for example, `Roam Grid v0.5.2`). Roam can reuse a
+confirm the running version (for example, `Roam Grid v0.6.0`). Roam can reuse a
 cached remote bundle during the same app session; if the badge still shows the
 older version, remove only this developer-extension URL and add the same URL
 again. The reinstall remounts the renderer and does not alter any table blocks,
@@ -46,7 +46,7 @@ keys or long-lived secrets.
 The release workflow is: run the tests and `npm run build`, push the release
 branch, wait for the GitHub Pages workflow to complete, then reload the same URL
 entry in Depot developer mode. No reinstall or graph migration is required for
-v0.5, and a reload preserves native cell blocks, table metadata, and large-grid
+v0.6, and a reload preserves native cell blocks, table metadata, and large-grid
 manifests.
 
 ## Install for local development
@@ -68,6 +68,11 @@ The extension deliberately does not use `roam/js`.
 ## Start
 
 - Focus an existing native table and run **Roam Grid: Enhance this table**.
+- Enhanced tables also render inside editable block references and inline
+  reference views. Every visible instance shares one table session, model,
+  persistence queue, formula cache, and undo history while retaining its own
+  selection and scroll state. The compact reference toolbar includes a source
+  button that opens the canonical table block.
 - Focus any enhanced table and run **Roam Grid: Save current grid as template**.
   Reinsert it later with **Roam Grid: New from saved template**. Saved templates
   keep formulas, merges, sizing, alignment, headers, charts, and visual options
@@ -155,6 +160,11 @@ The extension deliberately does not use `roam/js`.
   merges are rejected with the blocking coordinates. Enhanced rendering hides
   internal cell seams so a merge reads as one surface, while its outer-right
   and outer-bottom edges remain available for column and row resizing.
+- Known enhanced table UIDs are hidden before Roam paints their native renderer.
+  Added-node mounting then claims canonical and referenced instances without a
+  delayed document scan, preventing the native-table flash during navigation.
+  The guard is automatically released on restore, unload, stale metadata, or a
+  failed mount so native fallback remains intact.
 
 ## Formats and charts
 
@@ -212,6 +222,12 @@ Formula and reverse-dependency caches repaint only changed results and their
 transitive dependents. Rich-rendered hosts remain connected during structural
 grid swaps and are explicitly unmounted before a native or virtualized surface
 is discarded.
+
+Blueprint compatibility is extension-owned. Each table samples the actual host
+palette once, stores it in scoped `--rg-*` tokens, and reuses that palette for
+body-mounted editors and menus without forcing a style read during route
+mounting. Runtime theme changes are frame-coalesced; no global Blueprint rule or
+personal `roam/css` patch is required.
 
 Ordinary edits travel through a coalesced content-only persistence lane: only
 dirty cell blocks are validated and updated, matching pull-watch events from the

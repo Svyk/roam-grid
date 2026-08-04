@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.6.0
+
+- Added a graph-scoped pre-paint guard for enhanced table UIDs and replaced the
+  delayed whole-document scan with synchronous added-node claims. Canonical and
+  referenced tables no longer expose a native renderer frame during navigation,
+  while restore, unload, stale metadata, and mount failures still reveal the
+  ordinary Roam table.
+- Replaced the one-view native mount with one shared session per canonical table
+  UID and any number of source or referenced views. Models, pull watches,
+  persistence queues, formula dependencies, structural operations, and undo
+  history are shared; selection, scrolling, sizing controls, and editor
+  presentation remain local to each visible instance.
+- Made enhanced tables fully editable inside block references and inline
+  reference views, including source-absent references. A compact responsive
+  toolbar keeps Undo, Redo, Source, and overflow controls available in narrow
+  reference contexts.
+- Added an extension-scoped theme bridge that samples Roam and Blueprint host
+  colors before hiding the native renderer, supports live light/dark switching,
+  and styles every Roam Grid portal without graph-global CSS overrides.
+- Removed first-mount viewport scroll reads and reused the cached grid palette
+  for the persistent floating editor, eliminating Roam Grid's remaining
+  route-mount computed-style read.
+- Added regression coverage for UID guards, stale-cache release, canonical and
+  reference resolution, shared sessions, cross-view editing, compact toolbars,
+  runtime theming, first-mount layout reads, and cached portal theming.
+
 ## 0.5.2
 
 - Added a Roam Grid-owned portal palette so the F2 editor, formula and Roam

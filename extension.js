@@ -1,5 +1,5 @@
-/* Roam Grid v0.5.2 | MIT | generated from src/extension.js */
-const VERSION = "0.5.2";
+/* Roam Grid v0.6.0 | MIT | generated from src/extension.js */
+const VERSION = "0.6.0";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
@@ -16,17 +16,62 @@ const MAX_ROW_HEIGHT = 480;
 const MIN_COL_WIDTH = 56;
 const MAX_COL_WIDTH = 640;
 const FORMULA_REFERENCE_COLORS = ["#d9822b", "#8f398f", "#0f9960", "#106ba3", "#c23030", "#5c7080"];
+const PREPAINT_STYLE_ID = "roam-grid-prepaint-guard";
+const ENHANCED_UID_CACHE_PREFIX = "roam-grid:enhanced-uids:";
+const SESSION_IDLE_MS = 1500;
 
 const runtime = {
   extensionAPI: null,
   observer: null,
   metadata: null,
   templates: null,
-  mounts: new Map(),
+  sessions: new Map(),
+  largeMounts: new Map(),
+  views: new Set(),
+  viewsByNative: new WeakMap(),
+  guardStyle: null,
+  pendingScanRoots: new Set(),
+  scanQueued: false,
+  gridThemePalette: null,
+  gridThemeSignature: null,
   disposers: [],
   registries: null,
   lastFocusedUid: null,
 };
+
+function cssAttributeValue(value) {
+  return String(value ?? "").replaceAll("\\", "\\\\").replaceAll('"', '\\"').replace(/[\n\r\f]/g, "");
+}
+
+export function graphCacheKey(hash = globalThis.location?.hash || "") {
+  const graph = /#\/app\/([^/]+)/.exec(String(hash))?.[1] || "unknown";
+  return `${ENHANCED_UID_CACHE_PREFIX}${decodeURIComponent(graph)}`;
+}
+
+export function readEnhancedUidCache(storage = globalThis.localStorage, key = graphCacheKey()) {
+  try {
+    const parsed = JSON.parse(storage?.getItem?.(key) || "[]");
+    return new Set(Array.isArray(parsed) ? parsed.filter((uid) => typeof uid === "string" && uid.length > 0) : []);
+  } catch { return new Set(); }
+}
+
+export function writeEnhancedUidCache(uids, storage = globalThis.localStorage, key = graphCacheKey()) {
+  const values = [...new Set([...uids].map(String).filter(Boolean))].sort();
+  try { storage?.setItem?.(key, JSON.stringify(values)); } catch { /* localStorage can be unavailable in hardened browsers */ }
+  return values;
+}
+
+export function enhancedUidGuardCss(uids) {
+  const selectors = [];
+  for (const uid of [...new Set([...uids].map(String).filter(Boolean))].sort()) {
+    const escaped = cssAttributeValue(uid);
+    selectors.push(
+      `[id$="${escaped}"] .rm-table:not(.rg-native-hidden)`,
+      `.rm-block-ref[data-uid="${escaped}"] .rm-table:not(.rg-native-hidden)`,
+    );
+  }
+  return selectors.length ? `${selectors.join(",\n")} { visibility: hidden !important; pointer-events: none !important; }` : "";
+}
 
 export class GridError extends Error {
   constructor(code, message, details = {}) {
@@ -2185,6 +2230,252 @@ export class NativeTableAdapter {
   dispose() { this.watchCallback = null; this.deferredStructuralWatches.length = 0; this.expectedStructuralTransitions.length = 0; this.selfWrites.clear(); return this.watch?.(); }
 }
 
+/** One canonical native-table model/persistence lane shared by every visible DOM instance. */
+export class NativeGridSession {
+  constructor(tableUid, { adapter = null, model = null, onIdle = null } = {}) {
+    this.tableUid = tableUid;
+    this.adapter = adapter || new NativeTableAdapter(tableUid);
+    this.model = model || this.adapter.load();
+    this.adapter.model = this.model;
+    this.onIdle = onIdle;
+    this.views = new Set();
+    this.themePalette = null;
+    this.activeEditorView = null;
+    this.changeVersion = 0;
+    this.savedVersion = 0;
+    this.saveTimer = null;
+    this.idleTimer = null;
+    this.metadataDirty = false;
+    this.dirtyCells = new Map();
+    this.editRevisions = new Map();
+    this.structuralPending = false;
+    this.contentSavePromise = null;
+    this.disposed = false;
+    this.stopWatch = this.adapter.watchExternal?.((nextModel, event) => this.handleExternalChange(nextModel, event));
+  }
+
+  addView(view) {
+    clearTimeout(this.idleTimer); this.idleTimer = null;
+    view.session = this; view.model = this.model; view.adapter = this.adapter;
+    this.views.add(view);
+    return view;
+  }
+
+  removeView(view) {
+    this.views.delete(view);
+    if (this.activeEditorView === view) this.activeEditorView = null;
+    if (!this.views.size) this.scheduleIdle();
+  }
+
+  scheduleIdle() {
+    clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      if (this.views.size) return;
+      if (this.contentSavePromise || this.structuralPending || this.dirtyCells.size) return this.scheduleIdle();
+      this.onIdle?.(this);
+    }, SESSION_IDLE_MS);
+  }
+
+  async beginEdit(view, start) {
+    const previous = this.activeEditorView;
+    if (previous && previous !== view && previous.editorController?.state) await previous.editorController.finish(true);
+    this.activeEditorView = view;
+    return start();
+  }
+
+  editorFinished(view) { if (this.activeEditorView === view) this.activeEditorView = null; }
+
+  setSaving(value) { for (const view of this.views) view.root?.classList?.toggle("rg-root--saving", value); }
+
+  replaceModel(model, { render = true } = {}) {
+    this.model = model; this.adapter.model = model;
+    for (const view of this.views) {
+      view.model = model;
+      if (render) view.render();
+    }
+    return model;
+  }
+
+  renderStructural(contexts = null) {
+    for (const view of this.views) {
+      let patched = false;
+      try { patched = view.patchRowDeletion(contexts?.get(view) || null); }
+      catch (error) { console.warn("[roam-grid] Incremental row deletion failed; using a full render", error); }
+      if (!patched) view.render();
+    }
+  }
+
+  refreshValues() { for (const view of this.views) view.refreshValues(); }
+
+  commitMutation(sourceView, label, mutation, structural, { rowDeletion = false } = {}) {
+    try {
+      const contexts = structural && rowDeletion ? new Map([...this.views].map((view) => [view, view.captureRowDeletionContext()])) : null;
+      this.model.transact(label, mutation);
+      if (!structural && !(this.model.lastChangedCells || []).length) return Promise.resolve(this.model);
+      if (structural) this.renderStructural(contexts); else this.refreshValues();
+      if (!structural) this.queueChangedCells();
+      this.markChanged(structural);
+      globalThis.window?.dispatchEvent(new CustomEvent("roam-grid:changed", { detail: { tableUid: this.tableUid, label } }));
+      return Promise.resolve(this.model);
+    } catch (error) {
+      toast(error.message, "danger");
+      return Promise.resolve(null);
+    }
+  }
+
+  queueChangedCells() {
+    for (const [row, col] of this.model.lastChangedCells || []) {
+      const cell = this.model.getCell(row, col); if (!cell?.uid) continue;
+      const revision = (this.editRevisions.get(cell.uid) || 0) + 1;
+      this.editRevisions.set(cell.uid, revision);
+      const existing = this.dirtyCells.get(cell.uid);
+      const baseRaw = existing?.baseRaw ?? this.adapter.getBaseRaw?.(cell.uid) ?? cell.raw;
+      if (cell.raw === baseRaw) this.dirtyCells.delete(cell.uid);
+      else this.dirtyCells.set(cell.uid, { uid: cell.uid, baseRaw, raw: cell.raw, revision });
+    }
+  }
+
+  markChanged(layoutChanged = false) {
+    this.changeVersion += 1;
+    this.metadataDirty ||= layoutChanged; this.structuralPending ||= layoutChanged;
+    clearTimeout(this.saveTimer);
+    if (!layoutChanged && !this.dirtyCells.size) { this.savedVersion = this.changeVersion; return; }
+    this.saveTimer = setTimeout(() => layoutChanged ? this.flushSave() : this.flushContentSave(), layoutChanged ? 0 : 220);
+  }
+
+  coordinateForUid(uid) {
+    for (let row = 0; row < this.model.rowCount; row += 1) for (let col = 0; col < this.model.colCount; col += 1) {
+      if (this.model.getCell(row, col)?.uid === uid) return { row, col };
+    }
+    return null;
+  }
+
+  prunePersistenceUids() {
+    const valid = new Set(this.model.rows.flat().map((cell) => cell.uid));
+    for (const uid of this.dirtyCells.keys()) if (!valid.has(uid)) this.dirtyCells.delete(uid);
+    for (const uid of this.editRevisions.keys()) if (!valid.has(uid)) this.editRevisions.delete(uid);
+  }
+
+  async flushContentSave() {
+    if (this.disposed || this.structuralPending || !this.dirtyCells.size) return;
+    if (this.contentSavePromise) return this.contentSavePromise;
+    const batch = new Map([...this.dirtyCells].map(([uid, change]) => [uid, { ...change }]));
+    const task = this.adapter.saveContent(batch); this.contentSavePromise = task;
+    try {
+      const result = await task;
+      for (const saved of result.saved || []) {
+        const coordinate = this.coordinateForUid(saved.uid);
+        const currentRaw = coordinate ? this.model.getRaw(coordinate.row, coordinate.col) : null;
+        const revision = this.editRevisions.get(saved.uid) || saved.revision;
+        if (currentRaw == null || currentRaw === saved.raw) this.dirtyCells.delete(saved.uid);
+        else this.dirtyCells.set(saved.uid, { uid: saved.uid, baseRaw: saved.raw, raw: currentRaw, revision });
+      }
+      if (!this.dirtyCells.size && !this.structuralPending) this.savedVersion = this.changeVersion;
+    } catch (error) {
+      toast(error.message, "danger", 8000);
+      this.dirtyCells.clear(); this.structuralPending = false; this.metadataDirty = false;
+      try { this.replaceModel(this.adapter.load()); this.changeVersion = this.savedVersion; } catch { /* table may have disappeared */ }
+    } finally {
+      if (this.contentSavePromise === task) this.contentSavePromise = null;
+      if (!this.disposed && !this.structuralPending && this.dirtyCells.size) {
+        clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flushContentSave(), 220);
+      }
+    }
+  }
+
+  async flushSave() {
+    if (this.disposed || !this.structuralPending || this.savedVersion === this.changeVersion) return;
+    const version = this.changeVersion;
+    const payload = new GridModel({ ...this.model.snapshot(), tableUid: this.tableUid });
+    const pendingUids = payload.rows.map((row) => row.map((cell) => cell.uid));
+    const payloadRawByUid = new Map(payload.rows.flat().map((cell) => [cell.uid, cell.raw]));
+    const payloadEditRevisions = new Map(this.editRevisions);
+    payload.baseFingerprint = this.model.baseFingerprint; payload.baseSnapshot = this.model.baseSnapshot;
+    const saveMetadata = this.metadataDirty; this.metadataDirty = false; this.setSaving(true);
+    try {
+      const saved = await this.adapter.save(payload, { saveMetadata });
+      this.savedVersion = version;
+      const uidMap = new Map();
+      for (let row = 0; row < Math.min(pendingUids.length, saved.rowCount); row += 1) for (let col = 0; col < Math.min(pendingUids[row].length, saved.colCount); col += 1) {
+        if (pendingUids[row][col] !== saved.rows[row][col].uid) uidMap.set(pendingUids[row][col], saved.rows[row][col].uid);
+      }
+      for (const row of this.model.rows) for (let col = 0; col < row.length; col += 1) {
+        const oldUid = row[col].uid; const newUid = uidMap.get(oldUid); if (!newUid) continue;
+        row[col].uid = newUid;
+        if (col === 0 && Object.hasOwn(this.model.rowHeights, oldUid)) { this.model.rowHeights[newUid] = this.model.rowHeights[oldUid]; delete this.model.rowHeights[oldUid]; }
+        if (Object.hasOwn(this.model.alignments, oldUid)) { this.model.alignments[newUid] = this.model.alignments[oldUid]; delete this.model.alignments[oldUid]; }
+      }
+      for (const [oldUid, newUid] of uidMap) {
+        if (this.dirtyCells.has(oldUid)) { const dirty = this.dirtyCells.get(oldUid); this.dirtyCells.delete(oldUid); this.dirtyCells.set(newUid, { ...dirty, uid: newUid }); }
+        if (this.editRevisions.has(oldUid)) { this.editRevisions.set(newUid, this.editRevisions.get(oldUid)); this.editRevisions.delete(oldUid); }
+        if (payloadRawByUid.has(oldUid)) payloadRawByUid.set(newUid, payloadRawByUid.get(oldUid));
+        if (payloadEditRevisions.has(oldUid)) payloadEditRevisions.set(newUid, payloadEditRevisions.get(oldUid));
+      }
+      this.prunePersistenceUids();
+      this.model.baseFingerprint = saved.baseFingerprint; this.model.baseSnapshot = saved.baseSnapshot; this.adapter.model = this.model;
+      for (const [uid, dirty] of [...this.dirtyCells]) {
+        const savedRevision = payloadEditRevisions.get(uid) || 0;
+        if (dirty.revision <= savedRevision && dirty.raw === payloadRawByUid.get(uid)) this.dirtyCells.delete(uid);
+        else if (payloadRawByUid.has(uid)) this.dirtyCells.set(uid, { ...dirty, baseRaw: payloadRawByUid.get(uid) });
+      }
+      this.structuralPending = false;
+      if (uidMap.size) for (const view of this.views) view.render();
+      if (version !== this.changeVersion) {
+        clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.structuralPending ? this.flushSave() : this.flushContentSave(), 220);
+      }
+    } catch (error) {
+      this.metadataDirty ||= saveMetadata;
+      toast(error.message, "danger", 8000);
+      this.dirtyCells.clear(); this.structuralPending = false;
+      try { this.replaceModel(this.adapter.load()); this.changeVersion = this.savedVersion; } catch { /* table may have disappeared */ }
+    } finally { this.setSaving(false); }
+  }
+
+  handleExternalChange(externalModel, event) {
+    const localPending = this.structuralPending || this.dirtyCells.size > 0 || this.contentSavePromise;
+    if (event.structural || event.type === "structural") {
+      this.dirtyCells.clear(); this.structuralPending = false; this.metadataDirty = false;
+      clearTimeout(this.saveTimer); this.changeVersion = this.savedVersion;
+      this.replaceModel(externalModel, { render: false }); this.adapter.acceptExternalTree?.(event.tree, this.model); this.renderStructural();
+      if (localPending || event.conflict) toast("Roam Grid reloaded because the table structure changed elsewhere.", "warning");
+      return;
+    }
+    const conflicts = (event.changes || []).filter((change) => this.dirtyCells.has(change.uid));
+    if (conflicts.length) {
+      this.dirtyCells.clear(); this.structuralPending = false; clearTimeout(this.saveTimer); this.changeVersion = this.savedVersion;
+      this.replaceModel(externalModel, { render: false }); this.adapter.acceptExternalTree?.(event.tree, this.model); this.renderStructural();
+      toast("Roam Grid reloaded because this cell changed elsewhere.", "warning");
+      return;
+    }
+    const changed = [];
+    for (const change of event.changes || []) {
+      const coordinate = this.coordinateForUid(change.uid); if (!coordinate) continue;
+      const cell = this.model.getCell(coordinate.row, coordinate.col); if (!cell || cell.raw === change.raw) continue;
+      cell.raw = change.raw; changed.push([coordinate.row, coordinate.col]);
+    }
+    this.model.lastChangedCells = changed;
+    this.model.lastChangedCellUids = changed.map(([row, col]) => this.model.getCell(row, col)?.uid).filter(Boolean);
+    this.adapter.acceptExternalTree?.(event.tree, this.model, externalModel);
+    if (changed.length) this.refreshValues();
+  }
+
+  undo() { if (this.model.undo()) { this.renderStructural(); this.markChanged(true); return true; } return false; }
+  redo() { if (this.model.redo()) { this.renderStructural(); this.markChanged(true); return true; } return false; }
+
+  applyPatch(patch, sourceView = this.views.values().next().value || null) {
+    const patches = Array.isArray(patch) ? patch : [patch];
+    const rowDeletion = patches.length > 0 && patches.every((item) => item?.op === "deleteRows");
+    return this.commitMutation(sourceView, "External patch", () => applyPatchToModel(this.model, patch, false), patchChangesLayout(patch), { rowDeletion }).then(() => this.model.toJSON());
+  }
+
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true; clearTimeout(this.saveTimer); clearTimeout(this.idleTimer);
+    this.adapter.dispose?.(); this.stopWatch = null; this.views.clear(); this.activeEditorView = null; this.dirtyCells.clear();
+  }
+}
+
 function extractUrl(value) {
   const match = String(value || "").match(/https?:\/\/[^\s)\]}]+/);
   return match?.[0] || String(value || "").trim();
@@ -2565,21 +2856,20 @@ function createPublicApi() {
     registerTemplate: (name, template) => registries.register(registries.templates, name, template),
     listTemplates: templateNames,
     saveTemplate: async (name, tableUid = activeGridUid()) => {
-      const mount = tableUid ? runtime.mounts.get(tableUid) : null;
-      const model = mount instanceof GridView ? mount.model : tableUid && runtime.metadata.has(tableUid) ? new NativeTableAdapter(tableUid).load() : null;
+      const model = tableUid ? runtime.sessions.get(tableUid)?.model || (runtime.metadata.has(tableUid) ? new NativeTableAdapter(tableUid).load() : null) : null;
       if (!model) throw new GridError("TEMPLATE_SOURCE", "Focus an enhanced native grid before saving a template");
       return runtime.templates.save(name, model);
     },
     createFromTemplate: async (name) => createNativeTableFromModel(await resolveTemplateModel(name)),
     getTableModel: (tableUid) => {
-      const mount = runtime.mounts.get(tableUid);
-      if (mount?.model) return deepClone(mount.model.toJSON());
+      const session = runtime.sessions.get(tableUid);
+      if (session?.model) return deepClone(session.model.toJSON());
       if (!runtime.metadata.has(tableUid)) return null;
       return new NativeTableAdapter(tableUid).load().toJSON();
     },
     applyPatch: async (tableUid, patch) => {
-      const mount = runtime.mounts.get(tableUid);
-      if (mount?.applyPatch) return mount.applyPatch(patch);
+      const session = runtime.sessions.get(tableUid);
+      if (session) return session.applyPatch(patch);
       const adapter = new NativeTableAdapter(tableUid);
       const model = adapter.load();
       applyPatchToModel(model, patch);
@@ -2617,6 +2907,139 @@ function button(label, title, action, className = "") {
   return element;
 }
 
+const GRID_THEME_FALLBACKS = Object.freeze({
+  "--rg-bg": "#ffffff",
+  "--rg-color": "#182026",
+  "--rg-toolbar": "#ffffff",
+  "--rg-header": "#f6f7f9",
+  "--rg-border": "#d3d8de",
+  "--rg-border-strong": "#c5cbd3",
+  "--rg-muted": "#5f6b7c",
+  "--rg-active": "#2d72d2",
+});
+
+function applyGridThemeValues(gridRoot, values) {
+  if (!gridRoot?.style) return false;
+  const previous = gridRoot.__rgGridPalette || {};
+  let changed = false;
+  for (const [property, value] of Object.entries(values || {})) {
+    if (previous[property] === value) continue;
+    gridRoot.style.setProperty(property, value); changed = true;
+  }
+  gridRoot.__rgGridPalette = { ...(values || {}) };
+  return changed;
+}
+
+function gridThemeSignature(nativeElement) {
+  let themeContainer = null;
+  try { themeContainer = nativeElement?.closest?.("[data-theme], [data-color-mode], .bp3-dark, .bp4-dark, .bp5-dark, [class*='theme-']") || null; } catch { themeContainer = null; }
+  const html = globalThis.document?.documentElement;
+  const body = globalThis.document?.body;
+  return [html?.className, html?.getAttribute?.("data-theme"), body?.className, body?.getAttribute?.("data-theme"), themeContainer?.className, themeContainer?.getAttribute?.("data-theme")].map((value) => String(value || "")).join("|");
+}
+
+function colorIsTransparent(value) {
+  const color = String(value || "").trim().toLowerCase();
+  return !color || color === "transparent" || /rgba\([^)]*,\s*0(?:\.0+)?\s*\)$/.test(color);
+}
+
+function colorLooksDark(value) {
+  const values = String(value || "").match(/[\d.]+/g)?.slice(0, 3).map(Number);
+  if (!values || values.length < 3) return false;
+  return (0.2126 * values[0] + 0.7152 * values[1] + 0.0722 * values[2]) < 128;
+}
+
+function nearestOpaqueBackground(element, getStyle) {
+  const seen = new Set();
+  for (let node = element; node && !seen.has(node); node = node.parentElement || node.parentNode) {
+    seen.add(node);
+    const color = styleValue(computedStyleOf(node, getStyle), "background-color");
+    if (!colorIsTransparent(color)) return color;
+  }
+  return "";
+}
+
+/** Copies resolved host colors into extension-owned tokens before the native table is hidden. */
+export function syncGridThemeFromHost(nativeElement, gridRoot, getStyle = globalThis.getComputedStyle) {
+  if (!gridRoot?.style) return { changed: false, values: { ...GRID_THEME_FALLBACKS } };
+  const host = nativeElement?.parentElement || gridRoot.parentElement || globalThis.document?.body || null;
+  const cell = nativeElement?.querySelector?.("td,th,[role='gridcell']") || null;
+  const hostStyle = computedStyleOf(host, getStyle);
+  const cellStyle = computedStyleOf(cell, getStyle);
+  const bodyStyle = computedStyleOf(globalThis.document?.body, getStyle);
+  const background = nearestOpaqueBackground(host, getStyle) || styleValue(bodyStyle, "background-color", GRID_THEME_FALLBACKS["--rg-bg"]);
+  const color = styleValue(hostStyle, "color", styleValue(bodyStyle, "color", GRID_THEME_FALLBACKS["--rg-color"]));
+  const muted = styleValue(computedStyleOf(nativeElement, getStyle), "color", color);
+  const nativeBorder = styleValue(cellStyle, "border-right-color", styleValue(cellStyle, "border-top-color"));
+  const border = colorIsTransparent(nativeBorder) ? (colorLooksDark(background) ? "#5f6b7c" : GRID_THEME_FALLBACKS["--rg-border"]) : nativeBorder;
+  const active = colorLooksDark(background) ? "#48aff0" : GRID_THEME_FALLBACKS["--rg-active"];
+  const values = {
+    "--rg-bg": background,
+    "--rg-color": color,
+    "--rg-toolbar": background,
+    "--rg-header": `color-mix(in srgb, ${background} 88%, ${color} 12%)`,
+    "--rg-border": `color-mix(in srgb, ${background} 62%, ${border} 38%)`,
+    "--rg-border-strong": `color-mix(in srgb, ${background} 42%, ${border} 58%)`,
+    "--rg-muted": muted,
+    "--rg-active": active,
+  };
+  const changed = applyGridThemeValues(gridRoot, values);
+  return { changed, values };
+}
+
+/** Observes host theme boundaries without adding computed-style work to the typing path. */
+export function createGridThemeBridge(nativeElement, gridRoot, {
+  getStyle = globalThis.getComputedStyle,
+  MutationObserverClass = globalThis.MutationObserver,
+  matchMedia = globalThis.matchMedia,
+  initialSync = true,
+  onSync = null,
+} = {}) {
+  let disposed = false; let frame = null;
+  const sync = () => {
+    const result = disposed ? { changed: false, values: gridRoot?.__rgGridPalette || {} } : syncGridThemeFromHost(nativeElement, gridRoot, getStyle);
+    if (!disposed) onSync?.(result);
+    return result;
+  };
+  const schedule = () => {
+    if (disposed || frame != null) return;
+    const requestFrame = globalThis.requestAnimationFrame || ((callback) => setTimeout(callback, 0));
+    frame = requestFrame(() => { frame = null; sync(); });
+  };
+  let observer = null;
+  if (typeof MutationObserverClass === "function") {
+    observer = new MutationObserverClass(schedule);
+    const seen = new Set();
+    let themeContainer = null;
+    try { themeContainer = nativeElement?.closest?.("[data-theme], [data-color-mode], .bp3-dark, .bp4-dark, .bp5-dark, [class*='theme-']") || null; } catch { themeContainer = null; }
+    for (const node of [globalThis.document?.documentElement, globalThis.document?.body, themeContainer]) {
+      if (!node || seen.has(node)) continue; seen.add(node);
+      try { observer.observe(node, { attributes: true, attributeFilter: ["class", "style"] }); } catch { /* detached MiniDOM node */ }
+    }
+  }
+  let colorSchemeQuery = null;
+  if (typeof matchMedia === "function") {
+    try {
+      colorSchemeQuery = matchMedia.call(globalThis, "(prefers-color-scheme: dark)");
+      if (typeof colorSchemeQuery?.addEventListener === "function") colorSchemeQuery.addEventListener("change", schedule);
+      else colorSchemeQuery?.addListener?.(schedule);
+    } catch { colorSchemeQuery = null; }
+  }
+  if (initialSync) sync();
+  return {
+    sync,
+    dispose() {
+      if (disposed) return;
+      disposed = true; observer?.disconnect?.(); observer = null;
+      if (typeof colorSchemeQuery?.removeEventListener === "function") colorSchemeQuery.removeEventListener("change", schedule);
+      else colorSchemeQuery?.removeListener?.(schedule);
+      colorSchemeQuery = null;
+      if (frame != null && typeof globalThis.cancelAnimationFrame === "function") globalThis.cancelAnimationFrame(frame);
+      frame = null;
+    },
+  };
+}
+
 const PORTAL_THEME_FALLBACKS = Object.freeze({
   "--rg-portal-bg": "#ffffff",
   "--rg-portal-color": "#182026",
@@ -2643,6 +3066,22 @@ function computedStyleOf(element, getStyle) {
   try { return getStyle(element); } catch { return null; }
 }
 
+function portalThemeValuesFromGridPalette(palette) {
+  if (!palette || typeof palette !== "object" || !Object.keys(palette).length) return null;
+  return {
+    "--rg-portal-bg": palette["--rg-bg"] || PORTAL_THEME_FALLBACKS["--rg-portal-bg"],
+    "--rg-portal-color": palette["--rg-color"] || PORTAL_THEME_FALLBACKS["--rg-portal-color"],
+    "--rg-portal-border": palette["--rg-border"] || palette["--rg-border-strong"] || PORTAL_THEME_FALLBACKS["--rg-portal-border"],
+    "--rg-portal-header": palette["--rg-header"] || palette["--rg-toolbar"] || PORTAL_THEME_FALLBACKS["--rg-portal-header"],
+    "--rg-portal-muted": palette["--rg-muted"] || PORTAL_THEME_FALLBACKS["--rg-portal-muted"],
+    "--rg-portal-active": palette["--rg-active"] || PORTAL_THEME_FALLBACKS["--rg-portal-active"],
+    "--rg-portal-status": palette["--rg-muted"] || PORTAL_THEME_FALLBACKS["--rg-portal-status"],
+    "--rg-portal-success": palette["--rg-success"] || PORTAL_THEME_FALLBACKS["--rg-portal-success"],
+    "--rg-portal-warning": palette["--rg-warning"] || PORTAL_THEME_FALLBACKS["--rg-portal-warning"],
+    "--rg-portal-danger": palette["--rg-danger"] || PORTAL_THEME_FALLBACKS["--rg-portal-danger"],
+  };
+}
+
 /**
  * Copies the owning grid's resolved palette onto a body-mounted Roam Grid portal.
  * The inline custom properties deliberately scope theme compatibility to our own UI.
@@ -2660,10 +3099,11 @@ export function syncPortalThemeFromRoot(ownerRoot, portal, getStyle = globalThis
     portal.__rgPortalPalette = {};
     return { changed, values: {} };
   }
-  const rootStyle = computedStyleOf(root, getStyle);
-  const headerStyle = computedStyleOf(root?.querySelector?.(".rg-header, .rg-toolbar"), getStyle);
-  const statusStyle = computedStyleOf(root?.querySelector?.(".rg-status"), getStyle);
-  const values = {
+  const cachedValues = portalThemeValuesFromGridPalette(root.__rgGridPalette);
+  const rootStyle = cachedValues ? null : computedStyleOf(root, getStyle);
+  const headerStyle = cachedValues ? null : computedStyleOf(root?.querySelector?.(".rg-header, .rg-toolbar"), getStyle);
+  const statusStyle = cachedValues ? null : computedStyleOf(root?.querySelector?.(".rg-status"), getStyle);
+  const values = cachedValues || {
     "--rg-portal-bg": styleValue(rootStyle, "background-color", styleValue(rootStyle, "--rg-bg", PORTAL_THEME_FALLBACKS["--rg-portal-bg"])),
     "--rg-portal-color": styleValue(rootStyle, "color", PORTAL_THEME_FALLBACKS["--rg-portal-color"]),
     "--rg-portal-border": styleValue(rootStyle, "border-top-color", styleValue(rootStyle, "border-color", styleValue(rootStyle, "--rg-border", PORTAL_THEME_FALLBACKS["--rg-portal-border"]))),
@@ -2830,6 +3270,14 @@ export function releaseRichCellHosts(container) {
 }
 
 export function replaceGridViewportContents(viewport, nextGrid) {
+  // A first mount has no scroll state to preserve. Avoid reading layout-backed
+  // scroll properties after Roam has just inserted the native table: that read
+  // forced a synchronous layout for every newly referenced view.
+  const hasCurrentGrid = viewport.firstChild != null || Number(viewport.children?.length || 0) > 0;
+  if (!hasCurrentGrid) {
+    viewport.replaceChildren(nextGrid);
+    return viewport;
+  }
   const scrollLeft = viewport.scrollLeft; const scrollTop = viewport.scrollTop;
   releaseRichCellHosts(viewport);
   viewport.replaceChildren(nextGrid);
@@ -3334,15 +3782,19 @@ export class GridEditorController {
 }
 
 export class GridView {
-  constructor({ host, model, adapter, nativeElement = null }) {
+  constructor({ host, model, adapter, nativeElement = null, session = null, context = "source" }) {
     this.host = host;
-    this.model = model;
-    this.adapter = adapter;
+    this.session = session;
+    this.model = session?.model || model;
+    this.adapter = session?.adapter || adapter;
     this.nativeElement = nativeElement;
+    this.context = context;
     this.selection = { startRow: 0, endRow: 0, startCol: 0, endCol: 0 };
     this.anchor = { row: 0, col: 0 };
     this.root = document.createElement("section");
     this.root.className = "rg-root";
+    this.root.classList.toggle("rg-root--reference", context === "reference");
+    this.root.dataset.rgContext = context;
     this.root.tabIndex = 0;
     this.cells = new Map();
     this.disposed = false;
@@ -3373,6 +3825,27 @@ export class GridView {
     };
     this.boundWindowKeydown = (event) => { if (this.keyboardActive) this.onKeydown(event); };
     this.boundPointerUp = () => this.finishPointerAction();
+    const themeSignature = gridThemeSignature(this.nativeElement);
+    const cachedTheme = runtime.gridThemeSignature === themeSignature ? (this.session?.themePalette || runtime.gridThemePalette) : null;
+    if (cachedTheme) {
+      applyGridThemeValues(this.root, cachedTheme);
+      if (this.session) this.session.themePalette = cachedTheme;
+    }
+    else {
+      const initialTheme = syncGridThemeFromHost(this.nativeElement, this.root);
+      runtime.gridThemePalette = initialTheme.values;
+      runtime.gridThemeSignature = themeSignature;
+      if (this.session) this.session.themePalette = initialTheme.values;
+    }
+    this.themeBridge = createGridThemeBridge(this.nativeElement, this.root, {
+      initialSync: false,
+      onSync: (result) => {
+        runtime.gridThemePalette = result.values;
+        runtime.gridThemeSignature = gridThemeSignature(this.nativeElement);
+        if (this.session) this.session.themePalette = result.values;
+      },
+    });
+    this.session?.addView(this);
     this.mount();
   }
 
@@ -3384,7 +3857,7 @@ export class GridView {
     this.root.addEventListener("paste", this.boundPaste);
     document.addEventListener("pointerup", this.boundPointerUp, true);
     this.render();
-    this.adapter.watchExternal?.((model, event = { type: "structural", structural: true, changes: [] }) => this.handleExternalChange(model, event));
+    if (!this.session) this.adapter.watchExternal?.((model, event = { type: "structural", structural: true, changes: [] }) => this.handleExternalChange(model, event));
   }
 
   handleExternalChange(externalModel, event) {
@@ -3418,16 +3891,17 @@ export class GridView {
   toolbar() {
     const toolbar = document.createElement("div"); toolbar.className = "rg-toolbar";
     toolbar.append(
-      button("↶", "Undo (⌘Z)", () => this.undo()),
-      button("↷", "Redo (⌘⇧Z)", () => this.redo()),
-      button("Merge", "Merge selected cells (⌘⇧M)", () => this.mergeSelection()),
-      button("Unmerge", "Unmerge selected region", () => this.unmergeSelection()),
-      button("＋ Row", "Insert a row below", () => this.insertRow()),
-      button("＋ Col", "Insert a column right", () => this.insertCol()),
-      button("Chart", "Create a chart from this selection", () => this.insertChart()),
-      button("Export", "Export this grid", () => exportCommand(this.model)),
-      button("⋯", "More grid actions", (event) => this.openMenu(event.currentTarget))
+      button("↶", "Undo (⌘Z)", () => this.undo(), "rg-toolbar-primary"),
+      button("↷", "Redo (⌘⇧Z)", () => this.redo(), "rg-toolbar-primary"),
+      button("Merge", "Merge selected cells (⌘⇧M)", () => this.mergeSelection(), "rg-toolbar-secondary"),
+      button("Unmerge", "Unmerge selected region", () => this.unmergeSelection(), "rg-toolbar-secondary"),
+      button("＋ Row", "Insert a row below", () => this.insertRow(), "rg-toolbar-secondary"),
+      button("＋ Col", "Insert a column right", () => this.insertCol(), "rg-toolbar-secondary"),
+      button("Chart", "Create a chart from this selection", () => this.insertChart(), "rg-toolbar-secondary"),
+      button("Export", "Export this grid", () => exportCommand(this.model), "rg-toolbar-secondary")
     );
+    if (this.context === "reference") toolbar.appendChild(button("↗ Source", "Open the source table block", () => this.openSource(), "rg-source-button rg-toolbar-primary"));
+    toolbar.appendChild(button("⋯", "More grid actions", (event) => this.openMenu(event.currentTarget), "rg-toolbar-primary"));
     const status = document.createElement("span"); status.className = "rg-status"; status.textContent = `${this.model.rowCount} × ${this.model.colCount}`; status.setAttribute("aria-label", `Roam Grid v${VERSION} · ${this.model.rowCount} × ${this.model.colCount}`); status.title = `Roam Grid v${VERSION}`;
     this.statusElement = status;
     toolbar.appendChild(status);
@@ -3492,6 +3966,7 @@ export class GridView {
         else this.renderCellValue(cell, row, col);
         if (movement) this.moveSelection(...movement);
         this.root.focus({ preventScroll: true });
+        this.session?.editorFinished(this);
       },
     });
     this.chartsElement?.remove(); this.chartsElement = null;
@@ -4060,6 +4535,11 @@ export class GridView {
   }
 
   beginEdit(row, col, initial = null, floating = false) {
+    if (this.session) return this.session.beginEdit(this, () => this.beginEditLocal(row, col, initial, floating));
+    return this.beginEditLocal(row, col, initial, floating);
+  }
+
+  beginEditLocal(row, col, initial = null, floating = false) {
     const merge = this.model.mergeAt(row, col); row = merge?.row ?? row; col = merge?.col ?? col;
     const cell = this.cells.get(`${row}:${col}`); if (!cell) return;
     const raw = this.model.getRaw(row, col);
@@ -4168,8 +4648,18 @@ export class GridView {
   toggleAxisHeader(type, index) {
     return this.commitMutation(`Toggle header ${type}`, () => type === "row" ? this.model.toggleHeaderRow(index) : this.model.toggleHeaderColumn(index), true);
   }
-  undo() { if (this.model.undo()) { this.render(); this.markChanged(true); } }
-  redo() { if (this.model.redo()) { this.render(); this.markChanged(true); } }
+  undo() { if (this.session) return this.session.undo(); if (this.model.undo()) { this.render(); this.markChanged(true); } }
+  redo() { if (this.session) return this.session.redo(); if (this.model.redo()) { this.render(); this.markChanged(true); } }
+
+  openSource() {
+    const uid = this.model.tableUid;
+    if (!uid) return toast("This grid does not have a source block UID", "warning");
+    try {
+      const result = roam().ui?.mainWindow?.openBlock?.({ block: { uid } });
+      if (result?.catch) result.catch((error) => toast(`Could not open source: ${error.message}`, "danger"));
+      return result;
+    } catch (error) { return toast(`Could not open source: ${error.message}`, "danger"); }
+  }
 
   async insertChart() {
     const type = await showChoice("Choose chart type", ["line", "column", "bar", "scatter", "histogram", "boxplot", "density", "count", "multiline", "sparkline"].map((value, index) => ({ label: value[0].toUpperCase() + value.slice(1), value, primary: index === 0 })));
@@ -4193,6 +4683,7 @@ export class GridView {
     };
     const item = (label, action) => { const element = button(label, label, () => { dismiss(); action(); }); element.className = "bp3-menu-item"; return element; };
     menu.append(
+      ...(this.context === "reference" ? [item("Open source table", () => this.openSource())] : []),
       item("Merge selection", () => this.mergeSelection()), item("Unmerge", () => this.unmergeSelection()),
       item("Insert row below", () => this.insertRow()), item("Insert column right", () => this.insertCol()),
       item("Delete selected rows", () => { const range = normalizeRange(this.selection); this.commitMutation("Delete rows", () => this.model.deleteRows(range.startRow, range.endRow - range.startRow + 1), true, { rowDeletion: true }); }),
@@ -4365,6 +4856,7 @@ export class GridView {
   }
 
   commitMutation(label, mutation, structural, { rowDeletion = false } = {}) {
+    if (this.session) return this.session.commitMutation(this, label, mutation, structural, { rowDeletion });
     try {
       const rowDeletionContext = structural && rowDeletion ? this.captureRowDeletionContext() : null;
       this.model.transact(label, mutation);
@@ -4507,18 +4999,22 @@ export class GridView {
   }
 
   applyPatch(patch) {
+    if (this.session) return this.session.applyPatch(patch, this);
     const patches = Array.isArray(patch) ? patch : [patch];
     const rowDeletion = patches.length > 0 && patches.every((item) => item?.op === "deleteRows");
     return this.commitMutation("External patch", () => applyPatchToModel(this.model, patch, false), patchChangesLayout(patch), { rowDeletion }).then(() => this.model.toJSON());
   }
 
-  dispose() {
-    this.disposed = true; clearTimeout(this.saveTimer); this.dirtyCells.clear(); this.resizeCleanup?.(); this.adapter.dispose?.();
+  dispose({ releaseNative = true } = {}) {
+    this.disposed = true; clearTimeout(this.saveTimer); this.dirtyCells.clear(); this.resizeCleanup?.(); if (!this.session) this.adapter.dispose?.();
     this.editorController?.dispose(); this.editorController = null;
     this.clearSelectionPresentation();
     globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true);
     document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true);
-    document.removeEventListener("pointerup", this.boundPointerUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.nativeElement?.classList.remove("rg-native-hidden");
+    document.removeEventListener("pointerup", this.boundPointerUp, true); releaseRichCellHosts(this.root); this.root.remove();
+    this.themeBridge?.dispose?.(); this.themeBridge = null;
+    this.session?.removeView(this);
+    if (releaseNative) this.nativeElement?.classList.remove("rg-native-hidden", "rg-native-pending");
   }
 }
 
@@ -4892,7 +5388,7 @@ async function createNativeTableFromModel(model, afterUid = null) {
     for (let col = 0; col < Math.min(model.colCount, loaded.colCount); col += 1) loaded.setAlignment(row, col, model.getAlignment(row, col));
   }
   await runtime.metadata.set(tableUid, loaded, "native");
-  scheduleScan();
+  syncEnhancedUidGuard(); scheduleScan(document);
   return tableUid;
 }
 
@@ -4959,14 +5455,21 @@ function activeGridUid() {
   return ancestorWithMarker(uid, NATIVE_MARKER) || ancestorWithMarker(uid, LARGE_MARKER);
 }
 
-function activeMount() { const uid = activeGridUid(); return uid ? runtime.mounts.get(uid) : null; }
+function activeMount() {
+  const root = document.activeElement?.closest?.("[data-roam-grid-uid]");
+  if (root?.__rgView) return root.__rgView;
+  const uid = activeGridUid();
+  if (!uid) return null;
+  const session = runtime.sessions.get(uid);
+  return session ? [...session.views].find((view) => view.root?.isConnected) || null : runtime.largeMounts.get(uid) || null;
+}
 
 async function enhanceFocusedTable() {
   const uid = ancestorWithMarker(focusedUid(), NATIVE_MARKER);
   if (!uid) return toast("Focus a cell in a native {{table}} first.", "warning");
   if (runtime.metadata.has(uid)) return toast("This table is already enhanced.", "warning");
   try {
-    const adapter = new NativeTableAdapter(uid); const model = adapter.load(); await runtime.metadata.set(uid, model, "native"); scheduleScan(); toast("Enhanced this table. Its Roam blocks remain canonical.", "success");
+    const adapter = new NativeTableAdapter(uid); const model = adapter.load(); await runtime.metadata.set(uid, model, "native"); syncEnhancedUidGuard(); scheduleScan(document); toast("Enhanced this table. Its Roam blocks remain canonical.", "success");
   } catch (error) { toast(error.message, "danger"); }
 }
 
@@ -4975,7 +5478,7 @@ async function restoreFocusedTable() {
   if (!uid || !runtime.metadata.has(uid)) return toast("Focus an enhanced Roam Grid first.", "warning");
   const entry = runtime.metadata.entries.get(uid);
   if (entry?.value?.mode === "large") return toast("Large grids cannot become native fallback without creating a native copy.", "warning");
-  runtime.mounts.get(uid)?.dispose(); runtime.mounts.delete(uid); await runtime.metadata.remove(uid); toast("Restored the native Roam table.", "success");
+  disposeNativeSession(uid, true); await runtime.metadata.remove(uid); syncEnhancedUidGuard(); toast("Restored the native Roam table.", "success");
 }
 
 async function newLargeGrid() {
@@ -5031,38 +5534,139 @@ function findBlockElement(uid) {
   return null;
 }
 
-let scanTimer = null;
 const mounting = new Set();
 
-function scheduleScan() {
-  clearTimeout(scanTimer);
-  scanTimer = setTimeout(scanMounts, 60);
+function nativeMetadataUids() {
+  return new Set([...runtime.metadata?.entries || []].filter(([, entry]) => entry?.value?.mode !== "large").map(([uid]) => uid));
+}
+
+function installEnhancedUidGuard(uids) {
+  if (!globalThis.document?.head) return null;
+  const style = runtime.guardStyle || document.getElementById(PREPAINT_STYLE_ID) || document.createElement("style");
+  style.id = PREPAINT_STYLE_ID; style.textContent = enhancedUidGuardCss(uids);
+  if (!style.isConnected) document.head.appendChild(style);
+  runtime.guardStyle = style;
+  return style;
+}
+
+function syncEnhancedUidGuard() {
+  if (!runtime.metadata) return installEnhancedUidGuard(readEnhancedUidCache());
+  const uids = nativeMetadataUids(); writeEnhancedUidCache(uids); return installEnhancedUidGuard(uids);
+}
+
+function nativeTablesWithin(root) {
+  if (!root) return [];
+  const values = [];
+  if (root.matches?.(".rm-table")) values.push(root);
+  for (const table of root.querySelectorAll?.(".rm-table") || []) if (!values.includes(table)) values.push(table);
+  return values;
+}
+
+export function nativeTableInstanceInfo(nativeElement, entries = runtime.metadata?.entries || new Map()) {
+  if (!nativeElement) return null;
+  const reference = nativeElement.closest?.(".rm-block-ref[data-uid]");
+  const referenceUid = reference?.dataset?.uid || reference?.getAttribute?.("data-uid") || null;
+  if (referenceUid && entries.get?.(referenceUid)?.value?.mode !== "large" && entries.has?.(referenceUid)) {
+    return { uid: referenceUid, context: "reference", referenceElement: reference };
+  }
+  for (const [uid, entry] of entries) {
+    if (entry?.value?.mode === "large") continue;
+    for (let node = nativeElement; node; node = node.parentElement) {
+      if (node.dataset?.uid === uid || String(node.id || "").endsWith(uid)) return { uid, context: "source", referenceElement: null };
+    }
+  }
+  return null;
+}
+
+function claimNativeInstances(root) {
+  if (!runtime.metadata) return;
+  for (const nativeElement of nativeTablesWithin(root)) {
+    const info = nativeTableInstanceInfo(nativeElement); if (!info) continue;
+    nativeElement.classList.add("rg-native-pending");
+  }
+}
+
+function disposeNativeSession(uid, releaseNative = false) {
+  const session = runtime.sessions.get(uid); if (!session) return;
+  for (const view of [...session.views]) {
+    runtime.views.delete(view); runtime.viewsByNative.delete?.(view.nativeElement);
+    view.dispose({ releaseNative });
+  }
+  session.dispose(); runtime.sessions.delete(uid);
+}
+
+function getOrCreateNativeSession(uid) {
+  const existing = runtime.sessions.get(uid);
+  if (existing && !existing.disposed) { clearTimeout(existing.idleTimer); existing.idleTimer = null; return existing; }
+  const session = new NativeGridSession(uid, { onIdle: (idle) => {
+    if (runtime.sessions.get(uid) !== idle || idle.views.size) return;
+    idle.dispose(); runtime.sessions.delete(uid);
+  } });
+  runtime.sessions.set(uid, session); return session;
+}
+
+function mountNativeInstance(nativeElement, info) {
+  const current = runtime.viewsByNative.get(nativeElement);
+  if (current?.root?.isConnected) return current;
+  nativeElement.classList.add("rg-native-pending");
+  const session = getOrCreateNativeSession(info.uid);
+  const view = new GridView({ host: nativeElement.parentElement, model: session.model, adapter: session.adapter, nativeElement, session, context: info.context });
+  view.root.dataset.roamGridUid = info.uid; view.root.dataset.roamGridInstance = cryptoId(); view.root.__rgView = view;
+  runtime.views.add(view); runtime.viewsByNative.set(nativeElement, view);
+  nativeElement.classList.remove("rg-native-pending");
+  return view;
+}
+
+function cleanupDisconnectedViews() {
+  for (const view of [...runtime.views]) {
+    if (view.root?.isConnected && view.nativeElement?.isConnected) continue;
+    runtime.views.delete(view); runtime.viewsByNative.delete?.(view.nativeElement); view.dispose({ releaseNative: false });
+  }
+  for (const [uid, session] of [...runtime.sessions]) if (!runtime.metadata?.has(uid)) disposeNativeSession(uid, true);
+  for (const [uid, mount] of [...runtime.largeMounts]) if (!mount.root?.isConnected || !runtime.metadata?.has(uid)) {
+    mount.dispose(); runtime.largeMounts.delete(uid);
+  }
+}
+
+function scheduleScan(root = document) {
+  if (!root || !runtime.metadata) return;
+  claimNativeInstances(root);
+  runtime.pendingScanRoots.add(root);
+  if (runtime.scanQueued) return;
+  runtime.scanQueued = true;
+  queueMicrotask(() => { runtime.scanQueued = false; scanMounts(); });
+}
+
+function handleDomMutations(records) {
+  for (const record of records || []) for (const node of record.addedNodes || []) if (node.nodeType === 1) scheduleScan(node);
+  if (!(records || []).some((record) => record.addedNodes?.length)) scheduleScan(document);
 }
 
 async function scanMounts() {
   if (!runtime.metadata) return;
+  const roots = runtime.pendingScanRoots.size ? [...runtime.pendingScanRoots] : [document]; runtime.pendingScanRoots.clear();
+  for (const root of roots) for (const nativeElement of nativeTablesWithin(root)) {
+    const info = nativeTableInstanceInfo(nativeElement); if (!info || runtime.viewsByNative.get(nativeElement)?.root?.isConnected) continue;
+    try { mountNativeInstance(nativeElement, info); }
+    catch (error) {
+      console.error("[roam-grid] Mount failed", info.uid, error);
+      nativeElement.classList.remove("rg-native-hidden", "rg-native-pending");
+      nativeElement.parentElement?.querySelector?.(".rg-root")?.remove();
+      toast(`Roam Grid could not enhance ${info.uid}: ${error.message}`, "danger", 10000);
+    }
+  }
   for (const [uid, entry] of runtime.metadata.entries) {
-    if (runtime.mounts.get(uid)?.root?.isConnected || mounting.has(uid)) continue;
-    runtime.mounts.get(uid)?.dispose?.(); runtime.mounts.delete(uid);
+    if (entry.value.mode !== "large" || runtime.largeMounts.get(uid)?.root?.isConnected || mounting.has(uid)) continue;
     const block = findBlockElement(uid); if (!block) continue;
     mounting.add(uid);
     try {
-      if (entry.value.mode === "large") {
-        const marker = block.querySelector(".rm-block__input") || block.firstElementChild; const host = block;
-        const store = await new LargeGridStore(uid).initialize(); const view = new LargeGridView({ host, store, markerElement: marker }); view.root.dataset.roamGridUid = uid; runtime.mounts.set(uid, view);
-      } else {
-        const nativeElement = block.querySelector(".rm-table") || block.querySelector("table"); if (!nativeElement) continue;
-        const adapter = new NativeTableAdapter(uid); const model = adapter.load(); const view = new GridView({ host: nativeElement.parentElement, model, adapter, nativeElement }); view.root.dataset.roamGridUid = uid; runtime.mounts.set(uid, view);
-      }
-    } catch (error) {
-      console.error("[roam-grid] Mount failed", uid, error);
-      block.querySelector(".rm-table,table")?.classList.remove("rg-native-hidden");
-      block.querySelector(".rg-root,.rg-large-root")?.remove();
-      toast(`Roam Grid could not enhance ${uid}: ${error.message}`, "danger", 10000);
-    }
+      const marker = block.querySelector(".rm-block__input") || block.firstElementChild;
+      const store = await new LargeGridStore(uid).initialize(); const view = new LargeGridView({ host: block, store, markerElement: marker });
+      view.root.dataset.roamGridUid = uid; view.root.__rgView = view; runtime.largeMounts.set(uid, view);
+    } catch (error) { console.error("[roam-grid] Large-grid mount failed", uid, error); toast(`Roam Grid could not mount ${uid}: ${error.message}`, "danger", 10000); }
     finally { mounting.delete(uid); }
   }
-  for (const [uid, mount] of runtime.mounts) if (!runtime.metadata.has(uid)) { mount.dispose(); runtime.mounts.delete(uid); }
+  cleanupDisconnectedViews();
 }
 
 function registerCommands(extensionAPI) {
@@ -5094,25 +5698,28 @@ async function initializeSettings(extensionAPI) {
 }
 
 async function onload({ extensionAPI }) {
+  installEnhancedUidGuard(readEnhancedUidCache());
   runtime.extensionAPI = extensionAPI; runtime.registries = new RegistrySet(); runtime.metadata = new MetadataStore(); runtime.templates = new GridTemplateStore();
-  await runtime.metadata.initialize(); await runtime.templates.initialize(); await initializeSettings(extensionAPI); registerCommands(extensionAPI);
+  await runtime.metadata.initialize(); syncEnhancedUidGuard(); await runtime.templates.initialize(); await initializeSettings(extensionAPI); registerCommands(extensionAPI);
   const publicApi = createPublicApi(); globalThis.window.roamGrid = { ...(globalThis.window.roamGrid || {}), v1: publicApi };
   document.addEventListener("focusin", rememberFocusedUid, true);
   runtime.disposers.push(() => document.removeEventListener("focusin", rememberFocusedUid, true));
-  runtime.observer = new MutationObserver(scheduleScan); runtime.observer.observe(document.querySelector(".roam-app") || document.body, { childList: true, subtree: true });
-  scheduleScan();
+  runtime.observer = new MutationObserver(handleDomMutations); runtime.observer.observe(document.querySelector(".roam-app") || document.body, { childList: true, subtree: true });
+  scheduleScan(document);
   console.info(`[roam-grid] Loaded v${VERSION}`);
 }
 
 async function onunload() {
-  clearTimeout(scanTimer); runtime.observer?.disconnect(); runtime.observer = null;
-  for (const mount of runtime.mounts.values()) mount.dispose(); runtime.mounts.clear();
+  runtime.observer?.disconnect(); runtime.observer = null; runtime.pendingScanRoots.clear(); runtime.scanQueued = false;
+  for (const uid of [...runtime.sessions.keys()]) disposeNativeSession(uid, true);
+  for (const mount of runtime.largeMounts.values()) mount.dispose(); runtime.largeMounts.clear();
+  runtime.guardStyle?.remove(); runtime.guardStyle = null;
   for (const dispose of runtime.disposers.splice(0)) try { dispose(); } catch { /* no-op */ }
   document.querySelectorAll(".rg-toasts,.rg-dialog-overlay,.rg-context-menu").forEach((element) => {
     if (element.__rgDismiss) element.__rgDismiss(); else element.remove();
   });
   if (globalThis.window?.roamGrid?.v1?.version === VERSION) delete globalThis.window.roamGrid.v1;
-  runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null;
+  runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null; runtime.views.clear(); runtime.viewsByNative = new WeakMap();
   console.info("[roam-grid] Unloaded");
 }
 

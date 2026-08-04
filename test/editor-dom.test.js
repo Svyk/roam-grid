@@ -166,6 +166,27 @@ test("portal palette copies resolved grid colors and skips unchanged writes", ()
   assert.equal(portal.style.writeCount, writes);
 });
 
+test("portal palette reuses the grid theme cache without computed-style reads", () => {
+  const { body } = installMiniDom();
+  const root = new MiniNode("section"); root.className = "rg-root";
+  root.__rgGridPalette = {
+    "--rg-bg": "rgb(41, 55, 66)",
+    "--rg-color": "rgb(245, 248, 250)",
+    "--rg-header": "rgb(48, 64, 77)",
+    "--rg-border": "rgb(91, 103, 112)",
+    "--rg-muted": "rgb(171, 179, 191)",
+    "--rg-active": "rgb(72, 175, 240)",
+  };
+  const portal = new MiniNode("div"); body.append(root, portal);
+  let computedReads = 0;
+  const result = syncPortalThemeFromRoot(root, portal, () => { computedReads += 1; return {}; });
+  assert.equal(result.changed, true);
+  assert.equal(computedReads, 0);
+  assert.equal(portal.style.getPropertyValue("--rg-portal-bg"), "rgb(41, 55, 66)");
+  assert.equal(portal.style.getPropertyValue("--rg-portal-header"), "rgb(48, 64, 77)");
+  assert.equal(portal.style.getPropertyValue("--rg-portal-border"), "rgb(91, 103, 112)");
+});
+
 test("no-owner portals leave inline palette unset so Blueprint dark CSS remains authoritative", async () => {
   const { body } = installMiniDom(); body.className = "bp3-dark";
   const portal = new MiniNode("div"); body.appendChild(portal);
@@ -309,6 +330,16 @@ test("structural grid swaps preserve viewport identity and scroll while releasin
   assert.deepEqual(viewport.children, [nextGrid]);
   assert.equal(viewport.scrollLeft, 41); assert.equal(viewport.scrollTop, 73);
   assert.deepEqual(unmounted, [richHost]);
+});
+
+test("first grid mount skips layout-backed scroll reads", () => {
+  installMiniDom();
+  const viewport = new MiniNode("div");
+  Object.defineProperty(viewport, "scrollLeft", { get() { throw new Error("scrollLeft forced layout"); }, set() {} });
+  Object.defineProperty(viewport, "scrollTop", { get() { throw new Error("scrollTop forced layout"); }, set() {} });
+  const nextGrid = new MiniNode("div");
+  assert.equal(replaceGridViewportContents(viewport, nextGrid), viewport);
+  assert.deepEqual(viewport.children, [nextGrid]);
 });
 
 test("virtual teardown releases every Roam-rendered host before canvas replacement", () => {

@@ -3,6 +3,11 @@
   display: none !important;
 }
 
+.rg-native-pending {
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
 .rg-root {
   --rg-border: var(--bc-menu, #d3d8de);
   --rg-border-strong: var(--bc-main, #c5cbd3);
@@ -16,11 +21,12 @@
   --rg-warning: #a15c00;
   --rg-danger: #b42318;
   position: relative;
+  container-type: inline-size;
   width: 100%;
   max-width: 1200px;
   min-width: 0;
   margin: 4px 0 10px;
-  color: var(--cl-text-color, inherit);
+  color: var(--rg-color, var(--cl-text-color, inherit));
   background: var(--rg-bg);
   border: 1px solid var(--rg-border-strong);
   border-radius: 4px;
@@ -32,6 +38,7 @@
 }
 
 .bp3-dark .rg-root,
+body.bt-theme-dark .rg-root,
 body.roam-body.dark .rg-root {
   --rg-border: #5f6b7c;
   --rg-border-strong: #738091;
@@ -60,6 +67,7 @@ body.roam-body.dark .rg-root {
 /* Narrow safety net for dark modes that are global rather than app-scoped. */
 :root.bp3-dark .rg-portal,
 body.bp3-dark .rg-portal,
+body.bt-theme-dark .rg-portal,
 body.rm-dark-theme .rg-portal,
 .rm-dark-theme > .rg-portal,
 body.roam-body.dark .rg-portal {
@@ -127,6 +135,15 @@ body.roam-body.dark .rg-portal {
 .rg-button.bp3-button:hover {
   background: var(--rg-header);
   box-shadow: none;
+}
+
+.rg-source-button.bp3-button {
+  color: var(--rg-active);
+  font-weight: 600;
+}
+
+.rg-root--reference .rg-toolbar {
+  box-shadow: inset 3px 0 0 color-mix(in srgb, var(--rg-active) 62%, transparent);
 }
 
 .rg-status {
@@ -994,6 +1011,21 @@ body.roam-body.dark .rg-portal {
   .rg-button.bp3-button { padding-inline: 5px; }
   .rg-viewport,
   .rg-large-viewport { max-height: 62vh; }
+}
+
+@container (max-width: 560px) {
+  .rg-toolbar-secondary,
+  .rg-status {
+    display: none !important;
+  }
+
+  .rg-toolbar {
+    overflow-x: hidden;
+  }
+
+  .rg-source-button {
+    margin-left: auto;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
