@@ -3235,6 +3235,14 @@ export class NativeGridSession {
     }
     const conflicts = (event.changes || []).filter((change) => this.dirtyCells.has(change.uid));
     if (conflicts.length) {
+      // The reload adopts the graph's values wholesale, so every external change it
+      // brings in — not just the conflicting subset — must be marked stale first.
+      // Otherwise a later undo silently overwrites a value someone else wrote, the
+      // same failure the merge and checkpoint paths already refuse.
+      this.history?.onExternalContent((event.changes || []).filter((change) => {
+        const coordinate = this.coordinateForUid(change.uid); if (!coordinate) return false;
+        return this.model.getCell(coordinate.row, coordinate.col)?.raw !== change.raw;
+      }));
       this.dirtyCells.clear(); this.structuralPending = false; clearTimeout(this.saveTimer); this.changeVersion = this.savedVersion;
       this.replaceModel(externalModel, { render: false }); this.adapter.acceptExternalTree?.(event.tree, this.model); this.renderStructural();
       toast("Roam Grid reloaded because this cell changed elsewhere.", "warning");

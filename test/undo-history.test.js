@@ -729,3 +729,51 @@ test("rebasableUids reports every uid the history can rebase in place", () => {
   assert.deepEqual([...model.history.rebasableUids()].sort(), ["c00", "c11"]);
   assert.deepEqual([...new UndoHistory().rebasableUids()], []);
 });
+
+test("undo after a same-cell conflict reload keeps the external value and reports it dropped", () => {
+  const { model, session, history } = sessionHarness();
+  model.transact("edit", () => { model.setRaw(0, 0, "local-a"); model.setRaw(0, 1, "local-b"); });
+  session.queueChangedCells();
+  clearTimeout(session.saveTimer);
+  assert.ok(session.dirtyCells.has("c00"), "the conflicted cell is pending locally");
+  const entry = history.entries.at(-1);
+
+  // The graph kept our unsaved c01 edit out and took someone else's c00 value.
+  const external = new GridModel({ rows: [[{ uid: "c00", raw: "remote" }, { uid: "c01", raw: "0:1" }]], columnIds: ["col0", "col1"] });
+  session.handleExternalChange(external, { type: "content", structural: false, tree: {}, changes: [{ uid: "c00", raw: "remote" }] });
+
+  assert.equal(session.dirtyCells.size, 0, "the conflict reload discarded the pending local edits");
+  assert.strictEqual(session.model, external, "the conflict branch reloaded the model");
+  assert.ok(entry.stale.has("c00"), "the conflicted uid is marked stale on the entry that writes it");
+
+  const applyInverse = history.applyInverse.bind(history);
+  let reported = null;
+  history.applyInverse = (target, item) => { const result = applyInverse(target, item); reported = result.dropped; return result; };
+  assert.equal(session.undo(), true);
+  clearTimeout(session.saveTimer);
+  history.applyInverse = applyInverse;
+
+  assert.equal(session.model.getRaw(0, 0), "remote", "the undo keeps the value written elsewhere");
+  assert.deepEqual(reported, ["c00"], "and reports it dropped like every other stale path");
+
+  // Positive control: without the conflict-branch marking the same undo clobbers the
+  // external value and reports nothing dropped.
+  const control = sessionHarness({ tableUid: "table-control-conflict" });
+  control.model.transact("edit", () => { control.model.setRaw(0, 0, "local-a"); control.model.setRaw(0, 1, "local-b"); });
+  control.session.queueChangedCells();
+  clearTimeout(control.session.saveTimer);
+  const controlExternal = new GridModel({ rows: [[{ uid: "c00", raw: "remote" }, { uid: "c01", raw: "0:1" }]], columnIds: ["col0", "col1"] });
+  control.session.dirtyCells.clear(); control.session.structuralPending = false;
+  control.session.replaceModel(controlExternal, { render: false }); // the reload, minus the stale marking
+  const controlApply = control.history.applyInverse.bind(control.history);
+  let controlReported = null;
+  control.history.applyInverse = (target, item) => { const result = controlApply(target, item); controlReported = result.dropped; return result; };
+  assert.equal(control.session.undo(), true);
+  clearTimeout(control.session.saveTimer);
+  assert.throws(() => {
+    assert.equal(control.session.model.getRaw(0, 0), "remote");
+    assert.deepEqual(controlReported, ["c00"]);
+  }, "the conflict-branch assertions catch a reload that skipped the stale marking");
+  assert.equal(control.session.model.getRaw(0, 0), "0:0", "the unmarked reload really did clobber the external value");
+  assert.deepEqual(controlReported, [], "and reported nothing dropped");
+});

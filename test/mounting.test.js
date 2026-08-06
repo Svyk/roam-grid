@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import extension, {
   GridModel,
   NativeGridSession,
+  clearUndoHistories,
   createGridThemeBridge,
   enhancedUidGuardCss,
   graphCacheKey,
@@ -165,6 +166,7 @@ test("one native session shares a model, watch, repaint, and undo history across
     save: async (value) => value,
     dispose: () => { disposed += 1; },
   };
+  clearUndoHistories();
   const session = new NativeGridSession("table-a", { adapter, model });
   const makeView = () => ({
     model, adapter, session: null,
@@ -191,6 +193,7 @@ test("one native session shares a model, watch, repaint, and undo history across
 test("a shared session commits the previous instance editor before opening another", async () => {
   const model = new GridModel({ rows: [[""]], tableUid: "table-a" });
   const adapter = { model, load: () => model, watchExternal: () => () => {}, dispose() {} };
+  clearUndoHistories();
   const session = new NativeGridSession("table-a", { adapter, model });
   let finishes = 0; let starts = 0;
   const first = { editorController: { state: {}, finish: async (commit) => { assert.equal(commit, true); finishes += 1; } } };

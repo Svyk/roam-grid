@@ -5,6 +5,7 @@ import {
   GridView,
   NativeGridSession,
   claimKeyboard,
+  clearUndoHistories,
   installKeyboardOwnership,
   keyboardOwner,
   portalOwnerUid,
@@ -161,6 +162,7 @@ function makeGrid(dom, { rows = [[{ uid: "a1", raw: "1" }], [{ uid: "b1", raw: "
     save: async (value) => value,
     dispose() {},
   };
+  clearUndoHistories();
   const session = new NativeGridSession(uid, { adapter, model });
   const root = new Node("section"); root.className = "rg-root"; root.dataset.roamGridUid = uid;
   const cell = new Node("div"); cell.className = "rg-cell"; root.appendChild(cell);
