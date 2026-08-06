@@ -59,6 +59,7 @@ const TODAYS_CONSTANTS = {
   "editing-autocomplete": true,
   "editing-autocomplete-debounce-ms": 90,
   "editing-autocomplete-limit": 8,
+  "editing-autocomplete-empty-opener": true,
   "editing-capture-undo": true,
   "editing-enter-direction": "Down",
   "editing-tab-direction": "Right",

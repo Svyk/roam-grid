@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { FormulaEngine, GridEditorController, GridModel, GridView, NativeGridSession, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, queryBlockReferenceSources, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, settingsCache, syncPortalThemeFromRoot } from "../src/extension.js";
+import { FormulaEngine, GridEditorController, GridModel, GridView, NativeGridSession, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, queryBlockReferenceSources, recentsCacheReady, recentsDisabled, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, resetRoamRecents, searchRoamRecentSuggestions, settingsCache, syncPortalThemeFromRoot } from "../src/extension.js";
 
 class MiniClassList {
   constructor() { this.values = new Set(); }
@@ -90,13 +90,14 @@ function makeController(options = {}, domOptions = {}) {
     const cell = new MiniNode("div"); cell.dataset.row = String(row); cell.dataset.col = String(col); root.appendChild(cell); cells.set(`${row}:${col}`, cell);
   }
   const finishes = [];
-  const controller = new GridEditorController({ root }, {
+  const { view: viewExtra = null, ...controllerOptions } = options;
+  const controller = new GridEditorController({ root, ...viewExtra }, {
     viewport: null,
     dimensions: () => ({ rowCount: 3, colCount: 3 }),
     cellAt: (row, col) => cells.get(`${row}:${col}`) || null,
     mountedCells: () => cells.values(),
     onFinish: async (value) => { finishes.push(value); },
-    ...options,
+    ...controllerOptions,
   });
   return { ...dom, root, cells, finishes, controller };
 }
@@ -741,22 +742,177 @@ test("cell reference clicks toggle a local native-rendered references panel", as
 
 const waitForSearch = () => new Promise((resolve) => setTimeout(resolve, 2));
 
-test("bare Roam reference openers do not flash an empty inline portal", async () => {
+/**
+ * Replaces "bare Roam reference openers do not flash an empty inline portal". That test asserted
+ * `searches === 0` on a bare opener, which WAS the reported bug — Roam opens its own menu the moment
+ * you type `[[`, and typing `[[` here produced silence. Its letter is gone; its intent — never an
+ * empty shell, never a flash — is preserved below and strengthened into the invariant the whole
+ * popover is now governed by, asserted across both trigger types × cold / warm / empty / disabled.
+ */
+test("a bare [[ opens on recent pages and a bare (( on recent blocks", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents();
   let searches = 0;
   const { controller, cells, flush } = makeController({
     referenceSearchDelay: 0,
-    searchReferences: async () => { searches += 1; return []; },
+    searchReferences: async () => { searches += 1; return [{ kind: "roam-page", name: "Searched", description: "Page" }]; },
   });
+  globalThis.window.roamAlphaAPI = { q: (query) => (/:node\/title/.test(query)
+    ? [["Older Page", "pageold12", 10], ["Newest Page", "pagenew12", 90]]
+    : [["blkolder12", "an older block", 20], ["blknewer12", "a newer block", 80]]) };
+
   const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "[[", floating: false });
   flush(); await waitForSearch();
-  assert.equal(searches, 0);
-  assert.equal(controller.popover.hidden, true);
-  assert.equal(controller.suggestionList.hidden, true);
-  assert.equal(editor.getAttribute("aria-expanded"), "false");
+  assert.equal(searches, 0, "a bare opener takes the recents path, never the search path");
+  assert.equal(controller.suggestionKind, "roam-reference");
+  assert.deepEqual(controller.suggestions.map((suggestion) => suggestion.name), ["Newest Page", "Older Page"]);
+  assert.equal(controller.popover.hidden, false);
+  assert.equal(controller.suggestionList.hidden, false);
+  assert.equal(editor.getAttribute("aria-expanded"), "true");
+
   editor.value = "(("; editor.setSelectionRange(2, 2); editor.dispatch("input"); flush(); await waitForSearch();
   assert.equal(searches, 0);
-  assert.equal(controller.popover.hidden, true);
+  assert.deepEqual(controller.suggestions.map((suggestion) => suggestion.uid), ["blknewer12", "blkolder12"]);
+  assert.equal(controller.popover.hidden, false);
+
+  editor.value = "((que"; editor.setSelectionRange(5, 5); editor.dispatch("input"); flush(); await waitForSearch();
+  assert.equal(searches, 1, "a typed query still goes to the search path");
   controller.dispose();
+});
+
+/**
+ * The invariant that replaces the old test's intent, pinned rather than sampled: the popover is
+ * visible only when the list is showing rows, or the editor is floating, or the cell holds a formula.
+ */
+test("the popover is never an empty shell across trigger type and recents state", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  const rows = { page: [["Alpha", "pagealpha", 40]], block: [["blockalpha", "alpha block", 40]] };
+  const openers = [["[[", "page"], ["((", "block"]];
+
+  const assertInvariant = (controller, label) => {
+    const state = controller.state;
+    const raw = state.editor.value;
+    const formula = raw.startsWith("=") && !raw.startsWith("==");
+    const showingRows = Boolean(controller.suggestions.length) && !controller.suggestionList.hidden;
+    if (!controller.popover.hidden) assert.ok(showingRows || state.floating || formula, `${label}: a visible popover must have rows, be floating, or be a formula`);
+    assert.equal(state.editor.getAttribute("aria-expanded"), String(Boolean(controller.suggestions.length)), `${label}: aria-expanded tracks the rows`);
+    if (!controller.suggestions.length) assert.equal(controller.suggestionList.hidden, true, `${label}: an empty list is hidden`);
+  };
+
+  for (const [opener, type] of openers) {
+    for (const scenario of ["cold", "warm", "empty", "disabled"]) {
+      resetRoamRecents(); settingsCache.clear();
+      let queries = 0;
+      const { controller, cells, flush } = makeController({ referenceSearchDelay: 0 });
+      globalThis.window.roamAlphaAPI = { q: () => { queries += 1; return scenario === "empty" ? [] : rows[type]; } };
+      if (scenario === "warm") { await searchRoamRecentSuggestions({ type, query: "" }); assert.equal(queries, 1); }
+      if (scenario === "disabled") settingsCache.set("editing-autocomplete-empty-opener", false);
+      const label = `${opener} ${scenario}`;
+
+      const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: opener, floating: false });
+      flush(); await waitForSearch();
+      assertInvariant(controller, label);
+      const expectRows = scenario === "cold" || scenario === "warm";
+      assert.equal(controller.popover.hidden, !expectRows, `${label}: popover visibility follows the rows`);
+      assert.equal(controller.suggestions.length, expectRows ? 1 : 0, `${label}: row count`);
+      if (scenario === "warm") assert.equal(queries, 1, "a warm cache answers without a second query");
+      if (scenario === "disabled") assert.equal(queries, 0, "the empty-opener switch sits ahead of the query");
+      assert.equal(recentsCacheReady(type), scenario !== "disabled", `${label}: only a switched-off opener leaves the cache cold`);
+
+      editor.value = `=1+${opener}`; editor.setSelectionRange(5, 5); editor.dispatch("input"); flush(); await waitForSearch();
+      assertInvariant(controller, `${label} formula`);
+      assert.equal(controller.popover.hidden, false, `${label}: a formula cell always shows the assistant`);
+      controller.dispose();
+    }
+  }
+});
+
+test("recent blocks exclude the cells of the table being edited", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents();
+  const model = new GridModel({ rows: [[{ uid: "owncell001", raw: "mine" }, { uid: "owncell002", raw: "also mine" }]] });
+  const { controller, cells, flush } = makeController({ referenceSearchDelay: 0, view: { model } });
+  globalThis.window.roamAlphaAPI = { q: () => [
+    ["owncell001", "mine", 99],
+    ["outsider01", "a block somewhere else", 50],
+    ["owncell002", "also mine", 98],
+  ] };
+
+  await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "((", floating: false });
+  flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions.map((suggestion) => suggestion.uid), ["outsider01"]);
+  assert.equal(controller.popover.hidden, false);
+  controller.dispose();
+});
+
+test("a large grid has no cell uids to exclude and still gets its recents", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents();
+  const { controller, cells, flush } = makeController({ referenceSearchDelay: 0 });
+  assert.equal(controller.currentTableUids(), null, "a view with no model contributes no exclusions");
+  globalThis.window.roamAlphaAPI = { q: () => [["anyblock01", "a block", 10]] };
+  await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "((", floating: false });
+  flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions.map((suggestion) => suggestion.uid), ["anyblock01"]);
+  controller.dispose();
+});
+
+test("pages this extension inserted are promoted ahead of the graph's own edit times", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents();
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async () => [{ kind: "roam-page", name: "Chosen Page", description: "Page" }],
+  });
+  globalThis.window.roamAlphaAPI = { q: () => [["Chosen Page", "pagechosen", 1], ["Busy Page", "pagebusy12", 999]] };
+
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "[[Cho", floating: false });
+  flush(); await waitForSearch();
+  controller.onKeydown({ key: "Enter", preventDefault() {}, stopPropagation() {}, isComposing: false }); flush();
+  assert.equal(editor.value, "[[Chosen Page]]");
+
+  editor.value = "[[Chosen Page]] [["; editor.setSelectionRange(18, 18); editor.dispatch("input"); flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions.map((suggestion) => suggestion.name), ["Chosen Page", "Busy Page"], "the accepted page outranks the more recently edited one");
+  controller.dispose();
+});
+
+test("a cache-resolvable bare opener drops the debounce it has nothing to debounce", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents(); settingsCache.clear();
+  const { controller } = makeController();
+  globalThis.window.roamAlphaAPI = { q: () => [["Alpha", "pagealpha", 40]] };
+  assert.equal(controller.searchDelay({ type: "page", query: "" }), 90, "a cold bare opener still settles");
+  await searchRoamRecentSuggestions({ type: "page", query: "" });
+  assert.equal(controller.searchDelay({ type: "page", query: "" }), 0, "a warm cache resolves with no debounce");
+  assert.equal(controller.searchDelay({ type: "page", query: "Alp" }), 90, "a typed query is not cache-resolvable");
+  assert.equal(controller.searchDelay({ type: "block", query: "" }), 90, "the two openers cache separately");
+  assert.equal(controller.searchDelay(), 90);
+  controller.dispose();
+});
+
+test("a recents query over budget self-disables for the session through console.info, not a toast", async (t) => {
+  const info = console.info; const warn = console.warn;
+  const infos = []; const warns = [];
+  console.info = (message) => infos.push(message); console.warn = (message) => warns.push(message);
+  t.after(() => { console.info = info; console.warn = warn; resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents(); settingsCache.clear();
+
+  const elapsed = 290; const real = globalThis.performance;
+  let reading = 0;
+  globalThis.performance = { now: () => { reading += 1; return reading % 2 === 0 ? elapsed : 0; } };
+  const api = { q: () => [["Slow Page", "pageslow12", 5]] };
+
+  const first = await searchRoamRecentSuggestions({ type: "page", query: "" }, { api });
+  assert.deepEqual(first.map((suggestion) => suggestion.name), ["Slow Page"], "the result that blew the budget is still used — it is already paid for");
+  assert.equal(recentsDisabled(), true);
+  assert.equal(infos.length, 1);
+  assert.match(infos[0], /over the 250ms budget/);
+
+  const second = await searchRoamRecentSuggestions({ type: "block", query: "" }, { api });
+  assert.deepEqual(second, [], "the switch holds for the rest of the session");
+  assert.equal(infos.length, 1, "and says so exactly once");
+  assert.deepEqual(warns, []);
+  globalThis.performance = real;
 });
 
 test("plain Roam reference queries open only after results and use a plain address", async () => {
@@ -828,11 +984,13 @@ test("Roam page and block suggestions insert native syntax without stealing edit
  * hide the list while querying Roam on every keystroke, which is the cost the switch exists to avoid.
  */
 test("the autocomplete switch silences the function list and stops the Roam query being issued", async (t) => {
-  t.after(() => settingsCache.clear());
-  let searches = 0;
+  t.after(() => { settingsCache.clear(); resetRoamRecents(); });
+  resetRoamRecents();
+  let searches = 0; let recents = 0;
   const { controller, cells, flush } = makeController({
     referenceSearchDelay: 0,
     searchReferences: async () => { searches += 1; return [{ kind: "roam-page", name: "Project Alpha", description: "Page" }]; },
+    searchRecents: async () => { recents += 1; return [{ kind: "roam-page", name: "Recent Alpha", description: "Page" }]; },
   });
 
   settingsCache.set("editing-autocomplete", true);
@@ -848,6 +1006,11 @@ test("the autocomplete switch silences the function list and stops the Roam quer
   assert.equal(controller.suggestionKind, "roam-reference");
   await controller.finish(false);
 
+  await controller.start({ row: 2, col: 2, cell: cells.get("2:2"), raw: "[[", floating: false });
+  flush(); await waitForSearch();
+  assert.equal(recents, 1, "the bare opener is the baseline the switch degrades from too");
+  await controller.finish(false);
+
   settingsCache.set("editing-autocomplete", false);
   const editor = await controller.start({ row: 1, col: 0, cell: cells.get("1:0"), raw: "=SU", floating: false });
   flush();
@@ -861,6 +1024,13 @@ test("the autocomplete switch silences the function list and stops the Roam quer
   assert.equal(searches, 1, "the gate must sit ahead of the debounced query, not after its results");
   assert.deepEqual(controller.suggestions, []);
   assert.equal(controller.suggestionList.hidden, true);
+  await controller.finish(false);
+
+  await controller.start({ row: 2, col: 1, cell: cells.get("2:1"), raw: "((", floating: false });
+  flush(); await waitForSearch();
+  assert.equal(recents, 1, "the master switch gates the recents lookup too, ahead of it for the same reason");
+  assert.deepEqual(controller.suggestions, []);
+  assert.equal(controller.popover.hidden, true);
   controller.dispose();
 });
 

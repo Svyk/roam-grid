@@ -33,6 +33,14 @@ const DEFAULT_CONTENT_SAVE_MS = 220;
 const DEFAULT_LARGE_SAVE_MS = 500;
 const DEFAULT_AUTOCOMPLETE_MS = 90;
 const DEFAULT_AUTOCOMPLETE_LIMIT = 8;
+const RECENTS_TTL_MS = 60000;
+// The page query returns every page in the graph and has not been measured on a large one. Over
+// budget the result is still used — it is already paid for — but the empty-opener path switches
+// itself off for the rest of the session. This is a nicety, so it reports through console.info and
+// never a toast.
+const RECENTS_BUDGET_MS = 250;
+const RECENT_BLOCK_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const RECENT_ACCEPTED_PAGES = 25;
 const DEFAULT_COMPACT_ROW_HEIGHT = 24;
 const DEFAULT_GRID_MAX_WIDTH = 1200;
 const DEFAULT_NEW_GRID_ROWS = 100;
@@ -87,6 +95,7 @@ const SETTING_DESCRIPTORS = [
   { key: "editing-autocomplete", group: "Editing", name: "Suggest functions and pages while typing", description: "Offer formula-function and [[page]] / ((block)) suggestions inside the cell editor. With this off nothing pops up while you type and the two delay/results rows below do nothing.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-autocomplete-debounce-ms", group: "Editing", name: "Autocomplete delay (ms)", description: "How long a reference query settles before Roam is searched.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_MS, min: 0, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "editing-autocomplete-limit", group: "Editing", name: "Autocomplete results", description: "How many suggestions the formula and reference pickers offer.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_LIMIT, min: 1, max: 25, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "editing-autocomplete-empty-opener", group: "Editing", name: "Open the reference menu on a bare [[ or ((", description: "Offer recently edited pages the moment you type [[ and recently edited blocks the moment you type ((, the way Roam’s own menu does, before you have typed anything to search for. With this off the menu waits for a query.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-capture-undo", group: "Editing", name: "Capture grid undo history", description: "Record grid edits in the extension's own undo history so ⌘Z reverses them.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-enter-direction", group: "Editing", name: "Enter moves", description: "Where the selection lands after Enter finishes a cell edit.", control: "select", type: "enum", default: "Down", items: ["Down", "Right", "Stay"], scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-tab-direction", group: "Editing", name: "Tab moves", description: "Where the selection lands after Tab finishes a cell edit.", control: "select", type: "enum", default: "Right", items: ["Right", "Down"], scope: "graph", apply: "immediate", stage: "live" },
@@ -176,7 +185,13 @@ const runtime = {
   lastFocusedUid: null,
   keyboardOwner: null,
   commentArmed: false,
+  recentsDisabled: false,
+  recentlyAcceptedPages: [],
 };
+
+/** Recently-edited pages and blocks, keyed `<graph>:<page|block>`, 60 s TTL. The second and every
+ *  later bare opener in a session resolves out of here, which is what removes the debounce. */
+export const roamRecentsCache = new Map();
 
 export const pendingTimers = new Set();
 
@@ -422,6 +437,23 @@ export function headersVisible(gridFlag) {
  *  autocomplete sites so no open editor has to be rebuilt when the switch moves. */
 export function autocompleteEnabled() {
   return getSetting("editing-autocomplete") !== false;
+}
+
+/** True while a bare `[[` / `((` may open on recents. Read live for the same reason. */
+export function emptyOpenerEnabled() {
+  return getSetting("editing-autocomplete-empty-opener") !== false;
+}
+
+/** Session-scoped budget switch — see RECENTS_BUDGET_MS. */
+export function recentsDisabled() {
+  return runtime.recentsDisabled === true;
+}
+
+/** Drops the cached recents rows, the accepted-page LRU, and re-arms the budget switch. */
+export function resetRoamRecents() {
+  roamRecentsCache.clear();
+  runtime.recentsDisabled = false;
+  runtime.recentlyAcceptedPages.length = 0;
 }
 
 /** `toast` gate. An error always shows, and a message carrying an action is a control rather than a
@@ -6242,8 +6274,90 @@ export async function searchRoamReferenceSuggestions(context, limit = getSetting
   }).slice(0, boundedLimit);
 }
 
+const RECENT_PAGES_QUERY = '[:find ?title ?uid ?time :where [?p :node/title ?title] [?p :block/uid ?uid] [(get-else $ ?p :edit/time 0) ?time]]';
+const RECENT_BLOCKS_QUERY = '[:find ?uid ?string ?time :in $ ?since :where [?b :edit/time ?time] [(> ?time ?since)] [?b :block/string ?string] [(!= ?string "")] [?b :block/uid ?uid]]';
+
+/** The one recency signal this extension owns: pages it inserted itself. Promoted ahead of the
+ *  graph’s own edit times because inside a grid that ordering is what matches muscle memory. */
+export function rememberAcceptedPage(name) {
+  const title = String(name ?? "").trim(); if (!title) return;
+  const lru = runtime.recentlyAcceptedPages;
+  const at = lru.indexOf(title); if (at >= 0) lru.splice(at, 1);
+  lru.unshift(title);
+  if (lru.length > RECENT_ACCEPTED_PAGES) lru.length = RECENT_ACCEPTED_PAGES;
+}
+
+/** Whether a bare opener of this type can be answered without touching Roam — the condition under
+ *  which `searchDelay` drops the debounce. */
+export function recentsCacheReady(type, now = Date.now()) {
+  const entry = roamRecentsCache.get(`${graphKeyName()}:${type}`);
+  return Boolean(entry) && now - entry.at < RECENTS_TTL_MS;
+}
+
+function readRecentRows(type, api, now) {
+  const key = `${graphKeyName()}:${type}`;
+  const cached = roamRecentsCache.get(key);
+  if (cached && now - cached.at < RECENTS_TTL_MS) return cached.rows;
+  const clock = () => globalThis.performance?.now?.() ?? Date.now();
+  const started = clock();
+  const rows = type === "page" ? api.q(RECENT_PAGES_QUERY) : api.q(RECENT_BLOCKS_QUERY, now - RECENT_BLOCK_WINDOW_MS);
+  const elapsed = clock() - started;
+  const value = [...(rows || [])];
+  roamRecentsCache.set(key, { at: now, rows: value });
+  if (elapsed > RECENTS_BUDGET_MS && !runtime.recentsDisabled) {
+    runtime.recentsDisabled = true;
+    console.info(`[roam-grid] Recent ${type === "page" ? "pages" : "blocks"} took ${Math.round(elapsed)}ms, over the ${RECENTS_BUDGET_MS}ms budget. Bare [[ and (( will not open on their own for the rest of this session; typing a query still searches.`);
+  }
+  return value;
+}
+
+function recentPageSuggestions(rows, limit) {
+  const byTitle = new Map();
+  for (const row of rows) {
+    const title = String(row?.[0] ?? "").trim(); if (!title) continue;
+    byTitle.set(title, { name: title, uid: row[1] == null ? null : String(row[1]), time: Number(row[2]) || 0 });
+  }
+  const promoted = [];
+  for (const title of runtime.recentlyAcceptedPages) {
+    promoted.push(byTitle.get(title) || { name: title, uid: null, time: 0 });
+    byTitle.delete(title);
+  }
+  const rest = [...byTitle.values()].sort((a, b) => b.time - a.time);
+  return [...promoted, ...rest].slice(0, limit).map((entry) => ({ kind: "roam-page", name: entry.name, description: "Page", uid: entry.uid }));
+}
+
+function recentBlockSuggestions(rows, limit, excludeUids) {
+  const entries = [];
+  for (const row of rows) {
+    const uid = row?.[0] == null ? null : String(row[0]);
+    if (!uid || excludeUids?.has(uid)) continue;
+    const label = String(row[1] ?? "").replace(/\s+/g, " ").trim(); if (!label) continue;
+    entries.push({ uid, label, time: Number(row[2]) || 0 });
+  }
+  entries.sort((a, b) => b.time - a.time);
+  return entries.slice(0, limit).map((entry) => ({ kind: "roam-block", name: entry.label.slice(0, 120), description: `Block · ${entry.uid}`, uid: entry.uid }));
+}
+
+/**
+ * The recents path, deliberately separate from the search path: a bare `[[` offers the pages this
+ * graph edited most recently and a bare `((` the blocks it edited in the last week, which is what
+ * Roam’s own menu does. `excludeUids` is the caller’s own table — every cell edit touches a block,
+ * so without it a recent-blocks list opened inside a grid is mostly the grid you are sitting in.
+ * Large grids pass nothing, because their cells are JSON rows and have no uid to collide with.
+ */
+export async function searchRoamRecentSuggestions(context, { limit = getSetting("editing-autocomplete-limit"), api = globalThis.window?.roamAlphaAPI, excludeUids = null, now = Date.now() } = {}) {
+  if (!context || recentsDisabled() || !emptyOpenerEnabled()) return [];
+  if (typeof api?.q !== "function") return [];
+  const boundedLimit = clamp(Math.floor(Number(limit) || 8), 1, 20);
+  const page = context.type === "page";
+  let rows = [];
+  try { rows = readRecentRows(page ? "page" : "block", api, now); }
+  catch (error) { console.warn("[roam-grid] Recents query failed", error); return []; }
+  return page ? recentPageSuggestions(rows, boundedLimit) : recentBlockSuggestions(rows, boundedLimit, excludeUids);
+}
+
 export class GridEditorController {
-  constructor(view, { cellAt, dimensions, mountedCells = null, cellRange = null, navigateReference = null, revealReference = null, searchReferences = searchRoamReferenceSuggestions, referenceSearchDelay = null, onFinish, viewport }) {
+  constructor(view, { cellAt, dimensions, mountedCells = null, cellRange = null, navigateReference = null, revealReference = null, searchReferences = searchRoamReferenceSuggestions, searchRecents = searchRoamRecentSuggestions, referenceSearchDelay = null, onFinish, viewport }) {
     this.view = view;
     this.cellAt = cellAt;
     this.dimensions = dimensions;
@@ -6257,6 +6371,7 @@ export class GridEditorController {
     this.onFinish = onFinish;
     this.viewport = viewport;
     this.searchReferences = searchReferences;
+    this.searchRecents = searchRecents;
     this.referenceSearchDelay = referenceSearchDelay == null ? null : Math.max(0, Number(referenceSearchDelay) || 0);
     this.referenceSearchTimer = null;
     this.referenceSearchToken = 0;
@@ -6458,6 +6573,7 @@ export class GridEditorController {
     const state = this.state; const suggestion = this.suggestions[index]; const context = this.referenceContext;
     if (!state || !suggestion || !context) return;
     const replacement = suggestion.kind === "roam-page" ? `[[${suggestion.name}]]` : `((${suggestion.uid}))`;
+    if (suggestion.kind === "roam-page") rememberAcceptedPage(suggestion.name);
     state.editor.setRangeText(replacement, context.startIndex, context.replaceEndIndex ?? context.endIndex, "end");
     state.referenceAutocompleteClosed = true;
     clearTimeout(this.referenceSearchTimer); this.referenceSearchToken += 1;
@@ -6625,9 +6741,23 @@ export class GridEditorController {
     if (referenceContext) this.updateReferenceAutocomplete(referenceContext);
     else { this.clearReferenceAutocomplete(); this.updateAutocomplete(formula); }
     this.updateSignature(formula);
-    const hasReferenceResults = Boolean(referenceContext && !state.referenceAutocompleteClosed && !this.suggestionList.hidden && this.suggestionKind === "roam-reference" && this.suggestions.length);
-    this.setPopoverHidden(!state.floating && !formula && !hasReferenceResults);
+    this.syncPopoverVisibility();
     this.position();
+  }
+
+  /**
+   * The single place popover visibility is decided. The invariant it enforces: the popover is
+   * visible only when the suggestion list is showing rows, or the editor is floating, or the cell
+   * holds a formula. That is what keeps a bare opener from painting an empty shell while its query
+   * is in flight, and what keeps an Escape-dismissed list from reopening on the next paint.
+   */
+  syncPopoverVisibility() {
+    const state = this.state;
+    if (!state) return;
+    const raw = state.editor.value;
+    const formula = raw.startsWith("=") && !raw.startsWith("==");
+    const showingRows = Boolean(this.suggestions.length) && !this.suggestionList.hidden;
+    this.setPopoverHidden(!state.floating && !formula && !showingRows);
   }
 
   updateAutocomplete(formula) {
@@ -6651,21 +6781,40 @@ export class GridEditorController {
     clearTimeout(this.referenceSearchTimer); const token = ++this.referenceSearchToken;
     this.referenceContext = context; this.referenceContextKey = key; this.autocompleteContext = null;
     this.suggestions = []; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.renderSuggestionRows();
-    if (state.referenceAutocompleteClosed || !context.query.trim()) return;
+    if (state.referenceAutocompleteClosed) return;
+    // A bare opener takes the recents path instead of the search path. Its own switch and the
+    // session budget switch are read here, ahead of the timer, so an off switch issues no query at
+    // all rather than issuing one and discarding its results.
+    const bare = !context.query.trim();
+    if (bare && (!emptyOpenerEnabled() || recentsDisabled())) return;
     this.referenceSearchTimer = setTimeout(async () => {
       this.referenceSearchTimer = null;
       let results = [];
-      try { results = await this.searchReferences(context); } catch (error) { console.warn("[roam-grid] Reference search failed", error); }
+      try { results = bare ? await this.searchRecents(context, { excludeUids: this.currentTableUids() }) : await this.searchReferences(context); }
+      catch (error) { console.warn("[roam-grid] Reference search failed", error); }
       if (token !== this.referenceSearchToken || !this.state || this.referenceContextKey !== key) return;
       this.suggestions = results; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.renderSuggestionRows();
-      if (!this.state.floating) this.setPopoverHidden(!this.suggestions.length && !(this.state.editor.value.startsWith("=") && !this.state.editor.value.startsWith("==")));
+      this.syncPopoverVisibility();
       this.position();
-    }, this.searchDelay());
+    }, this.searchDelay(context));
   }
 
-  /** An explicit constructor delay wins; otherwise the setting is read live, so no live controller
-   *  has to be rebuilt when the user changes it. */
-  searchDelay() {
+  /** The cells of the table being edited, so the recents path can drop them. Every cell edit touches
+   *  a block, so an unfiltered recent-blocks list inside a grid is mostly that grid’s own rows. A
+   *  large grid has no `model` — its cells are JSON rows with no uid — and correctly contributes none. */
+  currentTableUids() {
+    const rows = this.view?.model?.rows;
+    if (!Array.isArray(rows)) return null;
+    const uids = new Set();
+    for (const row of rows) for (const cell of row) if (cell?.uid) uids.add(cell.uid);
+    return uids;
+  }
+
+  /** A cache-resolvable bare opener answers without touching Roam, so it skips the debounce it has
+   *  nothing to debounce. Otherwise an explicit constructor delay wins, and the setting is read live
+   *  so no open controller has to be rebuilt when the user changes it. */
+  searchDelay(context = null) {
+    if (context && !String(context.query || "").trim() && recentsCacheReady(context.type)) return 0;
     return this.referenceSearchDelay ?? Math.max(0, Number(getSetting("editing-autocomplete-debounce-ms")) || 0);
   }
 
