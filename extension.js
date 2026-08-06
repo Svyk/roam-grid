@@ -19,6 +19,7 @@ const FORMULA_REFERENCE_COLORS = ["#d9822b", "#8f398f", "#0f9960", "#106ba3", "#
 const PREPAINT_STYLE_ID = "roam-grid-prepaint-guard";
 const ENHANCED_UID_CACHE_PREFIX = "roam-grid:enhanced-uids:";
 const SESSION_IDLE_MS = 1500;
+const MAX_GUARD_UIDS = 2000;
 
 const runtime = {
   extensionAPI: null,
@@ -38,6 +39,19 @@ const runtime = {
   registries: null,
   lastFocusedUid: null,
 };
+
+export const pendingTimers = new Set();
+
+function trackedTimeout(callback, delay) {
+  const id = setTimeout(() => { pendingTimers.delete(id); callback(); }, delay);
+  pendingTimers.add(id);
+  return id;
+}
+
+function clearTrackedTimers() {
+  for (const id of pendingTimers) clearTimeout(id);
+  pendingTimers.clear();
+}
 
 function cssAttributeValue(value) {
   return String(value ?? "").replaceAll("\\", "\\\\").replaceAll('"', '\\"').replace(/[\n\r\f]/g, "");
@@ -63,7 +77,12 @@ export function writeEnhancedUidCache(uids, storage = globalThis.localStorage, k
 
 export function enhancedUidGuardCss(uids) {
   const selectors = [];
-  for (const uid of [...new Set([...uids].map(String).filter(Boolean))].sort()) {
+  const unique = [...new Set([...uids].map(String).filter(Boolean))].sort();
+  if (unique.length > MAX_GUARD_UIDS) {
+    console.warn(`[roam-grid] Skipping the pre-paint guard: ${unique.length} cached table uids exceeds the ${MAX_GUARD_UIDS} cap`);
+    return "";
+  }
+  for (const uid of unique) {
     const escaped = cssAttributeValue(uid);
     selectors.push(
       `[id$="${escaped}"] .rm-table:not(.rg-native-hidden)`,
@@ -1561,8 +1580,9 @@ function normalizeTree(block) {
 }
 
 function getTree(uid) {
-  const safeUid = String(uid).replace(/["\\]/g, "");
-  const result = roam().q(`[:find (pull ?block [:block/uid :block/string :block/order :edit/time {:block/children ...}]) :where [?block :block/uid "${safeUid}"]]`);
+  const result = roam().q(`[:find (pull ?block [:block/uid :block/string :block/order :edit/time {:block/children ...}])
+    :in $ ?uid
+    :where [?block :block/uid ?uid]]`, String(uid));
   return normalizeTree(result?.[0]?.[0]);
 }
 
@@ -1775,19 +1795,25 @@ export function templateModelFromValue(value) {
   return model;
 }
 
-class MetadataStore {
+export class MetadataStore {
   constructor() {
     this.pageUid = null;
     this.entries = new Map();
   }
 
   async initialize() {
-    this.pageUid = getPageUid(METADATA_PAGE) || await createPage(METADATA_PAGE);
+    this.pageUid = getPageUid(METADATA_PAGE);
     await this.reload();
+  }
+
+  async ensurePage() {
+    if (!this.pageUid) this.pageUid = getPageUid(METADATA_PAGE) || await createPage(METADATA_PAGE);
+    return this.pageUid;
   }
 
   async reload() {
     this.entries.clear();
+    if (!this.pageUid) return;
     const tree = getTree(this.pageUid);
     for (const block of tree?.children || []) {
       if (!block.string.startsWith(METADATA_PREFIX)) continue;
@@ -1812,7 +1838,8 @@ class MetadataStore {
     const value = { schema: 1, mode, tableUid, columnIds: model.columnIds, merges: model.merges, widths: model.widths, rowHeights: model.rowHeights, alignments: model.alignments, headerColumns: model.headerColumns, headerRows: model.headerRows, frozenRows: model.frozenRows, frozenCols: model.frozenCols, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, colorFormulaCells: model.colorFormulaCells !== false, updatedAt: new Date().toISOString() };
     const string = `${METADATA_PREFIX} ${JSON.stringify(value)}`;
     const entry = this.entries.get(tableUid);
-    const blockUid = entry ? entry.blockUid : await createBlock(this.pageUid, string);
+    const pageUid = await this.ensurePage();
+    const blockUid = entry ? entry.blockUid : await createBlock(pageUid, string);
     if (entry) await updateBlock(blockUid, string);
     this.entries.set(tableUid, { blockUid, value });
     return blockUid;
@@ -1826,7 +1853,7 @@ class MetadataStore {
   }
 
   async createStaging(tableUid) {
-    return createBlock(this.pageUid, `roam-grid/staging:: ${tableUid}`);
+    return createBlock(await this.ensurePage(), `roam-grid/staging:: ${tableUid}`);
   }
 }
 
@@ -2611,8 +2638,11 @@ export class LargeGridStore {
     this.cache = new Map();
     this.dirty = new Set();
     this.metadataDirty = false;
+    this.disposed = false;
     this.queue = new MutationQueue();
   }
+
+  dispose() { this.disposed = true; }
 
   async initialize(model = null) {
     const tree = getTree(this.anchorUid);
@@ -2671,6 +2701,7 @@ export class LargeGridStore {
     }
     const chunk = await downloadJson(descriptor.url);
     if (chunk.schema !== "roam-grid/chunk" || chunk.version !== 1 || chunk.index !== index || !Array.isArray(chunk.rows)) throw new GridError("CHUNK_CORRUPT", `Large-grid chunk ${index} is malformed`);
+    if (this.disposed) return chunk;
     this.cache.set(index, chunk);
     return chunk;
   }
@@ -2808,6 +2839,7 @@ export class LargeGridStore {
       const url = await uploadJson(next, `roam-grid-${this.anchorUid}-manifest-${next.revision}.json`);
       const verified = await downloadJson(url);
       this.validateManifest(verified);
+      if (this.disposed) throw new GridError("DISPOSED", "Roam Grid unloaded before this large grid finished saving");
       await updateBlock(this.pointerUid, `${MANIFEST_PREFIX} ${url}`);
       this.manifest = verified;
       this.manifestUrl = url;
@@ -2967,7 +2999,7 @@ function toast(message, intent = "primary", timeout = 4500) {
   item.className = `rg-toast rg-toast--${intent}`;
   item.textContent = message;
   container.appendChild(item);
-  setTimeout(() => item.remove(), timeout);
+  trackedTimeout(() => item.remove(), timeout);
 }
 
 function button(label, title, action, className = "") {
@@ -5598,13 +5630,13 @@ export class LargeGridView {
     this.invalidateLargeCells(coordinates); await this.store.commit(); this.scheduleRender();
     return { manifest: deepClone(this.store.manifest) };
   }
-  dispose() { clearTimeout(this.saveTimer); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true); document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden"); }
+  dispose() { clearTimeout(this.saveTimer); this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true); document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden"); }
 }
 
 function downloadText(text, filename, type = "text/plain") {
   const url = URL.createObjectURL(new Blob([text], { type }));
   const link = document.createElement("a"); link.href = url; link.download = filename; link.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  trackedTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 async function exportCommand(model) {
@@ -5781,7 +5813,7 @@ function findBlockElement(uid) {
   return null;
 }
 
-const mounting = new Set();
+export const mounting = new Set();
 
 function nativeMetadataUids() {
   return new Set([...runtime.metadata?.entries || []].filter(([, entry]) => entry?.value?.mode !== "large").map(([uid]) => uid));
@@ -5948,37 +5980,48 @@ function registerCommands(extensionAPI) {
   }
 }
 
-async function initializeSettings(extensionAPI) {
-  if (extensionAPI.settings.get("nativeMutationBudget") == null) await extensionAPI.settings.set("nativeMutationBudget", MAX_NATIVE_MUTATIONS);
+export async function initializeSettings(extensionAPI) {
+  if (extensionAPI.settings.canSet !== false && extensionAPI.settings.get("nativeMutationBudget") == null) await extensionAPI.settings.set("nativeMutationBudget", MAX_NATIVE_MUTATIONS);
   await extensionAPI.settings.panel.create({
     tabTitle: "Roam Grid",
     settings: [{ id: "nativeMutationBudget", name: "Native write budget", description: "Maximum Roam block mutations in one structural operation. Larger operations should use large-grid mode.", action: { type: "input", onChange: () => {} } }],
   });
 }
 
+let roamGridGlobalPreexisted = false;
+
 async function onload({ extensionAPI }) {
-  installEnhancedUidGuard(readEnhancedUidCache());
-  runtime.extensionAPI = extensionAPI; runtime.registries = new RegistrySet(); runtime.metadata = new MetadataStore(); runtime.templates = new GridTemplateStore();
-  await runtime.metadata.initialize(); syncEnhancedUidGuard(); await runtime.templates.initialize(); await initializeSettings(extensionAPI); registerCommands(extensionAPI);
-  const publicApi = createPublicApi(); globalThis.window.roamGrid = { ...(globalThis.window.roamGrid || {}), v1: publicApi };
-  document.addEventListener("focusin", rememberFocusedUid, true);
-  runtime.disposers.push(() => document.removeEventListener("focusin", rememberFocusedUid, true));
-  runtime.observer = new MutationObserver(handleDomMutations); runtime.observer.observe(document.querySelector(".roam-app") || document.body, { childList: true, subtree: true });
-  scheduleScan(document);
+  roamGridGlobalPreexisted = Boolean(globalThis.window?.roamGrid);
+  try {
+    installEnhancedUidGuard(readEnhancedUidCache());
+    runtime.extensionAPI = extensionAPI; runtime.registries = new RegistrySet(); runtime.metadata = new MetadataStore(); runtime.templates = new GridTemplateStore();
+    await runtime.metadata.initialize(); syncEnhancedUidGuard(); await runtime.templates.initialize(); await initializeSettings(extensionAPI); registerCommands(extensionAPI);
+    const publicApi = createPublicApi(); globalThis.window.roamGrid = { ...(globalThis.window.roamGrid || {}), v1: publicApi };
+    document.addEventListener("focusin", rememberFocusedUid, true);
+    runtime.disposers.push(() => document.removeEventListener("focusin", rememberFocusedUid, true));
+    runtime.observer = new MutationObserver(handleDomMutations); runtime.observer.observe(document.querySelector(".roam-app") || document.body, { childList: true, subtree: true });
+    scheduleScan(document);
+  } catch (error) {
+    await onunload();
+    throw error;
+  }
   console.info(`[roam-grid] Loaded v${VERSION}`);
 }
 
 async function onunload() {
   runtime.observer?.disconnect(); runtime.observer = null; runtime.pendingScanRoots.clear(); runtime.scanQueued = false;
   for (const uid of [...runtime.sessions.keys()]) disposeNativeSession(uid, true);
-  for (const mount of runtime.largeMounts.values()) mount.dispose(); runtime.largeMounts.clear();
+  for (const mount of runtime.largeMounts.values()) mount.dispose(); runtime.largeMounts.clear(); mounting.clear();
   runtime.guardStyle?.remove(); runtime.guardStyle = null;
   for (const dispose of runtime.disposers.splice(0)) try { dispose(); } catch { /* no-op */ }
+  clearTrackedTimers();
   document.querySelectorAll(".rg-toasts,.rg-dialog-overlay,.rg-context-menu").forEach((element) => {
     if (element.__rgDismiss) element.__rgDismiss(); else element.remove();
   });
   if (globalThis.window?.roamGrid?.v1?.version === VERSION) delete globalThis.window.roamGrid.v1;
-  runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null; runtime.views.clear(); runtime.viewsByNative = new WeakMap();
+  if (!roamGridGlobalPreexisted && globalThis.window?.roamGrid && Object.keys(globalThis.window.roamGrid).length === 0) delete globalThis.window.roamGrid;
+  roamGridGlobalPreexisted = false;
+  runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null; runtime.gridThemePalette = null; runtime.gridThemeSignature = null; runtime.views.clear(); runtime.viewsByNative = new WeakMap();
   console.info("[roam-grid] Unloaded");
 }
 

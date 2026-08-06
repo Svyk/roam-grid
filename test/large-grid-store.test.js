@@ -27,7 +27,7 @@ function installRoamMock(initial = {}) {
   const findParent = (uid) => [...blocks.values()].find((block) => block.children?.some((child) => child.uid === uid));
   globalThis.window = { roamAlphaAPI: {
     util: { generateUID: () => `uid${String(++uidCounter).padStart(6, "0")}` },
-    q: (query) => { const uid = /:block\/uid \"([^\"]+)\"/.exec(query)?.[1]; return uid && blocks.has(uid) ? [[clone(blocks.get(uid))]] : []; },
+    q: (query, bound) => { const uid = bound ?? /:block\/uid \"([^\"]+)\"/.exec(query)?.[1]; return uid && blocks.has(uid) ? [[clone(blocks.get(uid))]] : []; },
     data: { block: {
       create: async ({ location, block }) => { const created = { ...block, order: location.order === "last" ? 999 : location.order, children: [] }; blocks.set(block.uid, created); blocks.get(location["parent-uid"]).children.push(created); },
       update: async ({ block }) => { blocks.get(block.uid).string = block.string; },
