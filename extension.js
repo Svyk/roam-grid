@@ -128,7 +128,7 @@ const SETTING_DESCRIPTORS = [
  * (nothing to seed, cache, coerce, or reset) and are appended to the rendered panel instead.
  */
 const MAINTENANCE_ACTIONS = Object.freeze([
-  { key: "maintenance-apply-display", group: "Maintenance", name: "Apply display defaults to open grids", description: "Rewrite fit-to-width on every grid currently on screen to match the Appearance default above. Existing grids keep their own fit setting until you press this. Headers and formula tinting are not listed here because their switches already reach open grids on their own.", control: "button", type: "string", default: "", scope: "graph", apply: "immediate", stage: "live" },
+  { key: "maintenance-apply-display", group: "Maintenance", name: "Apply display defaults to open grids", description: "Rewrite headers and fit-to-width on every grid currently on screen to match the Appearance defaults above. Existing grids keep their own settings until you press this. Use it when a grid you hid the labels on should follow the default again — the “Show row and column headers” switch hides labels everywhere while it is off, but on its own it never overrides a table you deliberately opted out.", control: "button", type: "string", default: "", scope: "graph", apply: "immediate", stage: "live" },
   { key: "maintenance-forget-device", group: "Maintenance", name: "Forget this device's overrides", description: "Drop the device-only values (toolbar, theme, maximum width, overscan) and fall back to the graph-synced ones.", control: "button", type: "string", default: "", scope: "device", apply: "immediate", stage: "live" },
   { key: "maintenance-clear-caches", group: "Maintenance", name: "Clear local caches", description: "Forget the cached enhanced-table list and the theme palette. Nothing in your graph changes.", control: "button", type: "string", default: "", scope: "device", apply: "immediate", stage: "live" },
   { key: "maintenance-reset", group: "Maintenance", name: "Reset all Roam Grid settings", description: "Restore every setting on this page to its default.", control: "button", type: "string", default: "", scope: "graph", apply: "immediate", stage: "live" },
@@ -350,13 +350,13 @@ export function applySettingsChange(descriptor, value) {
   return counts;
 }
 
-/** `fitToWidth` uses `!== false` semantics in ~30 places, so "absent" cannot be told apart from
- *  "explicitly true". It is therefore stamped at creation only, never inherited, and
- *  `maintenance-apply-display` is the only path that retro-applies it.
+/** What CREATION stamps. `fitToWidth` uses `!== false` semantics in ~30 places, so "absent" cannot be
+ *  told apart from "explicitly true"; it is therefore stamped at creation only, never inherited.
  *  `colorFormulaCells` and `showHeaders` are deliberately absent: both are masked live
  *  (`formulaTintEnabled`, `headersVisible`), and a value cannot be both an inherited creation default
  *  and a live mask without the two disagreeing — a grid created while the master switch was off would
- *  have stayed suppressed after the switch came back on. */
+ *  have stayed suppressed after the switch came back on. `displayRestampValues` is the separate set the
+ *  maintenance button writes, and it does include `showHeaders`. */
 export function displayDefaults() {
   return {
     fitToWidth: getSetting("appearance-fit-to-width") !== false,
@@ -365,6 +365,25 @@ export function displayDefaults() {
 
 export function applyDisplayDefaults(target) {
   return target ? Object.assign(target, displayDefaults()) : target;
+}
+
+/**
+ * What `maintenance-apply-display` writes, which is deliberately NOT what creation stamps.
+ *
+ * The mask is implicit and reversible; the button is an explicit user act that writes. `showHeaders`
+ * therefore belongs here but not in `displayDefaults`: stamping it at creation would leave a grid made
+ * while the switch was off permanently headerless once the switch came back on, whereas pressing this
+ * button is the user saying "make the open grids match my default" out loud.
+ *
+ * It is also the only bulk path that can override an explicit per-table opt-out. The mask can suppress
+ * globally but can never force a `false` flag back to true — that asymmetry is correct, and it is
+ * exactly why this action has to exist.
+ */
+export function displayRestampValues() {
+  return {
+    ...displayDefaults(),
+    showHeaders: getSetting("appearance-show-headers") !== false,
+  };
 }
 
 /**
@@ -9355,15 +9374,18 @@ function registerCommands(extensionAPI) {
   }
 }
 
-/** Rewrites the stamped display flags of every grid already on screen. This is the only path that can
- *  retro-apply them: `!== false` semantics mean an open grid's own flags are indistinguishable from
- *  "never chosen", so nothing may change them behind the user's back. Only `fitToWidth` is left —
- *  `showHeaders` and `colorFormulaCells` are live global masks and need no restamping. */
+/** Rewrites the display flags of every grid already on screen, from `displayRestampValues` rather than
+ *  `displayDefaults`. This is the only path that may retro-apply them: `!== false` semantics mean an
+ *  open grid's own flags are indistinguishable from "never chosen", so nothing changes them behind the
+ *  user's back — and it is the only bulk path that can lift an explicit per-table `showHeaders: false`,
+ *  which the live mask deliberately cannot. `colorFormulaCells` is absent: it has no per-table state
+ *  worth forcing, only the `fx` button, and 0.9.0 removed it here when the tint mask landed. */
 export function applyDisplayDefaultsToOpenGrids() {
   let grids = 0;
+  const values = displayRestampValues();
   for (const session of runtime.sessions.values()) {
     if (!session?.model) continue;
-    applyDisplayDefaults(session.model); grids += 1;
+    Object.assign(session.model, values); grids += 1;
     try { session.markChanged(true); } catch (error) { console.warn("[roam-grid] Could not persist display defaults", error); }
     for (const view of session.views || []) {
       try { view.render(); } catch (error) { console.warn("[roam-grid] Could not repaint a grid view", error); }
@@ -9371,8 +9393,8 @@ export function applyDisplayDefaultsToOpenGrids() {
   }
   for (const mount of runtime.largeMounts.values()) {
     if (!mount?.store?.manifest) continue;
-    const defaults = displayDefaults();
-    mount.store.setDisplayFlag("fitToWidth", defaults.fitToWidth);
+    mount.store.setDisplayFlag("showHeaders", values.showHeaders);
+    mount.store.setDisplayFlag("fitToWidth", values.fitToWidth);
     grids += 1; mount.rowMetricsKey = null;
     try { mount.scheduleSave(true); mount.scheduleRender(); } catch (error) { console.warn("[roam-grid] Could not repaint a large grid", error); }
   }

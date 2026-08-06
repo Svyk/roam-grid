@@ -15,6 +15,7 @@ import {
   clipPasteMatrix,
   coerceSetting,
   deviceSettingsKey,
+  displayRestampValues,
   enterMovement,
   formulaTintEnabled,
   getSetting,
@@ -769,7 +770,37 @@ test("fit-to-width stays creation-only and keeps the maintenance button", () => 
   assert.equal(descriptor.apply, "next-op");
   assert.equal(descriptor.onView, undefined, "a live mask here would apply to native grids only — LargeGridView never reads fitToWidth");
   assert.equal(descriptor.onLarge, undefined);
-  assert.ok(Object.hasOwn(displayDefaults(), "fitToWidth"), "it is the one flag the display-defaults button still restamps");
+  assert.ok(Object.hasOwn(displayDefaults(), "fitToWidth"), "it is the flag creation stamps");
+});
+
+/**
+ * The two halves are separate on purpose and are asserted separately. The mask is implicit and writes
+ * nothing; the button is an explicit user act that writes. Collapsing them either way is a bug:
+ * putting `showHeaders` back into `displayDefaults` re-creates the disagreement eb2ceb3 removed, and
+ * dropping it from the restamp leaves no bulk path to lift a per-table opt-out.
+ */
+test("creation never stamps headers, and the maintenance button always does", (t) => {
+  t.after(() => { clearRegistries(); settingsCache.clear(); });
+  clearRegistries();
+
+  refreshSettingsCache(makeApi({ values: { "appearance-show-headers": false } }).api, makeStorage());
+  assert.equal(Object.hasOwn(displayDefaults(), "showHeaders"), false, "creation must not stamp a live-masked flag");
+  assert.deepEqual(applyDisplayDefaults({ showHeaders: true }), { showHeaders: true, fitToWidth: true }, "a grid created while the switch is off keeps an unstamped flag, so the switch stays reversible");
+  assert.equal(displayRestampValues().showHeaders, false, "the button writes what the switch says");
+  assert.equal(displayRestampValues().fitToWidth, true, "and still carries every creation default with it");
+
+  // The case the button exists for: a table the user opted out of, with the global ON. The mask cannot
+  // lift an explicit false — only this can.
+  refreshSettingsCache(makeApi().api, makeStorage());
+  assert.equal(headersVisible(false), false, "the mask must not force an opt-out back on");
+  const model = { showHeaders: false, fitToWidth: false };
+  const manifest = { showHeaders: false, fitToWidth: false };
+  gridSessions.set("t1", { model, views: [], markChanged() {} });
+  largeGridMounts.set("l1", { store: { manifest, setDisplayFlag(key, value) { this.manifest[key] = value; } }, scheduleSave() {}, scheduleRender() {} });
+  assert.equal(applyDisplayDefaultsToOpenGrids(), 2);
+  assert.equal(model.showHeaders, true, "the button is the only bulk path that can lift a per-table opt-out");
+  assert.equal(manifest.showHeaders, true);
+  assert.equal(headersVisible(model.showHeaders), true, "and the lifted grid now renders its labels");
 });
 
 test("the notification level suppresses notices by intent and never a message that carries an action", (t) => {
@@ -829,10 +860,8 @@ test("the display-defaults button rewrites open grids and repaints them", (t) =>
   assert.equal(applyDisplayDefaultsToOpenGrids(), 2);
   assert.equal(model.fitToWidth, false);
   assert.equal(manifest.fitToWidth, false);
-  // Headers are a live mask now: the button must NOT write the per-grid flag, or a grid pressed while
-  // the global was off would stay headerless after the global came back on.
-  assert.equal(model.showHeaders, true, "the button must not restamp a live-masked flag");
-  assert.equal(manifest.showHeaders, true, "the button must not restamp a live-masked flag");
+  assert.equal(model.showHeaders, false, "the button is the explicit act that writes headers");
+  assert.equal(manifest.showHeaders, false);
   assert.equal(large.store.metadataDirty, true);
   assert.equal(large.rowMetricsKey, null);
   assert.deepEqual(marked, [true], "the layout change has to reach the metadata save path");
@@ -909,9 +938,10 @@ test("maintenance rows are buttons that carry the group convention and an onClic
   assert.deepEqual(clicks, MAINTENANCE_KEYS);
   assert.equal(byId.get("maintenance-reset").action.content, "Reset all Roam Grid settings");
   assert.deepEqual(Object.keys(SETTINGS_MAINTENANCE), MAINTENANCE_KEYS);
-  assert.match(SETTINGS_MAINTENANCE["maintenance-apply-display"].description, /Existing grids keep their own fit setting/);
-  // The two live-masked flags must not be advertised here, or the button promises work it no longer does.
-  assert.doesNotMatch(SETTINGS_MAINTENANCE["maintenance-apply-display"].description, /Rewrite headers/);
+  assert.match(SETTINGS_MAINTENANCE["maintenance-apply-display"].description, /Existing grids keep their own settings/);
+  // It restamps headers again, so it has to say so — and it is the control the user is pointed at when
+  // a per-table opt-out needs lifting in bulk.
+  assert.match(SETTINGS_MAINTENANCE["maintenance-apply-display"].description, /Rewrite headers and fit-to-width/);
 });
 
 test("the panel routes clicks through runMaintenanceAction and rebuilds itself", async () => {

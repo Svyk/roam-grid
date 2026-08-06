@@ -72,10 +72,17 @@ sync with your graph.
 and 1/2/3 labels on every grid at once — including large grids — and turning it
 back on returns each grid to its own **Labels** choice. Nothing per-grid is
 written either way, so it is instantly reversible. **Tint formula cells** works
-the same way. **Fit grids to the block width** stays a per-table decision (it
-depends on how many columns a particular table has, and a native grid's own
-resize handles turn it off), so it remains a creation default that
-**Apply display defaults to open grids** retro-applies.
+the same way.
+
+What the switch deliberately will not do is override a table you opted out of by
+hand: with the switch on, a grid whose own **Labels** setting is off stays off.
+**Apply display defaults to open grids** is the bulk path for that — it is an
+explicit act, so it writes, rewriting headers and fit-to-width on every grid
+currently on screen to match the Appearance defaults.
+
+**Fit grids to the block width** stays a per-table decision (it depends on how
+many columns a particular table has, and a native grid's own resize handles turn
+it off), so it remains a creation default that the same button retro-applies.
 
 Also new: **Suggest functions and pages while typing** turns autocomplete off
 entirely rather than only tuning its delay and result count; **Grow the grid to
