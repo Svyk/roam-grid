@@ -1308,6 +1308,20 @@ body.roam-body.dark .rg-portal {
   height: 28px;
 }
 
+.rg-large-error-band {
+  position: absolute;
+  z-index: 12;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  border: 1px dashed var(--rg-danger);
+  background: color-mix(in srgb, var(--rg-danger) 12%, transparent);
+  color: var(--rg-danger);
+  font-size: 12px;
+}
+
 @media (max-width: 700px) {
   .rg-root { width: 100%; border-radius: 4px; }
   .rg-toolbar { padding: 2px; }

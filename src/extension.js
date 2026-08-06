@@ -3574,14 +3574,48 @@ function extractUrl(value) {
   return match?.[0] || String(value || "").trim();
 }
 
-async function uploadJson(value, name) {
-  const file = new File([JSON.stringify(value)], name, { type: "application/json" });
+async function uploadText(text, name) {
+  const file = new File([text], name, { type: "application/json" });
   return extractUrl(await roam().file.upload({ file, toast: { hide: true } }));
 }
 
-async function downloadJson(url) {
+async function uploadJson(value, name) { return uploadText(JSON.stringify(value), name); }
+
+/**
+ * Downloading and parsing are separate steps on purpose: a response truncated in transit can still
+ * be valid JSON carrying the right schema, version and index, so every check that runs on the
+ * parsed object waves it through. Integrity is decided on these raw bytes, before `JSON.parse`.
+ */
+async function downloadFileText(url) {
   const file = await roam().file.get({ url });
-  return JSON.parse(await file.text());
+  return file.text();
+}
+
+async function downloadJson(url) { return JSON.parse(await downloadFileText(url)); }
+
+const CHUNK_DIGEST_RETRIES = 3;
+
+/** Bounded exponential backoff; instance-overridable on the store so tests do not sleep. */
+export function chunkRetryDelayMs(attempt) { return Math.min(1000, 150 * 2 ** attempt); }
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * `crypto.subtle` is a verified capability of the Roam renderer and is real in Node, so this is
+ * never a stub in practice. An absent one still degrades quietly to `null`: no digest is recorded
+ * on upload and none is demanded on download, which is exactly how a pre-0.9.0 chunk behaves.
+ */
+export async function sha256Hex(text) {
+  const subtle = globalThis.crypto?.subtle;
+  if (typeof subtle?.digest !== "function") return null;
+  const buffer = await subtle.digest("SHA-256", new TextEncoder().encode(String(text)));
+  return [...new Uint8Array(buffer)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** Only a well-formed hex digest is a claim worth enforcing; anything else is a legacy chunk. */
+export function chunkDigestOf(descriptor) {
+  const value = descriptor?.digest;
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : null;
 }
 
 function rawRows(model) {
@@ -3737,6 +3771,8 @@ export class LargeGridStore {
     this.metadataDirty = false;
     this.metricsVersion = 0;
     this.disposed = false;
+    this.unreadableChunks = new Map();
+    this.retryDelay = chunkRetryDelayMs;
     this.queue = new MutationQueue();
   }
 
@@ -3768,8 +3804,12 @@ export class LargeGridStore {
     const chunks = [];
     for (let start = 0, index = 0; start < rows.length; start += chunkSize, index += 1) {
       const chunkRows = rows.slice(start, start + chunkSize);
-      const url = await uploadJson({ schema: "roam-grid/chunk", version: 1, index, startRow: start, rows: chunkRows }, `roam-grid-${this.anchorUid}-${index}.json`);
-      chunks.push({ index, startRow: start, rowCount: chunkRows.length, url });
+      // The digest covers the exact bytes that are uploaded, which is the only thing a reader can
+      // compare against before it parses them.
+      const text = JSON.stringify({ schema: "roam-grid/chunk", version: 1, index, startRow: start, rows: chunkRows });
+      const digest = await sha256Hex(text);
+      const url = await uploadText(text, `roam-grid-${this.anchorUid}-${index}.json`);
+      chunks.push({ index, startRow: start, rowCount: chunkRows.length, url, digest });
     }
     // A fresh grid is born in the id namespace of its own first revision, and the chunks carry no
     // ids: every reader derives the same ones from position until a row actually moves.
@@ -3835,8 +3875,33 @@ export class LargeGridStore {
     return row < this.manifest.rowCount ? row : null;
   }
 
+  /**
+   * A digest mismatch is far more often a truncated or half-cached response than a file that rotted
+   * at rest, so the download is retried with backoff before the chunk is declared unreadable. The
+   * comparison runs on the raw body: a truncated response can still parse into a chunk with the
+   * right schema, version and index, so checking the parsed object would accept the missing rows.
+   */
+  async downloadChunk(index, descriptor) {
+    const expected = getSetting("large-verify-checksums") ? chunkDigestOf(descriptor) : null;
+    let failure = null;
+    for (let attempt = 0; attempt <= CHUNK_DIGEST_RETRIES; attempt += 1) {
+      if (attempt) await sleep(this.retryDelay(attempt - 1));
+      const text = await downloadFileText(descriptor.url);
+      if (!expected) return JSON.parse(text);
+      const actual = await sha256Hex(text);
+      if (actual === null || actual === expected) return JSON.parse(text);
+      failure = new GridError("CHUNK_DIGEST", `Large-grid chunk ${index} failed its checksum and may be truncated`, { index, url: descriptor.url, expected, actual });
+    }
+    this.unreadableChunks.set(index, failure);
+    throw failure;
+  }
+
   async loadChunk(index) {
     if (this.cache.has(index)) return this.cache.get(index);
+    // Sticky until something explicitly asks for a retry, so a failing chunk costs one round of
+    // downloads rather than a fresh round on every frame, edit and formula read.
+    const unreadable = this.unreadableChunks.get(index);
+    if (unreadable) throw unreadable;
     const descriptor = this.manifest.chunks.find((chunk) => chunk.index === index);
     if (!descriptor) {
       const empty = { schema: "roam-grid/chunk", version: 1, index, startRow: index * chunkRowsFor(this.manifest), rows: [] };
@@ -3844,7 +3909,7 @@ export class LargeGridStore {
       this.syncRowIds(index, empty);
       return empty;
     }
-    const chunk = await downloadJson(descriptor.url);
+    const chunk = await this.downloadChunk(index, descriptor);
     if (chunk.schema !== "roam-grid/chunk" || chunk.version !== 1 || chunk.index !== index || !Array.isArray(chunk.rows)) throw new GridError("CHUNK_CORRUPT", `Large-grid chunk ${index} is malformed`);
     if (this.disposed) return chunk;
     this.cache.set(index, chunk);
@@ -3852,12 +3917,34 @@ export class LargeGridStore {
     return chunk;
   }
 
+  forgetChunkError(index) { return this.unreadableChunks.delete(index); }
+
   async ensureRows(start, end) {
     const limit = Math.min(end, this.manifest.rowCount);
     if (limit <= start) return;
     const first = this.chunkIndexForRow(Math.max(0, start));
     const last = this.chunkIndexForRow(limit - 1);
     await Promise.all(Array.from({ length: last - first + 1 }, (_, offset) => this.loadChunk(first + offset)));
+  }
+
+  /**
+   * The render-time sibling of `ensureRows`: an unreadable chunk costs its own rows, not the whole
+   * frame. Only a failed integrity check is absorbed — anything else still surfaces as it does now.
+   */
+  async ensureRowsSettled(start, end) {
+    const failed = new Set();
+    const limit = Math.min(end, this.manifest.rowCount);
+    if (limit <= start) return failed;
+    const first = this.chunkIndexForRow(Math.max(0, start));
+    const last = this.chunkIndexForRow(limit - 1);
+    await Promise.all(Array.from({ length: last - first + 1 }, async (_, offset) => {
+      const index = first + offset;
+      try { await this.loadChunk(index); } catch (error) {
+        if (error?.code !== "CHUNK_DIGEST") throw error;
+        failed.add(index);
+      }
+    }));
+    return failed;
   }
 
   /** Synchronous read of an already-resident row, so a render pass never materializes a matrix. */
@@ -4044,10 +4131,12 @@ export class LargeGridStore {
       const replaced = [];
       for (const index of [...this.dirty].sort((a, b) => a - b)) {
         const chunk = this.cache.get(index);
-        const url = await uploadJson(chunk, `roam-grid-${this.anchorUid}-${index}-${cryptoId()}.json`);
+        const text = JSON.stringify(chunk);
+        const digest = await sha256Hex(text);
+        const url = await uploadText(text, `roam-grid-${this.anchorUid}-${index}-${cryptoId()}.json`);
         const existing = chunks.find((item) => item.index === index);
-        if (existing) { replaced.push(existing.url); existing.url = url; existing.rowCount = chunk.rows.length; }
-        else chunks.push({ index, startRow: chunk.startRow, rowCount: chunk.rows.length, url });
+        if (existing) { replaced.push(existing.url); existing.url = url; existing.digest = digest; existing.rowCount = chunk.rows.length; }
+        else chunks.push({ index, startRow: chunk.startRow, rowCount: chunk.rows.length, url, digest });
       }
       const next = { ...deepClone(this.manifest), revision: cryptoId(), previous: this.manifestUrl, updatedAt: new Date().toISOString(), chunks, retained: [this.manifestUrl, ...(this.manifest.retained || []).slice(0, 1), ...replaced] };
       const url = await uploadJson(next, `roam-grid-${this.anchorUid}-manifest-${next.revision}.json`);
@@ -7482,7 +7571,7 @@ export class LargeGridView {
     startCol = Math.max(0, startCol - 1);
     // Resident rows are read one cell at a time through `peekRaw`, so scrolling no longer allocates
     // an array-of-arrays of the whole visible band on every frame.
-    await this.store.ensureRows(startRow, endRow);
+    const unreadable = await this.store.ensureRowsSettled(startRow, endRow);
     if (token !== this.renderToken) return;
     releaseRichCellHosts(this.canvas); this.canvas.replaceChildren(); this.cells.clear();
     if (this.store.manifest.showHeaders !== false) for (let col = startCol; col < endCol; col += 1) {
@@ -7491,6 +7580,13 @@ export class LargeGridView {
     }
     const engine = this.formulaEngine;
     for (let row = startRow; row < endRow; row += 1) {
+      const chunkIndex = unreadable.size ? this.store.chunkIndexForRow(row) : -1;
+      if (unreadable.has(chunkIndex)) {
+        const bandEnd = Math.min(endRow, (chunkIndex + 1) * chunkRowsFor(this.store.manifest));
+        this.canvas.appendChild(this.buildChunkErrorBand(chunkIndex, row, bandEnd));
+        row = bandEnd - 1;
+        continue;
+      }
       if (this.store.manifest.showHeaders !== false) {
         const rowHeader = document.createElement("div"); rowHeader.className = "rg-header rg-large-row-header"; rowHeader.textContent = String(row + 1); rowHeader.style.top = `${this.rowTop(row)}px`; rowHeader.style.height = `${this.rowSpanHeight(row)}px`;
         const resize = document.createElement("span"); resize.className = "rg-large-row-resize"; resize.title = "Drag to resize row · double-click to reset"; resize.addEventListener("pointerdown", (event) => this.startRowResize(row, event)); resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.store.setRowHeight(row, null); this.scheduleSave(true); this.scheduleRender(); }); rowHeader.appendChild(resize); this.canvas.appendChild(rowHeader);
@@ -7509,6 +7605,24 @@ export class LargeGridView {
       }
     }
     this.editorController?.schedulePresentation();
+  }
+
+  /**
+   * The band names the rows that are missing instead of pretending they are empty, and offers the
+   * only action that can change the answer: ask for the chunk again.
+   */
+  buildChunkErrorBand(index, startRow, endRow) {
+    const band = document.createElement("div");
+    band.className = "rg-large-error-band";
+    band.dataset.chunk = String(index);
+    band.style.left = `${this.headerWidth()}px`;
+    band.style.top = `${this.rowTop(startRow)}px`;
+    band.style.width = `${Math.max(0, this.totalWidth() - this.headerWidth())}px`;
+    band.style.height = `${this.rowSpanHeight(startRow, endRow - startRow)}px`;
+    const label = document.createElement("span");
+    label.textContent = `⚠ chunk ${index} unreadable — `;
+    band.append(label, button("Reload", `Download chunk ${index} again`, () => { this.store.forgetChunkError(index); this.scheduleRender(); }));
+    return band;
   }
 
   async renderLargeCellValue(cell, raw, row, col, engine = this.formulaEngine) {
@@ -7578,6 +7692,9 @@ export class LargeGridView {
   async beginEdit(row, col, cell = this.cells.get(`${row}:${col}`), initial = null, floating = false) {
     if (!cell) return;
     const merge = this.store.mergeAt(row, col); row = merge?.row ?? row; col = merge?.col ?? col;
+    // Editing a row whose stored bytes never arrived would save a cell built on rows we never read.
+    const chunkIndex = this.store.chunkIndexForRow(row);
+    if (this.store.unreadableChunks.has(chunkIndex)) return toast(`Chunk ${chunkIndex} is unreadable — reload it before editing these rows`, "warning");
     const raw = await this.store.getRaw(row, col);
     return this.editorController?.start({ row, col, cell, raw, initial, floating });
   }
