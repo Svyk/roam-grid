@@ -805,7 +805,9 @@ test("the popover is never an empty shell across trigger type and recents state"
       resetRoamRecents(); settingsCache.clear();
       let queries = 0;
       const { controller, cells, flush } = makeController({ referenceSearchDelay: 0 });
-      globalThis.window.roamAlphaAPI = { q: () => { queries += 1; return scenario === "empty" ? [] : rows[type]; } };
+      // Counts RECENTS queries only. The enrichment pass issues its own `q`, and folding the two into
+      // one counter would make "a warm cache answers without a second query" stop meaning that.
+      globalThis.window.roamAlphaAPI = { q: (query) => { if (!/edit\/time/.test(query)) return []; queries += 1; return scenario === "empty" ? [] : rows[type]; } };
       if (scenario === "warm") { await searchRoamRecentSuggestions({ type, query: "" }); assert.equal(queries, 1); }
       if (scenario === "disabled") settingsCache.set("editing-autocomplete-empty-opener", false);
       const label = `${opener} ${scenario}`;
@@ -923,7 +925,8 @@ test("# and #[[ take the page path while {{ and / are recognised and answer noth
     referenceSearchDelay: 0,
     searchReferences: async (context) => { searched.push(context.type); return [{ kind: "roam-page", name: "Name With Spaces", description: "Page" }]; },
   });
-  globalThis.window.roamAlphaAPI = { q: () => { queries += 1; return [["Recent Page", "pagerecent", 40]]; } };
+  // Recents queries only — see the counter note in the never-an-empty-shell test above.
+  globalThis.window.roamAlphaAPI = { q: (query) => { if (!/edit\/time/.test(query)) return []; queries += 1; return [["Recent Page", "pagerecent", 40]]; } };
 
   const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "#", floating: false });
   flush(); await waitForSearch();
@@ -1435,6 +1438,85 @@ test("two slow batches switch rendering off for the session, and the setting doe
   assert.equal(offRenderer.rendered.length, 0, "the switch alone is enough");
   assert.equal(off.controller.suggestionList.children[0].querySelector(".rg-suggestion-text").textContent, roamSuggestionPlainText(setA[0].name));
   off.controller.dispose();
+});
+
+/**
+ * The controller half of U7, run against the REAL `enrichRoamSuggestions` rather than an injected
+ * stub, so a per-row implementation reds this test too and not only the unit one. `beforeEnrichment`
+ * is captured from inside the query itself — the rows are already built at that point, which is what
+ * makes the identity assertion at the end mean "enrichment painted these rows" rather than "the rows
+ * that exist now are the rows that exist now".
+ */
+test("one enrichment query per result set lands counts and breadcrumbs on the rows it was given", async (t) => {
+  t.after(() => { resetSuggestionRendering(); settingsCache.clear(); });
+  const pages = [
+    { kind: "roam-page", name: "Project Alpha", description: "Page", uid: "pagealpha" },
+    { kind: "roam-page", name: "Quiet Page", description: "Page", uid: "pagequiet" },
+  ];
+  const blocks = [
+    { kind: "roam-block", name: "first block", description: "Block · blkfirst01", uid: "blkfirst01" },
+    { kind: "roam-block", name: "orphan block", description: "Block · blkorphan1", uid: "blkorphan1" },
+  ];
+  let set = pages;
+  const queries = []; let beforeEnrichment = null;
+  const { controller, cells, flush } = makeController({ referenceSearchDelay: 0, searchReferences: async () => set });
+  globalThis.window.roamAlphaAPI = { q: (query, keys) => {
+    queries.push({ query, keys });
+    beforeEnrichment = [...controller.suggestionList.children];
+    return /\(count \?r\)/.test(query) ? [["Project Alpha", 12]] : [["blkfirst01", "Owning Page"]];
+  } };
+
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "[[Pro", floating: false });
+  flush(); await waitForSearch(); await drainRenders();
+
+  assert.equal(queries.length, 1, "two page rows plus the create row, and one query for the set");
+  assert.deepEqual(queries[0].keys, ["Project Alpha", "Quiet Page"]);
+  const rows = [...controller.suggestionList.children];
+  assert.equal(rows.length, 3);
+  assert.equal(rows[0].querySelector(".rg-suggestion-count").textContent, "12");
+  assert.equal(rows[0].querySelector(".rg-suggestion-count").getAttribute("aria-label"), "12 linked references");
+  assert.equal(rows[0].querySelector(".rg-suggestion-breadcrumb"), null, "a page has no owning page to breadcrumb");
+  assert.equal(rows[1].querySelector(".rg-suggestion-count"), null, "a page with no references gets no badge");
+  assert.equal(rows[2].querySelector(".rg-suggestion-count"), null, "and neither does the create-page row");
+  assert.equal(controller.suggestions[0].referenceCount, 12, "the enriched set is the one the controller now holds");
+  assert.equal(rows.length, beforeEnrichment.length);
+  rows.forEach((row, index) => assert.equal(row, beforeEnrichment[index], "enrichment paints the rows it was given — it never rebuilds them"));
+
+  set = blocks;
+  editor.value = "((fir"; editor.setSelectionRange(5, 5); editor.dispatch("input"); flush(); await waitForSearch(); await drainRenders();
+  assert.equal(queries.length, 2, "one more result set, one more query");
+  assert.deepEqual(queries[1].keys, ["blkfirst01", "blkorphan1"]);
+  const blockRows = [...controller.suggestionList.children];
+  assert.equal(blockRows[0].querySelector(".rg-suggestion-breadcrumb").textContent, "Owning Page");
+  assert.equal(blockRows[0].querySelector(".rg-suggestion-count"), null, "a block row carries a breadcrumb, not a count");
+  assert.equal(blockRows[1].querySelector(".rg-suggestion-breadcrumb"), null, "and a block whose page the query did not answer for carries neither");
+
+  controller.onKeydown(keypress("ArrowDown"));
+  assert.equal(controller.suggestionList.children[0], blockRows[0], "U1's guard still holds with enrichment on the rows");
+  assert.equal(controller.suggestionList.children[0].querySelector(".rg-suggestion-breadcrumb").textContent, "Owning Page");
+  controller.dispose();
+});
+
+test("an alias target is labelled on every row and accepting one leaves the alias's ) alone", async () => {
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async () => [{ kind: "roam-page", name: "Project Alpha", description: "Page", uid: "pagealpha" }],
+  });
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "[label]([[Pro)", floating: false });
+  editor.setSelectionRange(13, 13); editor.dispatch("select"); flush(); await waitForSearch();
+
+  assert.equal(controller.referenceContext.aliasTarget, true);
+  assert.equal(controller.suggestionList.children[0].querySelector(".rg-suggestion-detail").textContent, "Page · alias target");
+  assert.equal(controller.suggestionList.children[1].querySelector(".rg-suggestion-detail").textContent, "Create page · alias target");
+
+  controller.onKeydown(keypress("Enter")); flush();
+  assert.equal(editor.value, "[label]([[Project Alpha]])", "the replacement stops at the page closer, so the alias keeps its )");
+
+  editor.value = "See [[Pro"; editor.setSelectionRange(9, 9); editor.dispatch("input"); flush(); await waitForSearch();
+  assert.equal(controller.referenceContext.aliasTarget, undefined);
+  assert.equal(controller.suggestionList.children[0].querySelector(".rg-suggestion-detail").textContent, "Page",
+    "and the label goes away with the alias, even though the rows themselves are identical");
+  controller.dispose();
 });
 
 test("a pair key over a selection wraps it, and a formula keeps its own brackets", async () => {

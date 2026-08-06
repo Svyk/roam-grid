@@ -946,7 +946,7 @@ body.roam-body.dark .rg-portal {
 
 .rg-formula-suggestion {
   display: grid;
-  grid-template-columns: minmax(72px, auto) 1fr;
+  grid-template-columns: minmax(72px, auto) 1fr auto auto;
   gap: 10px;
   width: 100%;
   padding: 5px 7px;
@@ -969,6 +969,26 @@ body.roam-body.dark .rg-portal {
 .rg-formula-suggestion:hover,
 .rg-formula-suggestion--active {
   background: color-mix(in srgb, var(--rg-portal-active, #2d72d2) 13%, transparent);
+}
+
+.rg-suggestion-breadcrumb {
+  max-width: 14ch;
+  color: var(--rg-portal-muted, #5f6b7c);
+  font-size: 0.85em;
+}
+
+/* The same quiet treatment as .rg-cell-reference-count: a plain superscript-ish number, muted, no
+   pill and no glyph. It is a fact about the row, not a control. */
+.rg-suggestion-count {
+  justify-self: end;
+  min-width: 9px;
+  padding: 0 2px;
+  color: var(--rg-portal-muted, #5f6b7c);
+  font-size: 0.72em;
+  font-weight: 500;
+  line-height: 1;
+  vertical-align: super;
+  opacity: 0.86;
 }
 
 .rg-formula-signature {

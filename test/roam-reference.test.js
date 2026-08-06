@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { roamEditorTriggerContext, roamSuggestionPlainText, roamTriggerInsertion, searchRoamReferenceSuggestions, withCreatePageSuggestion } from "../src/extension.js";
+import { enrichRoamSuggestions, exactBlockSuggestion, roamEditorTriggerContext, roamSuggestionPlainText, roamTriggerInsertion, searchRoamReferenceSuggestions, withCreatePageSuggestion } from "../src/extension.js";
 
 test("the trigger context resolves six types against the nearest unclosed opener", () => {
   assert.deepEqual(roamEditorTriggerContext("See [[Proj", 10), {
@@ -142,6 +142,142 @@ test("the create-page row is offered last, only for a page opener whose name is 
   const source = [alpha];
   withCreatePageSuggestion({ type: "page", query: "Project Beta" }, source);
   assert.deepEqual(source, [alpha], "the caller's result array is never mutated");
+});
+
+/**
+ * The unit this whole enrichment design exists for. At the default limit of eight rows and a 90 ms
+ * debounce, one query per ROW would be up to twenty datalog queries per settled keystroke; one query
+ * per SET is one, whatever the row count. That is what this asserts, and it is the assertion the
+ * per-row positive control is aimed at.
+ */
+test("enrichment is one batched query per result set, never one per row", async () => {
+  const calls = [];
+  const api = { q: (query, keys) => { calls.push({ query, keys }); return keys.map((uid, index) => [uid, `Owning Page ${index}`]); } };
+  const rows = Array.from({ length: 8 }, (whole, index) => ({ kind: "roam-block", name: `block ${index}`, description: `Block · blkrow000${index}`, uid: `blkrow000${index}` }));
+
+  const enriched = await enrichRoamSuggestions(rows, { api, limit: 8 });
+  assert.equal(calls.length, 1, "eight rows, one query — a per-row implementation would issue eight");
+  assert.deepEqual(calls[0].keys, rows.map((row) => row.uid), "and the whole set goes in as one input binding");
+  assert.deepEqual(enriched.map((row) => row.breadcrumb), rows.map((whole, index) => `Owning Page ${index}`));
+  assert.deepEqual(rows.map((row) => row.breadcrumb), rows.map(() => undefined), "the caller's rows are never mutated");
+});
+
+test("counts land on page rows, breadcrumbs on block rows, and unanswered rows come back untouched", async () => {
+  const pageCalls = [];
+  const quiet = { kind: "roam-page", name: "Quiet Page", description: "Page", uid: "pagequiet" };
+  const pageApi = { q: (query, keys) => { pageCalls.push({ query, keys }); return [["Project Alpha", 12]]; } };
+  const pages = await enrichRoamSuggestions([alpha, quiet, CREATE_ROW], { api: pageApi, limit: 8 });
+  assert.equal(pageCalls.length, 1);
+  assert.match(pageCalls[0].query, /\(count \?r\)/, "a page row is enriched with its linked-reference count");
+  assert.deepEqual(pageCalls[0].keys, ["Project Alpha", "Quiet Page"], "a create-page row names a page that does not exist yet, so it is never keyed");
+  assert.equal(pages[0].referenceCount, 12);
+  assert.equal("referenceCount" in pages[1], false, "a page with no references gets no badge rather than a zero");
+  assert.equal(pages[2], CREATE_ROW, "and a row the query cannot answer for comes back as the object it went in as");
+  assert.equal(pages[1], quiet);
+
+  const blockCalls = [];
+  const first = { kind: "roam-block", name: "first block", description: "Block · blkfirst01", uid: "blkfirst01" };
+  const orphan = { kind: "roam-block", name: "orphan block", description: "Block · blkorphan1", uid: "blkorphan1" };
+  const blockApi = { q: (query, keys) => { blockCalls.push({ query, keys }); return [["blkfirst01", "Owning Page"]]; } };
+  const blocks = await enrichRoamSuggestions([first, orphan], { api: blockApi, limit: 8 });
+  assert.equal(blockCalls.length, 1);
+  assert.match(blockCalls[0].query, /:block\/page/, "a block row is enriched with the page that owns it");
+  assert.equal(blocks[0].breadcrumb, "Owning Page");
+  assert.equal(blocks[1], orphan);
+  assert.equal("referenceCount" in blocks[0], false, "a block row carries a breadcrumb, not a count");
+});
+
+test("enrichment bounds its input, skips a set it has nothing to key, and survives a failing query", async () => {
+  let calls = 0;
+  const counting = { q: () => { calls += 1; return []; } };
+  assert.deepEqual(await enrichRoamSuggestions([], { api: counting }), []);
+  assert.deepEqual(await enrichRoamSuggestions([CREATE_ROW], { api: counting }), [CREATE_ROW]);
+  assert.equal(calls, 0, "no keys means no query at all, not a query over an empty binding");
+  assert.deepEqual(await enrichRoamSuggestions([alpha], { api: {} }), [alpha], "and a graph with no q is simply an unenriched menu");
+
+  const seen = [];
+  const many = Array.from({ length: 40 }, (whole, index) => ({ kind: "roam-block", name: `b${index}`, uid: `blk${String(index).padStart(6, "0")}` }));
+  await enrichRoamSuggestions([...many, many[0]], { api: { q: (query, keys) => { seen.push(keys); return []; } }, limit: 500 });
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].length, 20, "the input binding is capped at the same twenty that bounds the search");
+  assert.equal(new Set(seen[0]).size, 20, "and deduplicated, so a repeated row cannot widen it");
+
+  const warn = console.warn; const warns = [];
+  console.warn = (message) => warns.push(message);
+  const failing = { q: () => { throw new Error("datalog"); } };
+  assert.deepEqual(await enrichRoamSuggestions([alpha], { api: failing }), [alpha], "a failed enrichment leaves the menu exactly as it was");
+  console.warn = warn;
+  assert.equal(warns.length, 1);
+});
+
+/**
+ * The paste-a-uid case. `data.search` matches block TEXT, so before this a pasted nine-character uid
+ * searched for its own characters and found nothing — the block it names was never a candidate.
+ */
+test("a uid-shaped (( query also pulls the exact block and puts it first", async () => {
+  const pulls = [];
+  const searched = [{ ":block/string": "mentions abc-12_XY in passing", ":block/uid": "blkother1" }];
+  const makeApi = (hit) => ({
+    data: { search: () => searched },
+    pull: (pattern, eid) => { pulls.push({ pattern, eid }); return hit; },
+  });
+
+  const hits = await searchRoamReferenceSuggestions({ type: "block", query: "abc-12_XY" }, 8, makeApi({ ":block/string": "  the pasted   block ", ":block/uid": "abc-12_XY" }));
+  assert.deepEqual(pulls, [{ pattern: "[:block/string :block/uid]", eid: [":block/uid", "abc-12_XY"] }], "one pull, on the uid index");
+  assert.deepEqual(hits, [
+    { kind: "roam-block", name: "the pasted block", description: "Exact block · abc-12_XY", uid: "abc-12_XY" },
+    { kind: "roam-block", name: "mentions abc-12_XY in passing", description: "Block · blkother1", uid: "blkother1" },
+  ], "the exact block leads, and the text search's own hits follow it");
+
+  pulls.length = 0;
+  const miss = await searchRoamReferenceSuggestions({ type: "block", query: "abc-12_XY" }, 8, makeApi(null));
+  assert.equal(pulls.length, 1);
+  assert.deepEqual(miss.map((row) => row.uid), ["blkother1"], "a uid Roam does not know changes nothing");
+
+  pulls.length = 0;
+  const duplicated = await searchRoamReferenceSuggestions({ type: "block", query: "blkother1" }, 8, makeApi({ ":block/string": "mentions abc-12_XY in passing", ":block/uid": "blkother1" }));
+  assert.deepEqual(duplicated.map((row) => row.description), ["Exact block · blkother1"], "a block the text search also found is promoted, not listed twice");
+});
+
+test("only a uid-shaped block query issues a pull at all", async () => {
+  const pulls = [];
+  const api = { data: { search: () => [] }, pull: (pattern, eid) => { pulls.push(eid); return null; } };
+  for (const context of [
+    { type: "block", query: "abc" },
+    { type: "block", query: "abcdefghij" },
+    { type: "block", query: "abc 12_XY" },
+    { type: "block", query: "abc.12_XY" },
+    { type: "page", query: "abc-12_XY" },
+    { type: "tag", query: "abc-12_XY" },
+  ]) await searchRoamReferenceSuggestions(context, 8, api);
+  assert.deepEqual(pulls, [], "a query that is not Roam's uid shape, or is not a block opener, pulls nothing");
+
+  assert.equal(exactBlockSuggestion({ type: "block", query: "abc-12_XY" }, {}), null, "and a graph with no pull simply offers no exact row");
+  assert.equal(exactBlockSuggestion(null, api), null);
+  assert.deepEqual(pulls, []);
+});
+
+/**
+ * `[label]([[Page]])` — a `[[` opened directly after `](` is filling in an alias TARGET. The existing
+ * `replaceEndIndex` logic already stops at the page closer and leaves the alias's `)` alone; the flag
+ * is what lets the row list say which of the two the user is in.
+ */
+test("a [[ opened inside an alias target is flagged, and the ) is not swallowed", () => {
+  const open = roamEditorTriggerContext("[label]([[Proj", 14);
+  assert.equal(open.type, "page");
+  assert.equal(open.aliasTarget, true);
+  assert.equal(open.startIndex, 8, "the replacement starts at the [[, not at the alias's own [");
+  assert.equal(open.query, "Proj");
+  assert.equal(open.replaceEndIndex, 14, "with no closer typed yet the replacement stops at the caret, well short of any )");
+
+  const closed = roamEditorTriggerContext("[label]([[Proj]])", 14);
+  assert.equal(closed.aliasTarget, true);
+  assert.equal(closed.replaceEndIndex, 16, "an existing ]] is swallowed; the ) that follows it is not");
+
+  assert.equal(roamEditorTriggerContext("See [[Proj", 10).aliasTarget, undefined, "an ordinary page trigger carries no flag at all");
+  assert.equal(roamEditorTriggerContext("[[Proj", 6).aliasTarget, undefined, "and neither does one with no room for a ]( in front of it");
+  assert.equal(roamEditorTriggerContext("](((uid", 7).aliasTarget, undefined, "a block opener after ]( is not an alias target — Roam aliases point at pages");
+  assert.equal(roamEditorTriggerContext("](((uid", 7).type, "block");
 });
 
 /**
