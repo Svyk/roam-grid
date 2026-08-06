@@ -58,13 +58,21 @@ leaves a working native table.
 
 ### Settings
 
-A real settings panel at **Settings → Roam Depot → Roam Grid**: 35 controls in
-seven groups (Writes, Editing, Appearance, Sizing, New grids, Large grids,
-Comments) plus four maintenance actions — apply display defaults to open grids,
-forget this device's overrides, clear local caches, and reset everything.
+A real settings panel at **Settings → Roam Depot → Roam Grid**: 37 controls in
+eight groups (Writes, Editing, Appearance, Sizing, New grids, Large grids,
+Comments, Ranges) plus four maintenance actions — apply display defaults to open
+grids, forget this device's overrides, clear local caches, and reset everything.
 Presentation choices that are properly per-device (toolbar, theme, maximum
 width, overscan, chunk cache size) are stored per device; the rest sync with
 your graph.
+
+Every control does something. **Maximum cells in a rendered range** (2000) now
+bounds what a range reference paints — a bigger range renders whole rows up to
+that many cells and says so in its caption, instead of trying to draw the whole
+rectangle at once. **Render live range references** (on) is the escape hatch: off
+leaves the component as its raw text. A third range setting that promised
+editable ranges was removed rather than shipped — a range view has no write path
+at all, so the toggle would have been a lie.
 
 ### Notes for review
 

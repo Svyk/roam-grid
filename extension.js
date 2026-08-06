@@ -106,9 +106,8 @@ const SETTING_DESCRIPTORS = [
   { key: "comments-enabled", group: "Comments", name: "Enable cell comments", description: "Read and write native Roam comment threads from grid cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges() },
   { key: "comments-badges", group: "Comments", name: "Show comment badges", description: "Mark cells that carry a comment thread.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges() },
   { key: "comments-open-in-sidebar", group: "Comments", name: "Open comment threads in the right sidebar", description: "Open a cell's comment thread in the right sidebar instead of inline.", control: "switch", type: "bool", default: false, scope: "device", apply: "immediate", stage: "live" },
-  { key: "ranges-live-references", group: "Ranges", name: "Render live range references", description: "Render {{roam-grid-range: …}} components as a live view of the source cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
-  { key: "ranges-read-only", group: "Ranges", name: "Rendered ranges are read-only", description: "Block edits inside a rendered range so the source table stays authoritative.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
-  { key: "ranges-max-rendered-cells", group: "Ranges", name: "Maximum cells in a rendered range", description: "Ranges larger than this render as a link instead of a grid.", control: "input", type: "int", default: DEFAULT_RANGE_RENDERED_CELLS, min: 1, max: 50000, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "ranges-live-references", group: "Ranges", name: "Render live range references", description: "Render {{roam-grid-range: …}} components as a live view of the source cells. With this off the component stays as its raw text; views already on screen keep rendering until Roam next redraws their block.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "ranges-max-rendered-cells", group: "Ranges", name: "Maximum cells in a rendered range", description: "How many cells a rendered range may paint. A larger range renders whole rows up to this many cells and says so in its caption.", control: "input", type: "int", default: DEFAULT_RANGE_RENDERED_CELLS, min: 1, max: 50000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "large-cache-enabled", group: "Large grids", name: "Cache large-grid chunks on this device", description: "Keep downloaded chunks in IndexedDB so reopening a large grid is instant. Takes effect the next time Roam Grid loads.", control: "switch", type: "bool", default: true, scope: "device", apply: "next-op", stage: "live" },
   { key: "large-cache-max-mb", group: "Large grids", name: "Chunk cache size (MB)", description: "How much device storage the large-grid chunk cache may use.", control: "input", type: "int", default: DEFAULT_LARGE_CACHE_MB, min: 8, max: 4096, scope: "device", apply: "next-op", stage: "live" },
   { key: "large-verify-checksums", group: "Large grids", name: "Verify chunk checksums", description: "Re-hash each downloaded chunk before trusting it.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
@@ -8067,6 +8066,25 @@ export class GridView {
 }
 
 /**
+ * Bounds the rectangle a range paints.  Whole rows are dropped first so the excerpt keeps the full
+ * column shape of the source; a range wider than the cap falls back to one clipped row.  `rendered`
+ * counts coordinates, not mounted nodes — a merge inside the rectangle mounts one node for several
+ * coordinates, and the cap exists to bound the work, not to guarantee a node count.
+ */
+export function rangeRenderPlan(range, cap = getSetting("ranges-max-rendered-cells")) {
+  const limit = Math.max(1, Math.round(Number(cap) || DEFAULT_RANGE_RENDERED_CELLS));
+  const rows = range.endRow - range.startRow + 1; const cols = range.endCol - range.startCol + 1;
+  const total = rows * cols;
+  if (total <= limit) return { range, total, rendered: total, truncated: false };
+  const width = Math.min(cols, limit);
+  const height = Math.max(1, Math.floor(limit / width));
+  return {
+    range: { ...range, endRow: range.startRow + height - 1, endCol: range.startCol + width - 1 },
+    total, rendered: width * height, truncated: true,
+  };
+}
+
+/**
  * Read-only renderer for `{{roam-grid-range: ((uid)) B2:D5}}`.  Deliberately NOT a `GridView`
  * subclass: subclassing would drag in the editor controller, selection, drag-fill, paste, and the
  * window keydown listener, none of which may exist on a surface that never writes.  It attaches to
@@ -8143,10 +8161,12 @@ export class RangeGridView {
   caption() {
     const caption = document.createElement("div"); caption.className = "rg-range-caption";
     const text = document.createElement("span"); text.className = "rg-range-label"; text.textContent = this.label;
+    const truncated = document.createElement("span"); truncated.className = "rg-range-truncated";
+    truncated.title = "Raise Ranges — Maximum cells in a rendered range to show more.";
     const source = document.createElement("span"); source.className = "rg-range-source"; source.textContent = "↗";
     source.title = "Open the source table block"; source.setAttribute("role", "button");
-    caption.append(text, source);
-    this.captionElement = caption; this.captionLabel = text;
+    caption.append(text, truncated, source);
+    this.captionElement = caption; this.captionLabel = text; this.captionTruncated = truncated;
     return caption;
   }
 
@@ -8192,7 +8212,11 @@ export class RangeGridView {
     const grid = this.gridElement || (() => {
       const element = document.createElement("div"); element.className = "rg-grid rg-grid--clean rg-range-grid"; viewport.appendChild(element); this.gridElement = element; return element;
     })();
-    const range = this.clampedRange();
+    const plan = rangeRenderPlan(this.clampedRange());
+    const range = plan.range;
+    // Written only on change, so a repeat render of an unchanged excerpt still writes no text.
+    const note = plan.truncated ? `showing first ${plan.rendered} of ${plan.total} cells` : "";
+    if (this.captionTruncated.textContent !== note) this.captionTruncated.textContent = note;
     grid.style.width = "max-content";
     grid.style.gridTemplateColumns = gridTrackTemplate(this.model, "col", range.startCol, range.endCol);
     grid.style.gridTemplateRows = gridTrackTemplate(this.model, "row", range.startRow, range.endRow);
@@ -9044,6 +9068,10 @@ export function rangeBlockUid(element) {
  */
 export function rangeInstanceInfo(button, entries = runtime.rangeSpecs, readString = blockString) {
   if (!button) return null;
+  // The live-references escape hatch lives here because this is the mount path's only discovery
+  // call: with it off nothing is parsed and nothing is cached, so `scanMounts` falls into its
+  // no-spec branch and un-hides the raw component, and turning it back on parses on the next scan.
+  if (getSetting("ranges-live-references") === false) return null;
   const blockUid = rangeBlockUid(button.closest?.(".rm-block__input"));
   if (!blockUid) return null;
   const cached = entries?.get?.(blockUid);

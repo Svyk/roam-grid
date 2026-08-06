@@ -149,9 +149,9 @@ mouse-out is not a safe place to edit.
 
 ## Settings
 
-**Settings → Roam Depot → Roam Grid.** Thirty-five controls in seven groups —
-Writes, Editing, Appearance, Sizing, New grids, Large grids, Comments — plus
-four maintenance actions: apply display defaults to open grids, forget this
+**Settings → Roam Depot → Roam Grid.** Thirty-seven controls in eight groups —
+Writes, Editing, Appearance, Sizing, New grids, Large grids, Comments, Ranges —
+plus four maintenance actions: apply display defaults to open grids, forget this
 device's overrides, clear local caches, and reset every setting.
 
 Most settings sync with your graph. Presentation choices that are properly

@@ -14,8 +14,10 @@ import {
   rangeBlockUid,
   rangeButtonsWithin,
   rangeInstanceInfo,
+  rangeRenderPlan,
   resolveSourceModel,
   selectionBlockReferenceMatrix,
+  settingsCache,
 } from "../src/extension.js";
 
 function persistedModel() {
@@ -319,6 +321,57 @@ test("a range view renders only its rectangle, with each merge anchor mounted ex
   assert.equal(view.root.querySelector(".rg-range-caption").querySelector(".rg-range-label").textContent, "B2:D4");
 });
 
+test("rangeRenderPlan drops whole rows first and never exceeds the cap", () => {
+  const range = (startRow, endRow, startCol, endCol) => ({ startRow, endRow, startCol, endCol });
+  const under = rangeRenderPlan(range(0, 4, 0, 4), 25);
+  assert.equal(under.truncated, false);
+  assert.equal(under.total, 25);
+  assert.equal(under.rendered, 25);
+  assert.deepEqual(under.range, range(0, 4, 0, 4), "a rectangle at the cap is handed back untouched");
+
+  const clipped = rangeRenderPlan(range(0, 99, 0, 4), 12);
+  assert.equal(clipped.truncated, true);
+  assert.equal(clipped.total, 500);
+  assert.equal(clipped.rendered, 10, "two whole five-column rows, not a ragged twelve cells");
+  assert.deepEqual(clipped.range, range(0, 1, 0, 4), "the full column shape survives");
+
+  const wider = rangeRenderPlan(range(3, 40, 2, 101), 10);
+  assert.equal(wider.rendered, 10);
+  assert.deepEqual(wider.range, range(3, 3, 2, 11), "a range wider than the cap keeps one clipped row");
+
+  assert.equal(rangeRenderPlan(range(0, 9, 0, 9), 1).rendered, 1);
+  assert.deepEqual(rangeRenderPlan(range(0, 9, 0, 9), 1).range, range(0, 0, 0, 0));
+  assert.equal(rangeRenderPlan(range(0, 9, 0, 9), 0).rendered, 100, "a nonsense cap falls back to the default, not to zero cells");
+  assert.equal(rangeRenderPlan(range(0, 9, 0, 9), "nonsense").truncated, false);
+});
+
+test("a range past the cell cap mounts exactly the cap and reports the truncation in its caption", (t) => {
+  t.after(() => settingsCache.clear());
+  settingsCache.set("ranges-max-rendered-cells", 6);
+  const { view, model } = mountRange("A1:E5");
+
+  // 25 coordinates capped at 6: five columns fit, so one whole row renders and nothing below it.
+  assert.equal(view.cells.size, 5, "only the clamped rectangle may build nodes");
+  assert.deepEqual(mountedCoordinates(view), ["0:0", "0:1", "0:2", "0:3", "0:4"]);
+  assert.equal(view.gridElement.style.gridTemplateRows, gridTrackTemplate(model, "row", 0, 0), "the track template is capped too");
+  assert.equal(view.root.querySelector(".rg-range-truncated").textContent, "showing first 5 of 25 cells");
+  assert.equal(view.root.querySelector(".rg-range-label").textContent, "A1:E5", "the caption still names the authored range");
+
+  // A repeat render must not rewrite the note, or the zero-write guarantee above dies with it.
+  const before = textWrites;
+  view.render();
+  assert.equal(textWrites - before, 0);
+  assert.equal(view.cells.size, 5);
+});
+
+test("a range inside the cell cap renders whole and carries an empty truncation note", (t) => {
+  t.after(() => settingsCache.clear());
+  settingsCache.set("ranges-max-rendered-cells", 2000);
+  const { view } = mountRange("B2:D4");
+  assert.equal(view.cells.size, 6);
+  assert.equal(view.root.querySelector(".rg-range-truncated").textContent, "", "no note when nothing was dropped");
+});
+
 test("a range view carries no toolbar, no fill handle, no editor controller, and is not focusable", () => {
   const { view, session } = mountRange("A1:B2");
   assert.equal(view.root.querySelector(".rg-toolbar"), null);
@@ -551,6 +604,25 @@ test("a range spec is read once per block and re-read when Roam replaces the but
   const plainButton = new MiniNode("button"); plainButton.className = "rm-xparser-default-roam-grid-range"; plain.appendChild(plainButton);
   assert.equal(rangeInstanceInfo(plainButton, entries, () => "just some text"), null);
   assert.equal(rangeInstanceInfo(plainButton, entries, () => { throw new Error("pull failed"); }), null, "a failed read is not a crash");
+});
+
+test("with live range references off no spec is parsed, read, or cached", (t) => {
+  t.after(() => settingsCache.clear());
+  installMiniDom();
+  const reads = [];
+  const readString = (uid) => { reads.push(uid); return "{{roam-grid-range: ((tbl00001)) B2:D5}}"; };
+  const entries = new Map();
+  const input = new MiniNode("div"); input.className = "rm-block__input"; input.id = "block-input-main-window-blk123456";
+  const button = new MiniNode("button"); button.className = "rm-xparser-default-roam-grid-range"; input.appendChild(button);
+
+  settingsCache.set("ranges-live-references", false);
+  assert.equal(rangeInstanceInfo(button, entries, readString), null, "off means scanMounts never gets a spec to mount");
+  assert.deepEqual(reads, [], "and the source block is never read");
+  assert.equal(entries.size, 0, "a null must not be cached, or turning the setting back on would stay dead");
+
+  settingsCache.set("ranges-live-references", true);
+  assert.equal(rangeInstanceInfo(button, entries, readString).tableUid, "tbl00001", "back on parses on the very next scan");
+  assert.deepEqual(reads, ["blk123456"]);
 });
 
 test("range block uids come from the dataset first and the block-input id suffix second", () => {

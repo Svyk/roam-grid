@@ -76,7 +76,6 @@ const TODAYS_CONSTANTS = {
   "comments-badges": true,
   "comments-open-in-sidebar": false,
   "ranges-live-references": true,
-  "ranges-read-only": true,
   "ranges-max-rendered-cells": 2000,
   "large-cache-enabled": true,
   "large-cache-max-mb": 256,
@@ -84,11 +83,16 @@ const TODAYS_CONSTANTS = {
   "large-gc-orphans": false,
 };
 
-const PENDING_KEYS = [
-  "ranges-live-references", "ranges-read-only", "ranges-max-rendered-cells",
-];
+/**
+ * Empty since GOAL-3H: every declared key now has a read site. The list stays because the panel
+ * arithmetic below is written in terms of it, and because the schema sweep asserts that nothing may
+ * become `stage: "pending"` without being listed here.
+ */
+const PENDING_KEYS = [];
 
 const COMMENT_KEYS = ["comments-enabled", "comments-badges", "comments-open-in-sidebar"];
+
+const RANGE_KEYS = ["ranges-live-references", "ranges-max-rendered-cells"];
 
 const LARGE_STORAGE_KEYS = ["large-cache-enabled", "large-cache-max-mb", "large-verify-checksums", "large-gc-orphans"];
 
@@ -390,6 +394,19 @@ test("the panel omits pending rows but the schema still resolves them", async ()
     assert.ok(!ids.includes(key), `${key} must not be rendered while it is pending`);
     assert.equal(SETTINGS[key].stage, "pending");
   }
+  // PENDING_KEYS is empty today, so the loop above proves nothing on its own. This is the assertion
+  // that keeps it honest: a row may only be invisible if it is listed as pending.
+  for (const [key, descriptor] of Object.entries(SETTINGS)) {
+    if (descriptor.stage === "pending") assert.ok(PENDING_KEYS.includes(key), `${key} is pending but is not listed in PENDING_KEYS`);
+    else assert.ok(ids.includes(key), `${key} is live and must be rendered`);
+  }
+  // GOAL-3H wired these and deleted `ranges-read-only`: RangeGridView has no commitMutation and no
+  // onKeydown, so a toggle claiming a writable range could never have a true branch.
+  for (const key of RANGE_KEYS) {
+    assert.ok(ids.includes(key), `${key} backs a shipped feature and must be rendered`);
+    assert.equal(SETTINGS[key].stage, "live");
+  }
+  assert.equal(SETTINGS["ranges-read-only"], undefined, "a setting whose true branch cannot exist must not be declared");
   for (const key of COMMENT_KEYS) {
     assert.ok(ids.includes(key), `${key} ships with the comments feature and must be rendered`);
     assert.equal(SETTINGS[key].stage, "live");

@@ -353,9 +353,17 @@ so there is one source of truth rather than a flag plus a separate handler table
 
 `stage: "pending"` rows are reachable through `getSetting` but are never
 rendered. That is deliberate: a visible control that does nothing is exactly the
-defect the schema replaces. The three `ranges-*` descriptors are currently
-pending — live range rendering is unconditional, always read-only, and uncapped,
-so their controls would be inert.
+defect the schema replaces. No descriptor is pending today: every declared key
+has a read site.
+
+The `Ranges` group is where that rule was last enforced.
+`ranges-live-references` is read in `rangeInstanceInfo`, the mount path's only
+discovery call, so off means no spec is parsed and `scanMounts` un-hides the raw
+component. `ranges-max-rendered-cells` is read by `rangeRenderPlan`, which
+clamps the rectangle `RangeGridView.render` paints and reports the drop in the
+caption. A third descriptor, `ranges-read-only`, was deleted rather than wired:
+`RangeGridView` has no `commitMutation` and no `onKeydown`, and `claimKeyboard`
+refuses a view without one, so the toggle's "false" branch could not exist.
 
 Maintenance rows are actions, not settings: they hold no value, so they stay out
 of `SETTINGS` (nothing to seed, cache, coerce, or reset) and are appended to the

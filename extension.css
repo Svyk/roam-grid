@@ -219,6 +219,14 @@ body.roam-body.dark .rg-portal {
   font-size: 0.8em;
 }
 
+/* Empty unless the cell cap clipped the rectangle, so an untruncated caption is unchanged. */
+.rg-range-truncated {
+  overflow: hidden;
+  font-style: italic;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .rg-range-source {
   cursor: pointer;
   opacity: 0.5;
