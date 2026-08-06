@@ -6273,6 +6273,27 @@ export async function searchRoamReferenceSuggestions(context, limit = getSetting
   }).slice(0, boundedLimit);
 }
 
+/**
+ * Roam's own create-page row, appended LAST: a page opener with a typed name that no result already
+ * matches exactly gets one, including when the search returned nothing — that empty case is the dead
+ * end this closes, because typing a page that does not exist yet used to produce silence.
+ *
+ * Accepting it inserts `[[Name]]` and creates NOTHING. `:block/refs` is an entity reference, so Roam
+ * materializes the page itself when the committed string is parsed (verified live against the Svy
+ * graph on 2026-08-06: a `[[nonce]]` committed into a block made `[:node/title "nonce"]` pullable,
+ * having been nil immediately before). Eager creation would also orphan a page every time the user
+ * cancels the draft, which this editor — unlike Roam's own always-live block editor — really has.
+ */
+export function withCreatePageSuggestion(context, suggestions) {
+  const rows = [...(suggestions || [])];
+  if (context?.type !== "page") return rows;
+  const name = String(context.query ?? "").trim(); if (!name) return rows;
+  const folded = name.toLowerCase();
+  if (rows.some((row) => String(row?.name ?? "").trim().toLowerCase() === folded)) return rows;
+  rows.push({ kind: "roam-create-page", name, description: "Create page" });
+  return rows;
+}
+
 const RECENT_PAGES_QUERY = '[:find ?title ?uid ?time :where [?p :node/title ?title] [?p :block/uid ?uid] [(get-else $ ?p :edit/time 0) ?time]]';
 const RECENT_BLOCKS_QUERY = '[:find ?uid ?string ?time :in $ ?since :where [?b :edit/time ?time] [(> ?time ?since)] [?b :block/string ?string] [(!= ?string "")] [?b :block/uid ?uid]]';
 
@@ -6571,8 +6592,9 @@ export class GridEditorController {
   acceptReferenceSuggestion(index) {
     const state = this.state; const suggestion = this.suggestions[index]; const context = this.referenceContext;
     if (!state || !suggestion || !context) return;
-    const replacement = suggestion.kind === "roam-page" ? `[[${suggestion.name}]]` : `((${suggestion.uid}))`;
-    if (suggestion.kind === "roam-page") rememberAcceptedPage(suggestion.name);
+    const page = suggestion.kind === "roam-page" || suggestion.kind === "roam-create-page";
+    const replacement = page ? `[[${suggestion.name}]]` : `((${suggestion.uid}))`;
+    if (page) rememberAcceptedPage(suggestion.name);
     state.editor.setRangeText(replacement, context.startIndex, context.replaceEndIndex ?? context.endIndex, "end");
     state.referenceAutocompleteClosed = true;
     clearTimeout(this.referenceSearchTimer); this.referenceSearchToken += 1;
@@ -6792,7 +6814,7 @@ export class GridEditorController {
       try { results = bare ? await this.searchRecents(context, { excludeUids: this.currentTableUids() }) : await this.searchReferences(context); }
       catch (error) { console.warn("[roam-grid] Reference search failed", error); }
       if (token !== this.referenceSearchToken || !this.state || this.referenceContextKey !== key) return;
-      this.suggestions = results; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.renderSuggestionRows();
+      this.suggestions = withCreatePageSuggestion(context, results); this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.renderSuggestionRows();
       this.syncPopoverVisibility();
       this.position();
     }, this.searchDelay(context));

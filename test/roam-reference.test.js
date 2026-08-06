@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { roamReferenceAutocompleteContext, searchRoamReferenceSuggestions } from "../src/extension.js";
+import { roamReferenceAutocompleteContext, searchRoamReferenceSuggestions, withCreatePageSuggestion } from "../src/extension.js";
 
 test("Roam reference context finds the nearest unclosed page or block opener", () => {
   assert.deepEqual(roamReferenceAutocompleteContext("See [[Proj", 10), {
@@ -36,4 +36,36 @@ test("Roam reference search is type-filtered, bounded, and normalizes results", 
   assert.equal(calls[1]["search-pages"], false);
   assert.equal(calls[1]["search-blocks"], true);
   assert.equal(calls[1]["hide-code-blocks"], true);
+});
+
+const CREATE_ROW = { kind: "roam-create-page", name: "Project Beta", description: "Create page" };
+const alpha = { kind: "roam-page", name: "Project Alpha", description: "Page", uid: "pageuid01" };
+
+test("the create-page row is offered last, only for a page opener whose name is new", () => {
+  const partial = withCreatePageSuggestion({ type: "page", query: "Project Beta" }, [alpha]);
+  assert.deepEqual(partial, [alpha, CREATE_ROW], "a partial match still offers the name being typed, appended last");
+
+  assert.deepEqual(
+    withCreatePageSuggestion({ type: "page", query: "Project Beta" }, []),
+    [CREATE_ROW],
+    "zero hits is the dead end this closes — a new page name used to produce nothing at all",
+  );
+
+  const exact = { kind: "roam-page", name: "  Project Beta ", description: "Page", uid: "pageuid02" };
+  assert.deepEqual(withCreatePageSuggestion({ type: "page", query: " project beta " }, [alpha, exact]), [alpha, exact],
+    "an exact title match, compared trimmed and case-folded, needs no create row");
+
+  assert.deepEqual(withCreatePageSuggestion({ type: "block", query: "Project Beta" }, []), [],
+    "(( never offers to create a page");
+  assert.deepEqual(withCreatePageSuggestion({ type: "page", query: "" }, [alpha]), [alpha]);
+  assert.deepEqual(withCreatePageSuggestion({ type: "page", query: "   " }, [alpha]), [alpha],
+    "a whitespace-only query is an empty query");
+  assert.deepEqual(withCreatePageSuggestion(null, [alpha]), [alpha]);
+
+  assert.deepEqual(withCreatePageSuggestion({ type: "page", query: "Project Beta" }, partial), partial,
+    "applying it twice cannot produce two create rows");
+
+  const source = [alpha];
+  withCreatePageSuggestion({ type: "page", query: "Project Beta" }, source);
+  assert.deepEqual(source, [alpha], "the caller's result array is never mutated");
 });

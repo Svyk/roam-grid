@@ -876,6 +876,50 @@ test("pages this extension inserted are promoted ahead of the graph's own edit t
   controller.dispose();
 });
 
+/**
+ * The create-page row's whole point is the case with no hits: before it, typing a page name that did
+ * not exist yet produced an empty menu and no way forward. Accepting it must insert `[[Name]]` and
+ * call nothing on `data.page` — Roam materializes the page from the committed string itself, and
+ * creating it here would orphan a page every time the user then cancels the draft.
+ */
+test("a page name with no hits still offers to create it, inserting [[Name]] and creating nothing", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents();
+  const pageCalls = [];
+  const { controller, cells, flush } = makeController({ referenceSearchDelay: 0, searchReferences: async () => [] });
+  globalThis.window.roamAlphaAPI = {
+    q: () => [["Busy Page", "pagebusy12", 999]],
+    data: { page: { create: (...args) => { pageCalls.push(args); } }, block: { create: (...args) => { pageCalls.push(args); } } },
+  };
+
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "[[Brand New Page", floating: false });
+  flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions, [{ kind: "roam-create-page", name: "Brand New Page", description: "Create page" }]);
+  assert.equal(controller.popover.hidden, false, "the row is real, so the popover opens on it");
+  assert.equal(controller.suggestionList.children[0].textContent, "Brand New PageCreate page");
+
+  controller.onKeydown({ key: "Enter", preventDefault() {}, stopPropagation() {}, isComposing: false }); flush();
+  assert.equal(editor.value, "[[Brand New Page]]");
+  assert.deepEqual(pageCalls, [], "accepting creates no page — the committed string does that");
+
+  editor.value = "[[Brand New Page]] [["; editor.setSelectionRange(21, 21); editor.dispatch("input"); flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions.map((suggestion) => suggestion.name), ["Brand New Page", "Busy Page"],
+    "a created page joins the LRU, so the next bare opener offers it first");
+  controller.dispose();
+});
+
+test("a block opener never offers to create a page, however little it matches", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents();
+  const { controller, cells, flush } = makeController({ referenceSearchDelay: 0, searchReferences: async () => [] });
+  globalThis.window.roamAlphaAPI = { q: () => [] };
+  await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "((nothing matches this", floating: false });
+  flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions, []);
+  assert.equal(controller.popover.hidden, true);
+  controller.dispose();
+});
+
 test("a cache-resolvable bare opener drops the debounce it has nothing to debounce", async (t) => {
   t.after(() => { resetRoamRecents(); settingsCache.clear(); });
   resetRoamRecents(); settingsCache.clear();
@@ -1043,7 +1087,7 @@ test("Roam reference suggestions take keyboard precedence and Escape closes them
   flush(); await waitForSearch();
   assert.equal(controller.suggestionKind, "roam-reference");
   assert.equal(controller.address.textContent, "fx  A1");
-  assert.equal(controller.suggestions.every((suggestion) => suggestion.kind === "roam-page"), true);
+  assert.deepEqual(controller.suggestions.map((suggestion) => suggestion.kind), ["roam-page", "roam-create-page"]);
   assert.equal(controller.popover.dataset.mode, "reference");
   controller.onKeydown({ key: "Escape", preventDefault() {}, stopPropagation() {}, isComposing: false });
   assert.ok(controller.state); assert.equal(controller.suggestionList.hidden, true);
