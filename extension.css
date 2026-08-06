@@ -8,6 +8,15 @@
   pointer-events: none !important;
 }
 
+/* The one justified exception to "every rule's subject is a .rg-* class" (docs/ARCHITECTURE.md).
+   Roam renders {{roam-grid-range: ...}} as a button carrying this single class; the node exists
+   only because this extension defined the component, so nothing else can ever match. It is a
+   single-class selector with no descendant combinator, and a mounted or deliberately released
+   range clears it via .rg-range-restored. */
+.rm-xparser-default-roam-grid-range:not(.rg-range-restored) {
+  display: none !important;
+}
+
 .rg-root {
   --rg-border: var(--bc-menu, #d3d8de);
   --rg-border-strong: var(--bc-main, #c5cbd3);
@@ -170,6 +179,48 @@ body.roam-body.dark .rg-portal {
   min-width: 100%;
   align-items: stretch;
   background: var(--rg-bg);
+}
+
+.rg-range {
+  display: inline-block;
+  width: auto;
+  max-width: 100%;
+  margin: 2px 0;
+  vertical-align: top;
+}
+
+.rg-range-caption {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 8px;
+  color: var(--rg-muted);
+  background: var(--rg-toolbar);
+  border-bottom: 1px solid var(--rg-border);
+  font-size: 0.8em;
+}
+
+.rg-range-source {
+  cursor: pointer;
+  opacity: 0.5;
+}
+
+.rg-range-source:hover {
+  opacity: 1;
+}
+
+.rg-range-grid {
+  min-width: 0;
+}
+
+.rg-range-cell {
+  cursor: pointer;
+}
+
+/* Blueprint hover previews are small and vanish on mouseout, so a range there scrolls internally. */
+.rg-range--preview .rg-range-viewport {
+  max-height: 240px;
 }
 
 .rg-header {

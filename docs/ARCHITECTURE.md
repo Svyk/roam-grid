@@ -51,6 +51,38 @@ scrolling, handles, and responsive toolbar state stay view-local, while a
 session permits only one active draft editor and commits it before editing from
 another instance.
 
+### Live range references
+
+`{{roam-grid-range: ((tableUid)) B2:D5}}` renders a read-only excerpt of another
+grid. Roam turns an unknown component into a button carrying a single
+`rm-xparser-default-roam-grid-range` class, and the `((uid))` inside the braces
+produces a real `:block/refs` datom, so every live range is discoverable from
+the source table's linked references.
+
+`RangeGridView` is deliberately not a `GridView` subclass: subclassing would
+pull in the editor controller, selection, drag-fill, paste, and a window keydown
+listener, none of which may exist on a surface that never writes. It satisfies
+the session's view contract, attaches to the source table's existing
+`NativeGridSession` through `addView`, and therefore repaints through the same
+`refreshValues` / `renderStructural` fan-out as every other instance. Because it
+never writes it can never produce an echo, and it never becomes the session's
+active editor view. It owns no reference or comment badges — those belong to the
+source grid — so the session's optional-chained badge fan-out simply skips it.
+Cell content, the theme bridge, and the `grid-template-*` track math are the
+shared helpers, so a repeat render writes nothing. Mounting mirrors the native
+trio (`rangeButtonsWithin` / `rangeInstanceInfo` / `mountRangeInstance`) inside
+the same added-node-scoped, synchronous scan; specs are cached per block uid and
+invalidated when Roam replaces the button node.
+
+The pre-paint rule
+`.rm-xparser-default-roam-grid-range:not(.rg-range-restored)` is the single
+justified exception to the rule that every CSS rule's subject is a `.rg-*`
+class. It is a one-class selector with no descendant combinator, and the only
+nodes it can match exist because this extension defined the component. Any
+button the scan does not claim — an unresolvable spec, a target that is not an
+enhanced native grid, or a failed mount — is given `rg-range-restored` so the
+raw Roam component stays visible rather than leaving blank space.
+
 ### Theme bridge
 
 Before the native renderer is hidden, the view samples Roam's actual host,

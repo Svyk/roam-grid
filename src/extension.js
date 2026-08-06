@@ -114,6 +114,7 @@ const runtime = {
   viewsByNative: new WeakMap(),
   guardStyle: null,
   pendingScanRoots: new Set(),
+  rangeSpecs: new Map(),
   scanQueued: false,
   gridThemePalette: null,
   gridThemeSignature: null,
@@ -4270,6 +4271,19 @@ export function selectionBlockReferenceText(model, selection) {
   return selectionBlockReferenceMatrix(model, selection).map((row) => row.join("\t")).join("\n");
 }
 
+/**
+ * Resolves the model a range reference points at.  A live session is authoritative because it
+ * already holds unsaved edits; otherwise the table is read cold.  Both the paste path and the
+ * range-view mount path go through here so there is exactly one resolution rule.
+ */
+export function resolveSourceModel(tableUid, { sessions = runtime.sessions, loadModel = (uid) => new NativeTableAdapter(uid).load() } = {}) {
+  const uid = String(tableUid || "");
+  if (!uid) return null;
+  const live = sessions?.get?.(uid)?.model;
+  if (live) return live;
+  return loadModel(uid) || null;
+}
+
 export function queryBlockReferenceCounts(uids, api = roam()) {
   const unique = [...new Set((uids || []).map(String).filter((uid) => uid && !uid.startsWith("rg_")))];
   const counts = new Map(unique.map((uid) => [uid, 0]));
@@ -4516,6 +4530,24 @@ export function replaceGridViewportContents(viewport, nextGrid) {
   viewport.replaceChildren(nextGrid);
   viewport.scrollLeft = scrollLeft; viewport.scrollTop = scrollTop;
   return viewport;
+}
+
+/** One source of truth for `grid-template-*` track math, shared by the full grid and range excerpts. */
+export function gridTrackTemplate(model, axis, from = 0, to = (axis === "col" ? model.columnIds.length : model.rowCount) - 1, { fit = false, widths = null, heights = null } = {}) {
+  const tracks = [];
+  if (axis === "col") {
+    for (let col = from; col <= to; col += 1) {
+      const id = model.columnIds[col];
+      const width = widths?.[id] != null ? widths[id] : (model.widths[id] || DEFAULT_COL_WIDTH);
+      tracks.push(fit ? `minmax(${MIN_COL_WIDTH}px, ${width}fr)` : `${width}px`);
+    }
+    return tracks.join(" ");
+  }
+  for (let row = from; row <= to; row += 1) {
+    const height = heights?.row === row ? heights.height : model.getRowHeight(row);
+    tracks.push(height == null ? `minmax(${DEFAULT_ROW_HEIGHT}px, auto)` : `${height}px`);
+  }
+  return tracks.join(" ");
 }
 
 function activateRichHost(content, host, token) {
@@ -5562,22 +5594,16 @@ export class GridView {
 
   applyGridTemplateColumns(grid = this.gridElement) {
     if (!grid) return;
-    const widths = this.model.columnIds.map((id) => {
-      if (this.columnResizePreview?.widths?.[id] != null) return this.columnResizePreview.widths[id];
-      return this.model.widths[id] || DEFAULT_COL_WIDTH;
-    });
     const previewing = Boolean(this.columnResizePreview);
     grid.style.width = this.model.fitToWidth && !previewing ? "100%" : "max-content";
-    grid.style.gridTemplateColumns = `${this.model.showHeaders ? "42px " : ""}${widths.map((width) => previewing || !this.model.fitToWidth ? `${width}px` : `minmax(${MIN_COL_WIDTH}px, ${width}fr)`).join(" ")}`;
+    const tracks = gridTrackTemplate(this.model, "col", 0, this.model.columnIds.length - 1, { fit: this.model.fitToWidth && !previewing, widths: this.columnResizePreview?.widths || null });
+    grid.style.gridTemplateColumns = `${this.model.showHeaders ? "42px " : ""}${tracks}`;
   }
 
   applyGridTemplateRows(grid = this.gridElement) {
     if (!grid) return;
-    const tracks = Array.from({ length: this.model.rowCount }, (_, row) => {
-      const height = this.rowResizePreview?.row === row ? this.rowResizePreview.height : this.model.getRowHeight(row);
-      return height == null ? `minmax(${DEFAULT_ROW_HEIGHT}px, auto)` : `${height}px`;
-    });
-    grid.style.gridTemplateRows = `${this.model.showHeaders ? "28px " : ""}${tracks.join(" ")}`;
+    const tracks = gridTrackTemplate(this.model, "row", 0, this.model.rowCount - 1, { heights: this.rowResizePreview });
+    grid.style.gridTemplateRows = `${this.model.showHeaders ? "28px " : ""}${tracks}`;
   }
 
   startColumnResize(id, event) {
@@ -6202,12 +6228,11 @@ export class GridView {
     await this.pasteMatrix(matrix);
   }
 
-  async pasteReferencedRange(spec) {
-    let sourceModel = runtime.sessions.get(spec.tableUid)?.model || null;
-    if (!sourceModel) {
-      try { sourceModel = new NativeTableAdapter(spec.tableUid).load(); }
-      catch (error) { return toast(`Could not read the referenced grid: ${error.message}`, "danger"); }
-    }
+  async pasteReferencedRange(spec, resolve = resolveSourceModel) {
+    let sourceModel;
+    try { sourceModel = resolve(spec.tableUid); }
+    catch (error) { return toast(`Could not read the referenced grid: ${error.message}`, "danger"); }
+    if (!sourceModel) return toast("Could not read the referenced grid", "danger");
     let matrix;
     try { matrix = selectionBlockReferenceMatrix(sourceModel, spec.range); }
     catch (error) { return toast(error.message, "warning"); }
@@ -6531,6 +6556,206 @@ export class GridView {
   }
 }
 
+/**
+ * Read-only renderer for `{{roam-grid-range: ((uid)) B2:D5}}`.  Deliberately NOT a `GridView`
+ * subclass: subclassing would drag in the editor controller, selection, drag-fill, paste, and the
+ * window keydown listener, none of which may exist on a surface that never writes.  It attaches to
+ * the source table's existing `NativeGridSession`, so live repaint arrives through the session's
+ * ordinary `refreshValues` / `renderStructural` fan-out.  It never writes, so it can never generate
+ * an echo, and it must never become `session.activeEditorView`.
+ */
+export class RangeGridView {
+  constructor({ host, session, range, label = null, nativeElement = null, surface = "main" }) {
+    this.host = host;
+    this.session = session;
+    this.model = session.model;
+    this.adapter = session.adapter;
+    this.nativeElement = nativeElement;
+    this.context = "range";
+    this.surface = surface;
+    this.range = normalizeRange(range);
+    this.label = label || rangeLabel(this.range);
+    this.cells = new Map();
+    this.cellCoordinatesByUid = new Map();
+    this.disposed = false;
+    this.formulaEngine = null;
+    this.gridElement = null;
+    this.viewport = null;
+    this.referenceCounts = session?.referenceCounts || new Map();
+    this.commentThreads = session?.commentThreads || new Map();
+    this.root = document.createElement("section");
+    this.root.className = "rg-root rg-range";
+    this.root.classList.toggle("rg-range--preview", surface === "preview");
+    this.root.dataset.rgContext = "range";
+    this.root.dataset.rgSurface = surface;
+    this.root.tabIndex = -1;
+    this.root.__rgView = this;
+    this.boundClick = (event) => this.onClick(event);
+    const themeSignature = gridThemeSignature(this.nativeElement);
+    const cachedTheme = runtime.gridThemeSignature === themeSignature ? (this.session?.themePalette || runtime.gridThemePalette) : null;
+    if (cachedTheme) applyGridThemeValues(this.root, cachedTheme);
+    else {
+      const initialTheme = syncGridThemeFromHost(this.nativeElement, this.root);
+      runtime.gridThemePalette = initialTheme.values;
+      runtime.gridThemeSignature = themeSignature;
+      if (this.session) this.session.themePalette = initialTheme.values;
+    }
+    this.themeBridge = createGridThemeBridge(this.nativeElement, this.root, {
+      initialSync: false,
+      onSync: (result) => {
+        runtime.gridThemePalette = result.values;
+        runtime.gridThemeSignature = gridThemeSignature(this.nativeElement);
+        if (this.session) this.session.themePalette = result.values;
+      },
+    });
+    this.session?.addView(this);
+    this.mount();
+  }
+
+  mount() {
+    this.host.appendChild(this.root);
+    this.root.addEventListener("click", this.boundClick);
+    this.render();
+  }
+
+  /** The source grid can shrink under a saved reference; clamp instead of rendering holes. */
+  clampedRange() {
+    const rowCount = this.model.rowCount; const colCount = this.model.colCount;
+    return {
+      startRow: clamp(this.range.startRow, 0, Math.max(0, rowCount - 1)),
+      endRow: clamp(this.range.endRow, 0, Math.max(0, rowCount - 1)),
+      startCol: clamp(this.range.startCol, 0, Math.max(0, colCount - 1)),
+      endCol: clamp(this.range.endCol, 0, Math.max(0, colCount - 1)),
+    };
+  }
+
+  caption() {
+    const caption = document.createElement("div"); caption.className = "rg-range-caption";
+    const text = document.createElement("span"); text.className = "rg-range-label"; text.textContent = this.label;
+    const source = document.createElement("span"); source.className = "rg-range-source"; source.textContent = "↗";
+    source.title = "Open the source table block"; source.setAttribute("role", "button");
+    caption.append(text, source);
+    this.captionElement = caption; this.captionLabel = text;
+    return caption;
+  }
+
+  rangeCell(row, col, range) {
+    const cell = document.createElement("div");
+    cell.className = "rg-cell rg-range-cell"; cell.tabIndex = -1;
+    this.positionRangeCell(cell, row, col, range);
+    return cell;
+  }
+
+  positionRangeCell(cell, row, col, range) {
+    const merge = this.model.mergeAt(row, col);
+    const rowSpan = Math.min(merge?.rowSpan || 1, range.endRow - row + 1);
+    const colSpan = Math.min(merge?.colSpan || 1, range.endCol - col + 1);
+    cell.dataset.uid = this.model.getCell(row, col)?.uid || "";
+    cell.dataset.row = String(row); cell.dataset.col = String(col);
+    cell.classList.toggle("rg-cell--merged", Boolean(merge));
+    cell.classList.toggle("rg-cell--header", this.model.isHeaderRow(row) || this.model.isHeaderColumn(col));
+    cell.classList.remove("rg-cell--align-left", "rg-cell--align-center", "rg-cell--align-right");
+    const alignment = this.model.getAlignment(row, col);
+    if (alignment) cell.classList.add(`rg-cell--align-${alignment}`);
+    cell.style.gridRow = `${row - range.startRow + 1} / span ${rowSpan}`;
+    cell.style.gridColumn = `${col - range.startCol + 1} / span ${colSpan}`;
+  }
+
+  renderRangeCellValue(cell, row, col, engine) {
+    const raw = this.model.getRaw(row, col); const value = engine.evaluateCell(row, col);
+    const formula = raw.startsWith("=") && !raw.startsWith("==");
+    const content = ensureCellContent(cell);
+    cell.dataset.rgRaw = raw;
+    cell.classList.toggle("rg-cell--formula", formula && this.model.colorFormulaCells);
+    cell.classList.toggle("rg-cell--error", formula && String(value).startsWith("#"));
+    return renderStableCellContent(content, { raw, value, formula, renderRich: paintRichCellContent });
+  }
+
+  render() {
+    if (this.disposed) return;
+    if (!this.captionElement) this.root.appendChild(this.caption());
+    else if (this.captionLabel.textContent !== this.label) this.captionLabel.textContent = this.label;
+    const viewport = this.viewport || (() => {
+      const element = document.createElement("div"); element.className = "rg-viewport rg-range-viewport"; this.root.appendChild(element); this.viewport = element; return element;
+    })();
+    const grid = this.gridElement || (() => {
+      const element = document.createElement("div"); element.className = "rg-grid rg-grid--clean rg-range-grid"; viewport.appendChild(element); this.gridElement = element; return element;
+    })();
+    const range = this.clampedRange();
+    grid.style.width = "max-content";
+    grid.style.gridTemplateColumns = gridTrackTemplate(this.model, "col", range.startCol, range.endCol);
+    grid.style.gridTemplateRows = gridTrackTemplate(this.model, "row", range.startRow, range.endRow);
+    const engine = this.formulaEngine = new FormulaEngine(this.model, runtime.registries?.formulaFunctions, runtime.registries?.formulaFunctionMetadata);
+    const next = new Map(); const coordinates = new Map();
+    for (let row = range.startRow; row <= range.endRow && this.model.rowCount && this.model.colCount; row += 1) {
+      for (let col = range.startCol; col <= range.endCol; col += 1) {
+        if (this.model.isCovered(row, col)) continue;
+        const key = `${row}:${col}`;
+        // Reusing the mounted node is what makes a repeat render a no-op: `renderStableCellContent`
+        // short-circuits on the unchanged render key, so nothing writes `textContent`.
+        const cell = this.cells.get(key) || this.rangeCell(row, col, range);
+        if (this.cells.has(key)) this.positionRangeCell(cell, row, col, range); else grid.appendChild(cell);
+        this.renderRangeCellValue(cell, row, col, engine);
+        next.set(key, cell);
+        const uid = this.model.getCell(row, col)?.uid;
+        if (uid) coordinates.set(uid, { row, col });
+      }
+    }
+    for (const [key, cell] of this.cells) if (next.get(key) !== cell) { releaseRichCellHosts(cell); cell.remove(); }
+    this.cells = next; this.cellCoordinatesByUid = coordinates;
+  }
+
+  refreshValues() {
+    if (this.disposed) return;
+    const changedCells = this.model.lastChangedCells || [];
+    if (!changedCells.length) return;
+    const engine = this.formulaEngine || (this.formulaEngine = new FormulaEngine(this.model, runtime.registries?.formulaFunctions, runtime.registries?.formulaFunctionMetadata));
+    const affected = new Set();
+    for (const [row, col] of changedCells) for (const key of engine.invalidateCell(row, col)) affected.add(key);
+    for (const key of affected) {
+      const cell = this.cells.get(key); if (!cell) continue;
+      const [row, col] = key.split(":").map(Number);
+      this.renderRangeCellValue(cell, row, col, engine);
+    }
+  }
+
+  /** Row-deletion patching is a `GridView` optimisation; a range excerpt simply re-renders. */
+  patchRowDeletion() { return false; }
+
+  captureRowDeletionContext() { return null; }
+
+  /** A read-only excerpt owns no badge chrome — reference and comment counts live on the source
+   *  grid.  This exists because the session fans out to it unconditionally. */
+  updateReferenceCountBadges() { return false; }
+
+  onClick(event) {
+    if (event.target?.closest?.(".rg-range-source")) return openRoamBlock(this.model.tableUid, "table");
+    const cell = event.target?.closest?.(".rg-cell");
+    if (!cell) return null;
+    return openRoamBlock(cell.dataset?.uid, "cell");
+  }
+
+  dispose({ releaseNative = true } = {}) {
+    this.disposed = true;
+    this.root.removeEventListener("click", this.boundClick);
+    releaseRichCellHosts(this.root);
+    this.root.remove();
+    this.themeBridge?.dispose?.(); this.themeBridge = null;
+    this.cells.clear(); this.cellCoordinatesByUid.clear();
+    this.session?.removeView(this);
+    if (releaseNative) this.nativeElement?.classList.add("rg-range-restored");
+  }
+}
+
+function openRoamBlock(uid, kind = "block") {
+  if (!uid || String(uid).startsWith("rg_")) return toast(`This ${kind} does not have a source block UID`, "warning");
+  try {
+    const result = roam().ui?.mainWindow?.openBlock?.({ block: { uid } });
+    if (result?.catch) result.catch((error) => toast(`Could not open source: ${error.message}`, "danger"));
+    return result;
+  } catch (error) { return toast(`Could not open source: ${error.message}`, "danger"); }
+}
+
 export class AsyncFormulaEngine {
   constructor(store, functions = defaultFormulaFunctions(), metadata = defaultFormulaFunctionMetadata()) {
     this.store = store;
@@ -6849,7 +7074,25 @@ export class LargeGridView {
       return;
     }
     const text = event.clipboardData?.getData("text/plain"); if (!text) return;
+    const referenced = parseRangeComponent(text);
+    if (referenced) { event.preventDefault(); await this.pasteReferencedRange(referenced); return; }
     event.preventDefault(); const matrix = parseDelimited(text, text.includes("\t") ? "\t" : detectDelimiter(text));
+    const startRow = this.selection.startRow; const startCol = this.selection.startCol;
+    await this.store.applyMatrix(startRow, startCol, matrix);
+    const coordinates = matrix.flatMap((values, row) => values.map((_value, col) => [startRow + row, startCol + col]));
+    this.invalidateLargeCells(coordinates); this.scheduleSave(); this.scheduleRender();
+  }
+  /** A large grid cannot host a range view (its cells are JSON rows with no block uid), so a range
+   *  component pastes the referenced values instead — the same live `((uid))` matrix a native grid
+   *  receives, which the large-cell renderer resolves through the ordinary rich-content path. */
+  async pasteReferencedRange(spec, resolve = resolveSourceModel) {
+    let sourceModel;
+    try { sourceModel = resolve(spec.tableUid); }
+    catch (error) { return toast(`Could not read the referenced grid: ${error.message}`, "danger"); }
+    if (!sourceModel) return toast("Could not read the referenced grid", "danger");
+    let matrix;
+    try { matrix = selectionBlockReferenceMatrix(sourceModel, spec.range); }
+    catch (error) { return toast(error.message, "warning"); }
     const startRow = this.selection.startRow; const startCol = this.selection.startCol;
     await this.store.applyMatrix(startRow, startCol, matrix);
     const coordinates = matrix.flatMap((values, row) => values.map((_value, col) => [startRow + row, startCol + col]));
@@ -7150,6 +7393,51 @@ function mountNativeInstance(nativeElement, info, surface = instanceSurface(nati
   return view;
 }
 
+export function rangeButtonsWithin(root) {
+  if (!root) return [];
+  const values = [];
+  if (root.matches?.(RANGE_BUTTON_SELECTOR)) values.push(root);
+  for (const node of root.querySelectorAll?.(RANGE_BUTTON_SELECTOR) || []) if (!values.includes(node)) values.push(node);
+  return values;
+}
+
+/** Roam block inputs are `block-input-<window-id>-<block-uid>`; the uid is the trailing segment. */
+export function rangeBlockUid(element) {
+  if (!element) return null;
+  const dataUid = element.dataset?.uid || element.getAttribute?.("data-uid");
+  if (dataUid) return String(dataUid);
+  return /-([\w-]{9})$/.exec(String(element.id || ""))?.[1] || null;
+}
+
+/**
+ * Parses the range spec behind a rendered component button.  Specs are cached per block uid and
+ * invalidated when Roam replaces the button node, so a re-render costs one identity comparison.
+ */
+export function rangeInstanceInfo(button, entries = runtime.rangeSpecs, readString = blockString) {
+  if (!button) return null;
+  const blockUid = rangeBlockUid(button.closest?.(".rm-block__input"));
+  if (!blockUid) return null;
+  const cached = entries?.get?.(blockUid);
+  if (cached && cached.button === button) return cached.info;
+  let text = "";
+  try { text = readString(blockUid) || ""; } catch { text = ""; }
+  const spec = parseRangeComponent(text);
+  const info = spec ? { ...spec, blockUid } : null;
+  entries?.set?.(blockUid, { button, info });
+  return info;
+}
+
+function mountRangeInstance(button, info, surface = instanceSurface(button)) {
+  const current = runtime.viewsByNative.get(button);
+  if (current?.root?.isConnected) return current;
+  const session = getOrCreateNativeSession(info.tableUid);
+  const view = new RangeGridView({ host: button.parentElement, session, range: info.range, label: info.label, nativeElement: button, surface });
+  view.root.dataset.roamGridUid = info.tableUid; view.root.dataset.roamGridInstance = cryptoId();
+  runtime.views.add(view); runtime.viewsByNative.set(button, view);
+  button.classList.remove("rg-range-restored");
+  return view;
+}
+
 function cleanupDisconnectedViews() {
   for (const view of [...runtime.views]) {
     if (view.root?.isConnected && view.nativeElement?.isConnected) continue;
@@ -7241,14 +7529,29 @@ export function installPortalObservers({ MutationObserverClass = globalThis.Muta
 async function scanMounts() {
   if (!runtime.metadata) return;
   const roots = runtime.pendingScanRoots.size ? [...runtime.pendingScanRoots] : [document]; runtime.pendingScanRoots.clear();
-  for (const root of roots) for (const nativeElement of nativeTablesWithin(root)) {
-    const info = nativeTableInstanceInfo(nativeElement); if (!info || runtime.viewsByNative.get(nativeElement)?.root?.isConnected) continue;
-    try { mountNativeInstance(nativeElement, info); }
-    catch (error) {
-      console.error("[roam-grid] Mount failed", info.uid, error);
-      nativeElement.classList.remove("rg-native-hidden", "rg-native-pending");
-      nativeElement.parentElement?.querySelector?.(".rg-root")?.remove();
-      toast(`Roam Grid could not enhance ${info.uid}: ${error.message}`, "danger", 10000);
+  for (const root of roots) {
+    for (const nativeElement of nativeTablesWithin(root)) {
+      const info = nativeTableInstanceInfo(nativeElement); if (!info || runtime.viewsByNative.get(nativeElement)?.root?.isConnected) continue;
+      try { mountNativeInstance(nativeElement, info); }
+      catch (error) {
+        console.error("[roam-grid] Mount failed", info.uid, error);
+        nativeElement.classList.remove("rg-native-hidden", "rg-native-pending");
+        nativeElement.parentElement?.querySelector?.(".rg-root")?.remove();
+        toast(`Roam Grid could not enhance ${info.uid}: ${error.message}`, "danger", 10000);
+      }
+    }
+    // A range button we do not claim must be un-hidden, or the pre-paint rule leaves blank space.
+    for (const button of rangeButtonsWithin(root)) {
+      if (runtime.viewsByNative.get(button)?.root?.isConnected) continue;
+      const info = rangeInstanceInfo(button);
+      const entry = info ? runtime.metadata.entries.get(info.tableUid) : null;
+      if (!entry || entry.value?.mode === "large") { button.classList.add("rg-range-restored"); continue; }
+      try { mountRangeInstance(button, info); }
+      catch (error) {
+        console.error("[roam-grid] Range mount failed", info.tableUid, error);
+        button.classList.add("rg-range-restored");
+        button.parentElement?.querySelector?.(".rg-range")?.remove();
+      }
     }
   }
   for (const [uid, entry] of runtime.metadata.entries) {
@@ -7326,7 +7629,7 @@ async function onload({ extensionAPI }) {
 }
 
 async function onunload() {
-  runtime.observer?.disconnect(); runtime.observer = null; disposePortalObservers(); runtime.pendingScanRoots.clear(); runtime.scanQueued = false;
+  runtime.observer?.disconnect(); runtime.observer = null; disposePortalObservers(); runtime.pendingScanRoots.clear(); runtime.rangeSpecs.clear(); runtime.scanQueued = false;
   for (const uid of [...runtime.sessions.keys()]) disposeNativeSession(uid, true);
   for (const mount of runtime.largeMounts.values()) mount.dispose(); runtime.largeMounts.clear(); mounting.clear();
   clearUndoHistories();
