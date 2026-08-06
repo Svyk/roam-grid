@@ -183,7 +183,8 @@ test("one native session shares a model, watch, repaint, and undo history across
   assert.equal(first.refreshCount, 1); assert.equal(second.refreshCount, 1);
   assert.equal(session.undo(), true);
   assert.equal(first.model.getRaw(0, 0), "1");
-  assert.equal(first.renderCount, 1); assert.equal(second.renderCount, 1);
+  assert.equal(first.renderCount, 0); assert.equal(second.renderCount, 0);
+  assert.equal(first.refreshCount, 2); assert.equal(second.refreshCount, 2);
   session.dispose(); assert.equal(disposed, 1);
 });
 

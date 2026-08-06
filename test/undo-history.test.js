@@ -2,8 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   GridModel,
+  NativeGridSession,
+  NativeTableAdapter,
   UndoHistory,
   clearUndoHistories,
+  externalContentUndoEntry,
   gridShapeSignature,
   releaseUndoHistory,
   undoHistories,
@@ -368,4 +371,361 @@ test("entry lane and metadata separate a content edit from a layout change", () 
   const layout = model.history.entries.at(-1);
   assert.equal(layout.lane, "structural");
   assert.equal(layout.metadata, true);
+});
+
+// ---------------------------------------------------------------------------
+// GOAL-2A: the history wired into NativeGridSession.
+// ---------------------------------------------------------------------------
+
+function sessionHarness({ rows = null, tableUid = "table-undo", base = new Map([["c00", "0:0"], ["c01", "0:1"]]) } = {}) {
+  const model = new GridModel({ rows: rows || [[{ uid: "c00", raw: "0:0" }, { uid: "c01", raw: "0:1" }]], columnIds: ["col0", "col1"], tableUid });
+  const history = new UndoHistory();
+  model.history = history;
+  const flushed = [];
+  const session = Object.assign(Object.create(NativeGridSession.prototype), {
+    tableUid, model, history, views: new Set(),
+    adapter: {
+      model,
+      getBaseRaw: (uid) => (base && base.has(uid) ? base.get(uid) : null),
+      saveContent: async (batch) => { flushed.push([...batch.values()]); return { saved: [...batch.values()], skipped: [] }; },
+      load: () => model,
+      acceptExternalTree() {},
+    },
+    dirtyCells: new Map(), editRevisions: new Map(),
+    metadataDirty: false, structuralPending: false, contentSavePromise: null, disposed: false,
+    changeVersion: 0, savedVersion: 0, saveTimer: null, renders: 0, refreshes: 0,
+    renderStructural() { this.renders += 1; },
+    refreshValues() { this.refreshes += 1; },
+    scheduleReferenceCountRefresh() {},
+    setSaving() {},
+  });
+  return { model, history, session, flushed };
+}
+
+function captureTimeouts(t) {
+  const delays = []; const real = globalThis.setTimeout;
+  globalThis.setTimeout = (fn, delay, ...rest) => { delays.push(delay); return real(fn, delay, ...rest); };
+  t.after(() => { globalThis.setTimeout = real; });
+  return delays;
+}
+
+test("a content undo restores the cell, takes the 220 ms lane, and never sets metadataDirty", (t) => {
+  const delays = captureTimeouts(t);
+  const { model, session } = sessionHarness({ base: new Map([["c00", "edited"]]) });
+  model.transact("edit", () => model.setRaw(0, 0, "edited"));
+  session.queueChangedCells();
+  assert.equal(session.dirtyCells.size, 0, "the edit already matches its saved base");
+
+  delays.length = 0;
+  assert.equal(session.undo(), true);
+  clearTimeout(session.saveTimer);
+
+  assert.equal(model.getRaw(0, 0), "0:0", "the cell is restored");
+  assert.equal(session.refreshes, 1, "a content undo refreshes values");
+  assert.equal(session.renders, 0, "a content undo never does a structural render");
+  assert.equal(session.metadataDirty, false, "a content undo does not dirty the layout metadata");
+  assert.deepEqual(delays, [220], "a content undo schedules the 220 ms content lane, not the 0 ms structural lane");
+
+  // Positive control: the pre-2A `markChanged(true)` undo fails both assertions.
+  const controlDelays = []; const real = globalThis.setTimeout;
+  const control = sessionHarness({ tableUid: "table-control", base: new Map([["c00", "edited"]]) });
+  control.model.transact("edit", () => control.model.setRaw(0, 0, "edited"));
+  const controlEntry = control.history.popUndo();
+  control.model.transactSilently(() => control.history.applyInverse(control.model, controlEntry));
+  globalThis.setTimeout = (fn, delay, ...rest) => { controlDelays.push(delay); return real(fn, delay, ...rest); };
+  control.session.metadataDirty ||= true;
+  control.session.markChanged(true);
+  globalThis.setTimeout = real;
+  clearTimeout(control.session.saveTimer);
+  assert.throws(() => {
+    assert.equal(control.session.metadataDirty, false);
+    assert.deepEqual(controlDelays, [220]);
+  }, "the content-lane assertions catch an undo that takes the structural lane");
+});
+
+test("a structural undo renders, prunes, and takes the 0 ms structural lane", (t) => {
+  const delays = captureTimeouts(t);
+  const { model, session } = sessionHarness();
+  model.transact("insert", () => model.insertRows(1, 1));
+  delays.length = 0;
+  assert.equal(session.undo(), true);
+  clearTimeout(session.saveTimer);
+
+  assert.equal(model.rowCount, 1);
+  assert.equal(session.renders, 1); assert.equal(session.refreshes, 0);
+  assert.equal(session.metadataDirty, true, "a layout inverse carries metadata");
+  assert.deepEqual(delays, [0], "a structural undo flushes immediately");
+});
+
+test("edit, undo, then edit another cell never resurrects the undone value", async () => {
+  const { model, session, flushed } = sessionHarness();
+  model.transact("poison", () => model.setRaw(0, 0, "poison"));
+  session.queueChangedCells();
+  assert.deepEqual([...session.dirtyCells.keys()], ["c00"], "the edit is pending");
+
+  assert.equal(session.undo(), true);
+  clearTimeout(session.saveTimer);
+  assert.equal(session.dirtyCells.size, 0, "the undo removed the poisoned dirty entry");
+
+  model.transact("next cell", () => model.setRaw(0, 1, "next"));
+  session.queueChangedCells();
+  session.markChanged(false);
+  clearTimeout(session.saveTimer);
+  await NativeGridSession.prototype.flushContentSave.call(session);
+
+  assert.deepEqual(flushed.map((batch) => batch.map((change) => change.uid)), [["c01"]]);
+  assert.ok(!JSON.stringify(flushed).includes("poison"), "the flushed batch never carries the undone value");
+
+  // Positive control: the pre-2A undo (no re-queue after the inverse) flushes the undone value.
+  const controlFlushed = [];
+  const control = sessionHarness({ tableUid: "table-control-2" });
+  control.session.adapter.saveContent = async (batch) => { controlFlushed.push([...batch.values()]); return { saved: [...batch.values()], skipped: [] }; };
+  control.model.transact("poison", () => control.model.setRaw(0, 0, "poison"));
+  control.session.queueChangedCells();
+  const controlEntry = control.history.popUndo();
+  control.model.transactSilently(() => control.history.applyInverse(control.model, controlEntry));
+  control.model.transact("next cell", () => control.model.setRaw(0, 1, "next"));
+  control.session.queueChangedCells();
+  await NativeGridSession.prototype.flushContentSave.call(control.session);
+  clearTimeout(control.session.saveTimer);
+  assert.throws(() => {
+    assert.ok(!JSON.stringify(controlFlushed).includes("poison"));
+  }, "the resurrection assertion catches an undo that leaves the poisoned dirty entry behind");
+  assert.ok(JSON.stringify(controlFlushed).includes("poison"), "the unqueued undo really did re-flush the undone value");
+});
+
+test("undo survives a self-echo that missed the fingerprint and reached handleExternalChange", () => {
+  const { model, session } = sessionHarness();
+  model.transact("edit", () => model.setRaw(0, 0, "mine"));
+  const external = new GridModel({ rows: [[{ uid: "c00", raw: "mine" }, { uid: "c01", raw: "0:1" }]] });
+
+  session.handleExternalChange(external, { type: "content", structural: false, tree: {}, changes: [{ uid: "c00", raw: "mine" }] });
+
+  assert.equal(session.history.entries.length, 1, "the echo records no entry of its own");
+  assert.equal(session.history.entries[0].stale.size, 0, "the echo does not mark the local entry stale");
+  assert.equal(session.refreshes, 0, "an echo that changes nothing repaints nothing");
+  assert.equal(session.undo(), true);
+  clearTimeout(session.saveTimer);
+  assert.equal(model.getRaw(0, 0), "0:0", "the undo still restores the pre-edit value");
+});
+
+test("undo after an external non-conflicting change keeps the external value and clears redo", () => {
+  const { model, session, history } = sessionHarness();
+  model.transact("edit", () => { model.setRaw(0, 0, "local-a"); model.setRaw(0, 1, "local-b"); });
+  model.transact("second", () => model.setRaw(0, 0, "local-a2"));
+  assert.equal(session.undo(), true);
+  clearTimeout(session.saveTimer);
+  assert.equal(history.redoEntries.length, 1);
+  session.dirtyCells.clear(); // the local edits are already persisted, so the external edit is non-conflicting
+
+  const external = new GridModel({ rows: [[{ uid: "c00", raw: "remote" }, { uid: "c01", raw: "local-b" }]], columnIds: ["col0", "col1"] });
+  session.handleExternalChange(external, { type: "content", structural: false, tree: {}, changes: [{ uid: "c00", raw: "remote" }] });
+
+  assert.equal(model.getRaw(0, 0), "remote");
+  assert.equal(history.redoEntries.length, 0, "the external edit hit a redo entry's uid and cleared redo");
+  assert.equal(history.entries.length, 1, "a rebasable uid records no separate external entry");
+
+  assert.equal(session.undo(), true);
+  clearTimeout(session.saveTimer);
+  assert.equal(model.getRaw(0, 0), "remote", "the external value survives the undo");
+  assert.equal(model.getRaw(0, 1), "0:1", "every other cell in the entry still reverts");
+});
+
+test("an external change to a cell the history does not own becomes its own undoable entry", () => {
+  const { model, session, history } = sessionHarness();
+  const external = new GridModel({ rows: [[{ uid: "c00", raw: "remote" }, { uid: "c01", raw: "0:1" }]] });
+  session.handleExternalChange(external, { type: "content", structural: false, tree: {}, changes: [{ uid: "c00", raw: "remote" }] });
+
+  assert.equal(history.entries.length, 1, "the external edit is recorded rather than invisible");
+  assert.equal(history.entries[0].lane, "content");
+  assert.equal(history.entries[0].metadata, false);
+  assert.equal(session.undo(), true);
+  clearTimeout(session.saveTimer);
+  assert.equal(model.getRaw(0, 0), "0:0", "undo reverts the external edit");
+  assert.equal(session.redo(), true);
+  clearTimeout(session.saveTimer);
+  assert.equal(model.getRaw(0, 0), "remote");
+});
+
+test("externalContentUndoEntry drops no-op changes and derives a content-lane entry", () => {
+  const model = grid(2, 2);
+  assert.equal(externalContentUndoEntry(model, [{ uid: "c00", from: "same", to: "same" }]), null);
+  const entry = externalContentUndoEntry(model, [{ uid: "c00", from: "was", to: "now" }, { uid: "c11", from: "x", to: "x" }]);
+  assert.deepEqual(entry.inverse, [{ op: "setRaw", uid: "c00", raw: "was" }]);
+  assert.deepEqual(entry.forward, [{ op: "setRaw", uid: "c00", raw: "now" }]);
+  assert.deepEqual(entry.touched, ["c00"]);
+  assert.equal(entry.checkpoint, null); assert.equal(entry.metadata, false);
+  assert.equal(entry.shapeSignature, gridShapeSignature(model));
+});
+
+test("an external structural change truncates the history instead of discarding it", () => {
+  const { model, session, history } = sessionHarness();
+  model.transact("edit", () => model.setRaw(0, 0, "local"));
+  const external = new GridModel({ ...clone(model.snapshot()), tableUid: model.tableUid });
+
+  session.handleExternalChange(external, { type: "structural", structural: true, tree: {}, changes: [] });
+
+  assert.equal(history.entries.length, 1, "a matching shape keeps the entry");
+  assert.strictEqual(session.model.history, history, "the replacement model inherits the durable history");
+  assert.strictEqual(session.history, history);
+});
+
+test("a failed structural save preserves undo and clears only redo", async () => {
+  const { model, session, history } = sessionHarness();
+  model.transact("edit", () => model.setRaw(0, 0, "a"));
+  model.transact("more", () => model.setRaw(0, 1, "b"));
+  assert.equal(session.undo(), true);
+  clearTimeout(session.saveTimer);
+  assert.equal(history.redoEntries.length, 1);
+  const undoDepth = history.entries.length;
+
+  model.baseSnapshot = model.snapshot(); model.baseFingerprint = "base";
+  session.adapter.save = async () => { throw new Error("structural save failed"); };
+  session.structuralPending = true; session.changeVersion = 9; session.savedVersion = 0;
+  await NativeGridSession.prototype.flushSave.call(session);
+  clearTimeout(session.saveTimer);
+
+  assert.equal(history.entries.length, undoDepth, "undo survives the failed save");
+  assert.equal(history.redoEntries.length, 0, "redo is invalidated");
+  assert.equal(history.lastInvalidation, "structural-save-error");
+});
+
+test("a failed content save invalidates redo without touching undo", async () => {
+  const { model, session, history } = sessionHarness();
+  model.transact("edit", () => model.setRaw(0, 0, "a"));
+  model.transact("more", () => model.setRaw(0, 1, "b"));
+  assert.equal(session.undo(), true);
+  clearTimeout(session.saveTimer);
+  const undoDepth = history.entries.length;
+
+  session.adapter.saveContent = async () => { throw new Error("content save failed"); };
+  session.dirtyCells.set("c00", { uid: "c00", baseRaw: "0:0", raw: "a", revision: 1 });
+  await NativeGridSession.prototype.flushContentSave.call(session);
+  clearTimeout(session.saveTimer);
+
+  assert.equal(history.entries.length, undoDepth);
+  assert.equal(history.redoEntries.length, 0);
+  assert.equal(history.lastInvalidation, "content-save-error");
+});
+
+test("the history outlives session dispose and remount as the same object", () => {
+  clearUndoHistories();
+  const rows = () => [[{ uid: "c00", raw: "0:0" }]];
+  const adapter = { model: null, load: () => new GridModel({ rows: rows(), tableUid: "table-remount" }), watchExternal: () => () => {}, dispose() {} };
+  const first = new NativeGridSession("table-remount", { adapter });
+  first.model.transact("edit", () => first.model.setRaw(0, 0, "kept"));
+  assert.equal(first.history.entries.length, 1);
+
+  first.dispose();
+  assert.ok(undoHistories.has("table-remount"), "dispose does not release the history");
+
+  const second = new NativeGridSession("table-remount", { adapter });
+  assert.strictEqual(second.history, first.history, "the remounted session resumes the same history object");
+  assert.equal(second.model.getRaw(0, 0), "0:0", "the remounted model is a fresh load");
+  assert.equal(second.undo(), true);
+  clearTimeout(second.saveTimer);
+  assert.equal(second.history.redoEntries.length, 1, "the entry moved to redo across the remount");
+  second.dispose();
+  clearUndoHistories();
+});
+
+function installGraphApi(t) {
+  const calls = { creates: [], updates: [], moves: [], deletes: [] };
+  let sequence = 0;
+  globalThis.window = {
+    roamAlphaAPI: {
+      util: { generateUID: () => `roam${String(sequence += 1).padStart(5, "0")}` },
+      data: {
+        block: {
+          create: async ({ block }) => { calls.creates.push(block.uid); },
+          update: async ({ block }) => { calls.updates.push(block.uid); },
+          move: async ({ block }) => { calls.moves.push(block.uid); },
+          delete: async ({ block }) => { calls.deletes.push(block.uid); },
+        },
+      },
+    },
+  };
+  t.after(() => { delete globalThis.window; });
+  return calls;
+}
+
+function treeFromModel(model) {
+  return {
+    uid: model.tableUid, string: "{{[[table]]}}", order: 0,
+    children: model.rows.map((row, index) => {
+      let node = null;
+      for (let col = row.length - 1; col >= 0; col -= 1) {
+        node = { uid: row[col].uid, string: row[col].raw === "" ? " " : row[col].raw, order: col ? 0 : index, children: node ? [node] : [] };
+      }
+      return node;
+    }),
+  };
+}
+
+function localGrid() {
+  return new GridModel({
+    rows: [[{ uid: "rg_a", raw: "a" }, { uid: "rg_b", raw: "b" }], [{ uid: "rg_c", raw: "c" }, { uid: "rg_d", raw: "d" }]],
+    columnIds: ["col0", "col1"], tableUid: "table0001",
+  });
+}
+
+function stubAdapter(model) {
+  return Object.assign(Object.create(NativeTableAdapter.prototype), {
+    tableUid: "table0001", model, metadataStore: { createStaging: async () => "staging01" }, getBaseRaw: () => null,
+  });
+}
+
+test("undo after a uid remap addresses the new uids and stays on the sameShape save path", async (t) => {
+  const calls = installGraphApi(t);
+  const model = localGrid();
+  const history = new UndoHistory(); model.history = history;
+  model.transact("hard edit", () => model.setRaw(0, 0, "checkpointed"), { hard: true });
+  assert.ok(history.entries.at(-1).checkpoint, "the checkpoint holds the pre-mint uids");
+
+  const adapter = stubAdapter(model);
+  await NativeTableAdapter.prototype.reconcile.call(adapter, model, { uid: "table0001", string: "{{[[table]]}}", order: 0, children: [] });
+  assert.equal(calls.creates.length, 4, "the first save minted a Roam uid per cell");
+  assert.ok(model.rows.flat().every((cell) => !cell.uid.startsWith("rg_")), "the model now carries Roam uids");
+  assert.ok(history.entries.at(-1).checkpoint.rows.flat().every((cell) => !cell.uid.startsWith("rg_")), "the checkpoint was remapped with it");
+
+  const graphTree = treeFromModel(model);
+  const { session } = sessionHarness({ tableUid: "table0001" });
+  session.model = model; session.history = history; session.adapter = adapter;
+  model.transact("later edit", () => model.setRaw(1, 1, "later"));
+
+  assert.equal(session.undo(), true); clearTimeout(session.saveTimer);
+  assert.equal(session.undo(), true); clearTimeout(session.saveTimer);
+  assert.equal(model.getRaw(0, 0), "a", "the checkpoint restored the pre-edit content");
+
+  calls.creates.length = 0; calls.updates.length = 0;
+  await NativeTableAdapter.prototype.persistModel.call(adapter, model, graphTree);
+  assert.deepEqual(calls.creates, [], "zero createBlock calls: every cell block, and every inbound ((ref)) to it, survives");
+  assert.ok(calls.updates.length > 0, "the sameShape path issued plain updates instead");
+
+  // Positive control: without the remap the checkpoint restores the pre-mint uids and
+  // persistModel falls through to reconcile, recreating every cell block.
+  const controlCalls = calls;
+  const controlModel = localGrid();
+  const controlHistory = new UndoHistory(); controlModel.history = controlHistory;
+  controlModel.transact("hard edit", () => controlModel.setRaw(0, 0, "checkpointed"), { hard: true });
+  const controlAdapter = stubAdapter(controlModel);
+  controlHistory.remapUids = () => 0;
+  await NativeTableAdapter.prototype.reconcile.call(controlAdapter, controlModel, { uid: "table0001", string: "{{[[table]]}}", order: 0, children: [] });
+  const controlTree = treeFromModel(controlModel);
+  const controlEntry = controlHistory.popUndo();
+  controlModel.transactSilently(() => controlHistory.applyInverse(controlModel, controlEntry));
+  controlCalls.creates.length = 0;
+  await NativeTableAdapter.prototype.persistModel.call(controlAdapter, controlModel, controlTree);
+  assert.throws(() => {
+    assert.deepEqual(controlCalls.creates, []);
+  }, "the zero-createBlock assertion catches an unremapped checkpoint");
+  assert.equal(controlCalls.creates.length, 4, "the unremapped undo really did recreate every cell block");
+});
+
+test("rebasableUids reports every uid the history can rebase in place", () => {
+  const model = grid(2, 2);
+  model.transact("edit", () => { model.setRaw(0, 0, "a"); model.setRaw(1, 1, "b"); });
+  model.transact("resize", () => { model.widths[model.columnIds[0]] = 180; });
+  assert.deepEqual([...model.history.rebasableUids()].sort(), ["c00", "c11"]);
+  assert.deepEqual([...new UndoHistory().rebasableUids()], []);
 });

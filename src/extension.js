@@ -1371,6 +1371,24 @@ function buildUndoEntry(model, { label = "", before, beforeShape, afterShape, re
   };
 }
 
+// An external content merge is not recorded by `transact`, so its entry is
+// synthesized from the forward direction: the caller supplies `from`/`to` per
+// uid and the inverse is derived.  Only changes the history cannot already
+// rebase (see `rebasableUids`) become an entry; a uid an existing entry owns is
+// handled by `onExternalContent` marking it stale instead.
+export function externalContentUndoEntry(model, changes) {
+  const applicable = (changes || []).filter((change) => change?.uid && change.from !== change.to);
+  if (!applicable.length) return null;
+  undoEntrySequence += 1;
+  return {
+    id: `ue${undoEntrySequence}`, label: "External edit", at: Date.now(), lane: "content", metadata: false,
+    inverse: applicable.map((change) => ({ op: "setRaw", uid: change.uid, raw: change.from })),
+    forward: applicable.map((change) => ({ op: "setRaw", uid: change.uid, raw: change.to })),
+    touched: [...new Set(applicable.map((change) => change.uid))], shapeSignature: gridShapeSignature(model),
+    checkpoint: null, forwardCheckpoint: null, trashUid: null, stale: new Set(),
+  };
+}
+
 export class UndoHistory {
   constructor({ limit = MAX_UNDO_ENTRIES, checkpointLimit = MAX_UNDO_CHECKPOINTS } = {}) {
     this.entries = [];
@@ -1435,6 +1453,12 @@ export class UndoHistory {
       remapped += 1;
     }
     return remapped;
+  }
+
+  rebasableUids() {
+    const uids = new Set();
+    for (const entry of [...this.entries, ...this.redoEntries]) for (const op of entry.inverse) if (op.op === "setRaw") uids.add(op.uid);
+    return uids;
   }
 
   onExternalContent(changes = []) {
@@ -2915,13 +2939,14 @@ export class NativeTableAdapter {
     const stagingUid = await this.metadataStore.createStaging(this.tableUid);
     try {
       for (const row of currentRows) for (const cell of [...row].reverse()) await moveBlock(cell.uid, stagingUid, "last");
-      const desiredUids = new Set();
+      const desiredUids = new Set(); const minted = new Map();
       for (let rowIndex = 0; rowIndex < model.rowCount; rowIndex += 1) for (let colIndex = 0; colIndex < model.colCount; colIndex += 1) {
         const cell = model.rows[rowIndex][colIndex];
         const desired = cell.raw === "" ? " " : cell.raw;
         if (cell.uid.startsWith("rg_") || !current.some((old) => old.uid === cell.uid)) {
           const oldUid = cell.uid;
           cell.uid = await createBlock(stagingUid, desired);
+          minted.set(oldUid, cell.uid);
           if (colIndex === 0 && Object.hasOwn(model.rowHeights, oldUid)) {
             model.rowHeights[cell.uid] = model.rowHeights[oldUid];
             delete model.rowHeights[oldUid];
@@ -2931,6 +2956,10 @@ export class NativeTableAdapter {
         else if (current.find((old) => old.uid === cell.uid)?.string !== desired) await updateBlock(cell.uid, desired);
         desiredUids.add(cell.uid);
       }
+      // Undo entries address cells by uid; a checkpoint restored under the
+      // pre-mint uids would make the model disagree with the graph and force a
+      // full reconcile, destroying every inbound block reference to those cells.
+      if (minted.size) this.model?.history?.remapUids(minted);
       for (const cell of current) if (!desiredUids.has(cell.uid)) await deleteBlock(cell.uid);
       for (let rowIndex = 0; rowIndex < model.rowCount; rowIndex += 1) {
         const row = model.rows[rowIndex];
@@ -2952,6 +2981,10 @@ export class NativeGridSession {
     this.adapter = adapter || new NativeTableAdapter(tableUid);
     this.model = model || this.adapter.load();
     this.adapter.model = this.model;
+    // The history is keyed by table uid and outlives this session on purpose:
+    // unmount/remount must not silently throw the user's undo stack away.
+    this.history = undoHistoryFor(tableUid) || this.model.history;
+    this.model.history = this.history;
     this.onIdle = onIdle;
     this.views = new Set();
     this.themePalette = null;
@@ -3040,6 +3073,7 @@ export class NativeGridSession {
 
   replaceModel(model, { render = true } = {}) {
     this.model = model; this.adapter.model = model;
+    if (this.history) model.history = this.history;
     for (const view of this.views) {
       view.model = model;
       if (render) view.render();
@@ -3127,6 +3161,7 @@ export class NativeGridSession {
     } catch (error) {
       toast(error.message, "danger", 8000);
       this.dirtyCells.clear(); this.structuralPending = false; this.metadataDirty = false;
+      this.history?.invalidateRedo("content-save-error");
       try { this.replaceModel(this.adapter.load()); this.changeVersion = this.savedVersion; } catch { /* table may have disappeared */ }
     } finally {
       if (this.contentSavePromise === task) this.contentSavePromise = null;
@@ -3164,6 +3199,7 @@ export class NativeGridSession {
         if (payloadRawByUid.has(oldUid)) payloadRawByUid.set(newUid, payloadRawByUid.get(oldUid));
         if (payloadEditRevisions.has(oldUid)) payloadEditRevisions.set(newUid, payloadEditRevisions.get(oldUid));
       }
+      if (uidMap.size) this.history?.remapUids(uidMap);
       this.prunePersistenceUids();
       this.model.baseFingerprint = saved.baseFingerprint; this.model.baseSnapshot = saved.baseSnapshot; this.adapter.model = this.model;
       for (const [uid, dirty] of [...this.dirtyCells]) {
@@ -3180,6 +3216,7 @@ export class NativeGridSession {
       this.metadataDirty ||= saveMetadata;
       toast(error.message, "danger", 8000);
       this.dirtyCells.clear(); this.structuralPending = false;
+      this.history?.invalidateRedo("structural-save-error");
       try { this.replaceModel(this.adapter.load()); this.changeVersion = this.savedVersion; } catch { /* table may have disappeared */ }
     } finally { this.setSaving(false); }
   }
@@ -3189,6 +3226,9 @@ export class NativeGridSession {
     if (event.structural || event.type === "structural") {
       this.dirtyCells.clear(); this.structuralPending = false; this.metadataDirty = false;
       clearTimeout(this.saveTimer); this.changeVersion = this.savedVersion;
+      // Truncate to the entries recorded under the incoming shape instead of
+      // letting `replaceModel` implicitly discard the whole history.
+      this.history?.onExternalStructural(externalModel);
       this.replaceModel(externalModel, { render: false }); this.adapter.acceptExternalTree?.(event.tree, this.model); this.renderStructural();
       if (localPending || event.conflict) toast("Roam Grid reloaded because the table structure changed elsewhere.", "warning");
       return;
@@ -3200,20 +3240,56 @@ export class NativeGridSession {
       toast("Roam Grid reloaded because this cell changed elsewhere.", "warning");
       return;
     }
-    const changed = [];
+    const rebasable = this.history?.rebasableUids() || new Set();
+    const changed = []; const novel = []; const effective = [];
     for (const change of event.changes || []) {
       const coordinate = this.coordinateForUid(change.uid); if (!coordinate) continue;
       const cell = this.model.getCell(coordinate.row, coordinate.col); if (!cell || cell.raw === change.raw) continue;
+      effective.push(change);
+      if (!rebasable.has(cell.uid)) novel.push({ uid: cell.uid, from: cell.raw, to: change.raw });
       cell.raw = change.raw; changed.push([coordinate.row, coordinate.col]);
     }
+    // Only changes that actually moved a cell reach the history: an echo that
+    // reports the value we already hold must not mark an entry stale.
+    this.history?.onExternalContent(effective);
+    const externalEntry = this.history && novel.length ? externalContentUndoEntry(this.model, novel) : null;
+    if (externalEntry) this.history.pushUndo(externalEntry);
     this.model.lastChangedCells = changed;
     this.model.lastChangedCellUids = changed.map(([row, col]) => this.model.getCell(row, col)?.uid).filter(Boolean);
     this.adapter.acceptExternalTree?.(event.tree, this.model, externalModel);
     if (changed.length) this.refreshValues();
   }
 
-  undo() { if (this.model.undo()) { this.renderStructural(); this.markChanged(true); return true; } return false; }
-  redo() { if (this.model.redo()) { this.renderStructural(); this.markChanged(true); return true; } return false; }
+  undo() {
+    const entry = this.history?.popUndo();
+    if (!entry) return false;
+    const applied = this.model.transactSilently(() => this.history.applyInverse(this.model, entry));
+    this.history.pushRedo(entry);
+    return this.settleHistoryApply(entry, applied);
+  }
+
+  redo() {
+    const entry = this.history?.popRedo();
+    if (!entry) return false;
+    const applied = this.model.transactSilently(() => this.history.applyForward(this.model, entry));
+    this.history.pushUndo(entry);
+    return this.settleHistoryApply(entry, applied);
+  }
+
+  settleHistoryApply(entry, applied) {
+    this.model.lastChangedCells = applied.changedCoordinates;
+    this.model.lastChangedCellUids = applied.changedUids;
+    if (applied.structural) { this.renderStructural(); this.prunePersistenceUids(); }
+    else this.refreshValues();
+    // `queueChangedCells` deletes any dirty entry whose raw is back at its base,
+    // so this is what stops the next keystroke from re-flushing the undone value.
+    this.queueChangedCells();
+    this.metadataDirty ||= entry.metadata;
+    this.markChanged(applied.structural);
+    const kept = applied.result?.dropped?.length || 0;
+    if (kept) toast(`${kept} cell${kept === 1 ? "" : "s"} changed elsewhere and ${kept === 1 ? "was" : "were"} kept.`, "warning");
+    return true;
+  }
 
   applyPatch(patch, sourceView = this.views.values().next().value || null) {
     const patches = Array.isArray(patch) ? patch : [patch];
