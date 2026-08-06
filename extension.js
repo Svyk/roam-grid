@@ -37,10 +37,13 @@ const DEFAULT_AUTOCOMPLETE_MS = 90;
 const DEFAULT_AUTOCOMPLETE_LIMIT = 8;
 const RECENTS_TTL_MS = 60000;
 // The page query returns every page in the graph and has not been measured on a large one. Over
-// budget the result is still used — it is already paid for — but the empty-opener path switches
-// itself off for the rest of the session. This is a nicety, so it reports through console.info and
-// never a toast.
+// budget the result is still used — it is already paid for — but the empty-opener path disarms
+// after consecutive over-budget INLINE fetches and re-arms on the next fetch at or under budget,
+// warm or inline. This is a nicety, so it reports through console.info and never a toast.
 const RECENTS_BUDGET_MS = 250;
+// One slow fetch can be a GC pause; two in a row is the graph. Background warms never count
+// toward the streak — they run off the critical path, so they can only re-arm, never disarm.
+const RECENTS_DISARM_OVERRUNS = 2;
 const RECENT_BLOCK_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const RECENT_ACCEPTED_PAGES = 25;
 // The idle warm pays the recents queries before the first bare opener does. 2.5 s is the fallback
@@ -211,6 +214,8 @@ const runtime = {
   keyboardOwner: null,
   commentArmed: false,
   recentsDisabled: false,
+  recentsOverruns: 0,
+  recentsRearmedAt: null,
   recentlyAcceptedPages: [],
   suggestionRenderDisabled: false,
   slowSuggestionBatches: 0,
@@ -483,7 +488,8 @@ export function commandSuggestionsEnabled() {
   return getSetting("editing-autocomplete-commands") === true;
 }
 
-/** Session-scoped budget switch — see RECENTS_BUDGET_MS. */
+/** True while the budget gate has disarmed bare openers — see RECENTS_BUDGET_MS. Self-healing:
+ *  the next fetch at or under budget re-arms it. */
 export function recentsDisabled() {
   return runtime.recentsDisabled === true;
 }
@@ -515,6 +521,8 @@ function noteSuggestionRenderBatch(elapsed) {
 export function resetRoamRecents() {
   roamRecentsCache.clear();
   runtime.recentsDisabled = false;
+  runtime.recentsOverruns = 0;
+  runtime.recentsRearmedAt = null;
   runtime.recentlyAcceptedPages.length = 0;
 }
 
@@ -6861,18 +6869,39 @@ function readRecentRows(type, api, now, { background = false, force = false } = 
   const elapsed = clock() - started;
   const value = [...(rows || [])];
   roamRecentsCache.set(key, { at: now, rows: value });
+  noteRecentsFetch(type, elapsed, background);
   // A background warm runs off the critical path, so its cost never counts toward the disarm —
   // only inline fetches the user actually waited on do.
   if (background) {
     const target = globalThis.window;
     if (target) (target.__rgDiag ||= {}).recentsWarm = { at: Date.now(), type, ms: elapsed, rows: value.length };
-    return value;
-  }
-  if (elapsed > RECENTS_BUDGET_MS && !runtime.recentsDisabled) {
-    runtime.recentsDisabled = true;
-    console.info(`[roam-grid] Recent ${type === "page" ? "pages" : "blocks"} took ${Math.round(elapsed)}ms, over the ${RECENTS_BUDGET_MS}ms budget. Bare [[ and (( will not open on their own for the rest of this session; typing a query still searches.`);
   }
   return value;
+}
+
+/** The budget ledger every recents fetch reports to. A fetch at or under budget — warm or inline —
+ *  proves the graph healthy: the overrun streak resets and a disarmed gate re-arms. Over budget,
+ *  only inline fetches count, because a background warm never made anyone wait; CONSECUTIVE
+ *  overruns disarm, so one GC pause cannot kill bare openers for the session. Cache hits never
+ *  reach here — those rows are already paid for, so they open the menu armed or not. */
+function noteRecentsFetch(type, elapsed, background) {
+  const label = type === "page" ? "pages" : "blocks";
+  if (elapsed <= RECENTS_BUDGET_MS) {
+    runtime.recentsOverruns = 0;
+    if (runtime.recentsDisabled) {
+      runtime.recentsDisabled = false;
+      runtime.recentsRearmedAt = Date.now();
+      console.info(`[roam-grid] Recent ${label} back under the ${RECENTS_BUDGET_MS}ms budget (${Math.round(elapsed)}ms). Bare [[ and (( re-armed.`);
+    }
+  } else if (!background) {
+    runtime.recentsOverruns += 1;
+    if (!runtime.recentsDisabled && runtime.recentsOverruns >= RECENTS_DISARM_OVERRUNS) {
+      runtime.recentsDisabled = true;
+      console.info(`[roam-grid] Recent ${label} took ${Math.round(elapsed)}ms, over the ${RECENTS_BUDGET_MS}ms budget ${RECENTS_DISARM_OVERRUNS} fetches in a row. Bare [[ and (( open on cached recents only until a fetch comes back under budget; typing a query still searches.`);
+    }
+  }
+  const target = globalThis.window;
+  if (target) (target.__rgDiag ||= {}).recentsBudget = { disarmed: runtime.recentsDisabled, overruns: runtime.recentsOverruns, lastMs: Math.round(elapsed), rearmedAt: runtime.recentsRearmedAt };
 }
 
 /** Warms both recents caches off the critical path. Returns false when nothing could run, which is
@@ -6963,10 +6992,13 @@ function recentBlockSuggestions(rows, limit, excludeUids) {
  * Large grids pass nothing, because their cells are JSON rows and have no uid to collide with.
  */
 export async function searchRoamRecentSuggestions(context, { limit = getSetting("editing-autocomplete-limit"), api = globalThis.window?.roamAlphaAPI, excludeUids = null, now = Date.now() } = {}) {
-  if (!context || recentsDisabled() || !emptyOpenerEnabled()) return [];
+  if (!context || !emptyOpenerEnabled()) return [];
   if (typeof api?.q !== "function") return [];
   const boundedLimit = clamp(Math.floor(Number(limit) || 8), 1, 20);
   const page = triggerIsPageLike(context.type);
+  // The disarm gates only the run-the-query-now decision: with a fresh cache the rows are already
+  // paid for, so the menu opens on them armed or not.
+  if (recentsDisabled() && !recentsCacheReady(context.type, now)) return [];
   let rows = [];
   try { rows = readRecentRows(page ? "page" : "block", api, now); }
   catch (error) { console.warn("[roam-grid] Recents query failed", error); return []; }
@@ -7492,10 +7524,11 @@ export class GridEditorController {
     if (!SUGGESTIBLE_EDITOR_TRIGGERS.has(context.type)) return;
     if (state.referenceAutocompleteClosed) return;
     // A bare opener takes the recents path instead of the search path. Its own switch and the
-    // session budget switch are read here, ahead of the timer, so an off switch issues no query at
-    // all rather than issuing one and discarding its results.
+    // budget gate are read here, ahead of the timer, so an off switch issues no query at all
+    // rather than issuing one and discarding its results. The gate yields to a fresh cache:
+    // disarmed or not, rows already paid for open the menu without a new query.
     const bare = !context.query.trim();
-    if (bare && (!emptyOpenerEnabled() || recentsDisabled())) return;
+    if (bare && (!emptyOpenerEnabled() || (recentsDisabled() && !recentsCacheReady(context.type)))) return;
     this.referenceSearchTimer = setTimeout(async () => {
       this.referenceSearchTimer = null;
       let results = [];

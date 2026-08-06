@@ -1177,7 +1177,7 @@ test("a cache-resolvable bare opener drops the debounce it has nothing to deboun
   controller.dispose();
 });
 
-test("a recents query over budget self-disables for the session through console.info, not a toast", async (t) => {
+test("two consecutive over-budget recents queries disarm bare openers through console.info, not a toast", async (t) => {
   const info = console.info; const warn = console.warn;
   const infos = []; const warns = [];
   console.info = (message) => infos.push(message); console.warn = (message) => warns.push(message);
@@ -1189,14 +1189,18 @@ test("a recents query over budget self-disables for the session through console.
   globalThis.performance = { now: () => { reading += 1; return reading % 2 === 0 ? elapsed : 0; } };
   const api = { q: () => [["Slow Page", "pageslow12", 5]] };
 
-  const first = await searchRoamRecentSuggestions({ type: "page", query: "" }, { api });
+  const first = await searchRoamRecentSuggestions({ type: "page", query: "" }, { api, now: 1_000_000 });
   assert.deepEqual(first.map((suggestion) => suggestion.name), ["Slow Page"], "the result that blew the budget is still used — it is already paid for");
-  assert.equal(recentsDisabled(), true);
+  assert.equal(recentsDisabled(), false, "one slow fetch can be a GC pause — the gate holds");
+  assert.equal(infos.length, 0);
+
+  const second = await searchRoamRecentSuggestions({ type: "page", query: "" }, { api, now: 1_061_000 });
+  assert.equal(recentsDisabled(), true, "two consecutive over-budget fetches disarm");
   assert.equal(infos.length, 1);
   assert.match(infos[0], /over the 250ms budget/);
 
-  const second = await searchRoamRecentSuggestions({ type: "block", query: "" }, { api });
-  assert.deepEqual(second, [], "the switch holds for the rest of the session");
+  const blocked = await searchRoamRecentSuggestions({ type: "block", query: "" }, { api, now: 1_122_000 });
+  assert.deepEqual(blocked, [], "a cold cache behind a disarmed gate runs no query");
   assert.equal(infos.length, 1, "and says so exactly once");
   assert.deepEqual(warns, []);
   globalThis.performance = real;
