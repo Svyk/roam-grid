@@ -359,6 +359,77 @@ body.roam-body.dark .rg-portal {
   outline-offset: 0;
 }
 
+.rg-cell--editing > .rg-cell-comment-count {
+  visibility: hidden;
+}
+
+.rg-cell-comment-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 9px;
+  min-height: 12px;
+  margin: 0 0 0 1px;
+  padding: 0 2px;
+  color: var(--rg-muted);
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+  font: inherit;
+  font-size: 0.64em;
+  font-weight: 500;
+  line-height: 1;
+  vertical-align: super;
+  cursor: pointer;
+  opacity: 0.86;
+}
+
+.rg-cell-comment-count::before {
+  content: "\1F5E8";
+  margin-right: 1px;
+}
+
+.rg-cell-comment-count:hover,
+.rg-cell-comment-count:focus-visible {
+  color: var(--rg-active);
+  background: color-mix(in srgb, var(--rg-active) 10%, transparent);
+  opacity: 1;
+  outline: 1px solid color-mix(in srgb, var(--rg-active) 34%, transparent);
+  outline-offset: 0;
+}
+
+/* Roam's own inline affordances sit at opacity 0.5 / 0.8em; matching them keeps this reading native. */
+.rg-cell-comment-add {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  z-index: 2;
+  padding: 0 2px;
+  color: var(--rg-muted);
+  background: transparent;
+  border: 0;
+  font: inherit;
+  font-size: 0.8em;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.5;
+}
+
+.rg-cell-comment-add:hover,
+.rg-cell-comment-add:focus-visible {
+  color: var(--rg-active);
+  opacity: 1;
+  outline: none;
+}
+
+.rg-root--comment-armed .rg-cell {
+  cursor: cell;
+}
+
+.rg-inline-references--comments .rg-inline-references-title {
+  font-style: italic;
+}
+
 .rg-inline-references {
   color: var(--rg-color, inherit);
   background: color-mix(in srgb, var(--rg-header) 54%, var(--rg-bg));

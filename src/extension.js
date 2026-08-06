@@ -8,6 +8,8 @@ const METADATA_PAGE = "roam/grid/metadata";
 const METADATA_PREFIX = "roam-grid/table::";
 const TEMPLATE_PAGE = "roam/grid/templates";
 const TEMPLATE_PREFIX = "roam-grid/template::";
+const COMMENTS_PAGE = "roam/comments";
+const COMMENTS_CONTAINER_STRING = `[[${COMMENTS_PAGE}]]`;
 const MANIFEST_PREFIX = "roam-grid/manifest::";
 const MAX_NATIVE_MUTATIONS = 1200;
 const CHUNK_ROWS = 500;
@@ -75,9 +77,9 @@ const SETTING_DESCRIPTORS = [
   { key: "new-grid-rows", group: "New grids", name: "Rows in a new large grid", description: "How many rows a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_ROWS, min: 1, max: 100000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "new-grid-cols", group: "New grids", name: "Columns in a new large grid", description: "How many columns a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_COLS, min: 1, max: 702, scope: "graph", apply: "next-op", stage: "live" },
   { key: "large-overscan-rows", group: "Large grids", name: "Overscan rows", description: "Extra rows rendered above and below a large grid's viewport.", control: "input", type: "int", default: DEFAULT_LARGE_OVERSCAN_ROWS, min: 0, max: 200, scope: "device", apply: "next-op", stage: "live", onLarge: true },
-  { key: "comments-enabled", group: "Comments", name: "Enable cell comments", description: "Read and write native Roam comment threads from grid cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending", onView: true },
-  { key: "comments-badges", group: "Comments", name: "Show comment badges", description: "Mark cells that carry a comment thread.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending", onView: true },
-  { key: "comments-open-in-sidebar", group: "Comments", name: "Open comment threads in the right sidebar", description: "Open a cell's comment thread in the right sidebar instead of inline.", control: "switch", type: "bool", default: false, scope: "device", apply: "immediate", stage: "pending", onView: true },
+  { key: "comments-enabled", group: "Comments", name: "Enable cell comments", description: "Read and write native Roam comment threads from grid cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: true },
+  { key: "comments-badges", group: "Comments", name: "Show comment badges", description: "Mark cells that carry a comment thread.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: true },
+  { key: "comments-open-in-sidebar", group: "Comments", name: "Open comment threads in the right sidebar", description: "Open a cell's comment thread in the right sidebar instead of inline.", control: "switch", type: "bool", default: false, scope: "device", apply: "immediate", stage: "live", onView: true },
   { key: "ranges-live-references", group: "Ranges", name: "Render live range references", description: "Render {{roam-grid-range: …}} components as a live view of the source cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending", onView: true },
   { key: "ranges-read-only", group: "Ranges", name: "Rendered ranges are read-only", description: "Block edits inside a rendered range so the source table stays authoritative.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending", onView: true },
   { key: "ranges-max-rendered-cells", group: "Ranges", name: "Maximum cells in a rendered range", description: "Ranges larger than this render as a link instead of a grid.", control: "input", type: "int", default: DEFAULT_RANGE_RENDERED_CELLS, min: 1, max: 50000, scope: "graph", apply: "next-op", stage: "pending", onView: true },
@@ -119,6 +121,7 @@ const runtime = {
   registries: null,
   lastFocusedUid: null,
   keyboardOwner: null,
+  commentArmed: false,
 };
 
 export const pendingTimers = new Set();
@@ -2281,9 +2284,11 @@ async function createBlock(parentUid, string, order = "last", uid = null) {
   return blockUid;
 }
 
-async function updateBlock(uid, string) {
+async function updateBlock(uid, string, { open = null } = {}) {
   const update = roam().data?.block?.update || roam().updateBlock;
-  return update.call(roam().data?.block || roam(), { block: { uid, string: String(string ?? "") } });
+  const block = { uid, string: String(string ?? "") };
+  if (typeof open === "boolean") block.open = open;
+  return update.call(roam().data?.block || roam(), { block });
 }
 
 async function moveBlock(uid, parentUid, order = "last") {
@@ -2999,6 +3004,8 @@ export class NativeGridSession {
     this.structuralPending = false;
     this.contentSavePromise = null;
     this.referenceCounts = new Map();
+    this.commentThreads = new Map();
+    this.commentPageUid = null;
     this.referenceCountFrame = null;
     this.referenceCountTimer = null;
     this.disposed = false;
@@ -3009,6 +3016,7 @@ export class NativeGridSession {
     clearTimeout(this.idleTimer); this.idleTimer = null;
     view.session = this; view.model = this.model; view.adapter = this.adapter;
     view.referenceCounts = this.referenceCounts;
+    view.commentThreads = this.commentThreads;
     this.views.add(view);
     return view;
   }
@@ -3046,11 +3054,17 @@ export class NativeGridSession {
       this.referenceCountFrame = null;
       this.referenceCountTimer = setTimeout(() => {
         this.referenceCountTimer = null;
-        this.refreshReferenceCounts();
+        this.refreshCellBadges();
       }, 0);
     };
     if (typeof globalThis.requestAnimationFrame === "function") this.referenceCountFrame = globalThis.requestAnimationFrame(afterPaint);
-    else this.referenceCountTimer = setTimeout(() => { this.referenceCountTimer = null; this.refreshReferenceCounts(); }, 0);
+    else this.referenceCountTimer = setTimeout(() => { this.referenceCountTimer = null; this.refreshCellBadges(); }, 0);
+  }
+
+  refreshCellBadges() {
+    const counts = this.refreshReferenceCounts();
+    this.refreshCommentThreads();
+    return counts;
   }
 
   refreshReferenceCounts() {
@@ -3069,6 +3083,40 @@ export class NativeGridSession {
       if (changed.size) view.updateReferenceCountBadges(changed);
     }
     return next;
+  }
+
+  /** Comment writes land on the page, not the table subtree, so the pull watch never sees them.  A
+   *  thread merged optimistically by `addCellComment` makes this refresh diff to an empty set. */
+  refreshCommentThreads() {
+    if (this.disposed || !getSetting("comments-enabled")) return this.commentThreads;
+    let next;
+    try {
+      this.commentPageUid = this.commentPageUid || blockPageUid(this.tableUid);
+      next = this.commentPageUid ? queryCommentThreadIndex(this.commentPageUid) : new Map();
+    } catch (error) { console.warn("[roam-grid] Could not refresh cell comment threads", error); return this.commentThreads; }
+    const changed = diffCommentThreadIndex(this.commentThreads, next);
+    this.commentThreads = next;
+    for (const view of this.views) {
+      view.commentThreads = next;
+      if (changed.size) view.updateCommentBadges?.(changed);
+    }
+    this.lastCommentThreadChanges = changed;
+    return next;
+  }
+
+  async addCellComment(targetUid, body) {
+    const api = roam();
+    const pageUid = blockPageUid(targetUid, api);
+    if (!pageUid) throw new GridError("COMMENT_PAGE_UNKNOWN", "Could not resolve the page that holds this cell");
+    const dateTitle = api.util?.dateToPageTitle?.(new Date());
+    const plan = commentThreadPlan(getTree(pageUid), { pageUid, targetUid, dateTitle, authorTitle: commentAuthorTitle(api) });
+    const applied = await applyCommentThreadPlan(plan, { body });
+    mergeCommentThread(this.commentThreads, String(targetUid), applied.anchorUid);
+    for (const view of this.views) {
+      view.commentThreads = this.commentThreads;
+      view.updateCommentBadges?.([String(targetUid)]);
+    }
+    return applied;
   }
 
   replaceModel(model, { render = true } = {}) {
@@ -3712,6 +3760,42 @@ export function installKeyboardOwnership() {
   return dispose;
 }
 
+export function commentArmingState() { return Boolean(runtime.commentArmed); }
+
+/** Flips every mounted native grid into (or out of) the hover-affordance state.  Large grids do not
+ *  implement `setCommentArmed` at all — their cells are JSON rows with no block uid to comment on. */
+export function setCommentArming(armed) {
+  const next = Boolean(armed);
+  if (runtime.commentArmed === next) return next;
+  runtime.commentArmed = next;
+  for (const view of runtime.views) view.setCommentArmed?.(next);
+  return next;
+}
+
+/**
+ * The whole hover affordance costs four window listeners and one flag.  No `mousemove`, no per-cell
+ * listeners, and nothing at all in the DOM until the modifier is actually held.
+ */
+export function installCommentAffordance({ target = globalThis.window } = {}) {
+  const isModifier = (event) => event?.key === "Meta" || event?.key === "Control";
+  const onKeydown = (event) => { if (isModifier(event) && getSetting("comments-enabled")) setCommentArming(true); };
+  const onKeyup = (event) => { if (isModifier(event)) setCommentArming(false); };
+  const disarm = () => setCommentArming(false);
+  target?.addEventListener?.("keydown", onKeydown, true);
+  target?.addEventListener?.("keyup", onKeyup, true);
+  target?.addEventListener?.("blur", disarm);
+  target?.addEventListener?.("visibilitychange", disarm);
+  const dispose = () => {
+    target?.removeEventListener?.("keydown", onKeydown, true);
+    target?.removeEventListener?.("keyup", onKeyup, true);
+    target?.removeEventListener?.("blur", disarm);
+    target?.removeEventListener?.("visibilitychange", disarm);
+    setCommentArming(false);
+  };
+  runtime.disposers.push(dispose);
+  return dispose;
+}
+
 function blockString(uid) {
   const result = roam().data?.pull?.("[:block/string]", [":block/uid", uid]) || roam().pull?.("[:block/string]", [":block/uid", uid]);
   return result?.[":block/string"] ?? result?.string ?? "";
@@ -4222,6 +4306,156 @@ export function queryBlockReferenceSources(uid, api = roam()) {
     });
   }
   return [...unique.values()].sort((first, second) => first.pageTitle.localeCompare(second.pageTitle) || first.uid.localeCompare(second.uid));
+}
+
+export function commentAnchorString(targetUid) {
+  const uids = (Array.isArray(targetUid) ? targetUid : [targetUid]).map((uid) => String(uid ?? "").trim()).filter(Boolean);
+  return uids.map((uid) => `((${uid}))`).join(" ");
+}
+
+/**
+ * Roam's native comment thread lives on the COMMENTED BLOCK'S OWN PAGE as a collapsed container that
+ * *references* `[[roam/comments]]`; the `roam/comments` page itself has no children.  Decoded from 59
+ * live threads.  Shape: container -> `[[<date>]]` -> `[[<author>]]` -> `((targetUid))` -> comment bodies.
+ * Pure: it only reads the supplied page tree and returns the ops a writer must run.
+ */
+export function commentThreadPlan(tree, { pageUid, targetUid, dateTitle, authorTitle, generateUid = cryptoId } = {}) {
+  const anchorString = commentAnchorString(targetUid);
+  if (!pageUid) throw new GridError("COMMENT_PAGE_UNKNOWN", "A comment thread needs the page that holds the commented block");
+  if (!anchorString) throw new GridError("COMMENT_TARGET_UNKNOWN", "A comment thread needs at least one target block uid");
+  if (!dateTitle) throw new GridError("COMMENT_DATE_UNKNOWN", "A comment thread needs a Roam daily-note title");
+  if (!authorTitle) throw new GridError("COMMENT_AUTHOR_UNKNOWN", "A comment thread needs the author's display-page title");
+  const ops = [];
+  const level = (parentUid, children, string, order, extra = {}) => {
+    const found = ordered(children || []).find((child) => String(child?.string ?? "") === string);
+    if (found?.uid) return { uid: found.uid, children: found.children || [], existed: true };
+    const uid = generateUid();
+    ops.push({ type: "create", parentUid, uid, string, order, ...extra });
+    return { uid, children: [], existed: false };
+  };
+  const container = level(pageUid, tree?.children, COMMENTS_CONTAINER_STRING, "last", { open: false });
+  const date = level(container.uid, container.children, `[[${dateTitle}]]`, "first");
+  const author = level(date.uid, date.children, `[[${authorTitle}]]`, "last");
+  const anchor = level(author.uid, author.children, anchorString, "last");
+  return {
+    ops,
+    containerUid: container.uid, dateUid: date.uid, authorUid: author.uid, anchorUid: anchor.uid,
+    existed: { container: container.existed, date: date.existed, author: author.existed, anchor: anchor.existed },
+  };
+}
+
+/** Runs a plan's ops, then writes the comment body under the anchor.  Planned uids are remapped from
+ *  whatever `create` actually returns, so an API that ignores an explicit uid cannot break the chain. */
+export async function applyCommentThreadPlan(plan, { body = "", create = createBlock, update = updateBlock, generateUid = cryptoId } = {}) {
+  const remap = new Map();
+  const resolve = (uid) => remap.get(uid) || uid;
+  for (const op of plan?.ops || []) {
+    const actual = String((await create(resolve(op.parentUid), op.string, op.order, op.uid)) || op.uid);
+    if (actual !== op.uid) remap.set(op.uid, actual);
+    if (op.open === false) await update(actual, op.string, { open: false });
+  }
+  const anchorUid = resolve(plan?.anchorUid);
+  const text = String(body ?? "");
+  const commentUid = text ? String((await create(anchorUid, text, "last", generateUid())) || "") : null;
+  return {
+    ops: plan?.ops || [], existed: plan?.existed || null, commentUid, anchorUid,
+    containerUid: resolve(plan?.containerUid), dateUid: resolve(plan?.dateUid), authorUid: resolve(plan?.authorUid),
+  };
+}
+
+export function blockPageUid(uid, api = roam()) {
+  const target = String(uid || "");
+  if (!target || typeof api?.q !== "function") return null;
+  const rows = api.q(`[:find ?pageUid
+    :in $ ?uid
+    :where
+      [?block :block/uid ?uid]
+      [?block :block/page ?page]
+      [?page :block/uid ?pageUid]]`, target) || [];
+  return rows?.[0]?.[0] ? String(rows[0][0]) : null;
+}
+
+export function commentAuthorTitle(api = roam()) {
+  const userUid = api?.user?.uid?.();
+  if (!userUid || typeof api?.q !== "function") return null;
+  const rows = api.q(`[:find ?title
+    :in $ ?userUid
+    :where
+      [?user :user/uid ?userUid]
+      [?user :user/display-page ?page]
+      [?page :node/title ?title]]`, String(userUid)) || [];
+  return rows?.[0]?.[0] ? String(rows[0][0]) : null;
+}
+
+/**
+ * Page-scoped thread index: `Map<cellUid, [{threadUid, count}]>`.  Two parameterized queries, never
+ * string interpolation.  The `roam/comments` entity is resolved first so a graph with no comments at
+ * all costs exactly one query and returns an empty Map.  `queryBlockReferenceCounts` stays untouched:
+ * a measured single-query `or-join` partition costs 150 ms/400 uids against 58 ms today and cannot
+ * return thread uids.
+ */
+export function queryCommentThreadIndex(pageUid, api = roam()) {
+  const index = new Map();
+  const page = String(pageUid || "");
+  if (!page || typeof api?.q !== "function") return index;
+  const commentsRows = api.q(`[:find ?page
+    :in $ ?title
+    :where [?page :node/title ?title]]`, COMMENTS_PAGE) || [];
+  const commentsPage = commentsRows?.[0]?.[0];
+  if (commentsPage == null) return index;
+  const rows = api.q(`[:find ?cellUid ?anchorUid (count ?comment)
+    :in $ ?pageUid ?commentsPage
+    :where
+      [?page :block/uid ?pageUid]
+      [?container :block/page ?page]
+      [?container :block/refs ?commentsPage]
+      [?container :block/children ?date]
+      [?date :block/children ?author]
+      [?author :block/children ?anchor]
+      [?anchor :block/uid ?anchorUid]
+      [?anchor :block/refs ?cell]
+      [?cell :block/uid ?cellUid]
+      [?comment :block/parents ?anchor]]`, page, commentsPage) || [];
+  for (const row of rows) {
+    const cellUid = String(row?.[0] || ""); const threadUid = String(row?.[1] || "");
+    if (!cellUid || !threadUid) continue;
+    const entries = index.get(cellUid) || [];
+    if (entries.some((entry) => entry.threadUid === threadUid)) continue;
+    entries.push({ threadUid, count: Math.max(0, Number(row?.[2]) || 0) });
+    index.set(cellUid, entries);
+  }
+  for (const entries of index.values()) entries.sort((first, second) => first.threadUid.localeCompare(second.threadUid));
+  return index;
+}
+
+export function commentThreadSignature(entries) {
+  return JSON.stringify((entries || []).map((entry) => [String(entry?.threadUid ?? ""), Math.max(0, Number(entry?.count) || 0)]));
+}
+
+/** Returns the cell uids whose thread list actually changed; an absorbed echo yields an empty set. */
+export function diffCommentThreadIndex(previous, next) {
+  const changed = new Set();
+  for (const uid of new Set([...(previous?.keys?.() || []), ...(next?.keys?.() || [])])) {
+    if (commentThreadSignature(previous?.get?.(uid)) !== commentThreadSignature(next?.get?.(uid))) changed.add(uid);
+  }
+  return changed;
+}
+
+/** Optimistic merge of a just-written thread so the later datalog refresh diffs to nothing. */
+export function mergeCommentThread(index, cellUid, threadUid) {
+  const key = String(cellUid || ""); const thread = String(threadUid || "");
+  if (!index || !key || !thread) return index;
+  const entries = [...(index.get(key) || [])];
+  const position = entries.findIndex((entry) => entry.threadUid === thread);
+  if (position >= 0) entries[position] = { threadUid: thread, count: (Math.max(0, Number(entries[position].count) || 0)) + 1 };
+  else entries.push({ threadUid: thread, count: 1 });
+  entries.sort((first, second) => first.threadUid.localeCompare(second.threadUid));
+  index.set(key, entries);
+  return index;
+}
+
+export function commentThreadCount(entries) {
+  return (entries || []).reduce((total, entry) => total + Math.max(0, Number(entry?.count) || 0), 0);
 }
 
 function isMac() { return /Mac|iPhone|iPad/.test(globalThis.navigator?.platform || ""); }
@@ -4939,7 +5173,12 @@ export class GridView {
     this.resizeCleanup = null;
     this.editorController = null;
     this.referenceCounts = session?.referenceCounts || new Map();
+    this.commentThreads = session?.commentThreads || new Map();
+    this.commentArmed = false;
+    this.commentAddButton = null;
+    this.boundCommentPointerOver = null;
     this.inlineReferencesUid = null;
+    this.inlineReferencesMode = null;
     this.inlineReferencesPanel = null;
     this.inlineReferenceDisposers = new Set();
     this.selectedCellElements = new Set();
@@ -4979,6 +5218,7 @@ export class GridView {
     this.root.addEventListener("paste", this.boundPaste);
     document.addEventListener("pointerup", this.boundPointerUp, true);
     this.render();
+    if (runtime.commentArmed) this.setCommentArmed(true);
   }
 
   toolbar() {
@@ -5502,26 +5742,62 @@ export class GridView {
     this.updateCellReferenceCount(cell, this.model.getCell(row, col)?.uid);
   }
 
+  cellCommentThreads(uid) {
+    if (!getSetting("comments-enabled")) return [];
+    return this.commentThreads?.get?.(uid) || [];
+  }
+
   updateCellReferenceCount(cell, uid) {
     if (!cell || !uid) return;
-    const count = Math.max(0, Number(this.referenceCounts?.get(uid)) || 0);
+    const threads = this.cellCommentThreads(uid);
+    // Every thread anchor is a real ((cellUid)) ref, so the raw linked-reference count double-counts
+    // commented cells.  Partition it: refs keep the remainder, comments get their own badge.
+    const count = Math.max(0, (Math.max(0, Number(this.referenceCounts?.get(uid)) || 0)) - threads.length);
     let badge = cell.querySelector?.(".rg-cell-reference-count") || null;
-    if (!count) { badge?.remove(); return; }
+    if (!count) badge?.remove();
+    else {
+      if (!badge) {
+        badge = document.createElement("button");
+        badge.type = "button";
+        badge.className = "rg-cell-reference-count";
+        badge.dataset.rgReferenceUid = uid;
+        badge.addEventListener("pointerdown", (event) => { event.preventDefault(); event.stopPropagation(); });
+        badge.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); this.openCellReferences(uid); });
+        cell.appendChild(badge);
+      }
+      badge.dataset.rgReferenceUid = uid;
+      badge.textContent = String(count);
+      badge.title = "Click for references";
+      badge.setAttribute("aria-label", `${count} linked reference${count === 1 ? "" : "s"}. Click to toggle references`);
+      const openHere = this.inlineReferencesUid === uid && this.inlineReferencesMode !== "comments";
+      badge.setAttribute("aria-expanded", String(openHere));
+      if (openHere && this.inlineReferencesPanel?.id) badge.setAttribute("aria-controls", this.inlineReferencesPanel.id);
+      else badge.removeAttribute("aria-controls");
+    }
+    this.updateCellCommentCount(cell, uid, threads);
+  }
+
+  updateCellCommentCount(cell, uid, threads = this.cellCommentThreads(uid)) {
+    if (!cell || !uid) return;
+    let badge = cell.querySelector?.(".rg-cell-comment-count") || null;
+    if (!threads.length || !getSetting("comments-badges")) { badge?.remove(); return; }
+    const total = commentThreadCount(threads);
     if (!badge) {
       badge = document.createElement("button");
       badge.type = "button";
-      badge.className = "rg-cell-reference-count";
-      badge.dataset.rgReferenceUid = uid;
+      badge.className = "rg-cell-comment-count";
+      badge.dataset.rgCommentUid = uid;
       badge.addEventListener("pointerdown", (event) => { event.preventDefault(); event.stopPropagation(); });
-      badge.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); this.openCellReferences(uid); });
+      badge.addEventListener("click", (event) => { event.preventDefault(); event.stopPropagation(); this.openCellComments(uid); });
       cell.appendChild(badge);
     }
-    badge.dataset.rgReferenceUid = uid;
-    badge.textContent = String(count);
-    badge.title = "Click for references";
-    badge.setAttribute("aria-label", `${count} linked reference${count === 1 ? "" : "s"}. Click to toggle references`);
-    badge.setAttribute("aria-expanded", String(this.inlineReferencesUid === uid));
-    if (this.inlineReferencesUid === uid && this.inlineReferencesPanel?.id) badge.setAttribute("aria-controls", this.inlineReferencesPanel.id);
+    badge.dataset.rgCommentUid = uid;
+    badge.textContent = String(total);
+    badge.title = "Click for comments";
+    badge.setAttribute("aria-label", `${total} comment${total === 1 ? "" : "s"}. Click to toggle comments`);
+    const openHere = this.inlineReferencesUid === uid && this.inlineReferencesMode === "comments";
+    badge.setAttribute("aria-expanded", String(openHere));
+    if (openHere && this.inlineReferencesPanel?.id) badge.setAttribute("aria-controls", this.inlineReferencesPanel.id);
     else badge.removeAttribute("aria-controls");
   }
 
@@ -5533,9 +5809,21 @@ export class GridView {
     }
   }
 
-  referenceBadge(uid) {
+  updateCommentBadges(uids = this.commentThreads?.keys?.() || []) {
+    return this.updateReferenceCountBadges(uids);
+  }
+
+  cellForUid(uid) {
     const coordinate = this.cellCoordinatesByUid.get(uid);
-    return coordinate ? this.cells.get(`${coordinate.row}:${coordinate.col}`)?.querySelector?.(".rg-cell-reference-count") || null : null;
+    return coordinate ? this.cells.get(`${coordinate.row}:${coordinate.col}`) || null : null;
+  }
+
+  referenceBadge(uid) {
+    return this.cellForUid(uid)?.querySelector?.(".rg-cell-reference-count") || null;
+  }
+
+  commentBadge(uid) {
+    return this.cellForUid(uid)?.querySelector?.(".rg-cell-comment-count") || null;
   }
 
   closeInlineReferences() {
@@ -5547,9 +5835,11 @@ export class GridView {
     this.inlineReferencesPanel?.remove();
     this.inlineReferencesPanel = null;
     this.inlineReferencesUid = null;
-    const badge = previousUid ? this.referenceBadge(previousUid) : null;
-    badge?.setAttribute("aria-expanded", "false");
-    badge?.removeAttribute("aria-controls");
+    this.inlineReferencesMode = null;
+    for (const badge of previousUid ? [this.referenceBadge(previousUid), this.commentBadge(previousUid)] : []) {
+      badge?.setAttribute("aria-expanded", "false");
+      badge?.removeAttribute("aria-controls");
+    }
     return Boolean(previousUid);
   }
 
@@ -5578,29 +5868,45 @@ export class GridView {
     } catch { fallback(); }
   }
 
-  openCellReferences(uid) {
-    if (this.inlineReferencesUid === uid) { this.closeInlineReferences(); return true; }
+  /** Opens the cell's comment thread where 0.8.2 already puts references: the view-local inline panel.
+   *  `comments-open-in-sidebar` (default OFF) restores Roam's own right-sidebar behaviour. */
+  openCellComments(uid) {
+    const threads = this.cellCommentThreads(uid);
+    if (getSetting("comments-open-in-sidebar") && threads.length) {
+      try {
+        roam().ui?.rightSidebar?.addWindow?.({ window: { type: "block", "block-uid": threads[0].threadUid } });
+        return true;
+      } catch (error) { toast(`Could not open the comment thread: ${error.message}`, "danger"); return false; }
+    }
+    return this.openCellReferences(uid, { mode: "comments" });
+  }
+
+  openCellReferences(uid, { mode = "references" } = {}) {
+    if (this.inlineReferencesUid === uid && (this.inlineReferencesMode || "references") === mode) { this.closeInlineReferences(); return true; }
     this.closeInlineReferences();
     let sources;
     try { sources = queryBlockReferenceSources(uid); }
     catch (error) { toast(`Could not load cell references: ${error.message}`, "danger"); return false; }
+    const comments = mode === "comments";
+    const threadUids = new Set(this.cellCommentThreads(uid).map((thread) => thread.threadUid));
+    sources = sources.filter((source) => threadUids.has(source.uid) === comments);
     const coordinate = this.cellCoordinatesByUid.get(uid);
     const raw = coordinate ? this.model.getRaw(coordinate.row, coordinate.col) : "Referenced cell";
     const panel = document.createElement("section");
-    panel.className = "rg-inline-references";
+    panel.className = comments ? "rg-inline-references rg-inline-references--comments" : "rg-inline-references";
     panel.id = `rg-inline-references-${String(uid).replace(/[^A-Za-z0-9_-]/g, "")}-${cryptoId()}`;
     panel.dataset.uid = uid;
-    panel.setAttribute("aria-label", `References to ${String(raw).replace(/\s+/g, " ").trim() || "this cell"}`);
+    panel.setAttribute("aria-label", `${comments ? "Comments on" : "References to"} ${String(raw).replace(/\s+/g, " ").trim() || "this cell"}`);
     const header = document.createElement("div"); header.className = "rg-inline-references-header";
     const title = document.createElement("span"); title.className = "rg-inline-references-title";
     const label = String(raw).replace(/\s+/g, " ").trim() || "(empty cell)";
-    title.textContent = `References to: ${label}`;
+    title.textContent = `${comments ? "Comments on" : "References to"}: ${label}`;
     const count = document.createElement("span"); count.className = "rg-inline-references-count"; count.textContent = String(sources.length);
-    const close = button("×", "Close references", () => this.closeInlineReferences(), "rg-inline-references-close");
+    const close = button("×", comments ? "Close comments" : "Close references", () => this.closeInlineReferences(), "rg-inline-references-close");
     header.append(title, count, close); panel.appendChild(header);
     const list = document.createElement("div"); list.className = "rg-inline-references-list"; panel.appendChild(list);
     if (!sources.length) {
-      const empty = document.createElement("div"); empty.className = "rg-inline-references-empty"; empty.textContent = "No linked references found."; list.appendChild(empty);
+      const empty = document.createElement("div"); empty.className = "rg-inline-references-empty"; empty.textContent = comments ? "No comments found." : "No linked references found."; list.appendChild(empty);
     } else for (const source of sources) {
       const item = document.createElement("article"); item.className = "rg-inline-reference-item"; item.dataset.uid = source.uid;
       const breadcrumb = document.createElement("button"); breadcrumb.type = "button"; breadcrumb.className = "rg-inline-reference-breadcrumb";
@@ -5614,13 +5920,76 @@ export class GridView {
       });
     }
     this.inlineReferencesUid = uid;
+    this.inlineReferencesMode = mode;
     this.inlineReferencesPanel = panel;
     this.root.appendChild(panel);
-    const badge = this.referenceBadge(uid);
+    const badge = comments ? this.commentBadge(uid) : this.referenceBadge(uid);
     badge?.setAttribute("aria-expanded", "true");
     badge?.setAttribute("aria-controls", panel.id);
     panel.scrollIntoView?.({ block: "nearest", behavior: "smooth" });
     return true;
+  }
+
+  /**
+   * Arming installs exactly ONE delegated `pointerover` on this view's root and reuses ONE button
+   * node.  No `mousemove`, no per-cell listeners.  Disarmed means zero listeners and zero nodes.
+   */
+  setCommentArmed(armed) {
+    const next = Boolean(armed) && !this.disposed;
+    if (Boolean(this.commentArmed) === next) return next;
+    this.commentArmed = next;
+    this.root.classList?.toggle?.("rg-root--comment-armed", next);
+    if (next) {
+      this.boundCommentPointerOver = this.boundCommentPointerOver || ((event) => this.onCommentPointerOver(event));
+      this.root.addEventListener("pointerover", this.boundCommentPointerOver);
+      return true;
+    }
+    if (this.boundCommentPointerOver) this.root.removeEventListener("pointerover", this.boundCommentPointerOver);
+    this.commentAddButton?.remove();
+    this.commentAddButton = null;
+    return false;
+  }
+
+  commentAffordance() {
+    if (this.commentAddButton) return this.commentAddButton;
+    const element = document.createElement("button");
+    element.type = "button";
+    element.className = "rg-cell-comment-add";
+    element.textContent = "💬";
+    element.title = "Comment on this cell (⌘⌥=)";
+    element.addEventListener("pointerdown", (event) => { event.preventDefault(); event.stopPropagation(); });
+    element.addEventListener("click", (event) => {
+      event.preventDefault(); event.stopPropagation();
+      void this.addCellComment(Number(element.dataset.row), Number(element.dataset.col));
+    });
+    this.commentAddButton = element;
+    return element;
+  }
+
+  onCommentPointerOver(event) {
+    if (!this.commentArmed) return null;
+    const cell = event?.target?.closest?.(".rg-cell");
+    if (!cell || !this.root.contains?.(cell)) return null;
+    const row = Number(cell.dataset.row); const col = Number(cell.dataset.col);
+    if (!Number.isInteger(row) || !Number.isInteger(col) || this.model.isCovered(row, col)) return null;
+    const affordance = this.commentAffordance();
+    affordance.dataset.row = String(row); affordance.dataset.col = String(col);
+    affordance.setAttribute("aria-label", `Comment on ${cellLabel(row, col)}`);
+    if (affordance.parentElement !== cell) cell.appendChild(affordance);
+    return affordance;
+  }
+
+  async addCellComment(row, col) {
+    if (!getSetting("comments-enabled")) { toast("Cell comments are turned off in Roam Grid settings", "warning"); return null; }
+    if (!this.session) { toast("This grid is not attached to a Roam table yet", "warning"); return null; }
+    if (!this.model.inBounds(row, col)) return null;
+    const merge = this.model.mergeAt(row, col);
+    const uid = this.model.getCell(merge?.row ?? row, merge?.col ?? col)?.uid;
+    if (!uid || String(uid).startsWith("rg_")) { toast(`Cell ${cellLabel(row, col)} does not have a persisted Roam UID yet`, "warning"); return null; }
+    const body = await showPrompt(`Comment on ${cellLabel(merge?.row ?? row, merge?.col ?? col)}`, "", this.root);
+    if (body == null || !String(body).trim()) return null;
+    try { return await this.session.addCellComment(uid, String(body).trim()); }
+    catch (error) { toast(`Could not add the comment: ${error.message}`, "danger"); return null; }
   }
 
   select(range) {
@@ -5780,6 +6149,7 @@ export class GridView {
     if (event.target.matches("textarea,input")) return;
     event.stopPropagation();
     const command = event.metaKey || event.ctrlKey;
+    if (command && event.altKey && (event.key === "=" || event.key === "+" || event.key === "≠" || event.code === "Equal")) { event.preventDefault(); void this.addCellComment(this.selection.startRow, this.selection.startCol); return; }
     if (command && event.shiftKey && event.key.toLowerCase() === "c") { event.preventDefault(); this.copyRoamReferences(); return; }
     if (command && event.key.toLowerCase() === "c") { event.preventDefault(); this.copy(false); return; }
     if (command && event.key.toLowerCase() === "x") { event.preventDefault(); this.copy(true); return; }
@@ -6148,6 +6518,7 @@ export class GridView {
   }
 
   dispose({ releaseNative = true } = {}) {
+    this.setCommentArmed(false);
     this.disposed = true; this.resizeCleanup?.(); if (!this.session) this.adapter.dispose?.();
     this.editorController?.dispose(); this.editorController = null;
     this.closeInlineReferences();
@@ -6276,7 +6647,11 @@ export class LargeGridView {
     this.markerElement?.classList.add("rg-large-marker-hidden"); this.host.appendChild(this.root);
     const toolbar = document.createElement("div"); toolbar.className = "rg-toolbar";
     toolbar.append(button("Merge", "Safely merge selection", () => this.merge()), button("Unmerge", "Unmerge selection", () => this.unmerge()), button("⇤", "Align selection left", () => this.alignSelection("left")), button("≡", "Center selection", () => this.alignSelection("center")), button("⇥", "Align selection right", () => this.alignSelection("right")), button("fx", "Show or hide formula-cell coloring", () => this.toggleFormulaColors()), button("Labels", "Show or hide row and column labels", () => this.toggleHeaders()), button("Save", "Commit dirty chunks", () => this.flush()), button("Export", "Export visible selection", () => this.exportSelection()), button("Native copy", "Copy to a native table when within the write budget", () => copyLargeToNative(this.store)));
-    this.status = document.createElement("span"); this.status.className = "rg-status"; toolbar.appendChild(this.status);
+    this.status = document.createElement("span"); this.status.className = "rg-status";
+    // Large-grid cells are JSON rows in a chunk file, not Roam blocks, so there is nothing for a
+    // native comment thread to anchor to.  There is deliberately no alternate comment store.
+    this.status.title = "Cell comments need real Roam blocks. Large-grid cells are JSON rows — use “Native copy” first.";
+    toolbar.appendChild(this.status);
     this.viewport = document.createElement("div"); this.viewport.className = "rg-large-viewport";
     this.canvas = document.createElement("div"); this.canvas.className = "rg-large-canvas"; this.viewport.appendChild(this.canvas);
     this.root.append(toolbar, this.viewport); this.root.addEventListener("paste", (event) => this.onPaste(event));
@@ -6939,6 +7314,7 @@ async function onload({ extensionAPI }) {
     document.addEventListener("focusin", rememberFocusedUid, true);
     runtime.disposers.push(() => document.removeEventListener("focusin", rememberFocusedUid, true));
     installKeyboardOwnership();
+    installCommentAffordance();
     runtime.observer = new MutationObserver(handleDomMutations); runtime.observer.observe(document.querySelector(".roam-app") || document.body, { childList: true, subtree: true });
     installPortalObservers();
     scheduleScan(document);
@@ -6964,7 +7340,7 @@ async function onunload() {
   if (globalThis.window?.roamGrid?.v1?.version === VERSION) delete globalThis.window.roamGrid.v1;
   if (!roamGridGlobalPreexisted && globalThis.window?.roamGrid && Object.keys(globalThis.window.roamGrid).length === 0) delete globalThis.window.roamGrid;
   roamGridGlobalPreexisted = false;
-  runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null; runtime.keyboardOwner = null; runtime.gridThemePalette = null; runtime.gridThemeSignature = null; runtime.views.clear(); runtime.viewsByNative = new WeakMap();
+  runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null; runtime.keyboardOwner = null; runtime.commentArmed = false; runtime.gridThemePalette = null; runtime.gridThemeSignature = null; runtime.views.clear(); runtime.viewsByNative = new WeakMap();
   console.info("[roam-grid] Unloaded");
 }
 

@@ -63,10 +63,11 @@ const TODAYS_CONSTANTS = {
 };
 
 const PENDING_KEYS = [
-  "comments-enabled", "comments-badges", "comments-open-in-sidebar",
   "ranges-live-references", "ranges-read-only", "ranges-max-rendered-cells",
   "large-cache-enabled", "large-cache-max-mb", "large-verify-checksums", "large-gc-orphans",
 ];
+
+const COMMENT_KEYS = ["comments-enabled", "comments-badges", "comments-open-in-sidebar"];
 
 function makeApi({ values = {}, canSet = true, useGetAll = true } = {}) {
   const store = { ...values };
@@ -336,6 +337,10 @@ test("the panel omits pending rows but the schema still resolves them", async ()
   for (const key of PENDING_KEYS) {
     assert.ok(!ids.includes(key), `${key} must not be rendered while it is pending`);
     assert.equal(SETTINGS[key].stage, "pending");
+  }
+  for (const key of COMMENT_KEYS) {
+    assert.ok(ids.includes(key), `${key} ships with the comments feature and must be rendered`);
+    assert.equal(SETTINGS[key].stage, "live");
   }
   refreshSettingsCache(makeApi().api, makeStorage());
   assert.equal(getSetting("comments-open-in-sidebar"), false);
