@@ -6232,26 +6232,74 @@ function appendFormulaMirror(target, raw, colors = formulaReferenceColorMap(raw)
   target.append(document.createTextNode(raw.slice(cursor)));
 }
 
-export function roamReferenceAutocompleteContext(raw, caret = String(raw ?? "").length) {
+const PAIRED_EDITOR_TRIGGERS = [
+  { type: "page", opener: "[[", closer: "]]" },
+  { type: "block", opener: "((", closer: "))" },
+  { type: "component", opener: "{{", closer: "}}" },
+];
+/** Unpaired openers have no closer to bound them, so their query ends at the caret and any
+ *  whitespace inside it means the trigger is over. `#` additionally rejects a bracket, which is how
+ *  `#[[` reaches the tag-page branch instead of being read as a bare tag whose name starts with `[`. */
+const UNPAIRED_EDITOR_TRIGGERS = [
+  { type: "tag", opener: "#", closer: "", invalid: /[\s[\]]/ },
+  { type: "command", opener: "/", closer: "", invalid: /\s/ },
+];
+const PAGE_EDITOR_TRIGGERS = new Set(["page", "tag", "tag-page"]);
+const SUGGESTIBLE_EDITOR_TRIGGERS = new Set(["page", "tag", "tag-page", "block"]);
+/** A bare `#tag` ends at the first character Roam cannot read as part of a page name, so anything
+ *  outside this set has to be written `#[[Name]]` instead. Namespaces keep `/`. */
+const BARE_TAG_NAME = /^[\p{L}\p{N}_\-/]+$/u;
+
+/** Whether this trigger is answered by the page half of the Roam search and recents paths. */
+export function triggerIsPageLike(type) { return PAGE_EDITOR_TRIGGERS.has(type); }
+
+/**
+ * The six trigger types the cell editor understands, resolved against the nearest unclosed opener.
+ * An unclosed bracket owns everything after it, so a `#` or `/` typed inside `[[…` stays part of that
+ * query rather than starting a competing one, and `#[[` outranks `[[` by owning the `#` in front of it.
+ *
+ * Two formula guards, both live bugs before this existed. `=SUM((A1` used to produce a `block`
+ * context, and `=A1/B2` would open a command menu the moment `/` became a trigger. Inside a formula
+ * only a page-shaped trigger survives, and only where a Roam reference could actually be written —
+ * inside a string literal, which is what `formulaPositionIsQuoted` decides.
+ */
+export function roamEditorTriggerContext(raw, caret = String(raw ?? "").length, { formula = String(raw ?? "").startsWith("=") && !String(raw ?? "").startsWith("==") } = {}) {
   const source = String(raw ?? ""); const endIndex = clamp(Number.isFinite(caret) ? caret : source.length, 0, source.length);
   const prefix = source.slice(0, endIndex);
-  const candidates = [
-    { type: "page", opener: "[[", closer: "]]", startIndex: prefix.lastIndexOf("[["), closeIndex: prefix.lastIndexOf("]]" ) },
-    { type: "block", opener: "((", closer: "))", startIndex: prefix.lastIndexOf("(("), closeIndex: prefix.lastIndexOf("))") },
-  ].filter((candidate) => candidate.startIndex >= 0 && candidate.closeIndex < candidate.startIndex)
+  const paired = PAIRED_EDITOR_TRIGGERS
+    .map((trigger) => ({ ...trigger, startIndex: prefix.lastIndexOf(trigger.opener) }))
+    .filter((candidate) => candidate.startIndex >= 0 && prefix.lastIndexOf(candidate.closer) < candidate.startIndex)
     .sort((a, b) => b.startIndex - a.startIndex);
-  const match = candidates[0]; if (!match) return null;
+  let match = paired[0] || null;
+  if (match?.type === "page" && source[match.startIndex - 1] === "#") match = { type: "tag-page", opener: "#[[", closer: "]]", startIndex: match.startIndex - 1 };
+  if (!match) match = UNPAIRED_EDITOR_TRIGGERS
+    .map((trigger) => ({ ...trigger, startIndex: prefix.lastIndexOf(trigger.opener) }))
+    .filter((candidate) => candidate.startIndex >= 0)
+    .sort((a, b) => b.startIndex - a.startIndex)
+    .find((candidate) => (candidate.type !== "command" || candidate.startIndex === 0 || /\s/.test(prefix[candidate.startIndex - 1]))
+      && !candidate.invalid.test(prefix.slice(candidate.startIndex + 1))) || null;
+  if (!match) return null;
+  if (formula && !((match.type === "page" || match.type === "tag-page") && formulaPositionIsQuoted(source, endIndex))) return null;
   const queryStart = match.startIndex + match.opener.length; const query = source.slice(queryStart, endIndex);
   if (query.includes("\n") || query.includes("\r")) return null;
-  const replaceEndIndex = source.slice(endIndex, endIndex + match.closer.length) === match.closer ? endIndex + match.closer.length : endIndex;
-  return { type: match.type, query, startIndex: match.startIndex, queryStart, endIndex, replaceEndIndex };
+  const replaceEndIndex = match.closer && source.slice(endIndex, endIndex + match.closer.length) === match.closer ? endIndex + match.closer.length : endIndex;
+  return { type: match.type, query, startIndex: match.startIndex, queryStart, endIndex, replaceEndIndex, opener: match.opener, closer: match.closer };
+}
+
+/** Per-trigger insertion. A block is always `((uid))`; a page-shaped trigger keeps its own opener,
+ *  and a bare `#` falls back to `#[[Name]]` for any name Roam could not read unbracketed. */
+export function roamTriggerInsertion(type, suggestion) {
+  if (suggestion?.kind === "roam-block") return `((${suggestion.uid}))`;
+  const name = String(suggestion?.name ?? "");
+  if (type === "tag") return BARE_TAG_NAME.test(name) ? `#${name}` : `#[[${name}]]`;
+  return type === "tag-page" ? `#[[${name}]]` : `[[${name}]]`;
 }
 
 export async function searchRoamReferenceSuggestions(context, limit = getSetting("editing-autocomplete-limit"), api = globalThis.window?.roamAlphaAPI) {
   if (!context || !api?.data?.search) return [];
   const query = String(context.query || "").trim(); if (!query) return [];
   const boundedLimit = clamp(Math.floor(Number(limit) || 8), 1, 20);
-  const page = context.type === "page";
+  const page = triggerIsPageLike(context.type);
   const results = await Promise.resolve(api.data.search({
     "search-str": query,
     "search-pages": page,
@@ -6276,7 +6324,9 @@ export async function searchRoamReferenceSuggestions(context, limit = getSetting
 /**
  * Roam's own create-page row, appended LAST: a page opener with a typed name that no result already
  * matches exactly gets one, including when the search returned nothing — that empty case is the dead
- * end this closes, because typing a page that does not exist yet used to produce silence.
+ * end this closes, because typing a page that does not exist yet used to produce silence. Offered for
+ * every page-shaped trigger, `#` and `#[[` included, because Roam creates a page from those too; the
+ * accepted row is written back through the trigger's own insertion, so `#` yields `#Name`.
  *
  * Accepting it inserts `[[Name]]` and creates NOTHING. `:block/refs` is an entity reference, so Roam
  * materializes the page itself when the committed string is parsed (verified live against the Svy
@@ -6286,7 +6336,7 @@ export async function searchRoamReferenceSuggestions(context, limit = getSetting
  */
 export function withCreatePageSuggestion(context, suggestions) {
   const rows = [...(suggestions || [])];
-  if (context?.type !== "page") return rows;
+  if (!triggerIsPageLike(context?.type)) return rows;
   const name = String(context.query ?? "").trim(); if (!name) return rows;
   const folded = name.toLowerCase();
   if (rows.some((row) => String(row?.name ?? "").trim().toLowerCase() === folded)) return rows;
@@ -6310,7 +6360,8 @@ export function rememberAcceptedPage(name) {
 /** Whether a bare opener of this type can be answered without touching Roam — the condition under
  *  which `searchDelay` drops the debounce. */
 export function recentsCacheReady(type, now = Date.now()) {
-  const entry = roamRecentsCache.get(`${graphKeyName()}:${type}`);
+  if (!SUGGESTIBLE_EDITOR_TRIGGERS.has(type)) return false;
+  const entry = roamRecentsCache.get(`${graphKeyName()}:${triggerIsPageLike(type) ? "page" : "block"}`);
   return Boolean(entry) && now - entry.at < RECENTS_TTL_MS;
 }
 
@@ -6369,7 +6420,7 @@ export async function searchRoamRecentSuggestions(context, { limit = getSetting(
   if (!context || recentsDisabled() || !emptyOpenerEnabled()) return [];
   if (typeof api?.q !== "function") return [];
   const boundedLimit = clamp(Math.floor(Number(limit) || 8), 1, 20);
-  const page = context.type === "page";
+  const page = triggerIsPageLike(context.type);
   let rows = [];
   try { rows = readRecentRows(page ? "page" : "block", api, now); }
   catch (error) { console.warn("[roam-grid] Recents query failed", error); return []; }
@@ -6593,7 +6644,7 @@ export class GridEditorController {
     const state = this.state; const suggestion = this.suggestions[index]; const context = this.referenceContext;
     if (!state || !suggestion || !context) return;
     const page = suggestion.kind === "roam-page" || suggestion.kind === "roam-create-page";
-    const replacement = page ? `[[${suggestion.name}]]` : `((${suggestion.uid}))`;
+    const replacement = roamTriggerInsertion(context.type, suggestion);
     if (page) rememberAcceptedPage(suggestion.name);
     state.editor.setRangeText(replacement, context.startIndex, context.replaceEndIndex ?? context.endIndex, "end");
     state.referenceAutocompleteClosed = true;
@@ -6725,7 +6776,7 @@ export class GridEditorController {
     if (!state) return this.clearPresentation();
     const editor = state.editor; const raw = editor.value;
     const formula = raw.startsWith("=") && !raw.startsWith("==");
-    const referenceContext = roamReferenceAutocompleteContext(raw, editor.selectionStart);
+    const referenceContext = roamEditorTriggerContext(raw, editor.selectionStart, { formula });
     this.view.root.classList.toggle("rg-root--formula-editing", formula);
     const mode = referenceContext ? "reference" : formula ? "formula" : "plain";
     this.popover.dataset.mode = mode;
@@ -6802,6 +6853,10 @@ export class GridEditorController {
     clearTimeout(this.referenceSearchTimer); const token = ++this.referenceSearchToken;
     this.referenceContext = context; this.referenceContextKey = key; this.autocompleteContext = null;
     this.suggestions = []; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.renderSuggestionRows();
+    // `{{` and `/` are recognised so the page and block triggers stop firing inside them, but they
+    // have no catalog yet. Returning here renders nothing, which the never-empty popover invariant
+    // already handles correctly — it is an unanswerable trigger, not an empty result set.
+    if (!SUGGESTIBLE_EDITOR_TRIGGERS.has(context.type)) return;
     if (state.referenceAutocompleteClosed) return;
     // A bare opener takes the recents path instead of the search path. Its own switch and the
     // session budget switch are read here, ahead of the timer, so an off switch issues no query at

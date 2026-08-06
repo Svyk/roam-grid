@@ -787,7 +787,8 @@ test("a bare [[ opens on recent pages and a bare (( on recent blocks", async (t)
 test("the popover is never an empty shell across trigger type and recents state", async (t) => {
   t.after(() => { resetRoamRecents(); settingsCache.clear(); });
   const rows = { page: [["Alpha", "pagealpha", 40]], block: [["blockalpha", "alpha block", 40]] };
-  const openers = [["[[", "page"], ["((", "block"]];
+  rows.tag = rows.page;
+  const openers = [["[[", "page"], ["((", "block"], ["#", "tag"]];
 
   const assertInvariant = (controller, label) => {
     const state = controller.state;
@@ -905,6 +906,51 @@ test("a page name with no hits still offers to create it, inserting [[Name]] and
   editor.value = "[[Brand New Page]] [["; editor.setSelectionRange(21, 21); editor.dispatch("input"); flush(); await waitForSearch();
   assert.deepEqual(controller.suggestions.map((suggestion) => suggestion.name), ["Brand New Page", "Busy Page"],
     "a created page joins the LRU, so the next bare opener offers it first");
+  controller.dispose();
+});
+
+/**
+ * `#` and `#[[` reuse the page search and recents paths verbatim; only detection and insertion
+ * differ. `{{` and `/` are recognised so that `[[` and `((` stop firing inside them, but they have no
+ * catalog until U9 and U10 — so they must render nothing, query nothing, and leave the popover shut,
+ * which is the never-empty invariant doing its job rather than a special case bolted onto it.
+ */
+test("# and #[[ take the page path while {{ and / are recognised and answer nothing", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents(); settingsCache.clear();
+  let queries = 0; const searched = [];
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async (context) => { searched.push(context.type); return [{ kind: "roam-page", name: "Name With Spaces", description: "Page" }]; },
+  });
+  globalThis.window.roamAlphaAPI = { q: () => { queries += 1; return [["Recent Page", "pagerecent", 40]]; } };
+
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "#", floating: false });
+  flush(); await waitForSearch();
+  assert.equal(controller.referenceContext.type, "tag");
+  assert.deepEqual(controller.suggestions.map((suggestion) => suggestion.name), ["Recent Page"], "a bare # offers recent pages, exactly as a bare [[ does");
+  assert.equal(queries, 1);
+
+  editor.value = "#Name"; editor.setSelectionRange(5, 5); editor.dispatch("input"); flush(); await waitForSearch();
+  assert.deepEqual(searched, ["tag"], "a typed tag goes to the page search path");
+  controller.onKeydown({ key: "Enter", preventDefault() {}, stopPropagation() {}, isComposing: false }); flush();
+  assert.equal(editor.value, "#[[Name With Spaces]]", "a name Roam cannot read bare is bracketed, and the # is kept");
+
+  editor.value = "#[[Nam"; editor.setSelectionRange(6, 6); editor.dispatch("input"); flush(); await waitForSearch();
+  assert.equal(controller.referenceContext.type, "tag-page");
+  controller.onKeydown({ key: "Enter", preventDefault() {}, stopPropagation() {}, isComposing: false }); flush();
+  assert.equal(editor.value, "#[[Name With Spaces]]", "#[[ replaces its own # rather than doubling it");
+
+  for (const [raw, type] of [["{{ta", "component"], ["/dat", "command"]]) {
+    editor.value = raw; editor.setSelectionRange(raw.length, raw.length); editor.dispatch("input"); flush(); await waitForSearch();
+    assert.equal(controller.referenceContext.type, type, `${raw} is recognised`);
+    assert.deepEqual(controller.suggestions, [], `${raw} has no catalog yet`);
+    assert.equal(controller.popover.hidden, true, `${raw} opens no empty shell`);
+    assert.equal(controller.suggestionList.hidden, true);
+    assert.equal(editor.getAttribute("aria-expanded"), "false");
+  }
+  assert.equal(queries, 1, "a trigger with no catalog issues no recents query");
+  assert.deepEqual(searched, ["tag", "tag-page"], "and no search either");
   controller.dispose();
 });
 
@@ -1083,7 +1129,9 @@ test("Roam reference suggestions take keyboard precedence and Escape closes them
     referenceSearchDelay: 0,
     searchReferences: async () => [{ kind: "roam-page", name: "Project", description: "Page" }],
   });
-  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "=SUM(A1)+[[Pro", floating: true });
+  // Quoted, because a `[[` outside a string literal is a formula syntax error rather than a
+  // reference — the same guard that stops `=SUM((A1` being read as a block opener.
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: '=SUM(A1)&"[[Pro', floating: true });
   flush(); await waitForSearch();
   assert.equal(controller.suggestionKind, "roam-reference");
   assert.equal(controller.address.textContent, "fx  A1");
@@ -1092,7 +1140,7 @@ test("Roam reference suggestions take keyboard precedence and Escape closes them
   controller.onKeydown({ key: "Escape", preventDefault() {}, stopPropagation() {}, isComposing: false });
   assert.ok(controller.state); assert.equal(controller.suggestionList.hidden, true);
   controller.onKeydown({ key: "Escape", preventDefault() {}, stopPropagation() {}, isComposing: false }); await Promise.resolve();
-  assert.equal(controller.state, null); assert.equal(finishes.at(-1).commit, false); assert.equal(editor.value, "=SUM(A1)+[[Pro");
+  assert.equal(controller.state, null); assert.equal(finishes.at(-1).commit, false); assert.equal(editor.value, '=SUM(A1)&"[[Pro');
   controller.dispose();
 });
 
