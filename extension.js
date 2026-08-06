@@ -44,6 +44,8 @@ const LARGE_RESIDENT_MIN_CHUNKS = 8;
 const LARGE_RESIDENT_MAX_CHUNKS = 32;
 const LARGE_UPLOAD_CONCURRENCY = 4;
 const LARGE_PREFETCH_CONCURRENCY = 6;
+const LARGE_LINEAGE_LIMIT = 16;
+const LARGE_COMMIT_ATTEMPTS = 3;
 const CHUNK_CACHE_DB = "roam-grid-chunks";
 const CHUNK_CACHE_DB_VERSION = 1;
 const CHUNK_CACHE_BODIES = "bodies";
@@ -4028,7 +4030,131 @@ export function normalizeManifest(manifest) {
   normalized.chunkRows = chunkRowsFor(normalized);
   normalized.rowIdRevision = rowIdRevisionFor(normalized);
   normalized.colorFormulaCells = normalized.colorFormulaCells !== false;
+  normalized.lineage = manifestLineage(normalized);
   return normalized;
+}
+
+/**
+ * The lineage is the whole reason a merge can decide "behind or forked" without fetching a single
+ * ancestor: every revision carries the last sixteen it descends from, so the question is answered by
+ * a lookup in the manifest that was going to be downloaded anyway. Walking `previous` instead would
+ * cost one download per generation, on the exact path where a user is waiting for a save.
+ */
+export function manifestLineage(manifest) {
+  const entries = Array.isArray(manifest?.lineage) ? manifest.lineage : [];
+  return entries.filter((entry) => typeof entry === "string" && entry).slice(0, LARGE_LINEAGE_LIMIT);
+}
+
+export function extendLineage(manifest) {
+  const revision = typeof manifest?.revision === "string" && manifest.revision ? [manifest.revision] : [];
+  return [...revision, ...manifestLineage(manifest)].slice(0, LARGE_LINEAGE_LIMIT);
+}
+
+/**
+ * A grid older than sixteen revisions behind reads as forked, which is the safe direction: the only
+ * cost is a refused save the user can resolve with a reload, where the unsafe direction silently
+ * discards whichever side lost.
+ */
+export function descendsFrom(live, baseRevision) {
+  if (typeof baseRevision !== "string" || !baseRevision) return false;
+  return live?.revision === baseRevision || manifestLineage(live).includes(baseRevision);
+}
+
+/**
+ * 3B made a chunk's url content-addressed — every upload mints a fresh one — so a url that differs
+ * from the base is proof the other writer rewrote that chunk, and a url that matches is proof it did
+ * not. That is what makes disjointness trustworthy rather than a guess about intent.
+ */
+export function changedChunkIndexes(base, live) {
+  const remaining = new Map((base?.chunks || []).map((chunk) => [chunk.index, chunk]));
+  const changed = new Set();
+  for (const chunk of live?.chunks || []) {
+    const previous = remaining.get(chunk.index);
+    if (!previous || previous.url !== chunk.url) changed.add(chunk.index);
+    remaining.delete(chunk.index);
+  }
+  for (const index of remaining.keys()) changed.add(index);
+  return changed;
+}
+
+const sameManifestValue = (left, right) => (left === right) || (left !== undefined && right !== undefined && JSON.stringify(left) === JSON.stringify(right));
+
+/**
+ * Three-way, key by key, over the id-keyed maps 3A introduced: a key only one side touched takes
+ * that side's value (including its deletion), a key both sides moved to different values is a
+ * conflict, and a key neither touched keeps whatever the live manifest holds. The legacy `*ByIndex`
+ * maps are merged as themselves and never read back into the id-keyed maps — a positional entry
+ * that migration already projected onto an id would otherwise reappear here as a "change" nobody
+ * made, and would then out-vote the id-keyed value the user actually set.
+ */
+export function mergeMetadataMaps(base = {}, ours = {}, theirs = {}) {
+  const merged = { ...theirs };
+  const conflicts = [];
+  for (const key of new Set([...Object.keys(base || {}), ...Object.keys(ours || {})])) {
+    const before = base?.[key];
+    const mine = ours?.[key];
+    if (sameManifestValue(mine, before)) continue;
+    const yours = theirs?.[key];
+    if (!sameManifestValue(yours, before)) { if (!sameManifestValue(yours, mine)) conflicts.push(key); continue; }
+    if (mine === undefined) delete merged[key];
+    else merged[key] = mine;
+  }
+  return { merged, conflicts };
+}
+
+const MERGEABLE_MANIFEST_MAPS = ["widths", "rowHeights", "alignments", "rowHeightsByIndex", "alignmentsByIndex"];
+const MERGEABLE_MANIFEST_VALUES = ["columnIds", "charts", "frozenRows", "frozenCols", "showHeaders", "fitToWidth", "colorFormulaCells"];
+
+const refuseMerge = (reason, message, details = {}) => { throw new GridError("CONFLICT", message, { reason, ...details }); };
+
+/**
+ * The refusal set matters more than the merge set: a refused save is one reload away from recovery
+ * and a wrong merge is not, so every question that is not provably safe answers "refuse". Merging is
+ * allowed only when the live manifest descends from our base, our dirty chunks are disjoint from the
+ * ones the other writer rewrote, dimensions and merges moved on at most one side, and no metadata
+ * key moved on both. Anything else throws `CONFLICT` carrying the reason it refused.
+ */
+export function planManifestMerge(base, ours, live, dirtyChunks = []) {
+  if (!descendsFrom(live, base?.revision)) refuseMerge("fork", "Large grid changed elsewhere along a different history. Reload or save as a copy.", { baseRevision: base?.revision ?? null, liveRevision: live?.revision ?? null });
+  // Both addresses rows: a different chunk size or id namespace means every index and every row id
+  // in our copy points somewhere else in theirs, which no key-level merge can reconcile.
+  if (chunkRowsFor(live) !== chunkRowsFor(base) || rowIdRevisionFor(live) !== rowIdRevisionFor(base)) refuseMerge("addressing", "Large grid was re-chunked elsewhere. Reload or save as a copy.", { baseChunkRows: chunkRowsFor(base), liveChunkRows: chunkRowsFor(live) });
+  const theirChunks = changedChunkIndexes(base, live);
+  const overlap = [...new Set(dirtyChunks)].filter((index) => theirChunks.has(index)).sort((a, b) => a - b);
+  if (overlap.length) refuseMerge("chunk-overlap", `Large grid rows ${overlap.length > 1 ? "in several blocks" : "in one block"} changed on both sides. Reload or save as a copy.`, { chunks: overlap });
+
+  const dimensions = {};
+  for (const key of ["rowCount", "colCount"]) {
+    const changedOurs = base?.[key] !== ours?.[key];
+    const changedTheirs = base?.[key] !== live?.[key];
+    if (changedOurs && changedTheirs) refuseMerge("dimensions", "The large grid was resized on both sides. Reload or save as a copy.", { key, base: base?.[key] ?? null, ours: ours?.[key] ?? null, live: live?.[key] ?? null });
+    dimensions[key] = changedOurs ? ours[key] : live?.[key];
+  }
+
+  const mergesChangedOurs = !sameManifestValue(ours?.merges, base?.merges);
+  const mergesChangedTheirs = !sameManifestValue(live?.merges, base?.merges);
+  if (mergesChangedOurs && mergesChangedTheirs) refuseMerge("merges", "Merged regions changed on both sides. Reload or save as a copy.");
+
+  const merged = { ...deepClone(live), ...dimensions, merges: deepClone((mergesChangedOurs ? ours?.merges : live?.merges) || []) };
+  const conflicts = [];
+  for (const key of MERGEABLE_MANIFEST_MAPS) {
+    const result = mergeMetadataMaps(base?.[key], ours?.[key], live?.[key]);
+    merged[key] = result.merged;
+    for (const conflict of result.conflicts) conflicts.push(`${key}.${conflict}`);
+  }
+  const scalars = mergeMetadataMaps(
+    Object.fromEntries(MERGEABLE_MANIFEST_VALUES.map((key) => [key, base?.[key]])),
+    Object.fromEntries(MERGEABLE_MANIFEST_VALUES.map((key) => [key, ours?.[key]])),
+    Object.fromEntries(MERGEABLE_MANIFEST_VALUES.map((key) => [key, live?.[key]])),
+  );
+  conflicts.push(...scalars.conflicts);
+  if (conflicts.length) refuseMerge("metadata", `Large grid settings changed on both sides (${conflicts.slice(0, 3).join(", ")}). Reload or save as a copy.`, { keys: conflicts });
+  for (const key of MERGEABLE_MANIFEST_VALUES) {
+    const value = scalars.merged[key];
+    if (value === undefined) delete merged[key];
+    else merged[key] = deepClone(value);
+  }
+  return { manifest: merged, theirChunks };
 }
 
 export class LargeGridStore {
@@ -4037,6 +4163,10 @@ export class LargeGridStore {
     this.pointerUid = pointerUid;
     this.manifestUrl = null;
     this.manifest = null;
+    // `manifest` is edited in place by every metadata setter, so a three-way merge has no way to ask
+    // what we started from unless the loaded copy is kept beside it. This is that copy, and it is
+    // replaced only when the pointer we own actually moves.
+    this.baseManifest = null;
     this.cache = new Map();
     this.residentLimit = LARGE_RESIDENT_MIN_CHUNKS;
     this.chunkCache = ChunkCache.disabled();
@@ -4063,6 +4193,7 @@ export class LargeGridStore {
       this.pointerUid = pointer.uid;
       this.manifestUrl = extractUrl(pointer.string.slice(MANIFEST_PREFIX.length));
       this.manifest = normalizeManifest(await downloadJson(this.manifestUrl));
+      this.baseManifest = deepClone(this.manifest);
       this.metricsVersion += 1;
       return this;
     }
@@ -4093,7 +4224,7 @@ export class LargeGridStore {
     // ids: every reader derives the same ones from position until a row actually moves.
     const revision = cryptoId();
     const manifest = {
-      schema: "roam-grid/manifest", version: 2, revision, rowIdRevision: revision, previous: null, createdAt: new Date().toISOString(),
+      schema: "roam-grid/manifest", version: 2, revision, rowIdRevision: revision, previous: null, lineage: [], createdAt: new Date().toISOString(),
       rowCount: model.rowCount, colCount: model.colCount, chunkRows: chunkSize, columnIds: model.columnIds, widths: model.widths,
       rowHeights: rowHeightsForManifest(model, chunkSize, revision), rowHeightsByIndex: {}, alignments: alignmentsForManifest(model, chunkSize, revision), alignmentsByIndex: {},
       frozenRows: model.frozenRows, frozenCols: model.frozenCols, merges: model.merges, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, colorFormulaCells: model.colorFormulaCells !== false, chunks, retained: [],
@@ -4103,6 +4234,7 @@ export class LargeGridStore {
     await updateBlock(this.pointerUid, `${MANIFEST_PREFIX} ${url}`);
     this.manifestUrl = url;
     this.manifest = verified;
+    this.baseManifest = deepClone(verified);
     this.metricsVersion += 1;
   }
 
@@ -4131,7 +4263,7 @@ export class LargeGridStore {
     }
     const revision = cryptoId();
     const manifest = {
-      schema: "roam-grid/manifest", version: 2, revision, rowIdRevision: revision, previous: null, createdAt: new Date().toISOString(),
+      schema: "roam-grid/manifest", version: 2, revision, rowIdRevision: revision, previous: null, lineage: [], createdAt: new Date().toISOString(),
       rowCount, colCount, chunkRows: chunkSize, columnIds, widths: { ...source.manifest.widths },
       rowHeights: copiedRowHeights(source, chunkSize, revision, rowCount), rowHeightsByIndex: {}, alignments: copiedAlignments(source, columnIds, chunkSize, revision, rowCount), alignmentsByIndex: {},
       frozenRows: clamp(Number(source.manifest.frozenRows) || 0, 0, rowCount), frozenCols: clamp(Number(source.manifest.frozenCols) || 0, 0, colCount),
@@ -4143,6 +4275,7 @@ export class LargeGridStore {
     await updateBlock(this.pointerUid, `${MANIFEST_PREFIX} ${url}`);
     this.manifestUrl = url;
     this.manifest = verified;
+    this.baseManifest = deepClone(verified);
     this.metricsVersion += 1;
   }
 
@@ -4525,41 +4658,96 @@ export class LargeGridStore {
     return true;
   }
 
+  livePointerUrl() {
+    const pointer = getTree(this.pointerUid);
+    return extractUrl(pointer?.string?.slice(MANIFEST_PREFIX.length));
+  }
+
+  /**
+   * Their chunk at this index is newer than the copy we are holding, and disjointness guarantees the
+   * copy we are holding is clean — so dropping it is free and keeping it would serve stale rows out
+   * of memory for the rest of the session.
+   */
+  dropResidentChunk(index) {
+    this.cache.delete(index);
+    for (const id of this.rowIds.get(index) || []) this.rowIndexById.delete(id);
+    this.rowIds.delete(index);
+    this.unreadableChunks.delete(index);
+  }
+
+  /**
+   * One download of the manifest the pointer now names, and no more: the lineage inside it answers
+   * descent, and 3B's content-addressed urls answer disjointness, so no ancestor is ever fetched. A
+   * live manifest we cannot read or cannot understand is a refusal, not a merge.
+   */
+  async planLiveMerge(liveUrl, dirtyChunks) {
+    let live = null;
+    try { live = normalizeManifest(await downloadJson(liveUrl)); }
+    catch (error) {
+      const reason = error?.code === "UNSUPPORTED_SCHEMA" ? "version" : "unreadable";
+      throw new GridError("CONFLICT", "Large grid changed elsewhere and the new version could not be read. Reload or save as a copy.", { reason, liveUrl, baseUrl: this.manifestUrl, cause: error?.message });
+    }
+    try { return { ...planManifestMerge(this.baseManifest, this.manifest, live, dirtyChunks), liveUrl }; }
+    catch (error) {
+      if (error instanceof GridError) { error.details = { ...error.details, liveUrl, baseUrl: this.manifestUrl }; }
+      throw error;
+    }
+  }
+
+  /**
+   * A hard refuse on every concurrent write was throwing away the common case: content-addressed
+   * immutable chunks make two writers who touched different row blocks trivially reconcilable. So
+   * the pointer is now a compare-and-swap target — plan a merge against whatever it names, write the
+   * merged manifest, and re-read the pointer immediately before claiming it. Three attempts, because
+   * a pointer that keeps moving is contention a fourth round-trip will not resolve.
+   */
   async commit() {
     return this.queue.run(async () => {
       if (!this.dirty.size && !this.metadataDirty) return this.manifest;
-      const pointer = getTree(this.pointerUid);
-      const liveUrl = extractUrl(pointer?.string?.slice(MANIFEST_PREFIX.length));
-      if (liveUrl !== this.manifestUrl) throw new GridError("CONFLICT", "Large grid changed elsewhere. Reload or save as a copy.", { liveUrl, baseUrl: this.manifestUrl });
-      const chunks = this.manifest.chunks.map((chunk) => ({ ...chunk }));
-      const replaced = [];
-      // Serializing a hundred dirty chunks behind one another made saving a large paste as slow as
-      // the round-trip count. Each upload carries its own text, digest and index through a single
-      // worker and the results come back in input order, so four in-flight uploads cannot cross a
-      // digest onto a neighbouring chunk and `chunks`/`replaced` end up identical to the serial form.
-      const uploaded = await mapWithConcurrency([...this.dirty].sort((a, b) => a - b), LARGE_UPLOAD_CONCURRENCY, async (index) => {
-        const chunk = this.cache.get(index);
-        const text = JSON.stringify(chunk);
-        const digest = await sha256Hex(text);
-        const url = await uploadText(text, `roam-grid-${this.anchorUid}-${index}-${cryptoId()}.json`);
-        return { index, url, digest, startRow: chunk.startRow, rowCount: chunk.rows.length };
-      });
-      for (const entry of uploaded) {
-        const existing = chunks.find((item) => item.index === entry.index);
-        if (existing) { replaced.push(existing.url); existing.url = entry.url; existing.digest = entry.digest; existing.rowCount = entry.rowCount; }
-        else chunks.push({ index: entry.index, startRow: entry.startRow, rowCount: entry.rowCount, url: entry.url, digest: entry.digest });
+      const dirtyChunks = [...this.dirty].sort((a, b) => a - b);
+      // Chunk bytes are content-addressed and say nothing about which manifest wins, so they are
+      // uploaded once and reused across attempts rather than re-uploaded into fresh garbage.
+      let uploaded = null;
+      for (let attempt = 1; attempt <= LARGE_COMMIT_ATTEMPTS; attempt += 1) {
+        const liveUrl = this.livePointerUrl();
+        const plan = liveUrl === this.manifestUrl ? null : await this.planLiveMerge(liveUrl, dirtyChunks);
+        const source = plan ? plan.manifest : this.manifest;
+        const chunks = source.chunks.map((chunk) => ({ ...chunk }));
+        const replaced = [];
+        // Serializing a hundred dirty chunks behind one another made saving a large paste as slow as
+        // the round-trip count. Each upload carries its own text, digest and index through a single
+        // worker and the results come back in input order, so four in-flight uploads cannot cross a
+        // digest onto a neighbouring chunk and `chunks`/`replaced` end up identical to the serial form.
+        uploaded ||= await mapWithConcurrency(dirtyChunks, LARGE_UPLOAD_CONCURRENCY, async (index) => {
+          const chunk = this.cache.get(index);
+          const text = JSON.stringify(chunk);
+          const digest = await sha256Hex(text);
+          const url = await uploadText(text, `roam-grid-${this.anchorUid}-${index}-${cryptoId()}.json`);
+          return { index, url, digest, startRow: chunk.startRow, rowCount: chunk.rows.length };
+        });
+        for (const entry of uploaded) {
+          const existing = chunks.find((item) => item.index === entry.index);
+          if (existing) { replaced.push(existing.url); existing.url = entry.url; existing.digest = entry.digest; existing.rowCount = entry.rowCount; }
+          else chunks.push({ index: entry.index, startRow: entry.startRow, rowCount: entry.rowCount, url: entry.url, digest: entry.digest });
+        }
+        const next = { ...deepClone(source), revision: cryptoId(), previous: liveUrl, lineage: extendLineage(source), updatedAt: new Date().toISOString(), chunks, retained: [liveUrl, ...(source.retained || []).slice(0, 1), ...replaced] };
+        const url = await uploadJson(next, `roam-grid-${this.anchorUid}-manifest-${next.revision}.json`);
+        const verified = normalizeManifest(await downloadJson(url));
+        if (this.disposed) throw new GridError("DISPOSED", "Roam Grid unloaded before this large grid finished saving");
+        // The comparison has to be the last thing before the swap. Everything above it is round
+        // trips, and a pointer read taken before them proves nothing about the pointer now.
+        if (this.livePointerUrl() !== liveUrl) continue;
+        await updateBlock(this.pointerUid, `${MANIFEST_PREFIX} ${url}`);
+        for (const index of plan?.theirChunks || []) this.dropResidentChunk(index);
+        this.manifest = verified;
+        this.baseManifest = deepClone(verified);
+        this.manifestUrl = url;
+        this.dirty.clear();
+        this.metadataDirty = false;
+        this.metricsVersion += 1;
+        return verified;
       }
-      const next = { ...deepClone(this.manifest), revision: cryptoId(), previous: this.manifestUrl, updatedAt: new Date().toISOString(), chunks, retained: [this.manifestUrl, ...(this.manifest.retained || []).slice(0, 1), ...replaced] };
-      const url = await uploadJson(next, `roam-grid-${this.anchorUid}-manifest-${next.revision}.json`);
-      const verified = normalizeManifest(await downloadJson(url));
-      if (this.disposed) throw new GridError("DISPOSED", "Roam Grid unloaded before this large grid finished saving");
-      await updateBlock(this.pointerUid, `${MANIFEST_PREFIX} ${url}`);
-      this.manifest = verified;
-      this.manifestUrl = url;
-      this.dirty.clear();
-      this.metadataDirty = false;
-      this.metricsVersion += 1;
-      return verified;
+      throw new GridError("CONFLICT", "Large grid kept changing while this save was in flight. Reload or save as a copy.", { reason: "cas", attempts: LARGE_COMMIT_ATTEMPTS, baseUrl: this.manifestUrl });
     });
   }
 
