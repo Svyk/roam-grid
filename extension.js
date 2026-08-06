@@ -3890,9 +3890,16 @@ function gridViewUid(view) {
 
 export function keyboardOwner() { return runtime.keyboardOwner; }
 
-/** Marks `view` as the single grid that owns the keyboard until something else claims or releases it. */
+/**
+ * Marks `view` as the single grid that owns the keyboard until something else claims or releases it.
+ * A hover-preview mount shares its session with the real document view, and a read-only excerpt has
+ * no keydown handler at all, so neither may hold the keyboard. The refusal RELEASES rather than
+ * returning the incumbent: leaving a previously focused grid as owner would let keystrokes aimed at
+ * a popover drive an off-screen grid.
+ */
 export function claimKeyboard(view) {
   if (!view || view.disposed) return runtime.keyboardOwner;
+  if (view.surface === "preview" || typeof view.onKeydown !== "function") return releaseKeyboard();
   const previous = runtime.keyboardOwner;
   if (previous?.view && previous.view !== view) previous.view.root?.classList?.toggle?.("rg-root--interaction-active", false);
   runtime.keyboardOwner = { uid: gridViewUid(view), view, kind: view.store ? "large" : "native" };
@@ -6270,6 +6277,7 @@ export class GridView {
   }
 
   async addCellComment(row, col) {
+    if (this.surface === "preview") return null;
     if (!getSetting("comments-enabled")) { toast("Cell comments are turned off in Roam Grid settings", "warning"); return null; }
     if (!this.session) { toast("This grid is not attached to a Roam table yet", "warning"); return null; }
     if (!this.model.inBounds(row, col)) return null;
@@ -6546,8 +6554,10 @@ export class GridView {
   toggleAxisHeader(type, index) {
     return this.commitMutation(`Toggle header ${type}`, () => type === "row" ? this.model.toggleHeaderRow(index) : this.model.toggleHeaderColumn(index), true);
   }
-  undo() { return this.session.undo(); }
-  redo() { return this.session.redo(); }
+  /** `session.undo`/`redo` write through the history, not `commitMutation`, so they need their own
+   *  preview guard — a tooltip must not be able to rewind the source table. */
+  undo() { return this.surface === "preview" ? false : this.session.undo(); }
+  redo() { return this.surface === "preview" ? false : this.session.redo(); }
 
   openSource() {
     const uid = this.model.tableUid;
@@ -6785,7 +6795,12 @@ export class GridView {
     copied.then(() => toast(`${rows} × ${cols} live cell references copied`, "success", 1800)).catch((error) => toast(`Copy failed: ${error.message}`, "danger"));
   }
 
+  /** The one funnel every view-level mutation goes through. A preview mount shares the source
+   *  table's session, so an ungated write here overwrites real blocks from a tooltip. Gated here
+   *  rather than in `NativeGridSession.commitMutation`, which also serves `sourceView = null`
+   *  conflict recovery and inbound external patches. */
   commitMutation(label, mutation, structural, { rowDeletion = false } = {}) {
+    if (this.surface === "preview") return Promise.resolve(null);
     return this.session.commitMutation(this, label, mutation, structural, { rowDeletion });
   }
 
@@ -7013,6 +7028,9 @@ export class RangeGridView {
   dispose({ releaseNative = true } = {}) {
     this.disposed = true;
     this.root.removeEventListener("click", this.boundClick);
+    // Defensive: `claimKeyboard` already refuses a view with no `onKeydown`, but disposal must not
+    // be the thing that decides whether a stale owner survives.
+    releaseKeyboard(this);
     releaseRichCellHosts(this.root);
     this.root.remove();
     this.themeBridge?.dispose?.(); this.themeBridge = null;
@@ -7498,13 +7516,25 @@ function activeGridUid() {
   return ancestorWithMarker(uid, NATIVE_MARKER) || ancestorWithMarker(uid, LARGE_MARKER);
 }
 
-function activeMount() {
+/** The view a command may act on: a read-only excerpt and a hover-preview mount render a grid but
+ *  can never write, so command routing resolves them to the session's source-document view. */
+function commandViewOf(session) {
+  if (!session) return null;
+  for (const view of session.views) {
+    if (view.root?.isConnected && view.surface !== "preview" && !(view instanceof RangeGridView)) return view;
+  }
+  return null;
+}
+
+export function activeMount() {
   const root = document.activeElement?.closest?.("[data-roam-grid-uid]");
-  if (root?.__rgView) return root.__rgView;
+  const mounted = root?.__rgView;
+  if (mounted instanceof RangeGridView || mounted?.surface === "preview") return commandViewOf(mounted.session);
+  if (mounted) return mounted;
   const uid = activeGridUid();
   if (!uid) return null;
   const session = runtime.sessions.get(uid);
-  return session ? [...session.views].find((view) => view.root?.isConnected) || null : runtime.largeMounts.get(uid) || null;
+  return session ? commandViewOf(session) : runtime.largeMounts.get(uid) || null;
 }
 
 async function enhanceFocusedTable() {

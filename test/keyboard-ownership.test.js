@@ -4,6 +4,8 @@ import {
   GridModel,
   GridView,
   NativeGridSession,
+  RangeGridView,
+  activeMount,
   claimKeyboard,
   clearUndoHistories,
   installKeyboardOwnership,
@@ -65,6 +67,7 @@ class Node {
   get isConnected() { for (let current = this; current; current = current.parentNode) if (current === globalThis.document?.body) return true; return false; }
   append(...nodes) { nodes.forEach((node) => this.appendChild(typeof node === "string" ? new Node("#text", node) : node)); }
   appendChild(node) { if (node.parentNode) node.remove(); node.parentNode = this; this.children.push(node); return node; }
+  prepend(...nodes) { for (const node of [...nodes].reverse()) { if (node.parentNode) node.remove(); node.parentNode = this; this.children.unshift(node); } }
   remove() { if (!this.parentNode) return; this.parentNode.children = this.parentNode.children.filter((node) => node !== this); this.parentNode = null; }
   contains(node) { for (let current = node; current; current = current.parentNode) if (current === this) return true; return false; }
   matches(selector) { return matchesSelector(this, selector); }
@@ -398,8 +401,10 @@ test("keyboard ownership tracks the large-grid kind and only the owning view can
   releaseKeyboard();
   const nativeRoot = new Node("section"); nativeRoot.className = "rg-root"; dom.body.appendChild(nativeRoot);
   const largeRoot = new Node("section"); largeRoot.className = "rg-root rg-large-root"; dom.body.appendChild(largeRoot);
-  const nativeView = { root: nativeRoot, model: { tableUid: "native-uid" }, disposed: false };
-  const largeView = { root: largeRoot, store: { anchorUid: "large-uid" }, disposed: false };
+  // Both stand-ins carry `onKeydown` because a real `GridView`/`LargeGridView` does: `claimKeyboard`
+  // refuses a view that cannot handle a keystroke.
+  const nativeView = { root: nativeRoot, model: { tableUid: "native-uid" }, disposed: false, onKeydown() {} };
+  const largeView = { root: largeRoot, store: { anchorUid: "large-uid" }, disposed: false, onKeydown() {} };
 
   assert.equal(claimKeyboard(nativeView).kind, "native");
   assert.equal(keyboardOwner().uid, "native-uid");
@@ -414,4 +419,244 @@ test("keyboard ownership tracks the large-grid kind and only the owning view can
 
   largeView.disposed = true;
   assert.equal(claimKeyboard(largeView), null, "a disposed view cannot claim the keyboard");
+});
+
+// ---------------------------------------------------------------------------
+// GOAL-R1 — read-only surfaces must be read-only.  A hover-preview mount and a
+// range excerpt share the source table's session, so every write they reach
+// lands on the real blocks in the graph.
+// ---------------------------------------------------------------------------
+
+/** One session with a counting adapter, so a refused write is provable at the queue and the wire. */
+function sharedSession(uid = "table-a") {
+  const model = new GridModel({
+    rows: [[{ uid: "a1", raw: "1" }, { uid: "b1", raw: "2" }], [{ uid: "a2", raw: "3" }, { uid: "b2", raw: "4" }]],
+    tableUid: uid,
+  });
+  const writes = { content: 0, structural: 0 };
+  const adapter = {
+    model,
+    load: () => model,
+    watchExternal: () => () => {},
+    getBaseRaw: () => "",
+    saveContent: async (batch) => { writes.content += 1; return { saved: [...batch.values()], skipped: [] }; },
+    save: async (value) => { writes.structural += 1; return value; },
+    dispose() {},
+  };
+  clearUndoHistories();
+  return { model, adapter, writes, session: new NativeGridSession(uid, { adapter, model }) };
+}
+
+/** A `GridView`-shaped mount on `session` that borrows the real prototype write paths. */
+function surfaceGrid(dom, session, { surface = "main" } = {}) {
+  const root = new Node("section"); root.className = "rg-root";
+  root.dataset.roamGridUid = session.tableUid; root.dataset.rgSurface = surface;
+  const cell = new Node("div"); cell.className = "rg-cell"; cell.dataset.row = "0"; cell.dataset.col = "0";
+  root.appendChild(cell); dom.body.appendChild(root);
+  const view = {
+    root, session, model: session.model, adapter: session.adapter, context: "source", surface, disposed: false,
+    cells: new Map([["0:0", cell]]),
+    selection: { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+    anchor: { row: 0, col: 0 },
+    renders: 0,
+    addCellComment: GridView.prototype.addCellComment,
+    clearSelection: GridView.prototype.clearSelection,
+    commitMutation: GridView.prototype.commitMutation,
+    copy: GridView.prototype.copy,
+    fillRange: GridView.prototype.fillRange,
+    finishPointerAction: GridView.prototype.finishPointerAction,
+    onKeydown: GridView.prototype.onKeydown,
+    openMenu: GridView.prototype.openMenu,
+    pasteMatrix: GridView.prototype.pasteMatrix,
+    redo: GridView.prototype.redo,
+    undo: GridView.prototype.undo,
+    captureRowDeletionContext: () => null,
+    patchRowDeletion: () => false,
+    render() { this.renders += 1; },
+    refreshValues() {},
+    select() {},
+    moveSelection() {},
+    beginEdit() {},
+  };
+  root.__rgView = view;
+  session.addView(view);
+  return { view, root, cell };
+}
+
+/** A live `RangeGridView` over the same session, mounted the way `mountRangeInstance` mounts one. */
+function rangeExcerpt(dom, session, { surface = "main" } = {}) {
+  const host = new Node("div"); dom.body.appendChild(host);
+  const anchor = new Node("button"); anchor.className = "bp3-button"; host.appendChild(anchor);
+  const view = new RangeGridView({ host, session, range: { startRow: 0, endRow: 1, startCol: 0, endCol: 1 }, nativeElement: anchor, surface });
+  view.root.dataset.roamGridUid = session.tableUid;
+  return { view, host, anchor };
+}
+
+function rawGrid(model) {
+  return model.rows.map((row) => row.map((cell) => cell.raw));
+}
+
+test("a preview-surface grid cannot own the keyboard, and clicking one releases the previous owner", () => {
+  const dom = installDom();
+  releaseKeyboard();
+  const uninstall = installKeyboardOwnership();
+  const { session } = sharedSession();
+  const main = surfaceGrid(dom, session);
+  const preview = surfaceGrid(dom, session, { surface: "preview" });
+  try {
+    assert.equal(claimKeyboard(preview.view), null, "a preview mount is refused outright");
+
+    dom.firePointerDown(main.cell);
+    assert.equal(keyboardOwner()?.view, main.view);
+
+    dom.firePointerDown(preview.cell);
+    assert.equal(keyboardOwner(), null, "clicking a hover preview must RELEASE, not leave the source grid owning the keyboard");
+    assert.equal(main.root.classList.contains("rg-root--interaction-active"), false);
+
+    // The keystroke that follows therefore reaches Roam instead of an off-screen grid.
+    const typed = dom.fireKeydown(preview.cell, { key: "x" });
+    assert.equal(typed.defaultPrevented, false);
+  } finally { uninstall(); session.dispose(); }
+});
+
+test("commitMutation on a preview view is a no-op that never reaches the write queue", async () => {
+  const dom = installDom();
+  releaseKeyboard();
+  const { session, model, writes } = sharedSession();
+  const preview = surfaceGrid(dom, session, { surface: "preview" });
+  try {
+    const before = rawGrid(model);
+    const result = await preview.view.commitMutation("Clear cells", () => model.setRaw(0, 0, ""), false);
+
+    assert.equal(result, null, "a refused mutation resolves null, the same shape a failed one resolves");
+    assert.deepEqual(rawGrid(model), before, "the source model must be byte-for-byte unchanged");
+    assert.equal(session.dirtyCells.size, 0, "nothing may be queued for persistence");
+    assert.equal(writes.content, 0);
+    assert.equal(writes.structural, 0);
+    assert.equal(session.changeVersion, 0, "no change version means no save was ever scheduled");
+  } finally { session.dispose(); }
+});
+
+test("Delete, Cmd+X, paste, the fill handle, and a context-menu delete leave a preview view's source untouched", async () => {
+  const dom = installDom();
+  releaseKeyboard();
+  const uninstall = installKeyboardOwnership();
+  const { session, model, writes } = sharedSession();
+  const preview = surfaceGrid(dom, session, { surface: "preview" });
+  const before = rawGrid(model);
+  try {
+    preview.view.selection = { startRow: 0, endRow: 1, startCol: 0, endCol: 1 };
+
+    preview.view.onKeydown(makeEvent("keydown", preview.cell, { key: "Delete" }));
+    preview.view.onKeydown(makeEvent("keydown", preview.cell, { key: "x", metaKey: true }));
+    await preview.view.pasteMatrix([["PASTED", "PASTED"]]);
+
+    preview.view.fillStart = { startRow: 0, endRow: 0, startCol: 0, endCol: 0 };
+    preview.view.fillTarget = { row: 1, col: 1 };
+    preview.view.finishPointerAction();
+
+    const anchor = new Node("button"); dom.body.appendChild(anchor);
+    preview.view.openMenu(anchor);
+    const menu = dom.body.querySelector(".rg-context-menu");
+    const deleteRows = menu.children.find((child) => child.textContent === "Delete selected rows");
+    assert.ok(deleteRows, "the preview still builds its menu — the guard is at the write, not the UI");
+    deleteRows.dispatch("click");
+
+    assert.deepEqual(rawGrid(model), before, "no destructive entry point may reach the source blocks");
+    assert.equal(model.rowCount, 2);
+    assert.equal(session.dirtyCells.size, 0);
+    assert.equal(writes.content, 0);
+    assert.equal(writes.structural, 0);
+  } finally { uninstall(); session.dispose(); }
+});
+
+test("addCellComment and undo are refused on a preview view", async () => {
+  const dom = installDom();
+  releaseKeyboard();
+  const { session, model } = sharedSession();
+  const main = surfaceGrid(dom, session);
+  const preview = surfaceGrid(dom, session, { surface: "preview" });
+  let commentCalls = 0;
+  session.addCellComment = async () => { commentCalls += 1; return null; };
+  try {
+    // Not awaited directly: without the guard `showPrompt` never settles, so the race is what keeps
+    // a regression a failure instead of a hang.
+    const settled = await Promise.race([
+      preview.view.addCellComment(0, 0),
+      new Promise((resolve) => { setTimeout(() => resolve("PROMPTED"), 0); }),
+    ]);
+    assert.equal(settled, null, "a preview view must refuse the comment before prompting");
+    assert.equal(dom.body.querySelector(".rg-dialog-overlay"), null, "no prompt may be raised from a tooltip");
+    assert.equal(commentCalls, 0, "the session comment writer must never be reached");
+
+    await main.view.commitMutation("Delete rows", () => model.deleteRows(1, 1), true, { rowDeletion: true });
+    assert.equal(model.rowCount, 1, "the source grid's own delete still works");
+
+    assert.equal(preview.view.undo(), false, "undo bypasses commitMutation, so it needs its own guard");
+    assert.equal(preview.view.redo(), false);
+    assert.equal(model.rowCount, 1, "a preview view may not rewind the source table");
+
+    assert.equal(main.view.undo(), true);
+    assert.equal(model.rowCount, 2, "the source view's undo is unaffected");
+  } finally { session.dispose(); }
+});
+
+test("a range excerpt never claims the keyboard and a following keystroke does not throw", () => {
+  const dom = installDom();
+  releaseKeyboard();
+  const uninstall = installKeyboardOwnership();
+  const { session } = sharedSession();
+  const main = surfaceGrid(dom, session);
+  const excerpt = rangeExcerpt(dom, session);
+  try {
+    assert.equal(typeof excerpt.view.onKeydown, "undefined", "the excerpt deliberately has no keyboard methods");
+
+    dom.firePointerDown(main.cell);
+    assert.equal(keyboardOwner()?.view, main.view);
+
+    const label = excerpt.view.root.querySelector(".rg-range-label");
+    dom.firePointerDown(label);
+    assert.equal(keyboardOwner(), null, "pointerdown on the excerpt's caption releases instead of claiming");
+
+    // Pre-fix this threw `owner.view.onKeydown is not a function` on every keystroke.
+    const typed = dom.fireKeydown(label, { key: "a" });
+    assert.equal(typed.defaultPrevented, false);
+    const undoAttempt = dom.fireKeydown(label, { key: "z", metaKey: true });
+    assert.equal(undoAttempt.defaultPrevented, false, "⌘Z must stay with Roam, not be swallowed by a read-only excerpt");
+  } finally { uninstall(); session.dispose(); }
+});
+
+test("RangeGridView.dispose leaves no stale keyboard owner", () => {
+  const dom = installDom();
+  releaseKeyboard();
+  const { session } = sharedSession();
+  const excerpt = rangeExcerpt(dom, session);
+  try {
+    // `claimKeyboard` already refuses a view with no `onKeydown`; giving the instance one is how the
+    // stale-owner state this disposer defends against would arise.
+    excerpt.view.onKeydown = () => {};
+    assert.equal(claimKeyboard(excerpt.view)?.view, excerpt.view);
+
+    excerpt.view.dispose();
+    assert.equal(keyboardOwner(), null, "a disposed excerpt must not stay the keyboard owner");
+  } finally { session.dispose(); }
+});
+
+test("a focused range excerpt routes commands to the source grid, not to the excerpt", () => {
+  const dom = installDom();
+  releaseKeyboard();
+  const { session } = sharedSession();
+  const main = surfaceGrid(dom, session);
+  const preview = surfaceGrid(dom, session, { surface: "preview" });
+  const excerpt = rangeExcerpt(dom, session);
+  try {
+    document.activeElement = main.cell;
+    assert.equal(activeMount(), main.view);
+
+    document.activeElement = excerpt.view.root.querySelector(".rg-range-label");
+    assert.equal(activeMount(), main.view, "Undo/Export/Convert must resolve an excerpt to its source grid");
+
+    document.activeElement = preview.cell;
+    assert.equal(activeMount(), main.view, "a hover preview resolves the same way");
+  } finally { session.dispose(); }
 });
