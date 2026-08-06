@@ -25,11 +25,14 @@ const MAX_UNDO_CHECKPOINTS = 8;
 const MAX_UNDO_HISTORIES = 24;
 
 export const undoHistories = new Map();
+export const portalObservers = new Map();
 
 const runtime = {
   undoHistories,
+  portalObservers,
   extensionAPI: null,
   observer: null,
+  portalBodyObserver: null,
   metadata: null,
   templates: null,
   sessions: new Map(),
@@ -94,6 +97,7 @@ export function enhancedUidGuardCss(uids) {
     selectors.push(
       `[id$="${escaped}"] .rm-table:not(.rg-native-hidden)`,
       `.rm-block-ref[data-uid="${escaped}"] .rm-table:not(.rg-native-hidden)`,
+      `[data-uid="${escaped}"] .rm-table:not(.rg-native-hidden)`,
     );
   }
   return selectors.length ? `${selectors.join(",\n")} { visibility: hidden !important; pointer-events: none !important; }` : "";
@@ -4580,19 +4584,21 @@ export class GridEditorController {
 }
 
 export class GridView {
-  constructor({ host, model, adapter, nativeElement = null, session = null, context = "source" }) {
+  constructor({ host, model, adapter, nativeElement = null, session = null, context = "source", surface = "main" }) {
     this.host = host;
     this.session = session;
     this.model = session?.model || model;
     this.adapter = session?.adapter || adapter;
     this.nativeElement = nativeElement;
     this.context = context;
+    this.surface = surface;
     this.selection = { startRow: 0, endRow: 0, startCol: 0, endCol: 0 };
     this.anchor = { row: 0, col: 0 };
     this.root = document.createElement("section");
     this.root.className = "rg-root";
     this.root.classList.toggle("rg-root--reference", context === "reference");
     this.root.dataset.rgContext = context;
+    this.root.dataset.rgSurface = surface;
     this.root.tabIndex = 0;
     this.cells = new Map();
     this.disposed = false;
@@ -5419,6 +5425,7 @@ export class GridView {
   }
 
   beginEdit(row, col, initial = null, floating = false) {
+    if (this.surface === "preview") return null;
     if (this.session) return this.session.beginEdit(this, () => this.beginEditLocal(row, col, initial, floating));
     return this.beginEditLocal(row, col, initial, floating);
   }
@@ -6347,13 +6354,25 @@ export function nativeTableInstanceInfo(nativeElement, entries = runtime.metadat
   if (referenceUid && entries.get?.(referenceUid)?.value?.mode !== "large" && entries.has?.(referenceUid)) {
     return { uid: referenceUid, context: "reference", referenceElement: reference };
   }
-  for (const [uid, entry] of entries) {
-    if (entry?.value?.mode === "large") continue;
-    for (let node = nativeElement; node; node = node.parentElement) {
-      if (node.dataset?.uid === uid || String(node.id || "").endsWith(uid)) return { uid, context: "source", referenceElement: null };
+  for (let node = nativeElement; node; node = node.parentElement) {
+    let idMatch = null;
+    for (const [uid, entry] of entries) {
+      if (entry?.value?.mode === "large") continue;
+      if (node.dataset?.uid === uid) return { uid, context: "source", referenceElement: null };
+      if (idMatch === null && String(node.id || "").endsWith(uid)) idMatch = uid;
     }
+    if (idMatch !== null) return { uid: idMatch, context: "source", referenceElement: null };
   }
   return null;
+}
+
+/** Classifies the Roam surface a native table is rendered on. Additive — it never replaces `context`. */
+export function instanceSurface(element) {
+  if (!element?.closest) return "main";
+  if (element.closest(".bp3-portal, .bp3-tooltip, .bp3-popover")) return "preview";
+  if (element.closest("#right-sidebar, #roam-right-sidebar-content")) return "sidebar";
+  if (element.closest(".rm-embed-container")) return "embed";
+  return "main";
 }
 
 function claimNativeInstances(root) {
@@ -6383,12 +6402,12 @@ function getOrCreateNativeSession(uid) {
   runtime.sessions.set(uid, session); return session;
 }
 
-function mountNativeInstance(nativeElement, info) {
+function mountNativeInstance(nativeElement, info, surface = instanceSurface(nativeElement)) {
   const current = runtime.viewsByNative.get(nativeElement);
   if (current?.root?.isConnected) return current;
   nativeElement.classList.add("rg-native-pending");
   const session = getOrCreateNativeSession(info.uid);
-  const view = new GridView({ host: nativeElement.parentElement, model: session.model, adapter: session.adapter, nativeElement, session, context: info.context });
+  const view = new GridView({ host: nativeElement.parentElement, model: session.model, adapter: session.adapter, nativeElement, session, context: info.context, surface });
   view.root.dataset.roamGridUid = info.uid; view.root.dataset.roamGridInstance = cryptoId(); view.root.__rgView = view;
   runtime.views.add(view); runtime.viewsByNative.set(nativeElement, view);
   nativeElement.classList.remove("rg-native-pending");
@@ -6430,6 +6449,57 @@ function handleDomMutations(records) {
   }
   if (referencesChanged) for (const session of runtime.sessions.values()) session.scheduleReferenceCountRefresh();
   if (!(records || []).some((record) => record.addedNodes?.length)) scheduleScan(document);
+}
+
+/** Portal subtrees are scanned added-node-first only — they must never fall back to a document scan. */
+function handlePortalMutations(records) {
+  for (const record of records || []) for (const node of record.addedNodes || []) if (node.nodeType === 1) scheduleScan(node);
+}
+
+function isBlueprintPortal(node) {
+  return Boolean(node?.nodeType === 1 && node.matches?.(".bp3-portal"));
+}
+
+function attachPortalObserver(portal, MutationObserverClass, scan) {
+  if (!portal || portalObservers.has(portal)) return null;
+  const observer = new MutationObserverClass(handlePortalMutations);
+  observer.observe(portal, { childList: true, subtree: true });
+  portalObservers.set(portal, observer);
+  scan(portal);
+  return observer;
+}
+
+function detachPortalObserver(portal) {
+  const observer = portalObservers.get(portal);
+  if (!observer) return false;
+  observer.disconnect?.(); portalObservers.delete(portal);
+  return true;
+}
+
+export function disposePortalObservers() {
+  runtime.portalBodyObserver?.disconnect?.(); runtime.portalBodyObserver = null;
+  for (const portal of [...portalObservers.keys()]) detachPortalObserver(portal);
+}
+
+/**
+ * Blueprint hangs `.bp3-portal` off `<body>`, outside the `.roam-app` subtree `runtime.observer`
+ * watches — while the pre-paint guard is document-global. Without this, a table in a hover preview
+ * is hidden but never claimed, so it renders as blank space.
+ */
+export function installPortalObservers({ MutationObserverClass = globalThis.MutationObserver, ownerDocument = globalThis.document, scan = scheduleScan } = {}) {
+  const body = ownerDocument?.body;
+  if (!body || typeof MutationObserverClass !== "function") return () => {};
+  const observer = new MutationObserverClass((records) => {
+    for (const record of records || []) {
+      for (const node of record.addedNodes || []) if (isBlueprintPortal(node)) attachPortalObserver(node, MutationObserverClass, scan);
+      for (const node of record.removedNodes || []) if (isBlueprintPortal(node)) detachPortalObserver(node);
+    }
+  });
+  observer.observe(body, { childList: true });
+  runtime.portalBodyObserver = observer;
+  for (const portal of ownerDocument.querySelectorAll?.(".bp3-portal") || []) attachPortalObserver(portal, MutationObserverClass, scan);
+  runtime.disposers.push(disposePortalObservers);
+  return disposePortalObservers;
 }
 
 async function scanMounts() {
@@ -6502,6 +6572,7 @@ async function onload({ extensionAPI }) {
     runtime.disposers.push(() => document.removeEventListener("focusin", rememberFocusedUid, true));
     installKeyboardOwnership();
     runtime.observer = new MutationObserver(handleDomMutations); runtime.observer.observe(document.querySelector(".roam-app") || document.body, { childList: true, subtree: true });
+    installPortalObservers();
     scheduleScan(document);
   } catch (error) {
     await onunload();
@@ -6511,7 +6582,7 @@ async function onload({ extensionAPI }) {
 }
 
 async function onunload() {
-  runtime.observer?.disconnect(); runtime.observer = null; runtime.pendingScanRoots.clear(); runtime.scanQueued = false;
+  runtime.observer?.disconnect(); runtime.observer = null; disposePortalObservers(); runtime.pendingScanRoots.clear(); runtime.scanQueued = false;
   for (const uid of [...runtime.sessions.keys()]) disposeNativeSession(uid, true);
   for (const mount of runtime.largeMounts.values()) mount.dispose(); runtime.largeMounts.clear(); mounting.clear();
   clearUndoHistories();

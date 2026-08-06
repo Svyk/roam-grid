@@ -1,13 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import {
+import extension, {
   GridModel,
   NativeGridSession,
   createGridThemeBridge,
   enhancedUidGuardCss,
   graphCacheKey,
+  installPortalObservers,
+  instanceSurface,
   nativeTableInstanceInfo,
+  portalObservers,
   readEnhancedUidCache,
   syncGridThemeFromHost,
   writeEnhancedUidCache,
@@ -32,6 +35,18 @@ test("pre-paint guard covers canonical and referenced instances without collapsi
   assert.doesNotMatch(css, /display:\s*none/);
 });
 
+test("pre-paint guard emits exactly three selector families per uid, including bare data-uid surfaces", () => {
+  const css = enhancedUidGuardCss(new Set(["NgPxePzgl", "abc"]));
+  const selectors = css.slice(0, css.indexOf("{")).split(",").map((selector) => selector.trim()).filter(Boolean);
+  assert.equal(selectors.length, 6);
+  for (const uid of ["NgPxePzgl", "abc"]) {
+    assert.ok(selectors.includes(`[id$="${uid}"] .rm-table:not(.rg-native-hidden)`));
+    assert.ok(selectors.includes(`.rm-block-ref[data-uid="${uid}"] .rm-table:not(.rg-native-hidden)`));
+    assert.ok(selectors.includes(`[data-uid="${uid}"] .rm-table:not(.rg-native-hidden)`));
+  }
+  assert.doesNotMatch(css, /display:\s*none/);
+});
+
 test("native table instance resolution prefers the canonical UID on a block reference", () => {
   const entries = new Map([
     ["sourceUid", { value: { mode: "native" } }],
@@ -47,6 +62,45 @@ test("native table instance resolution prefers the canonical UID on a block refe
 
   const largeReference = { dataset: { uid: "largeUid" }, getAttribute: () => "largeUid" };
   assert.equal(nativeTableInstanceInfo({ closest: () => largeReference }, entries), null);
+});
+
+test("native table instance resolution returns the nearest enhanced ancestor regardless of map insertion order", () => {
+  const outer = { id: "block-input-w1-outerUid", dataset: {}, parentElement: null };
+  const inner = { id: "block-input-w1-innerUid", dataset: {}, parentElement: outer };
+  const table = { closest: () => null, id: "", dataset: {}, parentElement: inner };
+  const native = { value: { mode: "native" } };
+
+  const outerFirst = new Map([["outerUid", native], ["innerUid", native]]);
+  const innerFirst = new Map([["innerUid", native], ["outerUid", native]]);
+  assert.deepEqual(nativeTableInstanceInfo(table, outerFirst), { uid: "innerUid", context: "source", referenceElement: null });
+  assert.deepEqual(nativeTableInstanceInfo(table, innerFirst), { uid: "innerUid", context: "source", referenceElement: null });
+
+  const nearestLarge = { id: "block-input-w1-largeUid", dataset: {}, parentElement: outer };
+  const belowLarge = { closest: () => null, id: "", dataset: {}, parentElement: nearestLarge };
+  const withLarge = new Map([["largeUid", { value: { mode: "large" } }], ["outerUid", native]]);
+  assert.deepEqual(nativeTableInstanceInfo(belowLarge, withLarge), { uid: "outerUid", context: "source", referenceElement: null });
+});
+
+test("native table instance resolution prefers a dataset uid over an id suffix on the same ancestor", () => {
+  const block = { id: "block-input-w1-suffixUid", dataset: { uid: "datasetUid" }, parentElement: null };
+  const table = { closest: () => null, id: "", dataset: {}, parentElement: block };
+  const native = { value: { mode: "native" } };
+  const suffixFirst = new Map([["suffixUid", native], ["datasetUid", native]]);
+  assert.deepEqual(nativeTableInstanceInfo(table, suffixFirst), { uid: "datasetUid", context: "source", referenceElement: null });
+});
+
+test("instanceSurface classifies preview, sidebar, embed, and main ancestries", () => {
+  const within = (...marks) => ({ closest: (selector) => (String(selector).split(",").map((part) => part.trim()).some((part) => marks.includes(part)) ? { marks } : null) });
+  assert.equal(instanceSurface(within(".bp3-portal")), "preview");
+  assert.equal(instanceSurface(within(".bp3-tooltip")), "preview");
+  assert.equal(instanceSurface(within(".bp3-popover")), "preview");
+  assert.equal(instanceSurface(within("#right-sidebar")), "sidebar");
+  assert.equal(instanceSurface(within("#roam-right-sidebar-content")), "sidebar");
+  assert.equal(instanceSurface(within(".rm-embed-container")), "embed");
+  assert.equal(instanceSurface(within()), "main");
+  assert.equal(instanceSurface(within(".bp3-portal", "#right-sidebar", ".rm-embed-container")), "preview");
+  assert.equal(instanceSurface(null), "main");
+  assert.equal(instanceSurface({}), "main");
 });
 
 test("host theme bridge samples Blueprint-style body colors and skips unchanged writes", () => {
@@ -144,6 +198,89 @@ test("a shared session commits the previous instance editor before opening anoth
   await session.beginEdit(second, async () => { starts += 1; });
   assert.equal(finishes, 1); assert.equal(starts, 1); assert.equal(session.activeEditorView, second);
   session.dispose();
+});
+
+function makePortal(name) {
+  return { nodeType: 1, name, matches: (selector) => selector === ".bp3-portal" };
+}
+
+function installPortalHarness(existing = []) {
+  const instances = [];
+  class FakeObserver {
+    constructor(callback) { this.callback = callback; this.observed = []; this.disconnects = 0; instances.push(this); }
+    observe(node, options) { this.observed.push({ node, options }); }
+    disconnect() { this.disconnects += 1; }
+  }
+  const scans = [];
+  const ownerDocument = { body: { name: "body" }, querySelectorAll: (selector) => (selector === ".bp3-portal" ? existing : []) };
+  const dispose = installPortalObservers({ MutationObserverClass: FakeObserver, ownerDocument, scan: (root) => scans.push(root) });
+  return { instances, scans, ownerDocument, dispose, body: instances[0] };
+}
+
+test("the portal watcher observes body with childList only and never subtree", (t) => {
+  const harness = installPortalHarness();
+  t.after(harness.dispose);
+  assert.equal(harness.instances.length, 1);
+  assert.equal(harness.body.observed.length, 1);
+  assert.equal(harness.body.observed[0].node, harness.ownerDocument.body);
+  assert.deepEqual(harness.body.observed[0].options, { childList: true });
+  assert.equal("subtree" in harness.body.observed[0].options, false);
+});
+
+test("each Blueprint portal gets its own subtree observer and a synchronous scan", (t) => {
+  const preexisting = makePortal("preexisting");
+  const harness = installPortalHarness([preexisting]);
+  t.after(harness.dispose);
+  assert.equal(portalObservers.size, 1, "portals already mounted at install time must be swept");
+  assert.deepEqual(harness.scans, [preexisting]);
+
+  const added = makePortal("added");
+  const ignored = { nodeType: 1, name: "not-a-portal", matches: () => false };
+  harness.body.callback([{ addedNodes: [added, ignored], removedNodes: [] }]);
+  assert.equal(portalObservers.size, 2);
+  assert.deepEqual(harness.scans, [preexisting, added]);
+  const observer = portalObservers.get(added);
+  assert.notEqual(observer, portalObservers.get(preexisting));
+  assert.deepEqual(observer.observed, [{ node: added, options: { childList: true, subtree: true } }]);
+
+  harness.body.callback([{ addedNodes: [added], removedNodes: [] }]);
+  assert.equal(portalObservers.size, 2, "a re-reported portal must not be observed twice");
+  assert.deepEqual(harness.scans, [preexisting, added]);
+});
+
+test("a removed Blueprint portal disconnects and drops its observer", (t) => {
+  const harness = installPortalHarness();
+  t.after(harness.dispose);
+  const portal = makePortal("transient");
+  harness.body.callback([{ addedNodes: [portal], removedNodes: [] }]);
+  const observer = portalObservers.get(portal);
+  assert.ok(observer);
+
+  harness.body.callback([{ addedNodes: [], removedNodes: [portal] }]);
+  assert.equal(portalObservers.has(portal), false);
+  assert.equal(observer.disconnects, 1);
+  assert.equal(portalObservers.size, 0);
+});
+
+test("unload disconnects the body watcher and empties the portal observer map", async () => {
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  globalThis.document = { querySelectorAll: () => [] };
+  delete globalThis.window;
+  const harness = installPortalHarness([makePortal("one")]);
+  harness.body.callback([{ addedNodes: [makePortal("two")], removedNodes: [] }]);
+  const portalWatchers = [...portalObservers.values()];
+  assert.equal(portalWatchers.length, 2);
+  try {
+    await extension.onunload();
+    assert.equal(portalObservers.size, 0);
+    assert.equal(harness.body.disconnects, 1);
+    for (const watcher of portalWatchers) assert.equal(watcher.disconnects, 1);
+  } finally {
+    harness.dispose();
+    if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
+    if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
+  }
 });
 
 test("extension CSS owns Blueprint dark and compact referenced toolbar behavior", async () => {
