@@ -684,3 +684,26 @@ test("the raw range component's pre-paint rule is the only CSS selector without 
   const docs = await readFile(new URL("../docs/ARCHITECTURE.md", import.meta.url), "utf8");
   assert.match(docs, /rm-xparser-default-roam-grid-range/);
 });
+
+// node:test has no layout engine, so this cannot observe wrapping behavior. It is a CSS-level
+// regression guard only: `overflow-wrap: anywhere` breaks a word at any character (shredding
+// "Protein / 100g" into "Protei" / "n /" / "100g"), while `break-word` only breaks a word that
+// cannot fit on a line of its own. Formula source is the one place an unbroken run of characters
+// genuinely should break anywhere, so `.rg-formula-expression` is asserted the other way.
+test("cell and inline-reference text wraps at word boundaries, not mid-word", async () => {
+  const css = (await readFile(new URL("../extension.css", import.meta.url), "utf8")).replace(/\/\*[\s\S]*?\*\//g, "");
+
+  const cellRule = css.match(/\.rg-cell\s*\{([^}]*)\}/);
+  assert.ok(cellRule, "the sweep must actually find the .rg-cell rule");
+  assert.match(cellRule[1], /overflow-wrap:\s*break-word;/);
+  assert.doesNotMatch(cellRule[1], /overflow-wrap:\s*anywhere/);
+
+  const inlineReferenceRule = css.match(/\.rg-inline-reference-block\s*\{([^}]*)\}/);
+  assert.ok(inlineReferenceRule, "the sweep must actually find the .rg-inline-reference-block rule");
+  assert.match(inlineReferenceRule[1], /overflow-wrap:\s*break-word;/);
+  assert.doesNotMatch(inlineReferenceRule[1], /overflow-wrap:\s*anywhere/);
+
+  const formulaExpressionRule = css.match(/\.rg-formula-expression\s*\{([^}]*)\}/);
+  assert.ok(formulaExpressionRule, "the sweep must actually find the .rg-formula-expression rule");
+  assert.match(formulaExpressionRule[1], /overflow-wrap:\s*anywhere;/, "formula source is a single unbroken run, unlike prose — it keeps the aggressive break");
+});

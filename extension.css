@@ -364,7 +364,7 @@ body.roam-body.dark .rg-portal {
   border-bottom: 1px solid var(--rg-border);
   line-height: 1.45;
   overflow: hidden;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
   cursor: default;
   user-select: none;
 }
@@ -593,7 +593,7 @@ body.roam-body.dark .rg-portal {
 
 .rg-inline-reference-block {
   min-width: 0;
-  overflow-wrap: anywhere;
+  overflow-wrap: break-word;
 }
 
 .rg-inline-reference-block > .roam-block-container,
