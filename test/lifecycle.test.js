@@ -141,18 +141,21 @@ test("settings initialization performs zero writes when the graph forbids them",
   const writes = [];
   const panels = [];
   const readOnly = { settings: { canSet: false, get: () => null, set: async (key, value) => writes.push([key, value]), panel: { create: async (config) => panels.push(config) } } };
-  await initializeSettings(readOnly);
+  await initializeSettings(readOnly, { storage: null });
   assert.deepEqual(writes, []);
   assert.equal(panels.length, 1);
   assert.equal(panels[0].tabTitle, "Roam Grid");
+  assert.ok(panels[0].settings.some((row) => row.id === "writes-native-budget"));
 
   const writable = { settings: { get: () => null, set: async (key, value) => writes.push([key, value]), panel: { create: async () => {} } } };
-  await initializeSettings(writable);
-  assert.deepEqual(writes, [["nativeMutationBudget", 1200]]);
+  await initializeSettings(writable, { storage: null });
+  assert.deepEqual(writes[0], ["settingsVersion", 1]);
+  assert.ok(writes.some(([key, value]) => key === "writes-native-budget" && value === 1200));
+  const seeded = writes.length;
 
   const alreadySet = { settings: { canSet: true, get: () => 500, set: async (key, value) => writes.push([key, value]), panel: { create: async () => {} } } };
-  await initializeSettings(alreadySet);
-  assert.equal(writes.length, 1);
+  await initializeSettings(alreadySet, { storage: null });
+  assert.equal(writes.length, seeded, "a graph that already holds every key must not be reseeded");
 });
 
 test("large grid store refuses the pointer write after dispose", async (t) => {

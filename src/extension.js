@@ -22,6 +22,75 @@ const MAX_GUARD_UIDS = 2000;
 const MAX_UNDO_ENTRIES = 100;
 const MAX_UNDO_CHECKPOINTS = 8;
 const MAX_UNDO_HISTORIES = 24;
+const DEFAULT_CONTENT_SAVE_MS = 220;
+const DEFAULT_LARGE_SAVE_MS = 500;
+const DEFAULT_AUTOCOMPLETE_MS = 90;
+const DEFAULT_AUTOCOMPLETE_LIMIT = 8;
+const DEFAULT_COMPACT_ROW_HEIGHT = 24;
+const DEFAULT_GRID_MAX_WIDTH = 1200;
+const DEFAULT_NEW_GRID_ROWS = 100;
+const DEFAULT_NEW_GRID_COLS = 26;
+const DEFAULT_LARGE_OVERSCAN_ROWS = 8;
+const DEFAULT_RANGE_RENDERED_CELLS = 2000;
+const DEFAULT_LARGE_CACHE_MB = 256;
+const DEVICE_SETTINGS_PREFIX = "roam-grid:settings:";
+const SETTINGS_VERSION = 1;
+const SETTINGS_VERSION_KEY = "settingsVersion";
+const LEGACY_BUDGET_KEY = "nativeMutationBudget";
+const NATIVE_BUDGET_KEY = "writes-native-budget";
+
+/**
+ * Flat settings schema. Roam's panel supports switch/input/select/button rows only, so grouping is
+ * the `"<group> — <name>"` label convention plus a per-row className. `stage: "pending"` rows are
+ * reachable through `getSetting` but are never rendered — a visible control that does nothing is
+ * exactly the defect this schema replaces.
+ */
+const SETTING_DESCRIPTORS = [
+  { key: NATIVE_BUDGET_KEY, group: "Writes", name: "Native write budget", description: "Maximum Roam block mutations in one structural operation. Larger operations should use large-grid mode.", control: "input", type: "int", default: MAX_NATIVE_MUTATIONS, min: 50, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "writes-content-debounce-ms", group: "Writes", name: "Content save delay (ms)", description: "How long typing settles before edited cells are written back to Roam.", control: "input", type: "int", default: DEFAULT_CONTENT_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live", onSession: true },
+  { key: "writes-large-debounce-ms", group: "Writes", name: "Large-grid save delay (ms)", description: "How long a large grid settles before its chunks are uploaded.", control: "input", type: "int", default: DEFAULT_LARGE_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live", onLarge: true },
+  { key: "session-idle-ms", group: "Writes", name: "Session idle timeout (ms)", description: "How long an unmounted grid session stays warm before it is released.", control: "input", type: "int", default: SESSION_IDLE_MS, min: 200, max: 60000, scope: "graph", apply: "next-op", stage: "live", onSession: true },
+  { key: "editing-autocomplete-debounce-ms", group: "Editing", name: "Autocomplete delay (ms)", description: "How long a reference query settles before Roam is searched.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_MS, min: 0, max: 2000, scope: "graph", apply: "next-op", stage: "live", onView: true },
+  { key: "editing-autocomplete-limit", group: "Editing", name: "Autocomplete results", description: "How many suggestions the formula and reference pickers offer.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_LIMIT, min: 1, max: 25, scope: "graph", apply: "next-op", stage: "live", onView: true },
+  { key: "editing-capture-undo", group: "Editing", name: "Capture grid undo history", description: "Record grid edits in the extension's own undo history so ⌘Z reverses them.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onSession: true },
+  { key: "editing-enter-direction", group: "Editing", name: "Enter moves", description: "Where the selection lands after Enter finishes a cell edit.", control: "select", type: "enum", default: "Down", items: ["Down", "Right", "Stay"], scope: "graph", apply: "immediate", stage: "live", onView: true },
+  { key: "editing-tab-direction", group: "Editing", name: "Tab moves", description: "Where the selection lands after Tab finishes a cell edit.", control: "select", type: "enum", default: "Right", items: ["Right", "Down"], scope: "graph", apply: "immediate", stage: "live", onView: true },
+  { key: "appearance-formula-tinting", group: "Appearance", name: "Tint formula cells", description: "Give cells that hold a formula their own background tint.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: true, onLarge: true },
+  { key: "appearance-show-headers", group: "Appearance", name: "Show row and column headers", description: "Show the A/B/C and 1/2/3 axis headers on new grids.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: true, onLarge: true },
+  { key: "appearance-fit-to-width", group: "Appearance", name: "Fit grids to the block width", description: "Scale columns so a grid fills the width of its block instead of scrolling.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: true },
+  { key: "appearance-reference-badges", group: "Appearance", name: "Show cell reference badges", description: "Show the linked-reference count badge on cells that other blocks reference.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: true },
+  { key: "appearance-toolbar-preset", group: "Appearance", name: "Toolbar", description: "How much of the grid toolbar is shown.", control: "select", type: "enum", default: "Full", items: ["Full", "Compact", "Minimal", "Hidden"], scope: "device", apply: "immediate", stage: "live", onView: true, onLarge: true },
+  { key: "appearance-theme", group: "Appearance", name: "Theme", description: "Follow the Roam theme or pin the grid to light or dark.", control: "select", type: "enum", default: "Follow Roam", items: ["Follow Roam", "Light", "Dark"], scope: "device", apply: "immediate", stage: "live", onView: true, onLarge: true },
+  { key: "appearance-max-width", group: "Appearance", name: "Maximum grid width (px)", description: "Widest a grid may grow before it scrolls horizontally.", control: "input", type: "int", default: DEFAULT_GRID_MAX_WIDTH, min: 480, max: 4000, scope: "device", apply: "immediate", stage: "live", onView: true },
+  { key: "sizing-default-row-height", group: "Sizing", name: "Default row height (px)", description: "Height a row starts at before it is resized.", control: "input", type: "int", default: DEFAULT_ROW_HEIGHT, min: 22, max: 480, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "sizing-compact-row-height", group: "Sizing", name: "Compact row height (px)", description: "Height applied by the “Compact selected rows” menu item.", control: "input", type: "int", default: DEFAULT_COMPACT_ROW_HEIGHT, min: 22, max: 480, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "sizing-default-col-width", group: "Sizing", name: "Default column width (px)", description: "Width a column starts at before it is resized.", control: "input", type: "int", default: DEFAULT_COL_WIDTH, min: 56, max: 640, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "sizing-min-row-height", group: "Sizing", name: "Minimum row height (px)", description: "Smallest height a row may be dragged to.", control: "input", type: "int", default: MIN_ROW_HEIGHT, min: 8, max: 480, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "sizing-max-row-height", group: "Sizing", name: "Maximum row height (px)", description: "Largest height a row may be dragged to.", control: "input", type: "int", default: MAX_ROW_HEIGHT, min: 22, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "sizing-min-col-width", group: "Sizing", name: "Minimum column width (px)", description: "Smallest width a column may be dragged to.", control: "input", type: "int", default: MIN_COL_WIDTH, min: 16, max: 640, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "sizing-max-col-width", group: "Sizing", name: "Maximum column width (px)", description: "Largest width a column may be dragged to.", control: "input", type: "int", default: MAX_COL_WIDTH, min: 56, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "new-grid-rows", group: "New grids", name: "Rows in a new large grid", description: "How many rows a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_ROWS, min: 1, max: 100000, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "new-grid-cols", group: "New grids", name: "Columns in a new large grid", description: "How many columns a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_COLS, min: 1, max: 702, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "large-overscan-rows", group: "Large grids", name: "Overscan rows", description: "Extra rows rendered above and below a large grid's viewport.", control: "input", type: "int", default: DEFAULT_LARGE_OVERSCAN_ROWS, min: 0, max: 200, scope: "device", apply: "next-op", stage: "live", onLarge: true },
+  { key: "comments-enabled", group: "Comments", name: "Enable cell comments", description: "Read and write native Roam comment threads from grid cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending", onView: true },
+  { key: "comments-badges", group: "Comments", name: "Show comment badges", description: "Mark cells that carry a comment thread.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending", onView: true },
+  { key: "comments-open-in-sidebar", group: "Comments", name: "Open comment threads in the right sidebar", description: "Open a cell's comment thread in the right sidebar instead of inline.", control: "switch", type: "bool", default: false, scope: "device", apply: "immediate", stage: "pending", onView: true },
+  { key: "ranges-live-references", group: "Ranges", name: "Render live range references", description: "Render {{roam-grid-range: …}} components as a live view of the source cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending", onView: true },
+  { key: "ranges-read-only", group: "Ranges", name: "Rendered ranges are read-only", description: "Block edits inside a rendered range so the source table stays authoritative.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending", onView: true },
+  { key: "ranges-max-rendered-cells", group: "Ranges", name: "Maximum cells in a rendered range", description: "Ranges larger than this render as a link instead of a grid.", control: "input", type: "int", default: DEFAULT_RANGE_RENDERED_CELLS, min: 1, max: 50000, scope: "graph", apply: "next-op", stage: "pending", onView: true },
+  { key: "large-cache-enabled", group: "Large grids", name: "Cache large-grid chunks on this device", description: "Keep downloaded chunks in IndexedDB so reopening a large grid is instant.", control: "switch", type: "bool", default: true, scope: "device", apply: "immediate", stage: "pending", onLarge: true },
+  { key: "large-cache-max-mb", group: "Large grids", name: "Chunk cache size (MB)", description: "How much device storage the large-grid chunk cache may use.", control: "input", type: "int", default: DEFAULT_LARGE_CACHE_MB, min: 8, max: 4096, scope: "device", apply: "next-op", stage: "pending", onLarge: true },
+  { key: "large-verify-checksums", group: "Large grids", name: "Verify chunk checksums", description: "Re-hash each downloaded chunk before trusting it.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "pending", onLarge: true },
+  { key: "large-gc-orphans", group: "Large grids", name: "Permanently delete superseded large-grid files (irreversible)", description: "Delete chunk and manifest files that no revision references any more. This cannot be undone.", control: "switch", type: "bool", default: false, scope: "graph", apply: "next-op", stage: "pending", onLarge: true },
+];
+
+export const SETTINGS = Object.freeze(Object.fromEntries(SETTING_DESCRIPTORS.map((descriptor, index) => {
+  if (SETTING_DESCRIPTORS.findIndex((other) => other.key === descriptor.key) !== index) throw new Error(`Duplicate Roam Grid setting key: ${descriptor.key}`);
+  if (descriptor.items) descriptor.items = Object.freeze([...descriptor.items]);
+  return [descriptor.key, Object.freeze(descriptor)];
+})));
+
+export const settingsCache = new Map();
 
 export const undoHistories = new Map();
 export const portalObservers = new Map();
@@ -66,9 +135,17 @@ function cssAttributeValue(value) {
   return String(value ?? "").replaceAll("\\", "\\\\").replaceAll('"', '\\"').replace(/[\n\r\f]/g, "");
 }
 
-export function graphCacheKey(hash = globalThis.location?.hash || "") {
+export function graphKeyName(hash = globalThis.location?.hash || "") {
   const graph = /#\/app\/([^/]+)/.exec(String(hash))?.[1] || "unknown";
-  return `${ENHANCED_UID_CACHE_PREFIX}${decodeURIComponent(graph)}`;
+  return decodeURIComponent(graph);
+}
+
+export function graphCacheKey(hash = globalThis.location?.hash || "") {
+  return `${ENHANCED_UID_CACHE_PREFIX}${graphKeyName(hash)}`;
+}
+
+export function deviceSettingsKey(hash = globalThis.location?.hash || "") {
+  return `${DEVICE_SETTINGS_PREFIX}${graphKeyName(hash)}`;
 }
 
 export function readEnhancedUidCache(storage = globalThis.localStorage, key = graphCacheKey()) {
@@ -82,6 +159,146 @@ export function writeEnhancedUidCache(uids, storage = globalThis.localStorage, k
   const values = [...new Set([...uids].map(String).filter(Boolean))].sort();
   try { storage?.setItem?.(key, JSON.stringify(values)); } catch { /* localStorage can be unavailable in hardened browsers */ }
   return values;
+}
+
+export function coerceSetting(descriptor, raw) {
+  if (!descriptor) return undefined;
+  const fallback = descriptor.default;
+  if (descriptor.type === "bool") {
+    if (raw === true || raw === false) return raw;
+    if (raw === 0 || raw === 1) return raw === 1;
+    const text = typeof raw === "string" ? raw.trim().toLowerCase() : null;
+    if (text === "true" || text === "1") return true;
+    if (text === "false" || text === "0") return false;
+    return fallback;
+  }
+  if (descriptor.type === "enum") {
+    const text = raw == null ? "" : String(raw).trim().toLowerCase();
+    return (descriptor.items || []).find((item) => String(item).toLowerCase() === text) ?? fallback;
+  }
+  if (descriptor.type === "int") {
+    if (typeof raw !== "number" && typeof raw !== "string") return fallback;
+    if (typeof raw === "string" && raw.trim() === "") return fallback;
+    const value = typeof raw === "number" ? raw : Number(raw.trim());
+    if (!Number.isFinite(value)) return fallback;
+    const rounded = Math.round(value);
+    const min = Number.isFinite(descriptor.min) ? descriptor.min : rounded;
+    const max = Number.isFinite(descriptor.max) ? descriptor.max : rounded;
+    return Math.min(max, Math.max(min, rounded));
+  }
+  if (raw == null) return fallback;
+  const text = String(raw);
+  return text === "" ? fallback : text;
+}
+
+export function settingDefaults() {
+  return Object.fromEntries(Object.values(SETTINGS).map((descriptor) => [descriptor.key, descriptor.default]));
+}
+
+/** Pure migration planner: returns the exact write list, never performs I/O, never downgrades. */
+export function planSettingsMigration(storedVersion, storedValues = {}) {
+  const parsed = Number(storedVersion);
+  const from = Number.isFinite(parsed) ? Math.trunc(parsed) : 0;
+  if (from >= SETTINGS_VERSION) return { from, to: from, writes: [] };
+  const values = storedValues || {};
+  const writes = [];
+  if (values[LEGACY_BUDGET_KEY] != null && values[NATIVE_BUDGET_KEY] == null) writes.push([NATIVE_BUDGET_KEY, coerceSetting(SETTINGS[NATIVE_BUDGET_KEY], values[LEGACY_BUDGET_KEY])]);
+  writes.push([SETTINGS_VERSION_KEY, SETTINGS_VERSION]);
+  return { from, to: SETTINGS_VERSION, writes };
+}
+
+/** Device-scoped keys read device-first; the graph-synced value is only ever a seed. */
+export function resolveSettingValue(descriptor, graphValue, deviceValue) {
+  if (!descriptor) return undefined;
+  if (descriptor.scope === "device" && deviceValue != null) return coerceSetting(descriptor, deviceValue);
+  if (graphValue != null) return coerceSetting(descriptor, graphValue);
+  return descriptor.default;
+}
+
+export function readDeviceSettings(storage = globalThis.localStorage, key = deviceSettingsKey()) {
+  try {
+    const parsed = JSON.parse(storage?.getItem?.(key) || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch { return {}; }
+}
+
+export function writeDeviceSettings(values, storage = globalThis.localStorage, key = deviceSettingsKey()) {
+  const stored = {};
+  for (const [name, value] of Object.entries(values || {})) if (SETTINGS[name]?.scope === "device") stored[name] = value;
+  try { storage?.setItem?.(key, JSON.stringify(stored)); } catch { /* localStorage can be unavailable in hardened browsers */ }
+  return stored;
+}
+
+function readGraphSettings(extensionAPI) {
+  const api = extensionAPI?.settings;
+  if (typeof api?.getAll === "function") { try { return api.getAll() || {}; } catch { return {}; } }
+  if (typeof api?.get !== "function") return {};
+  const values = {};
+  for (const key of [...Object.keys(SETTINGS), SETTINGS_VERSION_KEY, LEGACY_BUDGET_KEY]) {
+    const value = api.get(key);
+    if (value != null) values[key] = value;
+  }
+  return values;
+}
+
+/** Rebuilds the whole cache from one bulk read so no later lookup touches extensionAPI. */
+export function refreshSettingsCache(extensionAPI = runtime.extensionAPI, storage = globalThis.localStorage) {
+  const graphValues = readGraphSettings(extensionAPI);
+  const deviceValues = readDeviceSettings(storage);
+  settingsCache.clear();
+  for (const descriptor of Object.values(SETTINGS)) settingsCache.set(descriptor.key, resolveSettingValue(descriptor, graphValues[descriptor.key], deviceValues[descriptor.key]));
+  return settingsCache;
+}
+
+/** O(1) Map read. Never call extensionAPI.settings.get from a render, keydown, or save path. */
+export function getSetting(key, fallback) {
+  if (settingsCache.has(key)) return settingsCache.get(key);
+  return SETTINGS[key] ? SETTINGS[key].default : fallback;
+}
+
+export async function setSetting(key, value, { extensionAPI = runtime.extensionAPI, storage = globalThis.localStorage } = {}) {
+  const descriptor = SETTINGS[key];
+  if (!descriptor) return undefined;
+  const coerced = coerceSetting(descriptor, value);
+  settingsCache.set(key, coerced);
+  if (descriptor.scope === "device") { const values = readDeviceSettings(storage); values[key] = coerced; writeDeviceSettings(values, storage); }
+  if (extensionAPI?.settings?.canSet !== false) {
+    try { await extensionAPI?.settings?.set?.(key, coerced); } catch (error) { console.warn("[roam-grid] Could not persist setting", key, error); }
+  }
+  applySettingsChange(descriptor, coerced);
+  return coerced;
+}
+
+/** Propagation to live views, sessions, and large mounts is wired in a later goal. */
+export function applySettingsChange(descriptor, value) {
+  return { key: descriptor?.key ?? null, value };
+}
+
+function settingsGroupClass(group) {
+  return `rg-settings-${String(group).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")}`;
+}
+
+function settingsEventValue(descriptor, event) {
+  if (descriptor.control === "switch") return event?.target?.checked ?? event;
+  return event?.target?.value ?? event;
+}
+
+export function settingsPanelRow(descriptor, { onChange = () => {}, onClick = () => {} } = {}) {
+  const action = descriptor.control === "button"
+    ? { type: "button", content: descriptor.name, onClick: () => onClick(descriptor.key) }
+    : { type: descriptor.control, onChange: (event) => onChange(descriptor.key, settingsEventValue(descriptor, event)) };
+  if (descriptor.control === "select") action.items = [...(descriptor.items || [])];
+  if (descriptor.control === "input") action.placeholder = String(descriptor.default);
+  return { id: descriptor.key, name: `${descriptor.group} — ${descriptor.name}`, description: descriptor.description, className: settingsGroupClass(descriptor.group), action };
+}
+
+export function buildSettingsPanelConfig(handlers = {}) {
+  const settings = [];
+  for (const descriptor of Object.values(SETTINGS)) {
+    if (descriptor.stage === "pending") continue;
+    settings.push(settingsPanelRow(descriptor, handlers));
+  }
+  return { tabTitle: "Roam Grid", settings };
 }
 
 export function enhancedUidGuardCss(uids) {
@@ -6550,12 +6767,19 @@ function registerCommands(extensionAPI) {
   }
 }
 
-export async function initializeSettings(extensionAPI) {
-  if (extensionAPI.settings.canSet !== false && extensionAPI.settings.get("nativeMutationBudget") == null) await extensionAPI.settings.set("nativeMutationBudget", MAX_NATIVE_MUTATIONS);
-  await extensionAPI.settings.panel.create({
-    tabTitle: "Roam Grid",
-    settings: [{ id: "nativeMutationBudget", name: "Native write budget", description: "Maximum Roam block mutations in one structural operation. Larger operations should use large-grid mode.", action: { type: "input", onChange: () => {} } }],
-  });
+export async function initializeSettings(extensionAPI, { storage = globalThis.localStorage } = {}) {
+  const stored = { ...readGraphSettings(extensionAPI) };
+  const plan = planSettingsMigration(stored[SETTINGS_VERSION_KEY], stored);
+  if (extensionAPI.settings.canSet !== false) {
+    for (const [key, value] of plan.writes) { await extensionAPI.settings.set(key, value); stored[key] = value; }
+    for (const descriptor of Object.values(SETTINGS)) {
+      if (descriptor.stage === "pending" || stored[descriptor.key] != null) continue;
+      await extensionAPI.settings.set(descriptor.key, descriptor.default);
+      stored[descriptor.key] = descriptor.default;
+    }
+  }
+  refreshSettingsCache(extensionAPI, storage);
+  await extensionAPI.settings.panel.create(buildSettingsPanelConfig({ onChange: (key, value) => { void setSetting(key, value, { extensionAPI, storage }); } }));
 }
 
 let roamGridGlobalPreexisted = false;
@@ -6585,6 +6809,7 @@ async function onunload() {
   for (const uid of [...runtime.sessions.keys()]) disposeNativeSession(uid, true);
   for (const mount of runtime.largeMounts.values()) mount.dispose(); runtime.largeMounts.clear(); mounting.clear();
   clearUndoHistories();
+  settingsCache.clear();
   runtime.guardStyle?.remove(); runtime.guardStyle = null;
   for (const dispose of runtime.disposers.splice(0)) try { dispose(); } catch { /* no-op */ }
   clearTrackedTimers();
