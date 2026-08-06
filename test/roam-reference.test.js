@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ROAM_COMPONENT_CATALOG, enrichRoamSuggestions, exactBlockSuggestion, roamComponentInsertion, roamComponentSuggestions, roamEditorTriggerContext, roamSuggestionPlainText, roamTriggerInsertion, searchRoamReferenceSuggestions, withCreatePageSuggestion } from "../src/extension.js";
+import { ROAM_COMMAND_CATALOG, ROAM_COMPONENT_CATALOG, enrichRoamSuggestions, exactBlockSuggestion, roamCommandInsertion, roamCommandSuggestions, roamComponentInsertion, roamComponentSuggestions, roamEditorTriggerContext, roamSuggestionPlainText, roamTriggerInsertion, searchRoamReferenceSuggestions, withCreatePageSuggestion } from "../src/extension.js";
 
 test("the trigger context resolves six types against the nearest unclosed opener", () => {
   assert.deepEqual(roamEditorTriggerContext("See [[Proj", 10), {
@@ -353,6 +353,139 @@ test("the component catalog filters on what was typed, prefix first, and bounds 
   assert.deepEqual(roamComponentInsertion({ template: "{{x}}" }), { text: "{{x}}", caret: 5 }, "an entry with no offset parks the caret at the end rather than at zero");
   assert.deepEqual(roamComponentInsertion({ template: "{{x}}", caret: 900 }), { text: "{{x}}", caret: 5 }, "and an offset past the template is clamped into it");
   assert.deepEqual(roamComponentInsertion(null), { text: "", caret: 0 });
+});
+
+/**
+ * Two thirds of Roam's own commands have a space in their name, so a `/` query that dies on the
+ * first space can never reach `Block Quote` or `Current Time`. It is loosened to interior single
+ * spaces, and the guard moves to the shape of the run instead: a LEADING space is prose (`in / out`
+ * is a slash between two words, not a command), so is a double space, and so is anything longer
+ * than Roam's longest command name.
+ */
+test("a command query carries the spaces its own names need, and nothing longer", () => {
+  assert.equal(roamEditorTriggerContext("/block quote", 12).query, "block quote", "a name Roam spells with a space is reachable");
+  assert.equal(roamEditorTriggerContext("/Mentions of Page or Block", 26).query, "Mentions of Page or Block");
+  assert.equal(roamEditorTriggerContext("note /current time", 18).query, "current time");
+
+  assert.equal(roamEditorTriggerContext("input / output", 14), null, "a space straight after the slash is prose, not a query");
+  assert.equal(roamEditorTriggerContext("/ ", 2), null);
+  assert.equal(roamEditorTriggerContext("/block  quote", 13), null, "and so is a double space");
+  assert.equal(roamEditorTriggerContext("/see [[Page", 11).type, "page", "a bracket inside a command query hands the trigger to the page opener");
+  assert.equal(roamEditorTriggerContext(`/${"a".repeat(32)}`, 33).query.length, 32, "Roam's longest command name still fits");
+  assert.equal(roamEditorTriggerContext(`/${"a".repeat(33)}`, 34), null, "one character more cannot be a command name");
+
+  assert.equal(roamEditorTriggerContext("a/b", 3), null, "the start-or-whitespace rule is untouched");
+  assert.equal(roamEditorTriggerContext("=A1/B2", 6), null, "and so is the formula guard");
+  assert.equal(roamEditorTriggerContext("=A1 /B2", 7), null);
+});
+
+/**
+ * The subset IS the feature. Every name here is one Roam's own `/` registry carries — read out of it
+ * rather than guessed — and the rows Roam has but a cell cannot honour are absent rather than present
+ * and failing. This test pins both halves, because a catalog that quietly grows a row Roam does not
+ * have, or quietly regains one that renders "Failed to render" in a cell, has broken the claim the
+ * setting description makes.
+ */
+test("the command catalog is a subset of Roam's own, and says so by what it leaves out", () => {
+  assert.equal(ROAM_COMMAND_CATALOG.length, 21, "21 of the 47 commands Roam's registry carries");
+  const names = new Set(ROAM_COMMAND_CATALOG.map((entry) => entry.name));
+  // Verified live on 2026-08-06 against Roam's slash-menu registry: these are simply not commands.
+  for (const absent of ["Horizontal Rule", "DONE", "Italic", "attr-table", "roam/render"]) {
+    assert.equal(names.has(absent), false, `${absent} is not a Roam command, so it must not be a row`);
+  }
+  // Verified live through renderString, the call a cell renders with: block-bound output.
+  for (const absent of ["Word Count", "Diagram", "Kanban Board", "Mermaid", "Character Count"]) {
+    assert.equal(names.has(absent), false, `${absent} cannot render in a cell, so it must not be a row`);
+  }
+  // And the modal ones, which are what "do not fake the unreachable" was written about.
+  for (const absent of ["Date Picker", "Upload Image, Audio, or File", "Template", "Query (and)"]) {
+    assert.equal(names.has(absent), false, `${absent} needs a Roam dialog, so it must not be a row`);
+  }
+  assert.equal(names.has("Italics"), true, "Roam spells it Italics, and the row uses Roam's spelling");
+  assert.equal(ROAM_COMMAND_CATALOG.find((entry) => entry.name === "Block Quote").template, "[[>]] ", "Roam's blockquote is [[>]], not >");
+  assert.equal(ROAM_COMMAND_CATALOG.find((entry) => entry.name === "Pomodoro Timer").template, "{{[[POMO]]: 25}}", "POMO is uppercase and carries its minutes");
+  for (const entry of ROAM_COMMAND_CATALOG) {
+    assert.ok(entry.description.length <= 26, `${entry.name}: the detail track ellipsizes past 26ch — ${entry.description}`);
+    assert.ok(entry.template != null || entry.dynamic, `${entry.name}: a row resolves to text or it is not a row`);
+  }
+});
+
+/**
+ * The caret offset simulated as the gesture, the way the component catalog does it: split the
+ * resolved text at its own offset, type there, and require what was typed to land where the row
+ * promised. The chaining half is the same assertion read through the trigger parser — a row that
+ * claims to open a picker has to actually leave the caret somewhere the parser calls one.
+ */
+test("every command lands its caret where the next keystroke belongs, and the picker rows open a picker", () => {
+  const api = { util: { dateToPageTitle: () => "August 6th, 2026" } };
+  const chains = { "Page Reference": "page", "Block Reference": "block", "Block Embed": "block", "Mentions of Page or Block": "page", "Inline Calculator": "block" };
+  for (const entry of ROAM_COMMAND_CATALOG) {
+    const placed = roamCommandInsertion(entry, { now: new Date(2026, 7, 6, 9, 5), api });
+    assert.ok(placed, `${entry.name}: resolves`);
+    assert.ok(placed.caret >= 0 && placed.caret <= placed.text.length, `${entry.name}: the offset is inside its own text`);
+    const type = roamEditorTriggerContext(placed.text, placed.caret)?.type ?? null;
+    if (chains[entry.name]) assert.equal(type, chains[entry.name], `${entry.name}: the caret lands inside a ${chains[entry.name]} opener`);
+    else assert.notEqual(type, "page", `${entry.name}: a row that does not claim a picker must not open one`);
+    if (!chains[entry.name]) assert.notEqual(type, "block", `${entry.name}: nor a block picker`);
+  }
+
+  const typed = (name) => { const placed = roamCommandInsertion(ROAM_COMMAND_CATALOG.find((entry) => entry.name === name), { api }); return `${placed.text.slice(0, placed.caret)}X${placed.text.slice(placed.caret)}`; };
+  assert.equal(typed("Bold"), "**X**", "a wrapping pair parks the caret at its midpoint, as Roam's own rule does");
+  assert.equal(typed("Italics"), "__X__");
+  assert.equal(typed("Highlight"), "^^X^^");
+  assert.equal(typed("Strikethrough"), "~~X~~");
+  assert.equal(typed("Code Inline"), "`X`");
+  assert.equal(typed("Code Block"), "```javascript\nX\n```", "the fenced block opens on the line the code goes on");
+  assert.equal(typed("Embed Video"), "{{[[video]]: X}}");
+  assert.equal(typed("Block Embed"), "{{[[embed]]: ((X))}}");
+  assert.equal(typed("TODO"), "{{[[TODO]]}}X", "a row with nothing left to fill in parks the caret at the end");
+  assert.equal(typed("Block Quote"), "[[>]] X");
+});
+
+/**
+ * The one thing in this unit that could write a reference to a page that does not exist. Roam's
+ * daily-page title is Roam's format to produce — `dateToPageTitle` returned "August 6th, 2026" live
+ * on 2026-08-06 — and a hand-rolled ordinal suffix that is off by one gives a link to nowhere. So
+ * the day rows use that call verbatim and, when it is missing, are not offered at all.
+ */
+test("the day commands take their title from Roam, and vanish when Roam cannot give one", () => {
+  const now = new Date(2026, 7, 6, 9, 5);
+  const api = { util: { dateToPageTitle: (date) => `${["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "August"][date.getMonth()]} ${date.getDate()}th, ${date.getFullYear()}` } };
+  const insert = (name) => roamCommandInsertion(ROAM_COMMAND_CATALOG.find((entry) => entry.name === name), { now, api }).text;
+  assert.equal(insert("Today"), "[[August 6th, 2026]]", "the title is whatever Roam formatted, wrapped and nothing else");
+  assert.equal(insert("Tomorrow"), "[[August 7th, 2026]]");
+  assert.equal(insert("Yesterday"), "[[August 5th, 2026]]");
+  assert.equal(insert("Current Time"), "09:05", "and the clock is zero-padded 24-hour, as Roam's own is");
+  assert.equal(roamCommandInsertion({ dynamic: "time" }, { now: new Date(2026, 7, 6, 18, 0) }).text, "18:00");
+
+  const offered = (options) => roamCommandSuggestions("", { limit: 100, ...options }).map((row) => row.name);
+  assert.equal(offered({ api }).includes("Today"), true);
+  assert.equal(offered({ api: {} }).includes("Today"), false, "no dateToPageTitle, no day rows — never a guessed format");
+  assert.deepEqual(offered({ api: {} }).filter((name) => ["Today", "Tomorrow", "Yesterday"].includes(name)), []);
+  assert.equal(offered({ api: { util: { dateToPageTitle: () => "" } } }).includes("Today"), false, "an empty title is no title");
+  assert.equal(offered({ api: {} }).includes("Current Time"), true, "a clock needs nothing from Roam, so it stays");
+  assert.equal(roamCommandInsertion({ dynamic: "day", offset: 0 }, { api: {} }), null);
+});
+
+test("the command catalog filters on what was typed, prefix first, and bounds itself", () => {
+  const api = { util: { dateToPageTitle: () => "August 6th, 2026" } };
+  const names = (query, limit = 100) => roamCommandSuggestions(query, { limit, api }).map((row) => row.name);
+  assert.deepEqual(names(""), ROAM_COMMAND_CATALOG.map((entry) => entry.name), "a bare / offers the whole catalog — there is no query to run");
+  assert.deepEqual(names("", 3), ["TODO", "Page Reference", "Block Reference"], "and the results setting bounds it");
+  assert.deepEqual(names("block"), ["Block Reference", "Block Embed", "Block Quote", "Mentions of Page or Block", "Code Block"],
+    "a name that starts with the query leads one that merely contains it, and catalog order breaks both ties");
+  assert.deepEqual(names("BOLD"), ["Bold"], "matching is case-insensitive");
+  assert.deepEqual(names("current time"), ["Current Time"], "a name Roam spells with a space matches when it is typed with one");
+  assert.deepEqual(names("  today  "), ["Today"], "a query is trimmed the same way every other trigger trims it");
+  assert.deepEqual(names("video"), ["Embed Video"]);
+  assert.deepEqual(names("zzz"), []);
+
+  const row = roamCommandSuggestions("bold", { api })[0];
+  assert.deepEqual(row, { kind: "roam-command", name: "Bold", template: "****", caret: 2, description: "Bold text" });
+  assert.deepEqual(roamCommandInsertion(row), { text: "****", caret: 2 });
+  assert.deepEqual(roamCommandInsertion({ template: "{{x}}" }), { text: "{{x}}", caret: 5 }, "an entry with no offset parks the caret at the end rather than at zero");
+  assert.deepEqual(roamCommandInsertion({ template: "{{x}}", caret: 900 }), { text: "{{x}}", caret: 5 }, "and an offset past the template is clamped into it");
+  assert.equal(roamCommandInsertion(null), null, "a row that resolves to nothing inserts nothing");
 });
 
 /**

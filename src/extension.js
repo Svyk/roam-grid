@@ -108,6 +108,7 @@ const SETTING_DESCRIPTORS = [
   { key: "editing-autocomplete-empty-opener", group: "Editing", name: "Open the reference menu on a bare [[ or ((", description: "Offer recently edited pages the moment you type [[ and recently edited blocks the moment you type ((, the way Roam’s own menu does, before you have typed anything to search for. With this off the menu waits for a query.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-autocomplete-render-rows", group: "Editing", name: "Render ((block)) suggestions the way Roam does", description: "Show block suggestions as Roam renders them — page links, bold, refs — instead of the raw markdown behind them. Page, tag and create-page rows are plain text either way. Rendering pauses itself for the rest of the session if it turns out to be slow on this graph.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-autocomplete-components", group: "Editing", name: "Complete {{components}} in cells", description: "Offer Roam's own components — TODO, query, embed, calc, video and the rest — the moment you type {{ in a cell. The list is a fixed catalog, so it costs no graph read and opens with no delay. Rows say where a component needs child bullets or does not render inside a cell at all.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
+  { key: "editing-autocomplete-commands", group: "Editing", name: "Offer / commands in cells (partial)", description: "Open a slash menu when you type / at the start of a cell or after a space. This is deliberately a PARTIAL subset: 21 of the 47 commands Roam's own / menu carries — the ones a cell can perform by inserting text. Commands that open a Roam dialog (date picker, file upload, template picker) and commands that only render correctly under a real block (word count, diagram, kanban board, mermaid) are left out rather than listed and doing nothing. Off by default.", control: "switch", type: "bool", default: false, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-capture-undo", group: "Editing", name: "Capture grid undo history", description: "Record grid edits in the extension's own undo history so ⌘Z reverses them.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-enter-direction", group: "Editing", name: "Enter moves", description: "Where the selection lands after Enter finishes a cell edit.", control: "select", type: "enum", default: "Down", items: ["Down", "Right", "Stay"], scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-tab-direction", group: "Editing", name: "Tab moves", description: "Where the selection lands after Tab finishes a cell edit.", control: "select", type: "enum", default: "Right", items: ["Right", "Down"], scope: "graph", apply: "immediate", stage: "live" },
@@ -462,6 +463,12 @@ export function emptyOpenerEnabled() {
  *  which governs a Roam READ: this catalog is static, so there is nothing to budget or debounce. */
 export function componentSuggestionsEnabled() {
   return getSetting("editing-autocomplete-components") !== false;
+}
+
+/** True while a `/` may offer the command subset. Defaults to OFF, unlike every other autocomplete
+ *  switch, because what it offers is a fraction of Roam's own menu — see ROAM_COMMAND_CATALOG. */
+export function commandSuggestionsEnabled() {
+  return getSetting("editing-autocomplete-commands") === true;
 }
 
 /** Session-scoped budget switch — see RECENTS_BUDGET_MS. */
@@ -6285,12 +6292,20 @@ const PAIRED_EDITOR_TRIGGERS = [
   { type: "block", opener: "((", closer: "))" },
   { type: "component", opener: "{{", closer: "}}" },
 ];
-/** Unpaired openers have no closer to bound them, so their query ends at the caret and any
- *  whitespace inside it means the trigger is over. `#` additionally rejects a bracket, which is how
- *  `#[[` reaches the tag-page branch instead of being read as a bare tag whose name starts with `[`. */
+/** Unpaired openers have no closer to bound them, so their query ends at the caret. A bare `#` ends
+ *  at the first whitespace, and additionally rejects a bracket, which is how `#[[` reaches the
+ *  tag-page branch instead of being read as a bare tag whose name starts with `[`.
+ *
+ *  `/` cannot use that rule: two thirds of the commands Roam's own menu carries have a space in
+ *  their name — `Block Quote`, `Current Time`, `Code Block`, `Mentions of Page or Block` — so a
+ *  query that dies on the first space can never reach them. It is loosened to interior single
+ *  spaces only, which is what keeps prose out: `input / output` puts the space FIRST, and a run
+ *  longer than Roam's longest command name (32) cannot be a command name either. Anything that gets
+ *  past this and still matches no row simply renders nothing, because the popover only opens on
+ *  rows — so the guard has to stop a stale CONTEXT, not a stale menu. */
 const UNPAIRED_EDITOR_TRIGGERS = [
   { type: "tag", opener: "#", closer: "", invalid: /[\s[\]]/ },
-  { type: "command", opener: "/", closer: "", invalid: /\s/ },
+  { type: "command", opener: "/", closer: "", invalid: /^\s|\s\s|[[\]]|.{33}/ },
 ];
 const PAGE_EDITOR_TRIGGERS = new Set(["page", "tag", "tag-page"]);
 const SUGGESTIBLE_EDITOR_TRIGGERS = new Set(["page", "tag", "tag-page", "block"]);
@@ -6409,6 +6424,106 @@ export function roamComponentInsertion(suggestion) {
   const text = String(suggestion?.template ?? "");
   const offset = Number.isFinite(suggestion?.caret) ? clamp(suggestion.caret, 0, text.length) : text.length;
   return { text, caret: offset };
+}
+
+/**
+ * A SUBSET of Roam's `/` menu — 21 rows against the 47 its own registry carries — and the subset is
+ * the point, not a stage on the way to parity. Three classes are missing on purpose:
+ *
+ * 1. Commands that open a Roam modal. `Date Picker `, `Upload Image, Audio, or File`, the template
+ *    picker: a cell editor cannot summon those, and a row that opens nothing is worse than no row.
+ * 2. Commands whose output needs a real block. Probed live through `renderString` on 2026-08-06,
+ *    the same call a cell renders with: `{{word-count}}` and `{{[[diagram]]}}` come back as a
+ *    "Failed to render" button, `{{[[kanban]]}}` and `{{[[mermaid]]}}` come back as a "nest a
+ *    bullet under here" hint a cell has no way to satisfy. They stay reachable under `{{`, where
+ *    the row says so; they are not offered as commands, because a command that fails is a bug.
+ * 3. The four `Query (…)` commands. Roam's templates seed `[[ex-A]]` / `[[ex-B]]` placeholders and
+ *    select them; committing a cell parses its string, so an unedited row would materialise two
+ *    junk pages in the graph. `{{query` covers the same ground and seeds nothing.
+ *
+ * Every name and every static template here is Roam's own, read out of its slash-menu registry
+ * rather than guessed — including the ones that are not what you would guess: the component is
+ * `Italics` not `Italic`, the blockquote is `[[>]] ` not `> `, and there is no `Horizontal Rule`
+ * and no `DONE` command in Roam at all.
+ *
+ * `caret` is an offset INTO the resolved text and follows Roam's own placement rules: the midpoint
+ * of a wrapping pair (`****` → 2), inside the inner reference of a component that takes one
+ * (`{{[[embed]]: (())}}` → 15), and the end when there is nothing left to fill in. Landing the
+ * caret inside `(())` or `[[]]` is also what makes `Block Reference`, `Block Embed`, `Mentions` and
+ * `Inline Calculator` hand straight over to the block or page picker.
+ *
+ * `dynamic` rows resolve at accept time rather than menu time, so `Current Time` is the time you
+ * accepted it. The three day rows are offered ONLY when `roamAlphaAPI.util.dateToPageTitle` is
+ * there to format them: the daily-page title is a format we must not guess, because guessing it
+ * writes a reference to a page that does not exist.
+ */
+export const ROAM_COMMAND_CATALOG = [
+  { name: "TODO", template: "{{[[TODO]]}}", description: "Checkbox" },
+  { name: "Page Reference", template: "[[]]", caret: 2, description: "Opens the page picker" },
+  { name: "Block Reference", template: "(())", caret: 2, description: "Opens the block picker" },
+  { name: "Block Embed", template: "{{[[embed]]: (())}}", caret: 15, description: "Opens the block picker" },
+  { name: "Mentions of Page or Block", template: "{{[[mentions]]: [[]]}}", caret: 18, description: "Opens the page picker" },
+  { name: "Inline Calculator", template: "{{[[calc]]: (())}}", caret: 14, description: "Opens the block picker" },
+  { name: "Pomodoro Timer", template: "{{[[POMO]]: 25}}", description: "25-minute timer" },
+  { name: "Current Time", dynamic: "time", description: "Now, as HH:MM" },
+  { name: "Today", dynamic: "day", offset: 0, description: "Today's daily page" },
+  { name: "Tomorrow", dynamic: "day", offset: 1, description: "Tomorrow's daily page" },
+  { name: "Yesterday", dynamic: "day", offset: -1, description: "Yesterday's daily page" },
+  { name: "Bold", template: "****", caret: 2, description: "Bold text" },
+  { name: "Italics", template: "____", caret: 2, description: "Italic text" },
+  { name: "Highlight", template: "^^^^", caret: 2, description: "Highlighted text" },
+  { name: "Strikethrough", template: "~~~~", caret: 2, description: "Struck-through text" },
+  { name: "Block Quote", template: "[[>]] ", description: "Blockquote" },
+  { name: "Code Inline", template: "``", caret: 1, description: "Inline code" },
+  // Roam's own template is "```javascript\n```" with the caret past the closing fence, because a
+  // Roam block hands the fenced text to CodeMirror the moment it is committed. A cell is edited as
+  // raw text, so it gets the empty line Roam's version leaves the user to make — verified to render
+  // as the identical code block through renderString.
+  { name: "Code Block", template: "```javascript\n\n```", caret: 14, description: "Fenced code block" },
+  { name: "Slider", template: "{{[[slider]]}}", description: "Drag slider" },
+  { name: "Table", template: "{{[[table]]}}", description: "Table creator" },
+  { name: "Embed Video", template: "{{[[video]]: }}", caret: 13, description: "Video player" },
+];
+
+/** Roam formats a daily-page title itself. We never format one — a hand-rolled "August 6th, 2026"
+ *  that is off by one suffix is a reference to a page that does not exist, which is exactly the
+ *  failure this whole unit is trying not to ship. No helper, no rows. */
+function roamDayPageReference(offset, { now, api }) {
+  const format = api?.util?.dateToPageTitle;
+  if (typeof format !== "function") return null;
+  const day = new Date(now.getTime());
+  day.setDate(day.getDate() + offset);
+  const title = format(day);
+  return title ? `[[${title}]]` : null;
+}
+
+/** The text a command row inserts and where the caret lands inside it, or null when the row cannot
+ *  be resolved at all — which the catalog filter has already made unreachable for offered rows. */
+export function roamCommandInsertion(suggestion, { now = new Date(), api = globalThis.window?.roamAlphaAPI } = {}) {
+  let text = suggestion?.template == null ? null : String(suggestion.template);
+  if (suggestion?.dynamic === "time") text = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+  else if (suggestion?.dynamic === "day") text = roamDayPageReference(Number(suggestion.offset) || 0, { now, api });
+  if (text == null) return null;
+  const offset = Number.isFinite(suggestion?.caret) ? clamp(suggestion.caret, 0, text.length) : text.length;
+  return { text, caret: offset };
+}
+
+/** The catalog filtered by what has been typed after `/`, ranked the way the component catalog is:
+ *  a name that starts with the query leads, one that merely contains it follows, catalog order
+ *  breaks both ties. A row whose insertion cannot be resolved on this graph is dropped here rather
+ *  than offered and refused on accept. */
+export function roamCommandSuggestions(query, { limit = getSetting("editing-autocomplete-limit"), now = new Date(), api = globalThis.window?.roamAlphaAPI } = {}) {
+  const folded = String(query ?? "").trim().toLowerCase();
+  const leading = []; const trailing = [];
+  for (const entry of ROAM_COMMAND_CATALOG) {
+    if (!roamCommandInsertion(entry, { now, api })) continue;
+    const name = entry.name.toLowerCase();
+    if (!folded || name.startsWith(folded)) leading.push(entry);
+    else if (name.includes(folded)) trailing.push(entry);
+  }
+  return [...leading, ...trailing]
+    .slice(0, clamp(Math.floor(Number(limit) || 8), 1, 25))
+    .map((entry) => ({ kind: "roam-command", ...entry }));
 }
 
 /**
@@ -6916,14 +7031,23 @@ export class GridEditorController {
     const state = this.state; const suggestion = this.suggestions[index]; const context = this.referenceContext;
     if (!state || !suggestion || !context) return;
     const page = suggestion.kind === "roam-page" || suggestion.kind === "roam-create-page";
-    // A component carries its own caret offset, so the caret lands where the argument is typed
-    // instead of past the closing braces — `"end"` would leave it after `}}` on every entry.
-    const component = suggestion.kind === "roam-component" ? roamComponentInsertion(suggestion) : null;
-    const replacement = component ? component.text : roamTriggerInsertion(context.type, suggestion);
+    // A component and a command each carry their own caret offset, so the caret lands where the
+    // argument is typed instead of past the closing braces — `"end"` would leave it after `}}` on
+    // every entry. A command is the one insertion that can fail to resolve (a day row on a Roam
+    // without `dateToPageTitle`); inserting nothing beats inserting a broken date.
+    const placed = suggestion.kind === "roam-component" ? roamComponentInsertion(suggestion)
+      : suggestion.kind === "roam-command" ? roamCommandInsertion(suggestion)
+      : null;
+    if (suggestion.kind === "roam-command" && !placed) return;
+    const replacement = placed ? placed.text : roamTriggerInsertion(context.type, suggestion);
     if (page) rememberAcceptedPage(suggestion.name);
     state.editor.setRangeText(replacement, context.startIndex, context.replaceEndIndex ?? context.endIndex, "end");
-    if (component) { const caret = context.startIndex + component.caret; state.editor.setSelectionRange(caret, caret); }
-    state.referenceAutocompleteClosed = true;
+    if (placed) { const caret = context.startIndex + placed.caret; state.editor.setSelectionRange(caret, caret); }
+    // A command may exist precisely to hand over to another trigger — `Block Reference` inserts
+    // `(())` and parks the caret inside it — so a command accept leaves the reference path OPEN and
+    // the next paint opens the block or page picker on what it just wrote. Every other accept closes
+    // it, because there the insertion is the whole answer.
+    state.referenceAutocompleteClosed = suggestion.kind !== "roam-command";
     clearTimeout(this.referenceSearchTimer); this.referenceSearchToken += 1;
     this.suggestions = []; this.disposeSuggestionRows(); this.suggestionList.hidden = true; this.suggestionList.setAttribute("aria-hidden", "true");
     state.editor.setAttribute("aria-expanded", "false"); state.editor.removeAttribute?.("aria-activedescendant");
@@ -7128,16 +7252,17 @@ export class GridEditorController {
     if (this.referenceContextKey === key && (this.referenceSearchTimer != null || this.suggestionKind === "roam-reference")) return;
     clearTimeout(this.referenceSearchTimer); const token = ++this.referenceSearchToken;
     this.referenceContext = context; this.referenceContextKey = key; this.autocompleteContext = null;
-    // `{{` is answered from a static catalog, so it resolves right here — no debounce to wait out,
-    // no token to fence and no Roam read to budget. It is folded into the same assignment as the
-    // clear so a component context paints its rows once rather than blanking and refilling them.
-    const components = context.type === "component" && !state.referenceAutocompleteClosed && componentSuggestionsEnabled()
-      ? roamComponentSuggestions(context.query)
+    // `{{` and `/` are both answered from a static catalog, so they resolve right here — no debounce
+    // to wait out, no token to fence and no Roam read to budget. Folded into the same assignment as
+    // the clear so a catalog context paints its rows once rather than blanking and refilling them.
+    // Each switch is read ahead of its own catalog, under the master switch already checked above.
+    const catalog = state.referenceAutocompleteClosed ? []
+      : context.type === "component" && componentSuggestionsEnabled() ? roamComponentSuggestions(context.query)
+      : context.type === "command" && commandSuggestionsEnabled() ? roamCommandSuggestions(context.query)
       : [];
-    this.suggestions = components; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.renderSuggestionRows();
-    // `/` is recognised so the page and block triggers stop firing inside it, but it has no catalog
-    // yet. Returning here renders nothing, which the never-empty popover invariant already handles
-    // correctly — it is an unanswerable trigger, not an empty result set.
+    this.suggestions = catalog; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.renderSuggestionRows();
+    // Neither catalog trigger searches Roam, so both stop here. Rendering nothing when a catalog is
+    // switched off is the never-empty popover invariant doing its job rather than a special case.
     if (!SUGGESTIBLE_EDITOR_TRIGGERS.has(context.type)) return;
     if (state.referenceAutocompleteClosed) return;
     // A bare opener takes the recents path instead of the search path. Its own switch and the

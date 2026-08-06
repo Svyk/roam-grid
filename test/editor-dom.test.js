@@ -913,12 +913,12 @@ test("a page name with no hits still offers to create it, inserting [[Name]] and
 
 /**
  * `#` and `#[[` reuse the page search and recents paths verbatim; only detection and insertion
- * differ. `/` is recognised so that `[[` and `((` stop firing inside it, but it has no catalog until
- * U10 — so it must render nothing, query nothing, and leave the popover shut, which is the
- * never-empty invariant doing its job rather than a special case bolted onto it. (`{{` was in this
- * loop until U9 gave it one; its rows are covered by the component tests below.)
+ * differ. `/` is recognised so that `[[` and `((` stop firing inside it, and with its own switch at
+ * its default it must render nothing, query nothing, and leave the popover shut — which is the
+ * never-empty invariant doing its job rather than a special case bolted onto it. That default is
+ * the point: the command subset is the one autocomplete that ships OFF.
  */
-test("# and #[[ take the page path while / is recognised and answers nothing", async (t) => {
+test("# and #[[ take the page path while / is recognised and answers nothing by default", async (t) => {
   t.after(() => { resetRoamRecents(); settingsCache.clear(); });
   resetRoamRecents(); settingsCache.clear();
   let queries = 0; const searched = [];
@@ -948,7 +948,7 @@ test("# and #[[ take the page path while / is recognised and answers nothing", a
   for (const [raw, type] of [["/dat", "command"]]) {
     editor.value = raw; editor.setSelectionRange(raw.length, raw.length); editor.dispatch("input"); flush(); await waitForSearch();
     assert.equal(controller.referenceContext.type, type, `${raw} is recognised`);
-    assert.deepEqual(controller.suggestions, [], `${raw} has no catalog yet`);
+    assert.deepEqual(controller.suggestions, [], `${raw} answers nothing while its switch is at its default`);
     assert.equal(controller.popover.hidden, true, `${raw} opens no empty shell`);
     assert.equal(controller.suggestionList.hidden, true);
     assert.equal(editor.getAttribute("aria-expanded"), "false");
@@ -1027,6 +1027,127 @@ test("both switches over the component catalog gate it ahead of the rows", async
   editor.dispatch("input"); flush(); await waitForSearch();
   assert.deepEqual(controller.suggestions, [], "the master switch covers the catalog too");
   assert.equal(controller.popover.hidden, true);
+  controller.dispose();
+});
+
+/**
+ * The `/` subset end to end. Its switch defaults OFF, so the first half of this is the gate itself:
+ * a recognised trigger with a silent catalog behind it. The second half pins that turning it on
+ * costs Roam nothing — the catalog is static, so no search, no recents and no `q` — and that the
+ * master switch still covers it.
+ */
+test("/ answers nothing until its own switch is on, and asks Roam nothing once it is", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents(); settingsCache.clear();
+  let searches = 0; let recents = 0; let queries = 0;
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async () => { searches += 1; return []; },
+    searchRecents: async () => { recents += 1; return []; },
+  });
+  globalThis.window.roamAlphaAPI = { q: () => { queries += 1; return []; } };
+
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "/tab", floating: false });
+  flush(); await waitForSearch();
+  assert.equal(controller.referenceContext.type, "command", "the trigger is recognised either way, so [[ and (( stay suppressed inside it");
+  assert.deepEqual(controller.suggestions, [], "and its default is off");
+  assert.equal(controller.popover.hidden, true);
+  assert.equal(editor.getAttribute("aria-expanded"), "false");
+
+  settingsCache.set("editing-autocomplete-commands", true);
+  editor.dispatch("input"); flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions.map((row) => row.name), ["Table"], "a switch moved mid-edit lands on the next keystroke");
+  assert.equal(controller.popover.hidden, false);
+  assert.equal(editor.getAttribute("aria-expanded"), "true");
+  assert.equal(controller.suggestionList.children[0].textContent, "TableTable creator");
+
+  editor.value = "/"; editor.setSelectionRange(1, 1); editor.dispatch("input"); flush(); await waitForSearch();
+  assert.equal(controller.suggestions.length, 8, "a bare / opens on the catalog, bounded by the same results setting as every other menu");
+  assert.equal(controller.suggestions[0].name, "TODO");
+  assert.equal(searches + recents + queries, 0, "a static catalog asks Roam nothing");
+
+  settingsCache.set("editing-autocomplete", false);
+  editor.dispatch("input"); flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions, [], "the master switch covers the catalog too");
+  assert.equal(controller.popover.hidden, true);
+  controller.dispose();
+});
+
+/**
+ * The half of the subset that is worth more than the rest of it: a command whose caret lands inside
+ * `((` or `[[` hands straight over to the picker for what it just wrote, in one gesture. Nothing
+ * special implements it — the accept simply leaves the reference path open, and the next paint reads
+ * the text the command inserted. The Bold half is the control: a command that IS the whole answer
+ * must leave the menu shut.
+ */
+test("a picker command hands the picker the reference it just wrote", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents(); settingsCache.clear();
+  settingsCache.set("editing-autocomplete-commands", true);
+  const opened = [];
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchRecents: async (context) => { opened.push(context.type); return [{ kind: "roam-block", name: "Recent block", description: "Block · blk000001", uid: "blk000001" }]; },
+  });
+  globalThis.window.roamAlphaAPI = { q: () => [] };
+
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "/block r", floating: false });
+  flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions.map((row) => row.name), ["Block Reference"], "a query with a space in it reaches a name with a space in it");
+  controller.onKeydown({ key: "Enter", preventDefault() {}, stopPropagation() {}, isComposing: false }); flush(); await waitForSearch();
+  assert.equal(editor.value, "(())");
+  assert.equal(editor.selectionStart, 2, "the caret is parked between the parens, not past them");
+  assert.deepEqual(opened, ["block"], "and the block picker opened on it without a second keystroke");
+  assert.deepEqual(controller.suggestions.map((row) => row.name), ["Recent block"]);
+
+  editor.value = "/mentions"; editor.setSelectionRange(9, 9); editor.dispatch("input"); flush(); await waitForSearch();
+  controller.onKeydown({ key: "Enter", preventDefault() {}, stopPropagation() {}, isComposing: false }); flush(); await waitForSearch();
+  assert.equal(editor.value, "{{[[mentions]]: [[]]}}");
+  assert.deepEqual(opened, ["block", "page"], "a component whose argument is a page opens the page picker instead");
+
+  editor.value = "/bold"; editor.setSelectionRange(5, 5); editor.dispatch("input"); flush(); await waitForSearch();
+  controller.onKeydown({ key: "Enter", preventDefault() {}, stopPropagation() {}, isComposing: false }); flush(); await waitForSearch();
+  assert.equal(editor.value, "****");
+  editor.setRangeText("loud", editor.selectionStart, editor.selectionEnd, "end");
+  assert.equal(editor.value, "**loud**", "what is typed next lands between the markers");
+  assert.deepEqual(opened, ["block", "page"], "and a command that is the whole answer opens nothing");
+  assert.deepEqual(controller.suggestions, []);
+  controller.dispose();
+});
+
+/**
+ * The day rows through the controller, because the pure test can only prove the wrapper: what
+ * matters live is that the title comes from `roamAlphaAPI.util.dateToPageTitle` and is never
+ * assembled here. Probed on the Svy graph on 2026-08-06, that call returned "August 6th, 2026" and
+ * pulling `[:node/title "August 6th, 2026"]` returned the real daily page — so the row writes a
+ * reference that resolves. With the call missing there is no format to fall back to, and the rows go.
+ */
+test("the day commands write the title Roam formats, and are absent when Roam cannot format one", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents(); settingsCache.clear();
+  settingsCache.set("editing-autocomplete-commands", true);
+  const { controller, cells, flush } = makeController({ referenceSearchDelay: 0 });
+  const asked = [];
+  globalThis.window.roamAlphaAPI = { q: () => [], util: { dateToPageTitle: (date) => { asked.push(date instanceof Date); return "August 6th, 2026"; } } };
+
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "/tod", floating: false });
+  flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions.map((row) => row.name), ["TODO", "Today"]);
+  controller.suggestionList.children[1].dispatch("click"); flush(); await waitForSearch();
+  assert.equal(editor.value, "[[August 6th, 2026]]", "the row inserts what Roam formatted, wrapped and nothing else");
+  assert.equal(asked.every(Boolean), true, "and it is handed a Date, which is what that call takes");
+  assert.deepEqual(controller.suggestions, [], "a completed page reference is not a page query");
+
+  globalThis.window.roamAlphaAPI = { q: () => [] };
+  editor.value = "/tod"; editor.setSelectionRange(4, 4); editor.dispatch("input"); flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions.map((row) => row.name), ["TODO"], "no dateToPageTitle, no day row — never a guessed date format");
+
+  // The guard behind that filter, reached the only way it can be: a row that cannot resolve must
+  // write NOTHING. Without it the accept falls through to the generic insert and the cell gets
+  // `[[Today]]` — a reference to a page named after the command, which is worse than no command.
+  controller.suggestions = [{ kind: "roam-command", name: "Today", description: "Today's daily page", dynamic: "day", offset: 0 }];
+  controller.acceptSuggestion(0); flush();
+  assert.equal(editor.value, "/tod", "an unresolvable command inserts nothing rather than a page named after itself");
   controller.dispose();
 });
 
