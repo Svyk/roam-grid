@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { roamEditorTriggerContext, roamTriggerInsertion, searchRoamReferenceSuggestions, withCreatePageSuggestion } from "../src/extension.js";
+import { roamEditorTriggerContext, roamSuggestionPlainText, roamTriggerInsertion, searchRoamReferenceSuggestions, withCreatePageSuggestion } from "../src/extension.js";
 
 test("the trigger context resolves six types against the nearest unclosed opener", () => {
   assert.deepEqual(roamEditorTriggerContext("See [[Proj", 10), {
@@ -142,4 +142,30 @@ test("the create-page row is offered last, only for a page opener whose name is 
   const source = [alpha];
   withCreatePageSuggestion({ type: "page", query: "Project Beta" }, source);
   assert.deepEqual(source, [alpha], "the caller's result array is never mutated");
+});
+
+/**
+ * The text every suggestion row carries from its first frame, and the permanent fallback wherever
+ * `renderString` is unavailable or fails. Pure by design: no DOM, no Roam, no controller.
+ */
+test("the suggestion normalizer strips each markdown form Roam would have rendered", () => {
+  assert.equal(roamSuggestionPlainText("[[Project Alpha]] status"), "Project Alpha status");
+  assert.equal(roamSuggestionPlainText("#[[Long Name]] and [[Short]]"), "Long Name and Short");
+  assert.equal(roamSuggestionPlainText("#ctx/computer done"), "ctx/computer done");
+  assert.equal(roamSuggestionPlainText("a #tag mid-sentence"), "a tag mid-sentence");
+  assert.equal(roamSuggestionPlainText("**bold** __italic__ ^^highlight^^ ~~struck~~ `code`"), "bold italic highlight struck code");
+  assert.equal(roamSuggestionPlainText("see [the docs](https://example.test/a) now"), "see the docs now");
+  assert.equal(roamSuggestionPlainText("![](https://example.test/a.png)"), "image", "an image with no alt text still says something");
+  assert.equal(roamSuggestionPlainText("![a chart](https://example.test/a.png)"), "a chart");
+  assert.equal(roamSuggestionPlainText("[label]([[Aliased Page]])"), "label", "an alias shows its label, not its target");
+  assert.equal(roamSuggestionPlainText("see ((abc-12_XY)) here"), "see (block) here",
+    "a block ref cannot be resolved without a graph read, so it collapses instead of showing a uid");
+  assert.equal(roamSuggestionPlainText("first\n\n   second\tthird"), "first second third");
+  assert.equal(roamSuggestionPlainText("   "), "");
+  assert.equal(roamSuggestionPlainText(null), "");
+  assert.equal(roamSuggestionPlainText(undefined), "");
+  assert.equal(roamSuggestionPlainText("Status:: Active"), "Status:: Active",
+    "an attribute is content, not markup — it renders as itself");
+  assert.equal(roamSuggestionPlainText("plain sentence"), "plain sentence");
+  assert.equal(roamSuggestionPlainText("{{[[TODO]]}} write it up"), "{{TODO}} write it up");
 });

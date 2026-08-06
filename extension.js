@@ -41,6 +41,17 @@ const RECENTS_TTL_MS = 60000;
 const RECENTS_BUDGET_MS = 250;
 const RECENT_BLOCK_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const RECENT_ACCEPTED_PAGES = 25;
+// Rendering a suggestion row mounts React. At the default limit of 8 rows and a 90ms debounce a fast
+// typist produces about eleven result sets a second, so an unbounded per-row render is ~88 mounts a
+// second while typing. The list is 190px tall — roughly six rows — so capping renders at six renders
+// nothing that was not already on screen. A module constant and NOT a setting, because a setting is
+// something a user can raise back into a storm.
+const MAX_RENDERED_SUGGESTION_ROWS = 6;
+// A batch is timed end to end; two over budget and the session goes text-only. This is what protects
+// a graph where `renderString` is slower than the one this was written against.
+const SUGGESTION_RENDER_BUDGET_MS = 32;
+const SLOW_SUGGESTION_BATCHES = 2;
+const RENDERED_SUGGESTION_CACHE = 12;
 const DEFAULT_COMPACT_ROW_HEIGHT = 24;
 const DEFAULT_GRID_MAX_WIDTH = 1200;
 const DEFAULT_NEW_GRID_ROWS = 100;
@@ -96,6 +107,7 @@ const SETTING_DESCRIPTORS = [
   { key: "editing-autocomplete-debounce-ms", group: "Editing", name: "Autocomplete delay (ms)", description: "How long a reference query settles before Roam is searched.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_MS, min: 0, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "editing-autocomplete-limit", group: "Editing", name: "Autocomplete results", description: "How many suggestions the formula and reference pickers offer.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_LIMIT, min: 1, max: 25, scope: "graph", apply: "next-op", stage: "live" },
   { key: "editing-autocomplete-empty-opener", group: "Editing", name: "Open the reference menu on a bare [[ or ((", description: "Offer recently edited pages the moment you type [[ and recently edited blocks the moment you type ((, the way Roam’s own menu does, before you have typed anything to search for. With this off the menu waits for a query.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
+  { key: "editing-autocomplete-render-rows", group: "Editing", name: "Render ((block)) suggestions the way Roam does", description: "Show block suggestions as Roam renders them — page links, bold, refs — instead of the raw markdown behind them. Page, tag and create-page rows are plain text either way. Rendering pauses itself for the rest of the session if it turns out to be slow on this graph.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-capture-undo", group: "Editing", name: "Capture grid undo history", description: "Record grid edits in the extension's own undo history so ⌘Z reverses them.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-enter-direction", group: "Editing", name: "Enter moves", description: "Where the selection lands after Enter finishes a cell edit.", control: "select", type: "enum", default: "Down", items: ["Down", "Right", "Stay"], scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-tab-direction", group: "Editing", name: "Tab moves", description: "Where the selection lands after Tab finishes a cell edit.", control: "select", type: "enum", default: "Right", items: ["Right", "Down"], scope: "graph", apply: "immediate", stage: "live" },
@@ -187,6 +199,8 @@ const runtime = {
   commentArmed: false,
   recentsDisabled: false,
   recentlyAcceptedPages: [],
+  suggestionRenderDisabled: false,
+  slowSuggestionBatches: 0,
 };
 
 /** Recently-edited pages and blocks, keyed `<graph>:<page|block>`, 60 s TTL. The second and every
@@ -447,6 +461,29 @@ export function emptyOpenerEnabled() {
 /** Session-scoped budget switch — see RECENTS_BUDGET_MS. */
 export function recentsDisabled() {
   return runtime.recentsDisabled === true;
+}
+
+/** True while a block suggestion may be rendered through Roam rather than shown as plain text. Both
+ *  the setting and the session auto-off are read live, at the batch site, so a switch that moves
+ *  mid-edit lands on the next result set instead of the next editor. */
+export function suggestionRenderingEnabled() {
+  return getSetting("editing-autocomplete-render-rows") !== false && runtime.suggestionRenderDisabled !== true;
+}
+
+/** Re-arms the session auto-off — see SUGGESTION_RENDER_BUDGET_MS. */
+export function resetSuggestionRendering() {
+  runtime.suggestionRenderDisabled = false;
+  runtime.slowSuggestionBatches = 0;
+}
+
+/** B8's auto-off, counted per batch rather than per row: one slow batch is a cold React bundle, two
+ *  is the graph. Reports through console.info and never a toast — rendered rows are a nicety. */
+function noteSuggestionRenderBatch(elapsed) {
+  if (elapsed <= SUGGESTION_RENDER_BUDGET_MS || runtime.suggestionRenderDisabled) return;
+  runtime.slowSuggestionBatches += 1;
+  if (runtime.slowSuggestionBatches < SLOW_SUGGESTION_BATCHES) return;
+  runtime.suggestionRenderDisabled = true;
+  console.info(`[roam-grid] Rendering suggestion rows went over the ${SUGGESTION_RENDER_BUDGET_MS}ms budget ${SLOW_SUGGESTION_BATCHES} times. Suggestion rows stay plain text for the rest of this session.`);
 }
 
 /** Drops the cached recents rows, the accepted-page LRU, and re-arms the budget switch. */
@@ -6104,12 +6141,14 @@ function ensureCellContent(cell) {
   return content;
 }
 
+/** `content` is null for a host parked outside its container — a suggestion row waiting in the
+ *  rendered-row cache — which still has to unmount through exactly this path. */
 function disposeRichHost(content, host) {
   if (!host || host.__rgDisposed) return;
   host.__rgDisposed = true;
   try { globalThis.window?.roamAlphaAPI?.ui?.components?.unmountNode?.({ el: host }); } catch { /* host may not be Roam-owned */ }
   host.remove();
-  content.__rgRichHosts?.delete(host);
+  content?.__rgRichHosts?.delete(host);
 }
 
 function clearRichCellHosts(content, keep = null) {
@@ -6166,7 +6205,9 @@ function activateRichHost(content, host, token) {
   host.dataset.rgRichActive = "true";
 }
 
-export function paintRichCellContent(content, raw, token) {
+/** `fallbackText` defaults to the raw string, which is what a cell wants. A suggestion row passes its
+ *  normalized plain text instead, so a failed render leaves readable text rather than markdown. */
+export function paintRichCellContent(content, raw, token, fallbackText = raw) {
   const host = document.createElement("span");
   host.className = "rg-rich-host";
   host.hidden = true;
@@ -6176,7 +6217,7 @@ export function paintRichCellContent(content, raw, token) {
   content.appendChild(host);
   const fallback = () => {
     if (content.dataset.rgRenderToken !== token || host.__rgDisposed) return disposeRichHost(content, host);
-    host.textContent = raw;
+    host.textContent = fallbackText;
     activateRichHost(content, host, token);
   };
   const render = () => {
@@ -6294,6 +6335,26 @@ export function roamTriggerInsertion(type, suggestion) {
   const name = String(suggestion?.name ?? "");
   if (type === "tag") return BARE_TAG_NAME.test(name) ? `#${name}` : `#[[${name}]]`;
   return type === "tag-page" ? `#[[${name}]]` : `[[${name}]]`;
+}
+
+/**
+ * What a suggestion row says before — and if `renderString` is unavailable, instead of — Roam renders
+ * it. Every row is non-empty from its first frame because this runs synchronously while the row node
+ * is built; the hidden host only ever replaces text that was already readable.
+ *
+ * A block ref cannot be resolved without a graph read, so it collapses to a short placeholder rather
+ * than showing nine characters of uid. Everything else is markdown this can strip on its own.
+ */
+export function roamSuggestionPlainText(raw) {
+  return String(raw ?? "")
+    .replace(/!\[([^\]\n]*)\]\([^)\n]*\)/gu, (whole, label) => label || "image")
+    .replace(/\[([^\]\n]+)\]\([^)\n]*\)/gu, "$1")
+    .replace(/\(\([A-Za-z0-9_-]+\)\)/gu, "(block)")
+    .replace(/#?\[\[([^[\]\n]+)\]\]/gu, "$1")
+    .replace(/(^|\s)#([\p{L}\p{N}_/-]+)/gu, "$1$2")
+    .replace(/\*\*|__|\^\^|~~|`/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
 }
 
 export async function searchRoamReferenceSuggestions(context, limit = getSetting("editing-autocomplete-limit"), api = globalThis.window?.roamAlphaAPI) {
@@ -6475,6 +6536,9 @@ export class GridEditorController {
     this.suggestions = [];
     this.suggestionIndex = 0;
     this.suggestionSignature = null;
+    this.suggestionRenderToken = 0;
+    this.renderedRowCache = new Map();
+    this.pendingSuggestionRenders = [];
     this.popover = document.createElement("div");
     this.popover.className = "rg-formula-popover rg-editor-popover";
     this.popover.hidden = true;
@@ -6643,6 +6707,7 @@ export class GridEditorController {
       if (hasSuggestions) {
         if (this.suggestionKind === "roam-reference") state.referenceAutocompleteClosed = true;
         else state.autocompleteClosed = true;
+        this.disposeSuggestionRows();
         this.suggestionList.hidden = true; this.suggestionList.setAttribute("aria-hidden", "true");
         state.editor.setAttribute("aria-expanded", "false"); state.editor.removeAttribute?.("aria-activedescendant");
         if (!state.floating && !(state.editor.value.startsWith("=") && !state.editor.value.startsWith("=="))) this.setPopoverHidden(true);
@@ -6949,13 +7014,20 @@ export class GridEditorController {
     this.currentEditor()?.setAttribute?.("aria-expanded", String(Boolean(this.suggestions.length)));
     const signature = this.suggestions.map((suggestion) => `${suggestion.kind}:${suggestion.uid || suggestion.name}`).join("|");
     if (signature === this.suggestionSignature) return this.paintActiveSuggestion();
+    this.disposeSuggestionRows({ retain: true });
     this.suggestionSignature = signature;
-    this.suggestionList.replaceChildren();
+    // B2 and the availability half of the permanent fallback. Only `roam-block` rows carry markdown
+    // worth rendering; a page title, tag, create-page row or function name is already its own label,
+    // so a typical `[[` menu issues ZERO renders.
+    const rendering = suggestionRenderingEnabled() && typeof globalThis.window?.roamAlphaAPI?.ui?.components?.renderString === "function";
+    const jobs = []; let rendered = 0;
     this.suggestions.forEach((suggestion, index) => {
       const option = document.createElement("button"); option.type = "button"; option.className = "rg-formula-suggestion";
       option.id = `${this.suggestionList.id}-option-${index}`;
       option.setAttribute("role", "option");
-      const name = document.createElement("strong"); name.textContent = suggestion.name;
+      const name = document.createElement("strong");
+      const text = document.createElement("span"); text.className = "rg-suggestion-text"; text.textContent = roamSuggestionPlainText(suggestion.name);
+      name.appendChild(text);
       const detail = document.createElement("span"); detail.textContent = suggestion.description;
       option.append(name, detail);
       option.addEventListener("pointerdown", (event) => event.preventDefault());
@@ -6965,8 +7037,52 @@ export class GridEditorController {
       option.addEventListener("mouseenter", () => { this.suggestionIndex = index; this.paintActiveSuggestion(); });
       option.addEventListener("click", () => this.acceptSuggestion(index));
       this.suggestionList.appendChild(option);
+      // B3 skips a block whose text holds no markup at all, and B4 stops at six — the height of the
+      // list, so everything past it is below the fold anyway.
+      if (!rendering || suggestion.kind !== "roam-block" || !requiresRoamRichRender(suggestion.name) || rendered >= MAX_RENDERED_SUGGESTION_ROWS) return;
+      rendered += 1;
+      name.dataset.rgSuggestionKey = `${suggestion.kind}:${suggestion.uid || ""}:${suggestion.name}`;
+      if (this.reuseRenderedRow(name)) return;
+      jobs.push({ host: name, raw: String(suggestion.name) });
     });
     this.paintActiveSuggestion();
+    if (jobs.length) this.renderSuggestionRowBatch(jobs);
+  }
+
+  /** B6. A host this controller already mounted, parked when its row left the list; backspacing to a
+   *  previous query re-attaches it instead of paying for the mount again. */
+  reuseRenderedRow(container) {
+    const key = container.dataset.rgSuggestionKey;
+    const host = this.renderedRowCache.get(key);
+    if (!host) return false;
+    this.renderedRowCache.delete(key);
+    if (host.__rgDisposed) return false;
+    container.dataset.rgRenderToken = String(this.suggestionRenderToken);
+    container.__rgRichHosts ||= new Set();
+    container.__rgRichHosts.add(host);
+    container.replaceChildren(host);
+    host.hidden = false;
+    return true;
+  }
+
+  /** B5. One microtask per row with a token check between them, so a newer result set aborts the rest
+   *  of the batch mid-flight instead of mounting rows nobody will see. The same token discipline the
+   *  rich-cell path uses per host, one step coarser: here the token also fences the queue itself. */
+  renderSuggestionRowBatch(jobs) {
+    const token = this.suggestionRenderToken;
+    this.pendingSuggestionRenders = jobs;
+    const clock = () => globalThis.performance?.now?.() ?? Date.now();
+    const started = clock();
+    const queue = globalThis.queueMicrotask || ((callback) => Promise.resolve().then(callback));
+    const step = () => {
+      if (token !== this.suggestionRenderToken) return;
+      const job = jobs.shift();
+      if (!job) return noteSuggestionRenderBatch(clock() - started);
+      job.host.dataset.rgRenderToken = String(token);
+      paintRichCellContent(job.host, job.raw, String(token), roamSuggestionPlainText(job.raw));
+      queue(step);
+    };
+    queue(step);
   }
 
   paintActiveSuggestion() {
@@ -6984,11 +7100,47 @@ export class GridEditorController {
     else editor.removeAttribute?.("aria-activedescendant");
   }
 
-  /** Teardown seam for whatever the rows own beyond their own nodes. Dropping the cached signature
-   *  is what keeps the next render from mistaking an emptied list for an up-to-date one. */
-  disposeSuggestionRows() {
+  /**
+   * B7. Teardown seam for what the rows own beyond their own nodes: every Roam-rendered host unmounts
+   * through the same path a cell uses, because a leaked React root is worse than raw markdown.
+   * Dropping the cached signature is what keeps the next render from mistaking an emptied list for an
+   * up-to-date one; bumping the render token is what aborts any batch still in flight.
+   *
+   * `retain` is the rebuild path and nothing else. A row leaving the list parks its finished host in
+   * the LRU rather than unmounting it, which is what makes B6 reuse possible; a host still mid-render
+   * is unmounted outright, because there is nothing to reuse and its own token check would only
+   * unmount it later. Every real teardown — accept, Escape, finish, dispose — leaves `retain` off and
+   * takes the cache down with the rows.
+   */
+  disposeSuggestionRows({ retain = false } = {}) {
     this.suggestionSignature = null;
+    this.suggestionRenderToken += 1;
+    for (const option of [...this.suggestionList.children]) {
+      for (const container of [...option.children]) {
+        for (const host of [...(container.__rgRichHosts || [])]) {
+          if (retain && !host.__rgDisposed && host.dataset?.rgRichActive === "true") this.parkRenderedRow(container, host);
+          else disposeRichHost(container, host);
+        }
+      }
+    }
     this.suggestionList.replaceChildren();
+    if (retain) return;
+    for (const host of this.renderedRowCache.values()) disposeRichHost(null, host);
+    this.renderedRowCache.clear();
+  }
+
+  parkRenderedRow(container, host) {
+    const key = container.dataset.rgSuggestionKey;
+    container.__rgRichHosts?.delete(host);
+    host.remove();
+    if (!key) return disposeRichHost(null, host);
+    this.renderedRowCache.delete(key);
+    this.renderedRowCache.set(key, host);
+    while (this.renderedRowCache.size > RENDERED_SUGGESTION_CACHE) {
+      const oldest = this.renderedRowCache.keys().next().value;
+      disposeRichHost(null, this.renderedRowCache.get(oldest));
+      this.renderedRowCache.delete(oldest);
+    }
   }
 
   updateSignature(formula) {

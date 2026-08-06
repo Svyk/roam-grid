@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { FormulaEngine, GridEditorController, GridModel, GridView, NativeGridSession, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, queryBlockReferenceSources, recentsCacheReady, recentsDisabled, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, resetRoamRecents, searchRoamRecentSuggestions, settingsCache, syncPortalThemeFromRoot, wrapSelectionOnPair } from "../src/extension.js";
+import { FormulaEngine, GridEditorController, GridModel, GridView, NativeGridSession, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, queryBlockReferenceSources, recentsCacheReady, recentsDisabled, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, resetRoamRecents, resetSuggestionRendering, roamSuggestionPlainText, searchRoamRecentSuggestions, settingsCache, syncPortalThemeFromRoot, wrapSelectionOnPair } from "../src/extension.js";
 
 class MiniClassList {
   constructor() { this.values = new Set(); }
@@ -1209,6 +1209,207 @@ test("hovering a row moves the highlight, and Enter accepts the row that looks s
   flush();
   assert.equal(editor.value, "[[Beta]]", "Enter takes the hovered row, not the one the keyboard left behind");
   controller.dispose();
+});
+
+/**
+ * U6's shared fixtures. `installSuggestionRenderer` stands in for Roam's React renderer: it records
+ * every mount, writes recognisable output into the host, and lets a test re-enter the controller from
+ * inside a render, which is the only deterministic way to supersede a batch mid-flight.
+ */
+function installSuggestionRenderer(onRender = null) {
+  const rendered = []; const unmounted = [];
+  globalThis.window.roamAlphaAPI = { ui: { components: {
+    renderString: ({ el, string }) => { rendered.push({ el, string }); el.appendChild(new MiniNode("em", `roam:${string}`)); onRender?.(rendered.length); },
+    unmountNode: ({ el }) => { unmounted.push(el); },
+  } } };
+  return { rendered, unmounted };
+}
+
+const richBlock = (index) => ({ kind: "roam-block", name: `row ${index} [[Ref${index}]] **bold**`, description: `Block · blkrow000${index}`, uid: `blkrow000${index}` });
+const drainRenders = async () => { for (let index = 0; index < 40; index += 1) await Promise.resolve(); };
+const keypress = (key) => ({ key, shiftKey: false, preventDefault() {}, stopPropagation() {}, isComposing: false });
+
+test("only block rows render through Roam — page, tag and create-page rows stay plain text", async (t) => {
+  t.after(() => { resetSuggestionRendering(); settingsCache.clear(); });
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async () => [
+      { kind: "roam-page", name: "A **Page** [[link]]", description: "Page", uid: "pageaaaa1" },
+      richBlock(1),
+      { kind: "roam-create-page", name: "New **Page**", description: "Create page" },
+    ],
+  });
+  const { rendered } = installSuggestionRenderer();
+  await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "((q", floating: false });
+  flush(); await waitForSearch(); await drainRenders();
+
+  assert.equal(rendered.length, 1, "a page title and a create-page name are already their own labels — zero renders");
+  assert.equal(rendered[0].string, richBlock(1).name);
+  const [page, block, create] = controller.suggestionList.children;
+  assert.equal(page.querySelector(".rg-suggestion-text").textContent, "A Page link", "and they show the normalizer's output, not raw markdown");
+  assert.equal(create.querySelector(".rg-suggestion-text").textContent, "New Page");
+  assert.equal(block.textContent.includes(`roam:${richBlock(1).name}`), true, "the block row shows what Roam rendered");
+  controller.dispose();
+});
+
+test("within a result set only the block rows that actually carry markup are rendered", async (t) => {
+  t.after(() => { resetSuggestionRendering(); settingsCache.clear(); });
+  const plain = { kind: "roam-block", name: "a plain sentence", description: "Block · blkplain01", uid: "blkplain01" };
+  const { controller, cells, flush } = makeController({ referenceSearchDelay: 0, searchReferences: async () => [plain, richBlock(2)] });
+  const { rendered } = installSuggestionRenderer();
+  await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "((q", floating: false });
+  flush(); await waitForSearch(); await drainRenders();
+
+  assert.equal(rendered.length, 1, "text with no markup in it has nothing to render");
+  assert.equal(rendered[0].string, richBlock(2).name);
+  assert.equal(controller.suggestionList.children[0].querySelector(".rg-suggestion-text").textContent, "a plain sentence");
+  controller.dispose();
+});
+
+test("the render cap is six rows, every row is non-empty from its first frame, and arrows re-render nothing", async (t) => {
+  t.after(() => { resetSuggestionRendering(); settingsCache.clear(); });
+  const rows = Array.from({ length: 8 }, (whole, index) => richBlock(index));
+  const { controller, cells, flush } = makeController({ referenceSearchDelay: 0, searchReferences: async () => rows });
+  let firstFrame = null;
+  const { rendered } = installSuggestionRenderer((count) => {
+    if (count === 1) firstFrame = [...controller.suggestionList.children].map((option) => option.textContent);
+  });
+  await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "((q", floating: false });
+  flush(); await waitForSearch(); await drainRenders();
+
+  assert.equal(controller.suggestionList.children.length, 8);
+  assert.equal(rendered.length, 6, "the cap is a module constant no setting can raise");
+  assert.deepEqual(rendered.map((entry) => entry.string), rows.slice(0, 6).map((row) => row.name), "and it takes the rows above the fold");
+  assert.equal(firstFrame.length, 8, "the whole list exists before the first render is issued");
+  assert.equal(firstFrame.every((text) => text.trim().length > 0), true, "no row is ever blank, not even for one frame");
+  assert.equal(firstFrame[7].startsWith(roamSuggestionPlainText(rows[7].name)), true, "an uncapped row keeps the normalizer's text for good");
+  assert.equal(controller.suggestionList.children[7].querySelector(".rg-suggestion-text").textContent, roamSuggestionPlainText(rows[7].name));
+
+  const [first, second] = controller.suggestionList.children;
+  controller.onKeydown(keypress("ArrowDown"));
+  controller.onKeydown(keypress("ArrowUp"));
+  await drainRenders();
+  assert.equal(controller.suggestionList.children[0], first, "U1's guard still holds once the rows are rendered");
+  assert.equal(controller.suggestionList.children[1], second);
+  assert.equal(rendered.length, 6, "navigation mounts nothing");
+  controller.dispose();
+});
+
+test("a superseded result set aborts the render batch mid-flight and leaves no host mounted", async (t) => {
+  t.after(() => { resetSuggestionRendering(); settingsCache.clear(); });
+  const later = [{ kind: "roam-page", name: "Quiet Page", description: "Page", uid: "pagequiet" }];
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async () => Array.from({ length: 6 }, (whole, index) => richBlock(index)),
+  });
+  const abortedRows = [];
+  const { rendered, unmounted } = installSuggestionRenderer((count) => {
+    if (count !== 2) return;
+    abortedRows.push(...controller.suggestionList.children);
+    controller.suggestions = later; controller.suggestionIndex = 0; controller.renderSuggestionRows();
+  });
+  await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "((q", floating: false });
+  flush(); await waitForSearch(); await drainRenders();
+
+  assert.equal(rendered.length, 2, "the batch stops on the row the newer result set arrived on — the remaining four never mount");
+  assert.equal(controller.suggestionList.children.length, 1, "and the list belongs to the newer set");
+  // The discriminating assertion. A detached host falls back to text instead of calling Roam and then
+  // disposes itself, so the DOM an aborted batch leaves behind is identical to the DOM a batch that
+  // ran to completion against dead rows leaves behind — and the mount count is identical too. The
+  // unrun tail of the queue is the only thing that tells the two apart.
+  assert.deepEqual(
+    controller.pendingSuggestionRenders.map((job) => job.raw),
+    [2, 3, 4, 5].map((index) => richBlock(index).name),
+    "the remaining four jobs are dropped unrun, not merely aimed at detached rows",
+  );
+  assert.equal(abortedRows.length, 6);
+  const skipped = abortedRows.slice(2);
+  assert.equal(skipped.every((option) => option.querySelector(".rg-rich-host") == null), true, "and no orphan host is left attached to them");
+  assert.equal(skipped.every((option) => option.querySelector(".rg-suggestion-text") != null), true, "while they keep the plain text they were built with");
+  const hosts = rendered.map((entry) => entry.el);
+  assert.equal(hosts.some((host) => controller.suggestionList.contains(host)), false, "no host from the aborted batch is left in the list");
+  controller.dispose();
+  for (const host of hosts) assert.equal(unmounted.filter((element) => element === host).length, 1, "every host the aborted batch made unmounts exactly once");
+});
+
+test("a row that comes back reuses the host it already mounted", async (t) => {
+  t.after(() => { resetSuggestionRendering(); settingsCache.clear(); });
+  const setA = [richBlock(1)]; const setB = [richBlock(2)];
+  const { controller, cells, flush } = makeController({ referenceSearchDelay: 0, searchReferences: async () => setA });
+  const { rendered, unmounted } = installSuggestionRenderer();
+  await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "((q", floating: false });
+  flush(); await waitForSearch(); await drainRenders();
+  assert.equal(rendered.length, 1);
+  const host = rendered[0].el;
+
+  controller.suggestions = setB; controller.renderSuggestionRows(); await drainRenders();
+  assert.equal(rendered.length, 2, "a different row is a different mount");
+  assert.equal(unmounted.includes(host), false, "the row that left the list is parked, not thrown away");
+
+  controller.suggestions = setA; controller.renderSuggestionRows(); await drainRenders();
+  assert.equal(rendered.length, 2, "backspacing to a previous query re-attaches the parked host instead of mounting again");
+  assert.equal(controller.suggestionList.children[0].textContent.includes(`roam:${setA[0].name}`), true, "and the row still shows what Roam rendered");
+  assert.equal(controller.suggestionList.contains(host), true);
+
+  controller.dispose();
+  assert.equal(unmounted.length, 2, "the cache goes down with the rows");
+});
+
+test("every teardown path unmounts every rendered suggestion host", async (t) => {
+  t.after(() => { resetSuggestionRendering(); settingsCache.clear(); });
+  for (const path of ["accept", "escape", "finish", "dispose"]) {
+    const { controller, cells, flush } = makeController({ referenceSearchDelay: 0, searchReferences: async () => [richBlock(1), richBlock(2)] });
+    const { rendered, unmounted } = installSuggestionRenderer();
+    await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "((q", floating: false });
+    flush(); await waitForSearch(); await drainRenders();
+    assert.equal(rendered.length, 2, `${path}: two hosts to account for`);
+
+    if (path === "accept") controller.onKeydown(keypress("Enter"));
+    if (path === "escape") controller.onKeydown(keypress("Escape"));
+    if (path === "finish") await controller.finish(false);
+    if (path === "dispose") controller.dispose();
+
+    assert.deepEqual(unmounted, rendered.map((entry) => entry.el), `${path}: every host unmounts, exactly once, in row order`);
+    assert.equal(controller.suggestionList.children.length, 0, `${path}: and no row node survives`);
+    if (path !== "dispose") controller.dispose();
+  }
+});
+
+test("two slow batches switch rendering off for the session, and the setting does the same on its own", async (t) => {
+  const realPerformance = globalThis.performance; const realInfo = console.info;
+  t.after(() => { globalThis.performance = realPerformance; console.info = realInfo; resetSuggestionRendering(); settingsCache.clear(); });
+  resetSuggestionRendering(); settingsCache.clear();
+  const notices = []; console.info = (message) => notices.push(String(message));
+  let ticks = 0;
+  globalThis.performance = { now: () => { ticks += 40; return ticks; } };
+
+  const setA = [richBlock(1)]; const setB = [richBlock(2)]; const setC = [richBlock(3)];
+  const { controller, cells, flush } = makeController({ referenceSearchDelay: 0, searchReferences: async () => setA });
+  const { rendered } = installSuggestionRenderer();
+  await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "((q", floating: false });
+  flush(); await waitForSearch(); await drainRenders();
+  assert.equal(rendered.length, 1, "the first slow batch still renders — one slow batch is a cold bundle");
+  assert.equal(notices.length, 0);
+
+  controller.suggestions = setB; controller.renderSuggestionRows(); await drainRenders();
+  assert.equal(rendered.length, 2, "so does the second, which is the one that trips the switch");
+  assert.equal(notices.length, 1, "and it says so once, through console.info and never a toast");
+
+  controller.suggestions = setC; controller.renderSuggestionRows(); await drainRenders();
+  assert.equal(rendered.length, 2, "after two slow batches the session is text-only");
+  assert.equal(controller.suggestionList.children[0].querySelector(".rg-suggestion-text").textContent, roamSuggestionPlainText(setC[0].name),
+    "text-only still means readable text, never raw markdown");
+  controller.dispose();
+
+  resetSuggestionRendering();
+  settingsCache.set("editing-autocomplete-render-rows", false);
+  const off = makeController({ referenceSearchDelay: 0, searchReferences: async () => setA });
+  const offRenderer = installSuggestionRenderer();
+  await off.controller.start({ row: 0, col: 0, cell: off.cells.get("0:0"), raw: "((q", floating: false });
+  off.flush(); await waitForSearch(); await drainRenders();
+  assert.equal(offRenderer.rendered.length, 0, "the switch alone is enough");
+  assert.equal(off.controller.suggestionList.children[0].querySelector(".rg-suggestion-text").textContent, roamSuggestionPlainText(setA[0].name));
+  off.controller.dispose();
 });
 
 test("a pair key over a selection wraps it, and a formula keeps its own brackets", async () => {
