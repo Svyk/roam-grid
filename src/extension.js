@@ -45,6 +45,9 @@ const LARGE_UPLOAD_CONCURRENCY = 4;
 const LARGE_PREFETCH_CONCURRENCY = 6;
 const LARGE_LINEAGE_LIMIT = 16;
 const LARGE_COMMIT_ATTEMPTS = 3;
+const LARGE_GARBAGE_LIMIT = 256;
+const LARGE_GARBAGE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
+const LARGE_GC_QUIET_MS = 60 * 60 * 1000;
 const CHUNK_CACHE_DB = "roam-grid-chunks";
 const CHUNK_CACHE_DB_VERSION = 1;
 const CHUNK_CACHE_BODIES = "bodies";
@@ -101,10 +104,10 @@ const SETTING_DESCRIPTORS = [
   { key: "ranges-live-references", group: "Ranges", name: "Render live range references", description: "Render {{roam-grid-range: …}} components as a live view of the source cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
   { key: "ranges-read-only", group: "Ranges", name: "Rendered ranges are read-only", description: "Block edits inside a rendered range so the source table stays authoritative.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
   { key: "ranges-max-rendered-cells", group: "Ranges", name: "Maximum cells in a rendered range", description: "Ranges larger than this render as a link instead of a grid.", control: "input", type: "int", default: DEFAULT_RANGE_RENDERED_CELLS, min: 1, max: 50000, scope: "graph", apply: "next-op", stage: "pending" },
-  { key: "large-cache-enabled", group: "Large grids", name: "Cache large-grid chunks on this device", description: "Keep downloaded chunks in IndexedDB so reopening a large grid is instant.", control: "switch", type: "bool", default: true, scope: "device", apply: "immediate", stage: "pending" },
-  { key: "large-cache-max-mb", group: "Large grids", name: "Chunk cache size (MB)", description: "How much device storage the large-grid chunk cache may use.", control: "input", type: "int", default: DEFAULT_LARGE_CACHE_MB, min: 8, max: 4096, scope: "device", apply: "next-op", stage: "pending" },
-  { key: "large-verify-checksums", group: "Large grids", name: "Verify chunk checksums", description: "Re-hash each downloaded chunk before trusting it.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "pending" },
-  { key: "large-gc-orphans", group: "Large grids", name: "Permanently delete superseded large-grid files (irreversible)", description: "Delete chunk and manifest files that no revision references any more. This cannot be undone.", control: "switch", type: "bool", default: false, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "large-cache-enabled", group: "Large grids", name: "Cache large-grid chunks on this device", description: "Keep downloaded chunks in IndexedDB so reopening a large grid is instant. Takes effect the next time Roam Grid loads.", control: "switch", type: "bool", default: true, scope: "device", apply: "next-op", stage: "live" },
+  { key: "large-cache-max-mb", group: "Large grids", name: "Chunk cache size (MB)", description: "How much device storage the large-grid chunk cache may use.", control: "input", type: "int", default: DEFAULT_LARGE_CACHE_MB, min: 8, max: 4096, scope: "device", apply: "next-op", stage: "live" },
+  { key: "large-verify-checksums", group: "Large grids", name: "Verify chunk checksums", description: "Re-hash each downloaded chunk before trusting it.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "large-gc-orphans", group: "Large grids", name: "Permanently delete superseded large-grid files (irreversible)", description: "Delete chunk and manifest files that no revision references any more. Runs once per session, only on grids nothing has saved for an hour, and only after a file has been superseded for seven days. This cannot be undone.", control: "switch", type: "bool", default: false, scope: "graph", apply: "next-op", stage: "live" },
 ];
 
 /**
@@ -1628,15 +1631,80 @@ export class UndoHistory {
   }
 }
 
-export function undoHistoryFor(tableUid, histories = undoHistories) {
+/**
+ * `UndoHistory`'s semantics over `(rowId, columnId)` instead of a block uid: a large-grid cell is a
+ * JSON row inside a chunk file and has no Roam block whose uid an entry could name. The stack, the
+ * limits, the redo invalidation and the `stale` rule — an external value is never overwritten — are
+ * inherited rather than reinvented, so there is one undo contract in this file and not two. Only the
+ * addressing and the apply target differ, which is why `applyInverse`/`applyForward`/`remapUids`
+ * (all `GridModel`-shaped) are never called on this subclass; `applyLargeUndoOps` replaces them.
+ */
+export class LargeGridHistory extends UndoHistory {
+  /**
+   * `cells` are the records `store.setCell` hands back. A cell whose value did not actually move is
+   * dropped here rather than at the call site, so every edit path records the same way.
+   */
+  record({ label = "", cells = [] } = {}) {
+    const changed = cells.filter((cell) => cell?.rowId && cell?.columnId && cell.previous !== cell.raw);
+    if (!changed.length) return null;
+    undoEntrySequence += 1;
+    return this.push({
+      id: `lge${undoEntrySequence}`, label, at: Date.now(), lane: "content", metadata: false,
+      inverse: changed.map((cell) => ({ op: "setCell", rowId: cell.rowId, columnId: cell.columnId, raw: cell.previous })).reverse(),
+      forward: changed.map((cell) => ({ op: "setCell", rowId: cell.rowId, columnId: cell.columnId, raw: cell.raw })),
+      touched: [...new Set(changed.map((cell) => alignmentKey(cell.rowId, cell.columnId)))],
+      shapeSignature: "", checkpoint: null, forwardCheckpoint: null, trashUid: null, stale: new Set(),
+    });
+  }
+
+  /**
+   * The large-grid twin of `onExternalContent`: a cell another writer moved is pinned into every
+   * entry's `stale` set, so undoing across it keeps their value rather than silently restoring ours
+   * over the top of it. Keys are `alignmentKey(rowId, columnId)`.
+   */
+  onExternalCells(keys = []) {
+    const external = new Set((keys || []).filter(Boolean));
+    if (!external.size) return { marked: 0, redoInvalidated: false };
+    let marked = 0;
+    for (const entry of [...this.entries, ...this.redoEntries]) for (const key of external) if (!entry.stale.has(key)) { entry.stale.add(key); marked += 1; }
+    const redoInvalidated = this.redoEntries.some((entry) => entry.touched.some((key) => external.has(key)));
+    if (redoInvalidated) this.invalidateRedo("external-large-content");
+    return { marked, redoInvalidated };
+  }
+}
+
+/**
+ * Applies one direction of a large-grid entry through `store.setCell`, so an undo takes exactly the
+ * path a keystroke takes: same bounds and merge checks, same chunk, same dirty marking. Rows are
+ * resolved by stable id, so an entry recorded before a row moved still lands on the row the user
+ * edited. A row or column that no longer exists, and a cell another writer owns, are dropped rather
+ * than forced — the same "refuse rather than guess" direction the merge planner takes.
+ */
+export async function applyLargeUndoOps(store, ops, entry = null) {
+  const applied = []; const dropped = [];
+  for (const op of ops) {
+    const key = alignmentKey(op.rowId, op.columnId);
+    if (entry?.stale?.has(key)) { dropped.push(key); continue; }
+    const row = store.rowIndexForRowId(op.rowId);
+    const col = (store.manifest.columnIds || []).indexOf(op.columnId);
+    if (row == null || col < 0) { dropped.push(key); continue; }
+    applied.push(await store.setCell(row, col, op.raw));
+  }
+  return { applied, dropped };
+}
+
+export function undoHistoryFor(tableUid, histories = undoHistories, Factory = UndoHistory) {
   if (!tableUid) return null;
   const existing = histories.get(tableUid);
   if (existing) { histories.delete(tableUid); histories.set(tableUid, existing); return existing; }
-  const history = new UndoHistory();
+  const history = new Factory();
   histories.set(tableUid, history);
   while (histories.size > MAX_UNDO_HISTORIES) histories.delete(histories.keys().next().value);
   return history;
 }
+
+/** Same registry and same LRU as a native table's — an anchor uid is one or the other, never both. */
+export function largeGridHistoryFor(anchorUid, histories = undoHistories) { return undoHistoryFor(anchorUid, histories, LargeGridHistory); }
 
 export function releaseUndoHistory(tableUid, histories = undoHistories) { return histories.delete(tableUid); }
 
@@ -3605,6 +3673,16 @@ async function downloadFileText(url) {
 async function downloadJson(url) { return JSON.parse(await downloadFileText(url)); }
 
 /**
+ * `roamAlphaAPI.file.delete` is confirmed to exist, but what it does when the url is already gone is
+ * not — so a rejection is reported rather than read as "already deleted". The caller keeps failures
+ * in `garbage` and retries them next session: a leaked file is recoverable and a deleted one is not.
+ */
+async function deleteFile(url) {
+  try { await roam().file.delete({ url }); return true; }
+  catch { return false; }
+}
+
+/**
  * The whole of the concurrency story: a fixed number of runners pulling from one shared cursor, so
  * the peak number of `worker` calls actually in flight is the limit and not the item count. Results
  * land at their input index rather than in completion order — that is what keeps a chunk's digest
@@ -4030,6 +4108,8 @@ export function normalizeManifest(manifest) {
   normalized.rowIdRevision = rowIdRevisionFor(normalized);
   normalized.colorFormulaCells = normalized.colorFormulaCells !== false;
   normalized.lineage = manifestLineage(normalized);
+  normalized.retained = manifestRetained(normalized);
+  normalized.garbage = manifestGarbage(normalized);
   return normalized;
 }
 
@@ -4047,6 +4127,42 @@ export function manifestLineage(manifest) {
 export function extendLineage(manifest) {
   const revision = typeof manifest?.revision === "string" && manifest.revision ? [manifest.revision] : [];
   return [...revision, ...manifestLineage(manifest)].slice(0, LARGE_LINEAGE_LIMIT);
+}
+
+export function manifestRetained(manifest) {
+  const entries = Array.isArray(manifest?.retained) ? manifest.retained : [];
+  return entries.filter((url) => typeof url === "string" && url);
+}
+
+/**
+ * Oldest first, so the entries closest to the end of their grace window are the ones a bounded list
+ * keeps hold of, and the cap drops the eldest. An entry it drops leaks forever — which is the
+ * pre-GC status quo and therefore not a regression, where a shorter grace window would not be.
+ * `deadAt` is carried through verbatim, including when it is missing or unparseable: that is the
+ * signal that makes the collector refuse the entry, so repairing it here would defeat it.
+ */
+export function manifestGarbage(manifest) {
+  const entries = Array.isArray(manifest?.garbage) ? manifest.garbage : [];
+  return entries.filter((entry) => entry && typeof entry.url === "string" && entry.url).map((entry) => ({ url: entry.url, deadAt: entry.deadAt ?? null })).slice(-LARGE_GARBAGE_LIMIT);
+}
+
+/**
+ * Deleting a live chunk is unrecoverable data loss, so this answers "keep" to every question it
+ * cannot answer with proof. The live set is rebuilt from the manifest at collection time rather than
+ * trusted from whatever put the url in `garbage` — a merge takes the other writer's `chunks`, so a
+ * url this client retired can still be the url that client is serving. Four refusals, in order: the
+ * manifest still references it, the url is unusable, `deadAt` does not parse, or the grace window
+ * has not closed. Everything else is provably unreachable and seven days stale.
+ */
+export function planOrphanCollection(manifest, manifestUrl, now = Date.now(), graceMs = LARGE_GARBAGE_GRACE_MS) {
+  const live = new Set([manifestUrl, manifest?.previous, ...(manifest?.chunks || []).map((chunk) => chunk?.url), ...manifestRetained(manifest)].filter((url) => typeof url === "string" && url));
+  const collect = []; const keep = [];
+  for (const entry of manifestGarbage(manifest)) {
+    const deadAt = Date.parse(entry.deadAt);
+    if (live.has(entry.url) || !Number.isFinite(deadAt) || now - deadAt < graceMs) keep.push(entry);
+    else collect.push(entry);
+  }
+  return { collect, keep, live };
 }
 
 /**
@@ -4156,6 +4272,11 @@ export function planManifestMerge(base, ours, live, dirtyChunks = []) {
   return { manifest: merged, theirChunks };
 }
 
+/** Anchor uids whose orphan sweep has already run this load. `onunload` clears it; tests reset it. */
+const orphanCollections = new Set();
+
+export function resetOrphanCollection(anchorUid = null) { if (anchorUid) orphanCollections.delete(anchorUid); else orphanCollections.clear(); }
+
 export class LargeGridStore {
   constructor(anchorUid, pointerUid = null) {
     this.anchorUid = anchorUid;
@@ -4172,11 +4293,17 @@ export class LargeGridStore {
     this.rowIds = new Map();
     this.rowIndexById = new Map();
     this.dirty = new Set();
+    // Index → the edit that last touched that chunk. `dirty` alone cannot distinguish "this chunk is
+    // exactly what the commit uploaded" from "a keystroke changed it while the upload was in
+    // flight", and the wholesale clear at the end of a commit silently discarded the second case.
+    this.dirtyEpoch = new Map();
+    this.editSequence = 0;
     this.metadataDirty = false;
     this.metricsVersion = 0;
     this.disposed = false;
     this.unreadableChunks = new Map();
     this.retryDelay = chunkRetryDelayMs;
+    this.orphanSweep = null;
     this.queue = new MutationQueue();
   }
 
@@ -4194,6 +4321,11 @@ export class LargeGridStore {
       this.manifest = normalizeManifest(await downloadJson(this.manifestUrl));
       this.baseManifest = deepClone(this.manifest);
       this.metricsVersion += 1;
+      // Deliberately not awaited: opening a grid must not wait on file deletions, and a sweep that
+      // fails must not fail the load. It is queued, so it still serializes behind any commit. The
+      // promise is kept rather than dropped so the work is nameable — an unobservable background
+      // deletion is not something a test can pin down, and this one deletes files.
+      this.orphanSweep = this.collectOrphans().catch(() => ({ skipped: "error", deleted: [], failed: [] }));
       return this;
     }
     if (!model && !source) {
@@ -4279,6 +4411,14 @@ export class LargeGridStore {
   }
 
   chunkIndexForRow(row) { return Math.floor(row / chunkRowsFor(this.manifest)); }
+
+  /** Every write to a chunk goes through here, so no path can mark one dirty without stamping it. */
+  markChunkDirty(index) {
+    this.editSequence += 1;
+    this.dirty.add(index);
+    this.dirtyEpoch.set(index, this.editSequence);
+    return this.editSequence;
+  }
 
   /**
    * Ids are synthesized when a chunk is read and re-synthesized whenever its rows move, so a row
@@ -4609,6 +4749,13 @@ export class LargeGridStore {
     this.metadataDirty = true;
   }
 
+  /**
+   * Returns what it overwrote. A large-grid cell has no Roam block whose earlier string an undo
+   * entry could read back later — the previous value exists only here, in the instant before it is
+   * replaced — so recording it is the caller's only chance. The address travels with it as the
+   * stable `(rowId, columnId)` pair from 3A rather than `(row, col)`, so an entry survives the rows
+   * above it moving.
+   */
   async setCell(row, col, raw) {
     if (row < 0 || col < 0) throw new GridError("OUT_OF_BOUNDS", "Large-grid edit is out of bounds");
     this.ensureSize(row + 1, col + 1);
@@ -4619,14 +4766,19 @@ export class LargeGridStore {
     const grew = chunk.rows.length <= local;
     while (chunk.rows.length <= local) chunk.rows.push(Array.from({ length: this.manifest.colCount }, () => ""));
     while (chunk.rows[local].length < this.manifest.colCount) chunk.rows[local].push("");
-    chunk.rows[local][col] = String(raw ?? "");
+    const previous = chunk.rows[local][col] ?? "";
+    const next = String(raw ?? "");
+    chunk.rows[local][col] = next;
     if (grew) this.syncRowIds(index, chunk);
-    this.dirty.add(index);
+    this.markChunkDirty(index);
+    return { row, col, index, previous, raw: next, rowId: this.rowIdAt(row), columnId: this.manifest.columnIds[col] ?? null };
   }
 
   async applyMatrix(startRow, startCol, matrix) {
     this.ensureSize(startRow + matrix.length, startCol + Math.max(0, ...matrix.map((row) => row.length)));
-    for (let row = 0; row < matrix.length; row += 1) for (let col = 0; col < matrix[row].length; col += 1) await this.setCell(startRow + row, startCol + col, matrix[row][col]);
+    const records = [];
+    for (let row = 0; row < matrix.length; row += 1) for (let col = 0; col < matrix[row].length; col += 1) records.push(await this.setCell(startRow + row, startCol + col, matrix[row][col]));
+    return records;
   }
 
   mergeAt(row, col) {
@@ -4719,17 +4871,27 @@ export class LargeGridStore {
         // digest onto a neighbouring chunk and `chunks`/`replaced` end up identical to the serial form.
         uploaded ||= await mapWithConcurrency(dirtyChunks, LARGE_UPLOAD_CONCURRENCY, async (index) => {
           const chunk = this.cache.get(index);
+          // The stamp is read in the same synchronous step that serializes the chunk. An edit can
+          // only land at an `await`, so these bytes and this epoch describe the same chunk — which
+          // is what lets the clear below tell an uploaded chunk from one a keystroke has moved on.
+          const epoch = this.dirtyEpoch.get(index);
           const text = JSON.stringify(chunk);
           const digest = await sha256Hex(text);
           const url = await uploadText(text, `roam-grid-${this.anchorUid}-${index}-${cryptoId()}.json`);
-          return { index, url, digest, startRow: chunk.startRow, rowCount: chunk.rows.length };
+          return { index, url, digest, epoch, startRow: chunk.startRow, rowCount: chunk.rows.length };
         });
         for (const entry of uploaded) {
           const existing = chunks.find((item) => item.index === entry.index);
           if (existing) { replaced.push(existing.url); existing.url = entry.url; existing.digest = entry.digest; existing.rowCount = entry.rowCount; }
           else chunks.push({ index: entry.index, startRow: entry.startRow, rowCount: entry.rowCount, url: entry.url, digest: entry.digest });
         }
-        const next = { ...deepClone(source), revision: cryptoId(), previous: liveUrl, lineage: extendLineage(source), updatedAt: new Date().toISOString(), chunks, retained: [liveUrl, ...(source.retained || []).slice(0, 1), ...replaced] };
+        const retained = [liveUrl, ...manifestRetained(source).slice(0, 1), ...replaced];
+        // A url that falls out of `retained` is unreachable from every revision a reader can still
+        // resolve, so this is where a superseded file becomes collectable. It carries the moment it
+        // died rather than being deleted here: a client that loaded the previous manifest a second
+        // ago is still reading these chunks, and the grace clock is what waits that reader out.
+        const retired = manifestRetained(source).filter((url) => !retained.includes(url)).map((url) => ({ url, deadAt: new Date().toISOString() }));
+        const next = { ...deepClone(source), revision: cryptoId(), previous: liveUrl, lineage: extendLineage(source), updatedAt: new Date().toISOString(), chunks, retained, garbage: manifestGarbage({ garbage: [...manifestGarbage(source), ...retired] }) };
         const url = await uploadJson(next, `roam-grid-${this.anchorUid}-manifest-${next.revision}.json`);
         const verified = normalizeManifest(await downloadJson(url));
         if (this.disposed) throw new GridError("DISPOSED", "Roam Grid unloaded before this large grid finished saving");
@@ -4741,12 +4903,57 @@ export class LargeGridStore {
         this.manifest = verified;
         this.baseManifest = deepClone(verified);
         this.manifestUrl = url;
-        this.dirty.clear();
+        // Only the chunks whose exact bytes went into this manifest stop being dirty. `dirty.clear()`
+        // also erased any chunk a keystroke had touched since its upload, which is a silently lost
+        // edit: the value survives in the resident chunk, but nothing was left to say it needed
+        // saving. A chunk whose stamp has moved keeps its mark and rides the next commit instead.
+        for (const entry of uploaded) {
+          if (this.dirtyEpoch.get(entry.index) !== entry.epoch) continue;
+          this.dirty.delete(entry.index);
+          this.dirtyEpoch.delete(entry.index);
+        }
         this.metadataDirty = false;
         this.metricsVersion += 1;
         return verified;
       }
       throw new GridError("CONFLICT", "Large grid kept changing while this save was in flight. Reload or save as a copy.", { reason: "cas", attempts: LARGE_COMMIT_ATTEMPTS, baseUrl: this.manifestUrl });
+    });
+  }
+
+  /**
+   * Opt-in, at most once per grid per session, and only on a grid nothing has saved for an hour —
+   * because the one thing this must never do is delete a file another client is still reading, and
+   * a quiet grid is the cheapest available evidence that no save is in flight anywhere. It runs
+   * inside the same `MutationQueue` as `commit`, so it cannot interleave with one that is uploading.
+   *
+   * Successes are dropped from `garbage` and failures are kept, so a url the API refused is retried
+   * next session rather than assumed gone. The pruned list is only marked dirty — no manifest is
+   * uploaded and no pointer is swapped for a garbage collection, which would itself create garbage;
+   * it rides along with the next ordinary save.
+   */
+  async collectOrphans({ now = Date.now } = {}) {
+    if (!getSetting("large-gc-orphans")) return { skipped: "disabled", deleted: [], failed: [] };
+    if (this.disposed) return { skipped: "disposed", deleted: [], failed: [] };
+    if (orphanCollections.has(this.anchorUid)) return { skipped: "session", deleted: [], failed: [] };
+    orphanCollections.add(this.anchorUid);
+    return this.queue.run(async () => {
+      if (this.disposed) return { skipped: "disposed", deleted: [], failed: [] };
+      const at = now();
+      const touched = Date.parse(this.manifest?.updatedAt || this.manifest?.createdAt || "");
+      // A manifest that cannot say when it was last written cannot be shown to be quiet.
+      if (!Number.isFinite(touched)) return { skipped: "unknown-age", deleted: [], failed: [] };
+      if (at - touched < LARGE_GC_QUIET_MS) return { skipped: "recent", deleted: [], failed: [] };
+      const { collect, keep } = planOrphanCollection(this.manifest, this.manifestUrl, at);
+      const deleted = []; const failed = [];
+      for (const entry of collect) {
+        if (this.disposed) { failed.push(entry); continue; }
+        if (!await deleteFile(entry.url)) { failed.push(entry); continue; }
+        deleted.push(entry.url);
+        await this.chunkCache.delete(entry.url);
+      }
+      this.manifest.garbage = [...keep, ...failed];
+      if (deleted.length) this.metadataDirty = true;
+      return { skipped: null, deleted, failed: failed.map((entry) => entry.url) };
     });
   }
 
@@ -8062,7 +8269,7 @@ export class LargeGridView {
     const pinnedTheme = pinnedGridThemePalette(); if (pinnedTheme) applyGridThemeValues(this.root, pinnedTheme);
     this.host.appendChild(this.root);
     const toolbar = document.createElement("div"); toolbar.className = "rg-toolbar";
-    toolbar.append(button("Merge", "Safely merge selection", () => this.merge()), button("Unmerge", "Unmerge selection", () => this.unmerge()), button("⇤", "Align selection left", () => this.alignSelection("left")), button("≡", "Center selection", () => this.alignSelection("center")), button("⇥", "Align selection right", () => this.alignSelection("right")), button("fx", "Show or hide formula-cell coloring", () => this.toggleFormulaColors()), button("Labels", "Show or hide row and column labels", () => this.toggleHeaders()), button("Save", "Commit dirty chunks", () => this.flush()), button("Export", "Export visible selection", () => this.exportSelection()), button("Native copy", "Copy to a native table when within the write budget", () => copyLargeToNative(this.store)));
+    toolbar.append(button("↶", "Undo (⌘Z)", () => { void this.undo(); }, "rg-toolbar-primary"), button("↷", "Redo (⌘⇧Z)", () => { void this.redo(); }, "rg-toolbar-primary"), button("Merge", "Safely merge selection", () => this.merge()), button("Unmerge", "Unmerge selection", () => this.unmerge()), button("⇤", "Align selection left", () => this.alignSelection("left")), button("≡", "Center selection", () => this.alignSelection("center")), button("⇥", "Align selection right", () => this.alignSelection("right")), button("fx", "Show or hide formula-cell coloring", () => this.toggleFormulaColors()), button("Labels", "Show or hide row and column labels", () => this.toggleHeaders()), button("Save", "Commit dirty chunks", () => this.flush()), button("Export", "Export visible selection", () => this.exportSelection()), button("Native copy", "Copy to a native table when within the write budget", () => copyLargeToNative(this.store)));
     this.status = document.createElement("span"); this.status.className = "rg-status";
     // Large-grid cells are JSON rows in a chunk file, not Roam blocks, so there is nothing for a
     // native comment thread to anchor to.  There is deliberately no alternate comment store.
@@ -8092,7 +8299,7 @@ export class LargeGridView {
         const previous = await this.store.getRaw(row, col);
         let affected = new Set([`${row}:${col}`]);
         if (commit && value !== previous) {
-          await this.store.setCell(row, col, value);
+          this.recordLargeEdit("Edit cell", await this.store.setCell(row, col, value));
           affected = this.formulaEngine.invalidateCell(row, col);
           this.scheduleSave();
         }
@@ -8294,6 +8501,7 @@ export class LargeGridView {
   }
   onKeydown(event) {
     if (event.target.matches("textarea,input")) return; event.stopPropagation(); const command = event.metaKey || event.ctrlKey;
+    if (command && event.key.toLowerCase() === "z") { event.preventDefault(); void (event.shiftKey ? this.redo() : this.undo()); return; }
     if (command && event.key.toLowerCase() === "c") { event.preventDefault(); this.copy(); return; }
     if (command && event.shiftKey && event.key.toLowerCase() === "m") { event.preventDefault(); this.merge(); return; }
     if (event.key === "Enter") { event.preventDefault(); const cell = this.cells.get(`${this.selection.startRow}:${this.selection.startCol}`); if (cell) this.beginEdit(this.selection.startRow, this.selection.startCol, cell); return; }
@@ -8311,7 +8519,7 @@ export class LargeGridView {
       try {
         const embeds = []; for (const file of images) embeds.push(await roam().file.upload({ file, toast: { hide: true } }));
         const row = this.selection.startRow; const col = this.selection.startCol;
-        await this.store.setCell(row, col, embeds.join(" "));
+        this.recordLargeEdit("Paste image", await this.store.setCell(row, col, embeds.join(" ")));
         await this.repaintLargeCells(this.invalidateLargeCells([[row, col]]));
         this.scheduleSave();
       } catch (error) { toast(error.message, "danger"); }
@@ -8322,7 +8530,7 @@ export class LargeGridView {
     if (referenced) { event.preventDefault(); await this.pasteReferencedRange(referenced); return; }
     event.preventDefault(); const matrix = parseDelimited(text, text.includes("\t") ? "\t" : detectDelimiter(text));
     const startRow = this.selection.startRow; const startCol = this.selection.startCol;
-    await this.store.applyMatrix(startRow, startCol, matrix);
+    this.recordLargeEdit("Paste", await this.store.applyMatrix(startRow, startCol, matrix));
     const coordinates = matrix.flatMap((values, row) => values.map((_value, col) => [startRow + row, startCol + col]));
     this.invalidateLargeCells(coordinates); this.scheduleSave(); this.scheduleRender();
   }
@@ -8338,9 +8546,39 @@ export class LargeGridView {
     try { matrix = selectionBlockReferenceMatrix(sourceModel, spec.range); }
     catch (error) { return toast(error.message, "warning"); }
     const startRow = this.selection.startRow; const startCol = this.selection.startCol;
-    await this.store.applyMatrix(startRow, startCol, matrix);
+    this.recordLargeEdit("Paste reference", await this.store.applyMatrix(startRow, startCol, matrix));
     const coordinates = matrix.flatMap((values, row) => values.map((_value, col) => [startRow + row, startCol + col]));
     this.invalidateLargeCells(coordinates); this.scheduleSave(); this.scheduleRender();
+  }
+
+  /** One entry per user gesture, from the records `setCell`/`applyMatrix` hand back. */
+  recordLargeEdit(label, cells) {
+    if (!getSetting("editing-capture-undo")) return null;
+    return largeGridHistoryFor(this.store.anchorUid)?.record({ label, cells: [].concat(cells ?? []) }) || null;
+  }
+  undo() { return this.applyLargeHistory("undo"); }
+  redo() { return this.applyLargeHistory("redo"); }
+
+  /**
+   * Runs inside the store's own `MutationQueue`, so an undo cannot interleave with a commit that is
+   * uploading the very chunk it is about to rewrite — it either lands wholly before that commit
+   * serialized its bytes, or wholly after, and the epoch stamp carries it into the next save.
+   */
+  async applyLargeHistory(direction) {
+    const history = largeGridHistoryFor(this.store.anchorUid);
+    const entry = direction === "undo" ? history?.popUndo() : history?.popRedo();
+    if (!entry) return false;
+    let result;
+    // The entry goes back where it came from if applying it throws. Its ops carry absolute values
+    // rather than deltas, so a half-applied entry is safe to run again — where dropping it would
+    // strand the user one step into a reversal they cannot finish or repeat.
+    try { result = await this.store.queue.run(() => applyLargeUndoOps(this.store, direction === "undo" ? entry.inverse : entry.forward, entry)); }
+    catch (error) { if (direction === "undo") history.pushUndo(entry); else history.pushRedo(entry); toast(error.message, "danger"); return false; }
+    if (direction === "undo") history.pushRedo(entry); else history.pushUndo(entry);
+    await this.repaintLargeCells(this.invalidateLargeCells(result.applied.map((cell) => [cell.row, cell.col])));
+    this.scheduleSave(); this.scheduleRender();
+    if (result.dropped.length) toast(`${result.dropped.length} cell${result.dropped.length === 1 ? "" : "s"} changed elsewhere and ${result.dropped.length === 1 ? "was" : "were"} kept.`, "warning");
+    return true;
   }
   async merge() { try { await this.store.merge(this.selection); this.scheduleSave(true); this.scheduleRender(); } catch (error) { toast(error.message, "danger"); } }
   unmerge() { if (!this.store.unmerge(this.selection.startRow, this.selection.startCol)) return toast("The active cell is not merged", "warning"); this.scheduleSave(true); this.scheduleRender(); }
@@ -8350,6 +8588,10 @@ export class LargeGridView {
   scheduleSave(immediate = false) { clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flush(), immediate ? 0 : getSetting("writes-large-debounce-ms")); }
   async flush() { clearTimeout(this.saveTimer); this.root.classList.add("rg-root--saving"); try { await this.store.commit(); toast("Large grid saved", "success", 1800); } catch (error) { toast(error.message, "danger", 8000); } finally { this.root.classList.remove("rg-root--saving"); } }
   async exportSelection() { const range = normalizeRange(this.selection); const rows = await this.store.getRows(range.startRow, range.endRow + 1); downloadText(rows.map((row) => row.slice(range.startCol, range.endCol + 1).map((value) => quoteDelimited(value, ",")).join(",")).join("\n"), "roam-grid-selection.csv", "text/csv"); }
+  /**
+   * Deliberately records no undo entry, matching `applyPatchToModel(model, patch, false)` on the
+   * native side: a programmatic write is not the user's keystroke to reverse.
+   */
   async applyPatch(patch) {
     const patches = Array.isArray(patch) ? patch : [patch]; const coordinates = [];
     for (const item of patches) {
@@ -8961,6 +9203,7 @@ async function onunload() {
   for (const uid of [...runtime.sessions.keys()]) disposeNativeSession(uid, true);
   for (const mount of runtime.largeMounts.values()) mount.dispose(); runtime.largeMounts.clear(); mounting.clear();
   resetChunkCache();
+  resetOrphanCollection();
   clearUndoHistories();
   settingsCache.clear();
   runtime.guardStyle?.remove(); runtime.guardStyle = null;

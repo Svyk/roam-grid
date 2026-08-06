@@ -86,10 +86,11 @@ const TODAYS_CONSTANTS = {
 
 const PENDING_KEYS = [
   "ranges-live-references", "ranges-read-only", "ranges-max-rendered-cells",
-  "large-cache-enabled", "large-cache-max-mb", "large-verify-checksums", "large-gc-orphans",
 ];
 
 const COMMENT_KEYS = ["comments-enabled", "comments-badges", "comments-open-in-sidebar"];
+
+const LARGE_STORAGE_KEYS = ["large-cache-enabled", "large-cache-max-mb", "large-verify-checksums", "large-gc-orphans"];
 
 const MAINTENANCE_KEYS = ["maintenance-apply-display", "maintenance-forget-device", "maintenance-clear-caches", "maintenance-reset"];
 
@@ -393,6 +394,15 @@ test("the panel omits pending rows but the schema still resolves them", async ()
     assert.ok(ids.includes(key), `${key} ships with the comments feature and must be rendered`);
     assert.equal(SETTINGS[key].stage, "live");
   }
+  // Their features landed in the 3B/3C/3F storage chain. A setting whose feature ships but whose
+  // control stays hidden is the mirror image of the defect this schema replaced, so the visibility
+  // of these four is asserted directly rather than only implied by their absence from PENDING_KEYS.
+  for (const key of LARGE_STORAGE_KEYS) {
+    assert.ok(ids.includes(key), `${key} backs a shipped feature and must be rendered`);
+    assert.equal(SETTINGS[key].stage, "live");
+  }
+  assert.equal(SETTINGS["large-gc-orphans"].default, false, "irreversible deletion is opt-in");
+  assert.match(SETTINGS["large-gc-orphans"].name, /irreversible/i, "the row must say so where the user reads it");
   refreshSettingsCache(makeApi().api, makeStorage());
   assert.equal(getSetting("comments-open-in-sidebar"), false);
   assert.equal(getSetting("large-cache-max-mb"), 256);

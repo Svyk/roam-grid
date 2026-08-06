@@ -481,8 +481,9 @@ test("both paste paths resolve their source through the shared resolver", async 
   const applied = [];
   const largeView = {
     selection: { startRow: 2, endRow: 2, startCol: 1, endCol: 1 },
-    store: { applyMatrix: async (row, col, matrix) => applied.push({ row, col, matrix }) },
-    invalidateLargeCells: () => [], scheduleSave() {}, scheduleRender() {},
+    // `applyMatrix` hands back one record per cell; this test is about routing, so it records none.
+    store: { applyMatrix: async (row, col, matrix) => { applied.push({ row, col, matrix }); return []; } },
+    invalidateLargeCells: () => [], recordLargeEdit() {}, scheduleSave() {}, scheduleRender() {},
   };
   await LargeGridView.prototype.pasteReferencedRange.call(largeView, parseRangeComponent("{{roam-grid-range: ((tbl00001)) A1:B2}}"), resolve);
   assert.deepEqual(asked, ["tbl00001", "tbl00001"]);
@@ -494,8 +495,8 @@ test("a range component pasted into a large grid pastes referenced values, not l
   const applied = [];
   const largeView = {
     selection: { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
-    store: { applyMatrix: async (row, col, matrix) => applied.push({ row, col, matrix }) },
-    invalidateLargeCells: () => [], scheduleSave() {}, scheduleRender() {},
+    store: { applyMatrix: async (row, col, matrix) => { applied.push({ row, col, matrix }); return []; } },
+    invalidateLargeCells: () => [], recordLargeEdit() {}, scheduleSave() {}, scheduleRender() {},
     pasteReferencedRange(spec) { return LargeGridView.prototype.pasteReferencedRange.call(this, spec, () => source); },
   };
   const event = pasteEvent("{{roam-grid-range: ((tbl00001)) A1:B2}}");
