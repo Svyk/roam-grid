@@ -38,6 +38,7 @@ const runtime = {
   disposers: [],
   registries: null,
   lastFocusedUid: null,
+  keyboardOwner: null,
 };
 
 export const pendingTimers = new Set();
@@ -2409,6 +2410,7 @@ export class NativeGridSession {
     try {
       const contexts = structural && rowDeletion ? new Map([...this.views].map((view) => [view, view.captureRowDeletionContext()])) : null;
       this.model.transact(label, mutation);
+      claimKeyboard(sourceView);
       if (!structural && !(this.model.lastChangedCells || []).length) return Promise.resolve(this.model);
       if (structural) this.renderStructural(contexts); else this.refreshValues();
       if (!structural) this.queueChangedCells();
@@ -2881,6 +2883,99 @@ function focusedUid() {
   return uid || runtime.lastFocusedUid;
 }
 
+function gridViewUid(view) {
+  return view?.model?.tableUid || view?.store?.anchorUid || view?.root?.dataset?.roamGridUid || null;
+}
+
+export function keyboardOwner() { return runtime.keyboardOwner; }
+
+/** Marks `view` as the single grid that owns the keyboard until something else claims or releases it. */
+export function claimKeyboard(view) {
+  if (!view || view.disposed) return runtime.keyboardOwner;
+  const previous = runtime.keyboardOwner;
+  if (previous?.view && previous.view !== view) previous.view.root?.classList?.toggle?.("rg-root--interaction-active", false);
+  runtime.keyboardOwner = { uid: gridViewUid(view), view, kind: view.store ? "large" : "native" };
+  view.root?.classList?.toggle?.("rg-root--interaction-active", true);
+  return runtime.keyboardOwner;
+}
+
+/** Releases keyboard ownership. With a view argument it only releases when that view still owns it. */
+export function releaseKeyboard(view = null) {
+  const owner = runtime.keyboardOwner;
+  if (!owner || (view && owner.view !== view)) return owner;
+  owner.view?.root?.classList?.toggle?.("rg-root--interaction-active", false);
+  runtime.keyboardOwner = null;
+  return null;
+}
+
+/** Resolves the grid UID that owns a body-mounted portal (context menu, axis menu, editor popover, dialog). */
+export function portalOwnerUid(target) {
+  return target?.closest?.("[data-rg-owner]")?.dataset?.rgOwner || null;
+}
+
+function tagPortalOwner(node, uid) {
+  if (node && uid) node.dataset.rgOwner = uid;
+  return node;
+}
+
+function ownerViewForUid(uid) {
+  if (!uid) return null;
+  const session = runtime.sessions.get(uid);
+  if (session) for (const view of session.views) if (view.root?.isConnected) return view;
+  return runtime.largeMounts.get(uid) || null;
+}
+
+function isRoamBlockInput(target) { return Boolean(uidFromFocusTarget(target)); }
+
+function isGridEditorInput(target) { return Boolean(target?.closest?.(".rg-editor,.rg-floating-editor-input,.rg-dialog-input")); }
+
+export function onGlobalPointerDown(event) {
+  const target = event?.target;
+  const root = target?.closest?.(".rg-root");
+  if (root) return root.__rgView ? claimKeyboard(root.__rgView) : runtime.keyboardOwner;
+  const portalUid = portalOwnerUid(target);
+  if (!portalUid) return releaseKeyboard();
+  if (runtime.keyboardOwner?.uid === portalUid) return runtime.keyboardOwner;
+  const view = ownerViewForUid(portalUid);
+  return view ? claimKeyboard(view) : runtime.keyboardOwner;
+}
+
+export function onGlobalFocusIn(event) {
+  if (isRoamBlockInput(event?.target)) releaseKeyboard();
+}
+
+/**
+ * The extension's only window keydown listener. Roam has no JS undo handler — it relies on the
+ * browser's native undo — so `preventDefault()` is what keeps ⌘Z from reaching a text input.
+ */
+export function onGlobalKeydown(event) {
+  const owner = runtime.keyboardOwner;
+  if (!owner?.view || owner.view.disposed) return;
+  const undoCombo = (event.metaKey || event.ctrlKey) && String(event.key ?? "").toLowerCase() === "z";
+  if (!undoCombo) return owner.view.onKeydown(event);
+  if (isRoamBlockInput(event.target)) return;
+  if (isGridEditorInput(event.target)) return;
+  const method = event.shiftKey ? "redo" : "undo";
+  if (typeof owner.view[method] !== "function") return owner.view.onKeydown(event);
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  return owner.view[method]();
+}
+
+export function installKeyboardOwnership() {
+  globalThis.window?.addEventListener?.("keydown", onGlobalKeydown, true);
+  document.addEventListener("pointerdown", onGlobalPointerDown, true);
+  document.addEventListener("focusin", onGlobalFocusIn, true);
+  const dispose = () => {
+    globalThis.window?.removeEventListener?.("keydown", onGlobalKeydown, true);
+    document.removeEventListener("pointerdown", onGlobalPointerDown, true);
+    document.removeEventListener("focusin", onGlobalFocusIn, true);
+    releaseKeyboard();
+  };
+  runtime.disposers.push(dispose);
+  return dispose;
+}
+
 function blockString(uid) {
   const result = roam().data?.pull?.("[:block/string]", [":block/uid", uid]) || roam().pull?.("[:block/string]", [":block/uid", uid]);
   return result?.[":block/string"] ?? result?.string ?? "";
@@ -3292,8 +3387,9 @@ function showPrompt(title, value = "", ownerRoot = null) {
     const footer = document.createElement("div"); footer.className = "rg-dialog-footer";
     const cancel = button("Cancel", "Cancel", () => finish(null));
     const accept = button("OK", "Accept", () => finish(input.value), "bp3-intent-primary");
-    footer.append(cancel, accept); dialog.append(heading, input, footer); overlay.appendChild(dialog); document.body.appendChild(overlay);
-    const theme = createPortalThemeBridge(portalOwnerRoot(ownerRoot), overlay);
+    footer.append(cancel, accept); dialog.append(heading, input, footer); overlay.appendChild(dialog);
+    const owner = portalOwnerRoot(ownerRoot); tagPortalOwner(overlay, owner?.dataset?.roamGridUid); document.body.appendChild(overlay);
+    const theme = createPortalThemeBridge(owner, overlay);
     const finish = (result) => { theme.dispose(); overlay.remove(); document.removeEventListener("keydown", onKey, true); resolve(result); };
     overlay.__rgDismiss = () => finish(null);
     const onKey = (event) => { if (event.key === "Escape") { event.preventDefault(); finish(null); } };
@@ -3311,7 +3407,8 @@ function showChoice(title, choices, ownerRoot = null) {
     dialog.setAttribute("role", "dialog"); dialog.setAttribute("aria-modal", "true");
     const heading = document.createElement("h4"); heading.className = "bp3-heading"; heading.textContent = title;
     const list = document.createElement("div"); list.className = "rg-choice-list";
-    const theme = createPortalThemeBridge(portalOwnerRoot(ownerRoot), overlay);
+    const owner = portalOwnerRoot(ownerRoot); tagPortalOwner(overlay, owner?.dataset?.roamGridUid);
+    const theme = createPortalThemeBridge(owner, overlay);
     const finish = (value) => { theme.dispose(); overlay.remove(); resolve(value); };
     overlay.__rgDismiss = () => finish(null);
     for (const choice of choices) list.appendChild(button(choice.label, choice.description || choice.label, () => finish(choice.value), choice.primary ? "bp3-intent-primary" : ""));
@@ -3629,6 +3726,7 @@ export class GridEditorController {
     body.className = "rg-editor-popover-body";
     body.append(this.input, this.mirror, this.suggestionList, this.pointHint, this.signature);
     this.popover.append(this.address, body);
+    tagPortalOwner(this.popover, gridViewUid(this.view));
     document.body.appendChild(this.popover);
     this.portalTheme = createPortalThemeBridge(this.view.root, this.popover);
     this.boundReposition = () => this.position();
@@ -4111,12 +4209,7 @@ export class GridView {
     this.selectionControls = new Set();
     this.boundPaste = (event) => this.onPaste(event);
     this.boundKeydown = (event) => this.onKeydown(event);
-    this.keyboardActive = false;
-    this.boundDocumentPointerDown = (event) => {
-      this.keyboardActive = this.root.contains(event.target) || Boolean(this.editorController?.popover.contains(event.target));
-      this.root.classList.toggle("rg-root--interaction-active", this.keyboardActive);
-    };
-    this.boundWindowKeydown = (event) => { if (this.keyboardActive) this.onKeydown(event); };
+    this.root.__rgView = this;
     this.boundPointerUp = () => this.finishPointerAction();
     const themeSignature = gridThemeSignature(this.nativeElement);
     const cachedTheme = runtime.gridThemeSignature === themeSignature ? (this.session?.themePalette || runtime.gridThemePalette) : null;
@@ -4145,8 +4238,6 @@ export class GridView {
   mount() {
     if (this.nativeElement) this.nativeElement.classList.add("rg-native-hidden");
     this.host.appendChild(this.root);
-    globalThis.window.addEventListener("keydown", this.boundWindowKeydown, true);
-    document.addEventListener("pointerdown", this.boundDocumentPointerDown, true);
     this.root.addEventListener("paste", this.boundPaste);
     document.addEventListener("pointerup", this.boundPointerUp, true);
     this.render();
@@ -4231,7 +4322,7 @@ export class GridView {
         if (commit && value !== this.model.getRaw(row, col)) this.commitMutation("Edit cell", () => this.model.setRaw(row, col, value), false);
         else this.renderCellValue(cell, row, col);
         if (movement) this.moveSelection(...movement);
-        this.root.focus({ preventScroll: true });
+        this.root.focus({ preventScroll: true }); claimKeyboard(this);
         this.session?.editorFinished(this);
       },
     });
@@ -4474,7 +4565,7 @@ export class GridView {
     this.updateSelection();
     this.viewport.scrollLeft = context.scrollLeft;
     this.viewport.scrollTop = context.scrollTop;
-    if (activeElement && !activeElement.isConnected) this.root.focus?.({ preventScroll: true });
+    if (activeElement && !activeElement.isConnected) { this.root.focus?.({ preventScroll: true }); claimKeyboard(this); }
     return true;
   }
 
@@ -4634,7 +4725,7 @@ export class GridView {
         this.startRowResize(edgeRow, event); return;
       }
       if (event.shiftKey) this.extendSelection(currentRow, currentCol); else { this.anchor = { row: currentRow, col: currentCol }; this.select({ startRow: currentRow, endRow: currentRow, startCol: currentCol, endCol: currentCol }); }
-      this.dragSelecting = true; this.root.focus({ preventScroll: true }); event.preventDefault();
+      this.dragSelecting = true; this.root.focus({ preventScroll: true }); claimKeyboard(this); event.preventDefault();
     });
     cell.addEventListener("pointerenter", () => { const currentRow = Number(cell.dataset.row); const currentCol = Number(cell.dataset.col); if (this.dragSelecting) this.extendSelection(currentRow, currentCol); if (this.fillStart) this.fillTarget = { row: currentRow, col: currentCol }; });
     cell.addEventListener("dblclick", () => this.beginEdit(Number(cell.dataset.row), Number(cell.dataset.col)));
@@ -5070,6 +5161,8 @@ export class GridView {
     const dismiss = () => {
       if (closed) return; closed = true; for (const timer of timers) clearTimeout(timer); timers.clear();
       theme?.dispose(); menu.remove(); document.removeEventListener("pointerdown", close, true);
+      if (this.disposed) return;
+      this.root.focus?.({ preventScroll: true }); claimKeyboard(this);
     };
     const item = (label, action) => { const element = button(label, label, () => { dismiss(); action(); }); element.className = "bp3-menu-item"; return element; };
     menu.append(
@@ -5100,6 +5193,7 @@ export class GridView {
       item("Copy to large grid", () => copyNativeToLarge(this.model))
     );
     menu.__rgDismiss = dismiss;
+    tagPortalOwner(menu, gridViewUid(this));
     document.body.appendChild(menu);
     theme = createPortalThemeBridge(this.root, menu);
     const rect = anchor.getBoundingClientRect(); menu.style.left = `${x ?? rect.left}px`; menu.style.top = `${y ?? rect.bottom}px`;
@@ -5123,6 +5217,8 @@ export class GridView {
       if (closed) return; closed = true; for (const timer of timers) clearTimeout(timer); timers.clear();
       theme?.dispose(); menu.remove(); anchor.classList.remove("bp3-popover-open");
       document.removeEventListener("pointerdown", closeOutside, true); document.removeEventListener("keydown", closeOnEscape, true);
+      if (this.disposed) return;
+      this.root.focus?.({ preventScroll: true }); claimKeyboard(this);
     };
     const closeOutside = (event) => { if (!menu.contains(event.target) && event.target !== anchor) dismiss(); };
     const closeOnEscape = (event) => { if (event.key === "Escape") dismiss(); };
@@ -5177,6 +5273,7 @@ export class GridView {
       item("Copy to large grid", () => copyNativeToLarge(this.model))
     );
     menu.__rgDismiss = dismiss;
+    tagPortalOwner(menu, gridViewUid(this));
     document.body.appendChild(menu);
     theme = createPortalThemeBridge(this.root, menu);
     const position = () => {
@@ -5284,8 +5381,7 @@ export class GridView {
     this.editorController?.dispose(); this.editorController = null;
     this.closeInlineReferences();
     this.clearSelectionPresentation();
-    globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true);
-    document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true);
+    releaseKeyboard(this);
     document.removeEventListener("pointerup", this.boundPointerUp, true); releaseRichCellHosts(this.root); this.root.remove();
     this.themeBridge?.dispose?.(); this.themeBridge = null;
     this.session?.removeView(this);
@@ -5402,8 +5498,7 @@ export class LargeGridView {
     this.formulaEngine = new AsyncFormulaEngine(this.store, runtime.registries.formulaFunctions, runtime.registries.formulaFunctionMetadata);
     this.saveTimer = null; this.renderToken = 0; this.dragSelecting = false; this.boundUp = () => { this.dragSelecting = false; };
     this.rowOffsets = null; this.rowMetricsKey = null; this.rowResizePreview = null; this.columnResizePreview = null; this.resizeCleanup = null;
-    this.keyboardActive = false; this.boundDocumentPointerDown = (event) => { this.keyboardActive = this.root.contains(event.target) || Boolean(this.editorController?.popover.contains(event.target)); };
-    this.boundWindowKeydown = (event) => { if (this.keyboardActive) this.onKeydown(event); };
+    this.disposed = false; this.root.__rgView = this;
     this.mount();
   }
   mount() {
@@ -5413,7 +5508,7 @@ export class LargeGridView {
     this.status = document.createElement("span"); this.status.className = "rg-status"; toolbar.appendChild(this.status);
     this.viewport = document.createElement("div"); this.viewport.className = "rg-large-viewport";
     this.canvas = document.createElement("div"); this.canvas.className = "rg-large-canvas"; this.viewport.appendChild(this.canvas);
-    this.root.append(toolbar, this.viewport); globalThis.window.addEventListener("keydown", this.boundWindowKeydown, true); document.addEventListener("pointerdown", this.boundDocumentPointerDown, true); this.root.addEventListener("paste", (event) => this.onPaste(event));
+    this.root.append(toolbar, this.viewport); this.root.addEventListener("paste", (event) => this.onPaste(event));
     this.editorController = new GridEditorController(this, {
       viewport: this.viewport,
       dimensions: () => ({ rowCount: this.store.manifest.rowCount, colCount: this.store.manifest.colCount }),
@@ -5441,7 +5536,7 @@ export class LargeGridView {
         }
         await this.repaintLargeCells(affected);
         if (movement) this.moveLargeSelection(...movement);
-        this.root.focus({ preventScroll: true });
+        this.root.focus({ preventScroll: true }); claimKeyboard(this);
       },
     });
     this.viewport.addEventListener("scroll", () => this.scheduleRender()); document.addEventListener("pointerup", this.boundUp, true); this.scheduleRender();
@@ -5504,7 +5599,7 @@ export class LargeGridView {
         const raw = rows[row - startRow]?.[col] ?? "";
         void this.renderLargeCellValue(cell, raw, row, col, engine);
         if (rangeContains(this.selection, row, col)) cell.classList.add("rg-cell--selected");
-        cell.addEventListener("pointerdown", (event) => { if (event.button !== 0) return; if (event.target.closest?.(".rg-editor")) return; const anchorMerge = this.store.mergeAt(row, col); const anchorRow = anchorMerge?.row ?? row; const anchorCol = anchorMerge?.col ?? col; if (this.editorController?.insertReference(anchorRow, anchorCol, event)) return; this.anchor = { row: anchorRow, col: anchorCol }; this.selection = { startRow: anchorRow, endRow: anchorRow, startCol: anchorCol, endCol: anchorCol }; this.dragSelecting = true; this.root.focus(); this.updateLargeSelection(); event.preventDefault(); });
+        cell.addEventListener("pointerdown", (event) => { if (event.button !== 0) return; if (event.target.closest?.(".rg-editor")) return; const anchorMerge = this.store.mergeAt(row, col); const anchorRow = anchorMerge?.row ?? row; const anchorCol = anchorMerge?.col ?? col; if (this.editorController?.insertReference(anchorRow, anchorCol, event)) return; this.anchor = { row: anchorRow, col: anchorCol }; this.selection = { startRow: anchorRow, endRow: anchorRow, startCol: anchorCol, endCol: anchorCol }; this.dragSelecting = true; this.root.focus(); claimKeyboard(this); this.updateLargeSelection(); event.preventDefault(); });
         cell.addEventListener("pointerenter", () => { if (this.dragSelecting) { this.selection = normalizeRange({ startRow: this.anchor.row, endRow: row, startCol: this.anchor.col, endCol: col }); this.scheduleRender(); } });
         cell.addEventListener("dblclick", () => this.beginEdit(row, col, cell)); this.canvas.appendChild(cell); this.cells.set(`${row}:${col}`, cell);
       }
@@ -5631,7 +5726,7 @@ export class LargeGridView {
     this.invalidateLargeCells(coordinates); await this.store.commit(); this.scheduleRender();
     return { manifest: deepClone(this.store.manifest) };
   }
-  dispose() { clearTimeout(this.saveTimer); this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; globalThis.window.removeEventListener("keydown", this.boundWindowKeydown, true); document.removeEventListener("pointerdown", this.boundDocumentPointerDown, true); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden"); }
+  dispose() { this.disposed = true; clearTimeout(this.saveTimer); this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; releaseKeyboard(this); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden"); }
 }
 
 function downloadText(text, filename, type = "text/plain") {
@@ -5971,6 +6066,8 @@ function registerCommands(extensionAPI) {
     ["Roam Grid: Copy/convert table", convertFocusedGrid],
     ["Roam Grid: Import", importCommand],
     ["Roam Grid: Export", exportFocusedCommand],
+    ["Roam Grid: Undo", () => commandOnActive("undo")],
+    ["Roam Grid: Redo", () => commandOnActive("redo")],
     ["Roam Grid: Insert chart", () => commandOnActive("insertChart")],
     ["Roam Grid: Merge", () => commandOnActive("mergeSelection", "merge")],
     ["Roam Grid: Unmerge", () => commandOnActive("unmergeSelection", "unmerge")],
@@ -6000,6 +6097,7 @@ async function onload({ extensionAPI }) {
     const publicApi = createPublicApi(); globalThis.window.roamGrid = { ...(globalThis.window.roamGrid || {}), v1: publicApi };
     document.addEventListener("focusin", rememberFocusedUid, true);
     runtime.disposers.push(() => document.removeEventListener("focusin", rememberFocusedUid, true));
+    installKeyboardOwnership();
     runtime.observer = new MutationObserver(handleDomMutations); runtime.observer.observe(document.querySelector(".roam-app") || document.body, { childList: true, subtree: true });
     scheduleScan(document);
   } catch (error) {
@@ -6022,7 +6120,7 @@ async function onunload() {
   if (globalThis.window?.roamGrid?.v1?.version === VERSION) delete globalThis.window.roamGrid.v1;
   if (!roamGridGlobalPreexisted && globalThis.window?.roamGrid && Object.keys(globalThis.window.roamGrid).length === 0) delete globalThis.window.roamGrid;
   roamGridGlobalPreexisted = false;
-  runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null; runtime.gridThemePalette = null; runtime.gridThemeSignature = null; runtime.views.clear(); runtime.viewsByNative = new WeakMap();
+  runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null; runtime.keyboardOwner = null; runtime.gridThemePalette = null; runtime.gridThemeSignature = null; runtime.views.clear(); runtime.viewsByNative = new WeakMap();
   console.info("[roam-grid] Unloaded");
 }
 
