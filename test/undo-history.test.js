@@ -910,3 +910,91 @@ test("undo after a same-cell conflict reload keeps the external value and report
   assert.equal(control.session.model.getRaw(0, 0), "0:0", "the unmarked reload really did clobber the external value");
   assert.deepEqual(controlReported, [], "and reported nothing dropped");
 });
+
+const gridRows = () => [
+  [{ uid: "c00", raw: "0:0" }, { uid: "c01", raw: "0:1" }],
+  [{ uid: "c10", raw: "1:0" }, { uid: "c11", raw: "1:1" }],
+];
+
+// Pre-fix `onExternalContent`: scoped to the uids an inverse setRaw names, which is
+// right for an op entry and wrong for a checkpoint that restores every cell.
+function inverseOnlyExternalContent(changes = []) {
+  const uids = new Set((changes || []).map((change) => change?.uid).filter(Boolean));
+  if (!uids.size) return { marked: 0, redoInvalidated: false };
+  let marked = 0;
+  for (const entry of [...this.entries, ...this.redoEntries]) {
+    for (const op of entry.inverse) {
+      if (op.op !== "setRaw" || !uids.has(op.uid) || entry.stale.has(op.uid)) continue;
+      entry.stale.add(op.uid); marked += 1;
+    }
+  }
+  const redoInvalidated = this.redoEntries.some((entry) => entry.touched.some((uid) => uids.has(uid)));
+  if (redoInvalidated) this.invalidateRedo("external-content");
+  return { marked, redoInvalidated };
+}
+
+test("undoing a checkpoint keeps a collaborator edit to a cell the checkpoint never wrote", () => {
+  const { model, session, history } = sessionHarness({ rows: gridRows(), tableUid: "table-checkpoint-widen" });
+  model.transact("content edit", () => model.setRaw(1, 1, "local-c11"));
+  const contentEntry = history.entries.at(-1);
+  model.transact("hard edit", () => model.setRaw(0, 0, "checkpointed"), { hard: true });
+  const checkpointEntry = history.entries.at(-1);
+  assert.ok(checkpointEntry.checkpoint && checkpointEntry.forwardCheckpoint, "the hard transaction carries both checkpoints");
+  assert.ok(!checkpointEntry.touched.includes("c11"), "and never wrote the cell the collaborator is about to edit");
+
+  // c11 is already rebasable, so this arrives on the merge path: no external entry is
+  // pushed and the checkpoint stays on top of the undo stack.
+  const external = new GridModel({ rows: gridRows(), columnIds: ["col0", "col1"] });
+  session.handleExternalChange(external, { type: "content", structural: false, tree: {}, changes: [{ uid: "c11", raw: "remote" }] });
+  assert.strictEqual(history.entries.at(-1), checkpointEntry, "nothing was pushed on top of the checkpoint");
+  assert.ok(checkpointEntry.stale.has("c11"), "the checkpoint marks the incoming uid stale despite never writing it");
+  assert.ok(contentEntry.stale.has("c11"), "and the op entry beneath it is marked the same way it always was");
+
+  assert.equal(session.undo(), true); clearTimeout(session.saveTimer);
+  assert.equal(session.model.getRaw(1, 1), "remote", "the wholesale restore leaves the collaborator's value alone");
+  assert.equal(session.model.getRaw(0, 0), "0:0", "while the checkpointed cell still reverts");
+  assert.equal(session.undo(), true); clearTimeout(session.saveTimer);
+  assert.equal(session.model.getRaw(1, 1), "remote", "the op entry beneath the checkpoint keeps it too");
+
+  // Positive control: with inverse-only scoping the checkpoint's stale set stays empty
+  // and one undo silently eats the remote value.
+  const control = sessionHarness({ rows: gridRows(), tableUid: "table-checkpoint-widen-control" });
+  control.model.transact("content edit", () => control.model.setRaw(1, 1, "local-c11"));
+  control.model.transact("hard edit", () => control.model.setRaw(0, 0, "checkpointed"), { hard: true });
+  const controlEntry = control.history.entries.at(-1);
+  control.history.onExternalContent = inverseOnlyExternalContent;
+  const controlExternal = new GridModel({ rows: gridRows(), columnIds: ["col0", "col1"] });
+  control.session.handleExternalChange(controlExternal, { type: "content", structural: false, tree: {}, changes: [{ uid: "c11", raw: "remote" }] });
+  assert.equal(controlEntry.stale.size, 0, "inverse-only scoping left the checkpoint's stale set empty");
+  assert.equal(control.session.undo(), true); clearTimeout(control.session.saveTimer);
+  assert.throws(() => {
+    assert.equal(control.session.model.getRaw(1, 1), "remote");
+  }, "the surviving-value assertion catches inverse-only scoping");
+  assert.equal(control.session.model.getRaw(1, 1), "local-c11", "inverse-only scoping really did lose the collaborator's value");
+});
+
+// Guard rail. `buildUndoEntry` checkpoints on two independent conditions: an explicit
+// `hard` transaction, and a `reshaped` one whose mutator changed the shape without
+// recording a shape op. Both restore wholesale, so both must absorb every incoming uid.
+// Asserting that invariant over what `buildUndoEntry` produces stays honest whenever a
+// `hard: true` caller or a shape-op-less mutator is added; a test asserting no such
+// caller exists would instead be deleted by the change that arms the trap.
+test("every checkpointed entry buildUndoEntry can produce takes the full incoming uid set", () => {
+  const armings = [
+    ["hard", (model) => model.transact("hard edit", () => model.setRaw(0, 0, "checkpointed"), { hard: true })],
+    ["reshaped", (model) => model.transact("unrecorded reshape", () => {
+      model.rows.push([{ uid: "c20", raw: "2:0" }, { uid: "c21", raw: "2:1" }]);
+    })],
+  ];
+  for (const [name, arm] of armings) {
+    const model = grid(2, 2);
+    arm(model);
+    const entry = model.history.entries.at(-1);
+    assert.ok(entry.checkpoint && entry.forwardCheckpoint, `${name} produced a checkpointed entry`);
+    const untouched = ["c01", "c10"].filter((uid) => !entry.touched.includes(uid));
+    assert.deepEqual(untouched, ["c01", "c10"], `${name}: the fixture really does leave cells the entry never wrote`);
+    const marked = model.history.onExternalContent(untouched.map((uid) => ({ uid, raw: "remote" }))).marked;
+    assert.equal(marked, untouched.length, `${name}: no incoming uid was skipped for being untouched`);
+    for (const uid of untouched) assert.ok(entry.stale.has(uid), `${name}: ${uid} survives the wholesale restore`);
+  }
+});

@@ -1583,6 +1583,15 @@ export class UndoHistory {
     if (!uids.size) return { marked: 0, redoInvalidated: false };
     let marked = 0;
     for (const entry of [...this.entries, ...this.redoEntries]) {
+      // A checkpoint restores EVERY cell, not only the ones an inverse setRaw names, so
+      // every incoming uid must survive it — not just the uids the entry itself wrote.
+      // Scoping by `touched` would be equally wrong: it is derived from the entry's own
+      // write uids, so it excludes exactly the untouched cells a wholesale restore eats.
+      // `forwardCheckpoint` is guarded too because `applyForward` shares this stale set.
+      if (entry.checkpoint || entry.forwardCheckpoint) {
+        for (const uid of uids) if (!entry.stale.has(uid)) { entry.stale.add(uid); marked += 1; }
+        continue;
+      }
       for (const op of entry.inverse) {
         if (op.op !== "setRaw" || !uids.has(op.uid) || entry.stale.has(op.uid)) continue;
         entry.stale.add(op.uid); marked += 1;
