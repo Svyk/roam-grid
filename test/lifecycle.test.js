@@ -8,7 +8,33 @@ import extension, {
   initializeSettings,
   mounting,
   pendingTimers,
+  toast,
 } from "../src/extension.js";
+
+function installFakeDom() {
+  const created = [];
+  const appendedToBody = [];
+  const makeElement = () => {
+    const element = { className: "", textContent: "", id: "", isConnected: false, children: [], style: { setProperty() {} }, classList: { add() {}, remove() {} } };
+    element.appendChild = (child) => { element.children.push(child); return child; };
+    element.remove = () => {};
+    element.querySelectorAll = () => [];
+    created.push(element);
+    return element;
+  };
+  const body = makeElement();
+  body.appendChild = (child) => { appendedToBody.push(child); child.isConnected = true; return child; };
+  const document = {
+    body,
+    querySelector: (selector) => (selector === ".rg-toasts" ? appendedToBody.find((node) => node.className === "rg-toasts") || null : null),
+    querySelectorAll: () => [],
+    createElement: makeElement,
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  return { document, created, appendedToBody, makeElement };
+}
+
 
 function installMetadataRoamMock() {
   let uidCounter = 0;
@@ -167,6 +193,48 @@ test("unload clears the tracked timer registry and the in-flight mount set", asy
     clearTimeout(timer);
     pendingTimers.clear();
     mounting.clear();
+    if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
+    if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
+  }
+});
+
+test("toast paints while loaded and is inert once the runtime is torn down", async () => {
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  const previousObserver = globalThis.MutationObserver;
+  const mock = installMetadataRoamMock();
+  const dom = installFakeDom();
+  globalThis.document = dom.document;
+  globalThis.MutationObserver = class { observe() {} disconnect() {} };
+  const extensionAPI = {
+    settings: { canSet: false, get: () => null, set: async () => {}, panel: { create: async () => {} } },
+    ui: { commandPalette: { addCommand() {} }, slashCommand: { addCommand() {} } },
+  };
+  try {
+    await extension.onload({ extensionAPI });
+    await Promise.resolve();
+    const timersWhileLoaded = pendingTimers.size;
+    toast("loaded", "primary", 60_000);
+    const container = dom.appendedToBody.find((node) => node.className === "rg-toasts");
+    assert.ok(container, "toast must create its container while the extension is loaded");
+    assert.equal(container.children.length, 1);
+    assert.equal(container.children[0].textContent, "loaded");
+    assert.equal(pendingTimers.size, timersWhileLoaded + 1, "a loaded toast must register a tracked dismiss timer");
+
+    await extension.onunload();
+    const bodyNodesAfterUnload = dom.appendedToBody.length;
+    const childrenAfterUnload = container.children.length;
+    assert.equal(pendingTimers.size, 0);
+
+    toast("after unload", "danger");
+    assert.equal(dom.appendedToBody.length, bodyNodesAfterUnload, "a post-unload toast must not append a .rg-toasts container");
+    assert.equal(container.children.length, childrenAfterUnload, "a post-unload toast must not append into a surviving container");
+    assert.equal(pendingTimers.size, 0, "a post-unload toast must not register a timer");
+  } finally {
+    for (const id of pendingTimers) clearTimeout(id);
+    pendingTimers.clear();
+    mock.dispose();
+    if (previousObserver === undefined) delete globalThis.MutationObserver; else globalThis.MutationObserver = previousObserver;
     if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
     if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
   }

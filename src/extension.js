@@ -2987,7 +2987,8 @@ function createPublicApi() {
   };
 }
 
-function toast(message, intent = "primary", timeout = 4500) {
+export function toast(message, intent = "primary", timeout = 4500) {
+  if (!runtime.extensionAPI) return;
   const container = document.querySelector(".rg-toasts") || (() => {
     const element = document.createElement("div");
     element.className = "rg-toasts";
