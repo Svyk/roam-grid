@@ -526,6 +526,12 @@ export function resetRoamRecents() {
   runtime.recentlyAcceptedPages.length = 0;
 }
 
+/** Test hook: the registries `onload` builds, so a spec can mount a real view without a full load. */
+export function ensureRuntimeRegistries() {
+  if (!runtime.registries) runtime.registries = new RegistrySet();
+  return runtime.registries;
+}
+
 /** `toast` gate. An error always shows, and a message carrying an action is a control rather than a
  *  notice, so it is never suppressed — suppressing it would remove the only way to run that action. */
 export function notificationAllowed(intent, hasAction = false, level = getSetting("appearance-notifications")) {
