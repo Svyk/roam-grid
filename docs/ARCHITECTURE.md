@@ -140,6 +140,149 @@ button the scan does not claim — an unresolvable spec, a target that is not an
 enhanced native grid, or a failed mount — is given `rg-range-restored` so the
 raw Roam component stays visible rather than leaving blank space.
 
+## Cell autocomplete
+
+`roamEditorTriggerContext(raw, caret, { formula })` is the single scanner. It
+returns the nearest unclosed opener as one of six types — `page` (`[[`),
+`block` (`((`), `tag` (`#`), `tag-page` (`#[[`), `component` (`{{`), `command`
+(`/`) — with the indices the accept path needs. `#[[` beats `[[` by looking at
+the character before `startIndex`. Inside a formula it suppresses `block`,
+`component`, `command` and `tag` outright and allows `page` only where
+`formulaPositionIsQuoted` says the caret is inside a string, which is what stops
+`=SUM((A1` from opening the block picker. `/` additionally requires index 0 or a
+preceding space, which is what stops `=A1/B2`.
+
+`GridEditorController` is constructed identically by `GridView` and
+`LargeGridView`, so everything below lands on both surfaces.
+
+### The never-empty-popover invariant
+
+> The popover is visible only when the suggestion list is showing rows, or the
+> editor is floating, or the cell holds a formula.
+
+`syncPopoverVisibility` is the only place that decides it; every other path
+mutates `this.suggestions` and then calls it. That one rule covers what used to
+be separate cases: a bare opener whose query is still in flight has no rows and
+so paints no empty shell, a catalog whose setting is off produces no rows and so
+opens nothing, and an Escape-dismissed list cannot reopen on the next paint.
+`renderSuggestionRows` keeps `hidden`, `aria-hidden` and the editor's
+`aria-expanded` in step with the same row count.
+
+### The recents path
+
+A bare opener takes a separate path from a search. `[[` / `#` / `#[[` read the
+most-recently-edited pages; `((` reads blocks edited within
+`RECENT_BLOCK_WINDOW_MS` (7 days). Two grid-specific corrections apply:
+
+- **The current table's own cell uids are excluded** from the block list. Every
+  cell edit touches a block, so unfiltered the list is the table the user is
+  sitting in. Large-grid cells are not blocks and contribute no uids, which is
+  correct rather than a gap.
+- **`runtime.recentlyAcceptedPages`** (LRU, 25, in memory only) is promoted
+  ahead of the graph's own edit times. It is the one recency signal this
+  extension owns, and inside a grid it is the one that matches muscle memory.
+
+Both result sets are cached in `roamRecentsCache`, keyed by graph and by
+page-vs-block, for `RECENTS_TTL_MS` (60 s). `recentsCacheReady(type)` is what
+`searchDelay` consults: a cache-resolvable bare opener returns 0 and skips the
+debounce entirely, because there is nothing to debounce. Each query is timed;
+over `RECENTS_BUDGET_MS` (250 ms) the result is still used — it is already paid
+for — and `runtime.recentsDisabled` turns the bare-opener path off for the rest
+of the session with a `console.info` and never a toast. The page query returns
+every page in the graph, so this switch is what makes the feature safe to ship
+before it is measured on a large one. `editing-autocomplete` and
+`editing-autocomplete-empty-opener` are both read **ahead** of the timer, so an
+off switch issues no query rather than issuing one and discarding it.
+
+### The eight render bounds
+
+Block suggestions are drawn with `roamAlphaAPI.ui.components.renderString`,
+reusing the hidden-host anti-flash pattern `paintRichCellContent` established.
+At the default limit of 8 rows and a 90 ms debounce a fast typist produces about
+eleven result sets a second, so an unbounded per-row render is roughly 88 React
+mounts a second while typing. Eight bounds hold it to **6 mounts per query and 0
+per navigation keystroke**:
+
+| | Bound |
+| --- | --- |
+| B1 | `renderSuggestionRows` rebuilds only when the result-set signature changes; `paintActiveSuggestion` moves the active row. |
+| B2 | Only `kind === "roam-block"` rows render. A typical `[[` menu issues zero. |
+| B3 | Within a set, only rows where `requiresRoamRichRender(raw)` is true. |
+| B4 | `MAX_RENDERED_SUGGESTION_ROWS = 6` — a module constant, not a setting. |
+| B5 | Renders are issued through a `queueMicrotask` chain with a stale-token check between each, so a newer set aborts the remainder mid-batch. |
+| B6 | A per-controller LRU of 12 rendered fragments, keyed by row signature, so backspacing reuses hosts. |
+| B7 | `disposeSuggestionRows` unmounts every host, on accept, Escape, finish and dispose. |
+| B8 | `editing-autocomplete-render-rows`, plus auto-off after two batches over `SUGGESTION_RENDER_BUDGET_MS` (32 ms). |
+
+**B1 is load-bearing, not an optimisation.** Before the split, the arrow-key
+branch of `onKeydown` called an unconditional `replaceChildren()` on every
+keypress. That was survivable while rows were `textContent`; with rows rendering
+through React it would mean a full unmount/remount of the visible list on every
+↓. Hover-to-highlight (`mouseenter` → set index → `paintActiveSuggestion`) is
+only affordable for the same reason: a rebuild there would drop the row the
+pointer is sitting on, on every mouse move. The regression guard is a node
+identity assertion across ↓ then ↑.
+
+Rows are never blank in the meantime. `roamSuggestionPlainText(raw)` is a pure
+normalizer that fills `.rg-suggestion-text` on the first frame; the hidden host
+replaces it on success. Being pure it unit-tests with no DOM, and it is the
+permanent fallback when `renderString` is absent.
+
+Enrichment (reference counts, page breadcrumbs) runs as **one batched query per
+settled result set**, after the rows are on screen, and paints onto the existing
+nodes rather than going back through `renderSuggestionRows` — a rebuild would
+discard the node identity B1 pins and re-mount the hosts B4 bounded, for
+decoration on a result set that did not change.
+
+### Large-grid reference shards
+
+A large-grid cell is a row in a chunk file, so a `[[page]]` typed into one is a
+link Roam has never indexed. `large-refs-sync` (default **false**) mirrors them
+into blocks Roam *will* index.
+
+Each manifest chunk entry carries a derived `refs` list, computed by regex over
+that chunk's rows at save time. After a successful commit — **after** the
+pointer swap, inside the same `MutationQueue` turn, not per CAS retry attempt —
+`manifestReferenceUnion` takes the union across chunk entries and
+`referenceShardPlan` materialises it under the grid's own anchor:
+
+```
+{{[[roam/grid]]}} anchor
+  roam-grid/manifest:: <url>
+  roam-grid/refs:: v1              (collapsed marker parent)
+    <shard 0: "[[A]] [[B]] ((uid)) …">   (LARGE_REFS_PER_SHARD = 100)
+    <shard 1: …>
+```
+
+Roam's own indexer then creates the `:block/refs` datoms, so the references are
+real by construction rather than emulated.
+
+**References are a set union, not positional data.** That single property is why
+this design needs no structural-op handling at all: a reference moving from row
+50 to row 51, or across a chunk boundary, leaves the union identical and every
+shard byte-for-byte unchanged, so row insert and delete write nothing. It is
+also why block count is bounded by *distinct references* rather than by cells —
+100,000 cells naming `[[Foo]]` produce one ref, and the realistic steady state
+is a handful of blocks with one `updateBlock` per save.
+
+The rest follows from the same property:
+
+- `planReferenceShardWrites` diffs against the existing children, so a save that
+  changed no reference costs zero transactor writes.
+- Shard content is a pure function of manifest content, so two correct devices
+  compute byte-identical strings and converge regardless of write order.
+  Truncation at `large-refs-max` is therefore taken **after** sorting, never in
+  encounter order, and the marker records it as `roam-grid/refs:: v1 (truncated
+  at N)`.
+- A chunk merge recomputes shards from the merged manifest. Deleting the grid's
+  anchor subtree removes the marker and Roam retracts the datoms, so there is no
+  GC pass. A shard write that fails after a successful commit leaves the mirror
+  **stale, never wrong**, and `initialize()` reconciles on next open.
+- `normalizeManifest` defaults a missing `refs` to `[]`, so existing v2
+  manifests load unchanged and references appear lazily as chunks are saved.
+
+Click-through is grid-precision: the page lists the grid, not the cell.
+
 ## Undo
 
 `UndoHistory` stores inverse-op entries, not snapshots. Each entry carries its

@@ -25,7 +25,26 @@ bounded formula highlighting, and native `[[page]]` /
 `((block))` completion. They also verify stale-search suppression, keyboard and
 pointer insertion, stable scalar rendering, connected rich-render hosts,
 official unmount cleanup, structural viewport swaps, and virtual-canvas
-teardown. Delta-selection coverage makes root queries and mounted-cell scans
+teardown.
+
+Cell-autocomplete coverage resolves all six trigger types (`[[`, `((`, `#`,
+`#[[`, `{{`, `/`), nearest-opener precedence with `#[[` beating `[[`, and the
+formula guards — `=SUM((A1` yields no block context, `=A1/B2` no command
+context, `="x" & [[P` a page context because the caret is quoted. On the recents
+path it pins that the current table's own cell uids are excluded, that the
+accepted-page LRU promotes on the next bare opener, and that the master
+autocomplete switch suppresses the query by call count rather than by
+discarding its results. On the render path it pins the plain-text normalizer per
+markdown form, that only block rows and only rows carrying markup render, the
+six-row cap, that a superseded result set aborts mid-batch and unmounts every
+host it had already made, that every teardown path unmounts, the auto-off after
+two slow batches, and — as the regression guard for all of it — that arrow-key
+navigation leaves `suggestionList.children[0]` node-identical. Enrichment is
+asserted to issue one query per result set regardless of row count. Large-grid
+reference mirroring is covered for per-chunk derivation, the union across
+chunks, diffed shard writes, row insert/delete changing no shard, deterministic
+labelled truncation, a v2 manifest with no `refs` key loading clean, and a
+failed shard write leaving the commit intact. Delta-selection coverage makes root queries and mounted-cell scans
 fail during movement, verifies that only the symmetric difference changes, and
 checks covered merge coordinates, merged-edge handles, range badges, and fill
 handles.
@@ -33,9 +52,20 @@ handles.
 Portal-theme tests verify that the F2 editor, formula and Roam-reference
 suggestions, context menus, axis menus, and dialogs receive the grid's resolved
 light/dark palette even though they mount under `body`. The editor tests also
-cover contextual assistant visibility: ordinary text has no menu, bare `[[` or
-`((` has no empty shell, non-empty reference queries show native Roam results,
-and formulas expose function suggestions and signature help. Combobox,
+cover contextual assistant visibility, which is pinned as one invariant rather
+than as a list of cases:
+
+> The popover is visible only when the suggestion list is showing rows, or the
+> editor is floating, or the cell holds a formula.
+
+`syncPopoverVisibility` is the single place that decides it, and the tests
+assert it across every trigger type against a cold cache, a warm cache, an empty
+recents result, and a disabled recents path — `aria-expanded` included. A bare
+`[[` or `((` therefore opens on recents when it has rows and shows no empty
+shell while its query is in flight, which is the same invariant producing two
+different outcomes rather than two special cases. Ordinary text still has no
+menu, non-empty reference queries still show native Roam results, and formulas
+still expose function suggestions and signature help. Combobox,
 listbox, option, active-descendant, and selected-option state are asserted.
 Mounting tests cover the graph-scoped enhanced-UID cache, synchronous guard
 generation, canonical and referenced UID resolution, stale-cache release,
@@ -57,7 +87,8 @@ manifest that loads only the requested visible chunk. The live smoke test is
 restricted to `[[roam-grid/dev]]` in `svy`; existing native tables are not
 opted in or changed.
 
-Current v0.7 release acceptance:
+v0.7.0 release acceptance, kept as a record of what was exercised by hand at
+that release rather than as a current count:
 
 - All 129 automated tests pass in the v0.7.0 release run. They exercise model,
   adapter, persistence, editor, DOM, and rendering behavior without claiming

@@ -3,7 +3,7 @@
 Turn a native Roam table into a real spreadsheet — formulas, merges, sorting,
 resizing, charts, comments — without moving a single cell out of your graph.
 
-Version 0.9.0. Your table's rows and columns stay ordinary nested Roam blocks,
+Version 0.10.0. Your table's rows and columns stay ordinary nested Roam blocks,
 so links, `((block references))`, search, exports, and the plain Roam renderer
 keep working exactly as before. Turn Roam Grid off and the table is still there.
 
@@ -39,6 +39,7 @@ is nothing else.
 | Saved templates | Blocks on the `[[roam/grid/templates]]` page | Only when you run **Save current grid as template** |
 | Comment threads | A collapsed `[[roam/comments]]` block on the **commented cell's own page**, exactly the structure Roam's own comments use | Only when you add a comment to a cell |
 | Large-grid data | JSON files in Roam's file storage, pointed at by a manifest block under the `{{[[roam/grid]]}}` block | Only for large grids you explicitly create |
+| Large-grid reference mirror | Collapsed blocks under that same `{{[[roam/grid]]}}` block, listing the distinct `[[page]]`, `#tag` and `((block))` references that grid's cells contain | Only while **Mirror large-grid references into Roam** is on, which is **off** by default |
 | Live range views | The `{{roam-grid-range: ((uid)) A1:D5}}` text you type into a block | Only when you paste a range reference |
 
 Cell contents never leave the blocks they already live in. Layout is kept
@@ -67,8 +68,11 @@ its own size setting and evicts itself.
   Grid's own expression engine, which can call only the built-in functions and
   any functions an extension explicitly registers. Arbitrary JavaScript and
   `=elisp:` are not supported and never will be.
-- Every database query binds its parameters; no block uid is ever concatenated
-  into a query string.
+- Database queries bind their parameters (`:in $ ?since`, `:in $ [?uid ...]`) or
+  go through `pull` with the uid as an argument. Three legacy fallbacks — used
+  only when `roamAlphaAPI.data.pull` is unavailable — interpolate a uid into the
+  query text, and strip `"` and `\` from it first so it cannot leave the string
+  literal it sits in.
 
 ## Using it
 
@@ -84,11 +88,46 @@ structural changes such as inserting or deleting rows. Roam Grid takes the
 keyboard only while a grid genuinely has focus and hands it straight back to
 Roam when you click into an ordinary block.
 
-Type `[[` or `((` in any cell editor to search pages or blocks; the picker
-inserts real `[[page]]` and `((uid))` syntax, so the reference behaves like any
-other Roam reference. Copy, cut, and paste understand rectangular ranges and
-TSV/CSV text. Pasted images upload through Roam and become ordinary `![](url)`
-markup.
+Copy, cut, and paste understand rectangular ranges and TSV/CSV text. Pasted
+images upload through Roam and become ordinary `![](url)` markup.
+
+### References and completion in a cell
+
+Type `[[`, `((`, `#`, or `#[[` in any cell editor. The menu opens on the bare
+opener, the way Roam's own does: `[[`, `#` and `#[[` offer the pages you edited
+most recently, `((` the blocks you edited in the last seven days. The block list
+leaves out the cells of the table you are sitting in — every cell edit touches a
+block, so without that filter a grid's own rows would be most of the list. Keep
+typing and it searches instead. Pages you insert are promoted to the top of the
+next bare opener.
+
+When no result matches what you typed exactly — including when there are no
+results at all, which used to be a dead end — the last row offers to create that
+page. Accepting it inserts `[[Name]]` and creates nothing else: Roam materialises the
+page when the committed cell string is parsed, so abandoning the edit leaves no
+orphan page behind. A tag inserts as `#Name`, or `#[[Name With Spaces]]` when
+the name needs the brackets.
+
+Block rows are shown the way Roam renders them rather than as the raw markdown
+behind them. Page rows carry their reference count and block rows the page they
+live on. Paste a nine-character uid after `((` and that exact block is offered
+first, instead of being searched for as text.
+
+`{{` completes Roam's components from a fixed catalog of 16 — TODO, query,
+embed, calc, video, table and the rest — landing the caret inside the braces.
+Rows that need child bullets, or that do not render inside a cell at all, say so
+rather than being left out. `/` opens a slash menu that is **off by default**
+and is a deliberate subset; see [known limitations](#known-limitations).
+
+Arrow keys move the highlight, and hovering a row moves it too, so `Enter`
+always accepts the row that looks selected. Moving the caret out of the query
+closes the menu. Outside a formula, `[`, `(`, `{` and `"` wrap the selection
+rather than replacing it.
+
+The picker inserts real `[[page]]` and `((uid))` syntax, so the reference
+behaves like any other Roam reference. Everything here works the same in a large
+grid's editor, though what a large grid can do with the resulting reference is
+limited — again, see known limitations.
 
 ### Formulas
 
@@ -140,6 +179,15 @@ file storage. Each chunk carries a SHA-256 digest that is verified before the
 data is trusted, chunks are cached on your device, and two people editing
 different parts of the same large grid are merged rather than refused.
 
+A large-grid cell is a row in a chunk file, not a block, so a `[[page]]` typed
+into one is a link Roam has never indexed: it looks live in the cell, but the
+page it names shows nothing. **Mirror large-grid references into Roam** collects
+the distinct references a grid contains and writes them into collapsed blocks
+under the grid, which is what makes Roam create the real reference — so the page
+lists the grid in its linked references. It is **off by default**, because it
+puts a write on Roam's transactor on every save, which is exactly the cost the
+chunk format exists to avoid. **Maximum mirrored references** (2000) bounds it.
+
 ## Where grids appear
 
 An enhanced table renders in the main pane, in linked references, inside block
@@ -151,7 +199,7 @@ mouse-out is not a safe place to edit.
 
 ## Settings
 
-**Settings → Roam Depot → Roam Grid.** Thirty-eight controls in eight groups —
+**Settings → Roam Depot → Roam Grid.** Forty-six controls in eight groups —
 Writes, Editing, Appearance, Sizing, New grids, Large grids, Comments, Ranges —
 plus four maintenance actions: apply display defaults to open grids, forget this
 device's overrides, clear local caches, and reset every setting.
@@ -166,6 +214,10 @@ Two settings deserve a note. **Capture grid undo history** (on) is what makes
 files** is **off** by default and is irreversible when on; it deletes only chunk
 and manifest files that no revision still references, only on grids nothing has
 saved for an hour, and only once a file has been superseded for seven days.
+
+Two more ship off: **Offer / commands in cells (partial)**, because what it
+offers is a fraction of Roam's own menu, and **Mirror large-grid references into
+Roam**, because it is the one feature here that adds a write.
 
 ## Public API
 
@@ -210,6 +262,31 @@ whose injected table commands write through `window.roamGrid.v1`.
 - Large-grid cells are JSON rows, not Roam blocks, so they have no block uid:
   comments, block references, and reference counts are native-table features
   only. Use **Copy/convert table** to get a native copy.
+- **The `/` menu is a subset, not parity.** Roam's own slash registry carries 47
+  commands; Roam Grid offers 21. Missing on purpose: the commands that open a
+  Roam dialog (date picker, image/file upload, the template picker) cannot be
+  summoned from outside Roam's own editor at all; the commands whose output only
+  renders under a real block (`word count`, `diagram`, `kanban`, `mermaid`) come
+  back as a failure or a "nest a bullet under here" hint in a cell, and are
+  reachable under `{{` — where the row says so — rather than offered as a
+  command that fails; and the four `Query (…)` commands seed `[[ex-A]]` /
+  `[[ex-B]]` placeholder pages that an unedited cell would commit into your
+  graph. This is why the setting is off by default.
+- **Ranking differs from Roam's.** Roam orders its menu from an in-memory index
+  we cannot read. Ours comes from datalog queries and the pages this extension
+  has inserted, so for the same keystrokes the top result can differ from the
+  one Roam's own menu would put there.
+- **Large-grid references are grid-precision, not cell-precision.** With
+  mirroring on, the page lists the grid; clicking through lands on the grid, not
+  on the cell that mentioned it.
+- **Roam does not retract a page it auto-created.** Committing `[[New Page]]`
+  into a cell makes the page; deleting that text afterwards leaves the empty
+  page behind. That is Roam's behaviour for any block, and the create-page row
+  inherits it.
+- Some workspaces carry a dark-theme `roam/css` override that sets suggestion
+  colours with `!important`. Our menu is scoped to its own `.rg-` classes and
+  reads the grid's resolved palette, but an `!important` rule aimed broadly
+  enough will still win over it.
 - Grids in hover previews are read-only by design.
 - Formula coverage is broad but not exhaustive; unknown functions evaluate to an
   error value rather than failing the grid.

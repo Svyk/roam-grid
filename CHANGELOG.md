@@ -1,5 +1,164 @@
 # Changelog
 
+## 0.10.0
+
+Cell autocomplete. The reported bug was that typing `[[` in a cell and stopping
+produced nothing at all, where Roam's own menu opens immediately; fixing it
+pulled in the rest of the reference surface a cell was missing. The storage
+model did not change, and the single new graph write in this release is off by
+default.
+
+### The reported bug
+
+- **`[[` and `((` open on the bare opener now.** `[[`, `#` and `#[[` offer the
+  pages you edited most recently; `((` offers the blocks you edited in the last
+  seven days. Two empty-query guards used to return before anything was looked
+  up, so a bare opener was silent — you had to already know the name of the
+  thing you were reaching for. Native and large grids build the same editor, so
+  both get this.
+- The recent-blocks list **excludes the cells of the table you are editing**.
+  Every cell edit touches a block, so unfiltered it was eight rows of the table
+  you were sitting in. Large-grid cells are not blocks and contribute nothing to
+  it, which is correct.
+- Both result sets are cached per graph for 60 seconds, so the second and every
+  later opener in a session resolves without a query and without a debounce. If
+  either query takes longer than 250 ms, the result is still used — it is
+  already paid for — and the bare-opener path switches itself off for the rest
+  of the session with a `console.info`, never a toast. Typing a query still
+  searches.
+
+### New in the menu
+
+- **Create page.** A page opener with a typed name that no result matches
+  exactly gets a last row offering to create it, including when the search
+  returned nothing — the case that used to be a dead end. Accepting it inserts
+  `[[Name]]` and **calls no page-creation API**: Roam materialises the page when
+  the committed cell string is parsed. Eager creation would have orphaned a page
+  every time a draft was cancelled, and this editor, unlike Roam's own, has real
+  drafts and a real cancel.
+- **`#` and `#[[` tag completion,** inserting `#Name` or `#[[Name With Spaces]]`
+  by Roam's own rule.
+- **`{{` component completion** from a fixed catalog of 16 — TODO, DONE, query,
+  embed, mentions, calc, POMO, slider, video, table, kanban, attr-table,
+  word-count, diagram, mermaid, roam/render — with the caret landing inside the
+  braces. It is a static list, so it costs no graph read and opens with no
+  delay. Rows that need child bullets or that do not render inside a cell say so
+  on the row instead of being quietly dropped.
+- **`/` commands — a partial subset, off by default.** 21 rows against the 47 in
+  Roam's own slash registry. Every name and static template is read out of that
+  registry rather than guessed. Three classes are left out on purpose and are
+  listed under known limitations in the README; the short version is that Roam's
+  modal commands cannot be summoned from outside its editor, some commands only
+  render under a real block, and the `Query (…)` commands would commit
+  placeholder pages into the graph. The three day rows appear only when
+  `roamAlphaAPI.util.dateToPageTitle` is present to format the title, because a
+  hand-rolled daily-page title is a reference to a page that does not exist.
+- **Block suggestions render through Roam** instead of showing the raw markdown
+  behind them, so a hit reads as Roam would draw it rather than as
+  `[[Foo]] **bar** ((abc123))`. Rendering is bounded: only block rows, only rows
+  that actually contain markup, at most six per result set, issued through a
+  microtask chain that a newer result set aborts, with every host unmounted on
+  every teardown path. Two batches over 32 ms and the session falls back to
+  plain text. Rows are never empty in the meantime — a pure text normalizer
+  fills each one on the first frame and is the permanent fallback when
+  `renderString` is absent.
+- **Reference counts and page breadcrumbs,** from one batched query per result
+  set, never one per row.
+- **Paste a nine-character uid after `((`** and that exact block is offered
+  first. Previously the uid was searched for as block *text*, which finds
+  nothing.
+
+### Keyboard
+
+- A caret that leaves the query **closes the menu**. Arrow keys in a
+  `<textarea>` fire neither `select` nor `input`, so pressing ← after `[[Pro`
+  used to leave a menu open against a caret that had walked out of it.
+- **Hovering a row moves the highlight,** so `Enter` accepts the row that looks
+  selected. Hover used to be CSS only, and Enter accepted a different row.
+- `[`, `(`, `{` and `"` **wrap a selection** rather than replacing it, outside
+  formulas. This is also how an aliased reference gets built by hand.
+- Arrow-key navigation no longer rebuilds the suggestion rows; it repaints the
+  active one.
+
+### Large grids
+
+- **Reference mirroring — opt-in, off by default** (**Mirror large-grid
+  references into Roam**). A large-grid cell is a row in a chunk file, so a
+  `[[page]]` typed into one is a link Roam has never indexed. With this on, the
+  distinct references a grid contains are written into collapsed blocks under
+  the grid's own `{{[[roam/grid]]}}` anchor, and Roam's indexer creates the real
+  `:block/refs` datoms — so the page lists the grid in its linked references.
+  It is off by default because each shard write lands on Roam's transactor,
+  which is the cost the chunk format exists to avoid.
+  - Block count is bounded by *distinct references*, not cells: 100,000 cells
+    all naming `[[Foo]]` produce one. **Maximum mirrored references** (2000)
+    caps it, and the cut is taken in sort order so two devices agree; the marker
+    block says when it truncated.
+  - Shards are rewritten only when their content changed, so the ordinary save
+    costs zero writes. Row insert and delete change nothing at all — the mirror
+    is a set union, and moving a reference between rows leaves the union
+    identical.
+  - Deleting the grid's anchor subtree removes the marker and Roam retracts the
+    datoms; there is no separate cleanup pass. A shard write that fails after a
+    successful commit leaves the mirror stale, never wrong, and it is reconciled
+    the next time the grid opens.
+  - Manifests written before this release load unchanged; references appear as
+    chunks are next saved.
+
+### Fixed
+
+- **A Roam block-input id was parsed into something that was not a uid.** The id
+  carries a window path before the uid — `block-input-sidebar-block-<window>-<uid>`
+  and `block-input-<user>-body-outline-<page>-<uid>` are both real — and the
+  parse anchored on the prefix and took the whole tail. The DOM-provided uid now
+  wins, and the id is parsed for its trailing nine-character uid. Consequences
+  this removes: **Roam Grid: Enhance this table** could refuse with "Focus a
+  cell in a native table first" while a table cell was genuinely focused, and an
+  insert-near-focus could be aimed at a uid that does not exist.
+- `=SUM((A1` no longer opens the block picker and `=A1/B2` no longer opens the
+  command menu — the trigger scanner is formula-aware now, and `/` additionally
+  requires the start of the cell or a preceding space. Inside a formula, a page
+  opener is honoured only in a quoted position.
+
+### Settings
+
+Six new controls, taking the panel to 46 in eight groups.
+
+| Setting | Group | Default |
+| --- | --- | --- |
+| Open the reference menu on a bare `[[` or `((` | Editing | on |
+| Render `((block))` suggestions the way Roam does | Editing | on |
+| Complete `{{components}}` in cells | Editing | on |
+| Offer `/` commands in cells (partial) | Editing | **off** |
+| Mirror large-grid references into Roam | Large grids | **off** |
+| Maximum mirrored references | Large grids | 2000 |
+
+The existing master switch, **Suggest functions and pages while typing**, gates
+all of them: with it off, no recents query is issued and no catalog is offered.
+
+### Notes for review
+
+- **New graph reads, all through `roamAlphaAPI`.** Two datalog queries for the
+  recents lists (most-recently-edited pages; blocks edited in the last seven
+  days, bound with `:in $ ?since`); two batched enrichment queries for reference
+  counts and page breadcrumbs, both bound with `:in $ [?key ...]` and capped at
+  the results limit (25 maximum); and one `pull` by uid when a `((` query is
+  uid-shaped. Nothing is interpolated into a query string by any of them.
+- **Exactly one new graph write, and it is off by default:** the large-grid
+  reference shards described above. Everything else in this release inserts text
+  into the cell you are editing and nothing more. In particular the create-page
+  row writes no page.
+- **Suggestion rendering uses Roam's own `roamAlphaAPI.ui.components.renderString`**
+  and unmounts every host it mounts, through the same official unmount path the
+  rich cell renderer already used. Cell content is passed to Roam's renderer, not
+  to `innerHTML`.
+- **Still no network, no telemetry, no dependencies, no `eval`.** No `fetch`,
+  no `XMLHttpRequest`, no external import was added.
+- The menu is styled through our own `.rg-autocomplete*` classes under the
+  existing `.rg-portal` scope. It deliberately does **not** reuse Roam's
+  `.rm-autocomplete__*` class names, which would inherit every installed theme's
+  overrides of them.
+
 ## 0.9.0
 
 The first release intended for Roam Depot. Nothing about the storage model
@@ -60,7 +219,7 @@ leaves a working native table.
 
 ### Settings
 
-A real settings panel at **Settings → Roam Depot → Roam Grid**: 41 controls in
+A real settings panel at **Settings → Roam Depot → Roam Grid**: 40 controls in
 eight groups (Writes, Editing, Appearance, Sizing, New grids, Large grids,
 Comments, Ranges) plus four maintenance actions — apply display defaults to open
 grids, forget this device's overrides, clear local caches, and reset everything.

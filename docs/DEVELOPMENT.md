@@ -42,7 +42,7 @@ folder again. Developer extensions remain local to each Roam client.
 
 For an immediate update after a push, wait for the GitHub Pages deployment and
 press the circular reload button beside this URL. Hover the grid-size badge to
-confirm the running version (for example, `Roam Grid v0.9.0`). Roam can reuse a
+confirm the running version (for example, `Roam Grid v0.10.0`). Roam can reuse a
 cached remote bundle during the same app session; if the badge still shows the
 older version, remove only this developer-extension URL and add the same URL
 again. The reinstall remounts the renderer and does not alter any table blocks,
