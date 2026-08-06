@@ -42,6 +42,11 @@ const RECENTS_TTL_MS = 60000;
 const RECENTS_BUDGET_MS = 250;
 const RECENT_BLOCK_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const RECENT_ACCEPTED_PAGES = 25;
+// The idle warm pays the recents queries before the first bare opener does. 2.5 s is the fallback
+// when requestIdleCallback is missing; the re-warm fires 5 s ahead of TTL expiry so the cache never
+// goes cold in front of an active grid.
+const RECENTS_WARM_FALLBACK_MS = 2500;
+const RECENTS_REWARM_LEAD_MS = 5000;
 // Rendering a suggestion row mounts React. At the default limit of 8 rows and a 90ms debounce a fast
 // typist produces about eleven result sets a second, so an unbounded per-row render is ~88 mounts a
 // second while typing. The list is 190px tall — roughly six rows — so capping renders at six renders
@@ -6845,21 +6850,81 @@ export function recentsCacheReady(type, now = Date.now()) {
   return Boolean(entry) && now - entry.at < RECENTS_TTL_MS;
 }
 
-function readRecentRows(type, api, now) {
+function readRecentRows(type, api, now, { background = false, force = false } = {}) {
   const key = `${graphKeyName()}:${type}`;
   const cached = roamRecentsCache.get(key);
-  if (cached && now - cached.at < RECENTS_TTL_MS) return cached.rows;
+  if (!force && cached && now - cached.at < RECENTS_TTL_MS) return cached.rows;
   const clock = () => globalThis.performance?.now?.() ?? Date.now();
   const started = clock();
   const rows = type === "page" ? api.q(RECENT_PAGES_QUERY) : api.q(RECENT_BLOCKS_QUERY, now - RECENT_BLOCK_WINDOW_MS);
   const elapsed = clock() - started;
   const value = [...(rows || [])];
   roamRecentsCache.set(key, { at: now, rows: value });
+  // A background warm runs off the critical path, so its cost never counts toward the disarm —
+  // only inline fetches the user actually waited on do.
+  if (background) {
+    const target = globalThis.window;
+    if (target) (target.__rgDiag ||= {}).recentsWarm = { at: Date.now(), type, ms: elapsed, rows: value.length };
+    return value;
+  }
   if (elapsed > RECENTS_BUDGET_MS && !runtime.recentsDisabled) {
     runtime.recentsDisabled = true;
     console.info(`[roam-grid] Recent ${type === "page" ? "pages" : "blocks"} took ${Math.round(elapsed)}ms, over the ${RECENTS_BUDGET_MS}ms budget. Bare [[ and (( will not open on their own for the rest of this session; typing a query still searches.`);
   }
   return value;
+}
+
+/** Warms both recents caches off the critical path. Returns false when nothing could run, which is
+ *  how the scheduler knows not to keep a re-warm chain alive against a dead API. */
+export function warmRecentsCache({ api = globalThis.window?.roamAlphaAPI, now = Date.now(), force = false } = {}) {
+  if (typeof api?.q !== "function") return false;
+  let warmed = true;
+  for (const type of ["page", "block"]) {
+    try { readRecentRows(type, api, now, { background: true, force }); }
+    catch (error) {
+      warmed = false;
+      const target = globalThis.window;
+      if (target) (target.__rgDiag ||= {}).lastError = String(error?.stack || error);
+    }
+  }
+  return warmed;
+}
+
+const recentsWarmHandles = { idleId: null, cancelIdle: null, timerId: null };
+
+function scheduleRecentsRewarm() {
+  recentsWarmHandles.timerId = trackedTimeout(() => {
+    recentsWarmHandles.timerId = null;
+    const visible = (globalThis.document?.visibilityState ?? "visible") === "visible";
+    const mounted = runtime.sessions.size > 0 || runtime.largeMounts.size > 0;
+    // An idle graph with no grids must not run perpetual background queries: the chain stops here
+    // and the next bare opener pays one inline fetch, exactly as before the warm existed.
+    if (!visible || !mounted) return;
+    if (warmRecentsCache({ force: true })) scheduleRecentsRewarm();
+  }, RECENTS_TTL_MS - RECENTS_REWARM_LEAD_MS);
+}
+
+/** Schedules the post-onload warm on idle time (a short timeout where idle callbacks are missing).
+ *  Every handle lands in the lifecycle: timers through pendingTimers, the idle handle through
+ *  cancelRecentsWarm, which onunload calls. */
+export function scheduleRecentsWarm({ requestIdle = globalThis.requestIdleCallback, cancelIdle = globalThis.cancelIdleCallback } = {}) {
+  cancelRecentsWarm();
+  const begin = () => {
+    recentsWarmHandles.idleId = null; recentsWarmHandles.cancelIdle = null; recentsWarmHandles.timerId = null;
+    if (warmRecentsCache()) scheduleRecentsRewarm();
+  };
+  if (typeof requestIdle === "function") {
+    recentsWarmHandles.idleId = requestIdle(begin);
+    recentsWarmHandles.cancelIdle = typeof cancelIdle === "function" ? cancelIdle : null;
+  } else {
+    recentsWarmHandles.timerId = trackedTimeout(begin, RECENTS_WARM_FALLBACK_MS);
+  }
+}
+
+export function cancelRecentsWarm() {
+  if (recentsWarmHandles.idleId != null && recentsWarmHandles.cancelIdle) recentsWarmHandles.cancelIdle(recentsWarmHandles.idleId);
+  if (recentsWarmHandles.timerId != null) { clearTimeout(recentsWarmHandles.timerId); pendingTimers.delete(recentsWarmHandles.timerId); }
+  recentsWarmHandles.idleId = null; recentsWarmHandles.cancelIdle = null; recentsWarmHandles.timerId = null;
 }
 
 function recentPageSuggestions(rows, limit) {
@@ -10431,6 +10496,7 @@ async function onload({ extensionAPI }) {
     throw error;
   }
   console.info(`[roam-grid] Loaded v${VERSION}`);
+  scheduleRecentsWarm();
 }
 
 async function onunload() {
@@ -10443,6 +10509,7 @@ async function onunload() {
   settingsCache.clear();
   runtime.guardStyle?.remove(); runtime.guardStyle = null;
   for (const dispose of runtime.disposers.splice(0)) try { dispose(); } catch { /* no-op */ }
+  cancelRecentsWarm();
   clearTrackedTimers();
   document.querySelectorAll(".rg-toasts,.rg-dialog-overlay,.rg-context-menu").forEach((element) => {
     if (element.__rgDismiss) element.__rgDismiss(); else element.remove();
