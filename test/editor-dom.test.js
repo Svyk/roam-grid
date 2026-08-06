@@ -271,6 +271,69 @@ test("formula assistant highlights references, locks with F4, and closes suggest
   controller.dispose();
 });
 
+/**
+ * The regression guard for rendering rows through anything heavier than textContent: moving the
+ * active index must repaint the active row, never rebuild the list. Node identity is the assertion
+ * because a rebuilt row is a different object even when it looks identical.
+ */
+test("arrow-key suggestion navigation repaints the active row without rebuilding any row", async () => {
+  const { controller, cells, flush } = makeController();
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "=co", floating: true });
+  flush();
+  assert.ok(controller.suggestions.length > 1, "navigation needs at least two rows to mean anything");
+  const [first, second] = controller.suggestionList.children;
+  assert.equal(first.getAttribute("aria-selected"), "true");
+
+  controller.onKeydown({ key: "ArrowDown", preventDefault() {}, stopPropagation() {}, isComposing: false });
+  assert.equal(controller.suggestionList.children[0], first, "ArrowDown must not rebuild row 0");
+  assert.equal(controller.suggestionList.children[1], second, "ArrowDown must not rebuild row 1");
+  assert.equal(controller.suggestionIndex, 1);
+  assert.equal(second.getAttribute("aria-selected"), "true");
+  assert.equal(second.classList.contains("rg-formula-suggestion--active"), true);
+  assert.equal(first.getAttribute("aria-selected"), "false");
+  assert.equal(first.classList.contains("rg-formula-suggestion--active"), false);
+  assert.equal(editor.getAttribute("aria-activedescendant"), second.id);
+
+  editor.dispatch("click"); flush();
+  assert.equal(controller.suggestionList.children[0], first, "a repaint over an unchanged result set must not rebuild row 0");
+  assert.equal(controller.suggestionList.children[1], second, "a repaint over an unchanged result set must not rebuild row 1");
+  assert.equal(controller.suggestionIndex, 1, "and it must not lose the active row either");
+  assert.equal(second.getAttribute("aria-selected"), "true");
+  assert.equal(editor.getAttribute("aria-activedescendant"), second.id);
+
+  controller.onKeydown({ key: "ArrowUp", preventDefault() {}, stopPropagation() {}, isComposing: false });
+  assert.equal(controller.suggestionList.children[0], first, "ArrowUp must not rebuild row 0");
+  assert.equal(controller.suggestionList.children[1], second, "ArrowUp must not rebuild row 1");
+  assert.equal(controller.suggestionIndex, 0);
+  assert.equal(first.getAttribute("aria-selected"), "true");
+  assert.equal(first.classList.contains("rg-formula-suggestion--active"), true);
+  assert.equal(second.getAttribute("aria-selected"), "false");
+  assert.equal(editor.getAttribute("aria-activedescendant"), first.id);
+  controller.dispose();
+});
+
+test("a changed result set does rebuild the rows, and accepting a suggestion drops the cached signature", async () => {
+  const { controller, cells, flush } = makeController();
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "=co", floating: true });
+  flush();
+  const stale = controller.suggestionList.children[0];
+  const staleSignature = controller.suggestionSignature;
+
+  editor.value = "=av"; editor.setSelectionRange(3, 3); editor.dispatch("input"); flush();
+  assert.notEqual(controller.suggestionSignature, staleSignature, "a different query is a different result set");
+  assert.notEqual(controller.suggestionList.children[0], stale, "a changed result set must rebuild the rows");
+  assert.equal(controller.suggestionList.children[0].textContent.startsWith("AVG"), true);
+
+  const accepted = controller.suggestionList.children[0];
+  controller.onKeydown({ key: "Enter", preventDefault() {}, stopPropagation() {}, isComposing: false });
+  assert.equal(accepted.parentNode, null, "accepting tears the rows down through the dispose seam");
+  assert.equal(controller.suggestionSignature, null, "a torn-down list must not look up to date to the next render");
+  flush();
+  assert.equal(controller.suggestionList.children.length, 0);
+  assert.equal(controller.suggestionList.hidden, true);
+  controller.dispose();
+});
+
 test("formula point mode builds a calculation with arrows, operators, and Enter", async () => {
   const revealed = [];
   const { controller, cells, flush, finishes } = makeController({

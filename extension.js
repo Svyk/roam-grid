@@ -6268,6 +6268,7 @@ export class GridEditorController {
     this.frame = null;
     this.suggestions = [];
     this.suggestionIndex = 0;
+    this.suggestionSignature = null;
     this.popover = document.createElement("div");
     this.popover.className = "rg-formula-popover rg-editor-popover";
     this.popover.hidden = true;
@@ -6415,7 +6416,7 @@ export class GridEditorController {
     if (hasSuggestions && ["ArrowDown", "ArrowUp"].includes(event.key)) {
       event.preventDefault();
       this.suggestionIndex = (this.suggestionIndex + (event.key === "ArrowDown" ? 1 : -1) + this.suggestions.length) % this.suggestions.length;
-      this.paintSuggestions();
+      this.paintActiveSuggestion();
       return;
     }
     if (hasSuggestions && ["Enter", "Tab"].includes(event.key)) {
@@ -6448,6 +6449,7 @@ export class GridEditorController {
       state.editor.setSelectionRange(caret, caret);
     }
     state.autocompleteClosed = true;
+    this.disposeSuggestionRows();
     state.editor.focus({ preventScroll: true });
     this.schedulePresentation();
   }
@@ -6459,7 +6461,7 @@ export class GridEditorController {
     state.editor.setRangeText(replacement, context.startIndex, context.replaceEndIndex ?? context.endIndex, "end");
     state.referenceAutocompleteClosed = true;
     clearTimeout(this.referenceSearchTimer); this.referenceSearchToken += 1;
-    this.suggestions = []; this.suggestionList.hidden = true; this.suggestionList.setAttribute("aria-hidden", "true");
+    this.suggestions = []; this.disposeSuggestionRows(); this.suggestionList.hidden = true; this.suggestionList.setAttribute("aria-hidden", "true");
     state.editor.setAttribute("aria-expanded", "false"); state.editor.removeAttribute?.("aria-activedescendant");
     state.editor.focus({ preventScroll: true });
     this.schedulePresentation();
@@ -6636,7 +6638,7 @@ export class GridEditorController {
     this.suggestions = context && autocompleteEnabled() && !state.autocompleteClosed ? rankFormulaFunctions(context.query, catalog, getSetting("editing-autocomplete-limit")) : [];
     this.suggestionKind = this.suggestions.length ? "formula" : null;
     this.suggestionIndex = clamp(this.suggestionIndex, 0, Math.max(0, this.suggestions.length - 1));
-    this.paintSuggestions();
+    this.renderSuggestionRows();
   }
 
   updateReferenceAutocomplete(context) {
@@ -6648,14 +6650,14 @@ export class GridEditorController {
     if (this.referenceContextKey === key && (this.referenceSearchTimer != null || this.suggestionKind === "roam-reference")) return;
     clearTimeout(this.referenceSearchTimer); const token = ++this.referenceSearchToken;
     this.referenceContext = context; this.referenceContextKey = key; this.autocompleteContext = null;
-    this.suggestions = []; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.paintSuggestions();
+    this.suggestions = []; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.renderSuggestionRows();
     if (state.referenceAutocompleteClosed || !context.query.trim()) return;
     this.referenceSearchTimer = setTimeout(async () => {
       this.referenceSearchTimer = null;
       let results = [];
       try { results = await this.searchReferences(context); } catch (error) { console.warn("[roam-grid] Reference search failed", error); }
       if (token !== this.referenceSearchToken || !this.state || this.referenceContextKey !== key) return;
-      this.suggestions = results; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.paintSuggestions();
+      this.suggestions = results; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.renderSuggestionRows();
       if (!this.state.floating) this.setPopoverHidden(!this.suggestions.length && !(this.state.editor.value.startsWith("=") && !this.state.editor.value.startsWith("==")));
       this.position();
     }, this.searchDelay());
@@ -6671,22 +6673,24 @@ export class GridEditorController {
     clearTimeout(this.referenceSearchTimer); this.referenceSearchTimer = null; this.referenceSearchToken += 1;
     this.referenceContext = null; this.referenceContextKey = null;
     if (this.suggestionKind === "roam-reference") {
-      this.suggestions = []; this.suggestionKind = null; this.paintSuggestions();
+      this.suggestions = []; this.suggestionKind = null; this.renderSuggestionRows();
     }
   }
 
-  paintSuggestions() {
-    this.suggestionList.replaceChildren();
+  /** Rebuilds the rows, but only when the result set itself changed. Moving the active index is
+   *  NOT a result-set change, so arrow keys reach paintActiveSuggestion and every row node survives. */
+  renderSuggestionRows() {
     this.suggestionList.hidden = !this.suggestions.length;
     this.suggestionList.setAttribute("aria-hidden", String(!this.suggestions.length));
-    const editor = this.currentEditor();
-    editor?.setAttribute?.("aria-expanded", String(Boolean(this.suggestions.length)));
+    this.currentEditor()?.setAttribute?.("aria-expanded", String(Boolean(this.suggestions.length)));
+    const signature = this.suggestions.map((suggestion) => `${suggestion.kind}:${suggestion.uid || suggestion.name}`).join("|");
+    if (signature === this.suggestionSignature) return this.paintActiveSuggestion();
+    this.suggestionSignature = signature;
+    this.suggestionList.replaceChildren();
     this.suggestions.forEach((suggestion, index) => {
       const option = document.createElement("button"); option.type = "button"; option.className = "rg-formula-suggestion";
       option.id = `${this.suggestionList.id}-option-${index}`;
       option.setAttribute("role", "option");
-      option.setAttribute("aria-selected", String(index === this.suggestionIndex));
-      option.classList.toggle("rg-formula-suggestion--active", index === this.suggestionIndex);
       const name = document.createElement("strong"); name.textContent = suggestion.name;
       const detail = document.createElement("span"); detail.textContent = suggestion.description;
       option.append(name, detail);
@@ -6694,10 +6698,29 @@ export class GridEditorController {
       option.addEventListener("click", () => this.acceptSuggestion(index));
       this.suggestionList.appendChild(option);
     });
-    if (editor) {
-      if (this.suggestions.length) editor.setAttribute("aria-activedescendant", `${this.suggestionList.id}-option-${this.suggestionIndex}`);
-      else editor.removeAttribute?.("aria-activedescendant");
+    this.paintActiveSuggestion();
+  }
+
+  paintActiveSuggestion() {
+    const rows = this.suggestionList.children;
+    for (let index = 0; index < rows.length; index += 1) {
+      const option = rows[index];
+      const active = index === this.suggestionIndex;
+      option.setAttribute("aria-selected", String(active));
+      option.classList.toggle("rg-formula-suggestion--active", active);
+      if (active) option.scrollIntoView?.({ block: "nearest" });
     }
+    const editor = this.currentEditor();
+    if (!editor) return;
+    if (this.suggestions.length) editor.setAttribute("aria-activedescendant", `${this.suggestionList.id}-option-${this.suggestionIndex}`);
+    else editor.removeAttribute?.("aria-activedescendant");
+  }
+
+  /** Teardown seam for whatever the rows own beyond their own nodes. Dropping the cached signature
+   *  is what keeps the next render from mistaking an emptied list for an up-to-date one. */
+  disposeSuggestionRows() {
+    this.suggestionSignature = null;
+    this.suggestionList.replaceChildren();
   }
 
   updateSignature(formula) {
@@ -6744,7 +6767,7 @@ export class GridEditorController {
       cell.classList.remove("rg-cell--formula-reference"); cell.style.removeProperty("--rg-reference-color"); delete cell.dataset.rgFormulaReference;
     }
     clearTimeout(this.referenceSearchTimer); this.referenceSearchTimer = null; this.referenceSearchToken += 1; this.referenceContext = null; this.referenceContextKey = null;
-    this.referenceCells.clear(); this.suggestions = []; this.suggestionKind = null; this.suggestionList.replaceChildren(); this.suggestionList.hidden = true; this.suggestionList.setAttribute("aria-hidden", "true");
+    this.referenceCells.clear(); this.suggestions = []; this.suggestionKind = null; this.disposeSuggestionRows(); this.suggestionList.hidden = true; this.suggestionList.setAttribute("aria-hidden", "true");
     this.input.setAttribute("aria-expanded", "false"); this.input.removeAttribute?.("aria-activedescendant");
     this.currentEditor()?.setAttribute?.("aria-expanded", "false"); this.currentEditor()?.removeAttribute?.("aria-activedescendant");
     this.signature.replaceChildren(); this.signature.hidden = true; this.signature.setAttribute("aria-hidden", "true");
@@ -6759,7 +6782,7 @@ export class GridEditorController {
     globalThis.window?.removeEventListener("resize", this.boundReposition);
     this.viewport?.removeEventListener("scroll", this.boundReposition);
     this.portalTheme?.dispose(); this.portalTheme = null;
-    this.clearPresentation(); this.popover.remove();
+    this.clearPresentation(); this.disposeSuggestionRows(); this.popover.remove();
   }
 }
 
