@@ -90,3 +90,121 @@ Remaining public-release gates:
   evaluator while retaining the safe registration boundary.
 - Add browser-level coverage for the complete pointer, clipboard-image,
   encrypted-file read, interrupted upload, and orphan-cleanup paths.
+
+## Optional-chaining audit (GOAL-2G) — Group 3 inventory
+
+`src/extension.js` uses `receiver.method?.()` (or `receiver?.method?.()`) in roughly 40
+places to call one of four DOM lookup methods: `closest`, `matches`, `querySelector`,
+`querySelectorAll`. Unlike the nine GOAL-2D sites fixed in this same pass (real registry
+members that always implement the method they're guarding), these calls exist because the
+codebase's test doubles are several independently hand-rolled fake DOM node shapes with
+inconsistent method coverage. The trailing `?.` before the call means a fake missing the
+method takes the same silent not-found branch as a fake that correctly implements it and
+returns no match — a test can stay green while asserting nothing about the branch it meant
+to exercise. This is the same failure class as the fixed Group 1 sites, at roughly four
+times the count, and it is pre-existing (not introduced by GOAL-2D). It is not fixed here;
+this section is the scoped inventory the goal asked for.
+
+### Site list
+
+One row per call site. "Selector kind" flags whether the selector is a bare class selector
+(the one shape every fake below can match) or uses attribute/tag/compound/`:scope`
+syntax that only the fullest fake supports (see next section).
+
+| Lines | Function | Call | Selector kind |
+|---|---|---|---|
+| 3870, 3872 | `uidFromFocusTarget(target)` | `target?.closest?.(".rm-block-input,[id^='block-input-']")`, `input?.closest?.("[data-uid]")` | attribute |
+| 3913 | `portalOwnerUid(target)` | `target?.closest?.("[data-rg-owner]")` | attribute |
+| 3930 | `isGridEditorInput(target)` | `target?.closest?.(".rg-editor,.rg-floating-editor-input,.rg-dialog-input")` | class list |
+| 3934 | `onGlobalPointerDown(event)` | `target?.closest?.(".rg-root")` | class |
+| 4211 | `gridThemeSignature(nativeElement)` | `nativeElement?.closest?.("[data-theme], [data-color-mode], .bp3-dark, .bp4-dark, .bp5-dark, [class*='theme-']")` | attribute + class |
+| 4244 | `syncGridThemeFromHost(nativeElement, …)` | `nativeElement?.querySelector?.("td,th,[role='gridcell']")` | tag + attribute |
+| 4292 | `createGridThemeBridge(…)` | same selector as `gridThemeSignature` (re-derived) | attribute + class |
+| 4369 | `syncPortalThemeFromRoot(ownerRoot, …)` | `ownerRoot?.closest?.(".rg-root")` | class |
+| 4382, 4383 | `syncPortalThemeFromRoot` | `root?.querySelector?.(".rg-header, .rg-toolbar")`, `root?.querySelector?.(".rg-status")` | class |
+| 4452 ×2 | `portalOwnerRoot(explicitRoot)` | `document.querySelector?.(".rg-root:focus-within")`, `document.querySelector?.(".rg-root")` | pseudo-class + class |
+| 4770, 4771 | `releaseRichCellHosts(container)` | `container.matches?.(".rg-cell-content")`, `container.querySelectorAll?.(".rg-cell-content")` | class |
+| 5822 ×2 | `GridView.patchRowDeletion(context)` | `cell?.querySelector?.(":scope > .rg-cell-content")`, `cell?.querySelectorAll?.(".rg-cell-content")` | `:scope` combinator + class |
+| 5874 | `GridView.startColumnResize(…)` | `pointerTarget?.closest?.(".rg-cell")` | class |
+| 5941 | `GridView.startRowResize(…)` | `pointerTarget?.closest?.(".rg-cell")` | class |
+| 5981 | `GridView.cellElement(…)` pointerdown handler | `event.target.closest?.(".rg-editor")` | class |
+| 6045 | `GridView.updateCellReferenceCount(cell, uid)` | `cell.querySelector?.(".rg-cell-reference-count")` | class |
+| 6071 | `GridView.updateCellCommentCount(cell, uid, …)` | `cell.querySelector?.(".rg-cell-comment-count")` | class |
+| 6111 | `GridView.referenceBadge(uid)` | `this.cellForUid(uid)?.querySelector?.(".rg-cell-reference-count")` | class |
+| 6115 | `GridView.commentBadge(uid)` | `this.cellForUid(uid)?.querySelector?.(".rg-cell-comment-count")` | class |
+| 6260 | `GridView.onCommentPointerOver(event)` | `event?.target?.closest?.(".rg-cell")` | class |
+| 7006, 7007 | `RangeGridView.onClick(event)` | `event.target?.closest?.(".rg-range-source")`, `event.target?.closest?.(".rg-cell")` | class |
+| 7251 | `LargeGridView.renderVisible(…)` pointerdown handler | `event.target.closest?.(".rg-editor")` | class |
+| 7494 | `activeGridUid()` | `document.activeElement?.closest?.("[data-roam-grid-uid]")` | attribute |
+| 7501 | `activeMount()` | `document.activeElement?.closest?.("[data-roam-grid-uid]")` | attribute |
+| 7609, 7610 | `nativeTablesWithin(root)` | `root.matches?.(".rm-table")`, `root.querySelectorAll?.(".rm-table")` | class |
+| 7616 | `nativeTableInstanceInfo(nativeElement, …)` | `nativeElement.closest?.(".rm-block-ref[data-uid]")` | class + attribute |
+| 7684, 7685 | `rangeButtonsWithin(root)` | `root.matches?.(RANGE_BUTTON_SELECTOR)`, `root.querySelectorAll?.(RANGE_BUTTON_SELECTOR)` | class |
+| 7703 | `rangeInstanceInfo(button, …)` | `button.closest?.(".rm-block__input")` | class |
+| 7747 ×2 | `containsRenderedBlockReference(node)` | `node.matches?.(".rm-block-ref")`, `node.querySelector?.(".rm-block-ref")` | class |
+| 7769 | `isBlueprintPortal(node)` | `node.matches?.(".bp3-portal")` | class |
+| 7809 | `installPortalObservers(…)` | `ownerDocument.querySelectorAll?.(".bp3-portal")` | class |
+| 7824 | `scanMounts()` (native-mount failure cleanup) | `nativeElement.parentElement?.querySelector?.(".rg-root")` | class |
+| 7838 | `scanMounts()` (range-mount failure cleanup) | `button.parentElement?.querySelector?.(".rg-range")` | class |
+
+Where a leading `receiver?.` also appears (e.g. `document.activeElement?.closest?.(…)`,
+`cell?.querySelector?.(…)`), that first `?.` is legitimate per the Group 1 rule — the
+receiver really can be `null` (no focused element, no cell at that coordinate) — only the
+**second** `?.`, guarding the method call itself, is the vacuity risk catalogued here.
+
+### Which MiniDOM methods are missing
+
+There is no single shared DOM test double. At least five independently hand-rolled fake
+node shapes exist across the suite, with inconsistent coverage of the four methods above:
+
+| Test file | Fake | `closest` | `matches` | `querySelector` | `querySelectorAll` | Selector support |
+|---|---|---|---|---|---|---|
+| `test/keyboard-ownership.test.js` | `Node` (`matchesSelector` helper) | yes | yes | yes | yes | class, attribute (`[x]`, `[x=y]`, `[x^=y]`), tag name, comma-lists — the fullest of the five |
+| `test/comments.test.js` | `MiniNode` | yes | yes | yes | yes | class selectors only (`part.startsWith(".")`); anything else (tag, attribute, `:scope`) silently fails to match |
+| `test/range-reference.test.js` | `MiniNode` | yes | yes | yes | yes | class selectors only, plus one hardcoded `:scope >` case in `querySelectorAll` |
+| `test/editor-dom.test.js` | `MiniNode` | **no** | yes | yes | yes | class selectors only; no `closest` method at all, so any `?.closest?.()` against this fake returns `undefined` unconditionally, method-present-or-not |
+| `test/settings.test.js` | `makeElement()` | no | no | no | no | only `classList` and `style` are implemented — a stand-in for `view.root`/`mount.root` in settings-application tests, not a DOM traversal target |
+| `test/mounting.test.js` | ad hoc literals, one shape per test (no shared class) | sometimes (`closest: () => null` or a selector-specific closure) | sometimes (`matches: (selector) => selector === "…"`) | rarely (`querySelector: () => cell`) | never | each literal implements only the single method its own test expects to be called — a stray `?.`-guarded call to any other method on the same fixture silently no-ops rather than failing |
+
+Two independent gaps compound here: (1) whether the method exists on the fake at all
+(`editor-dom.test.js`'s `MiniNode` has no `closest`; `mounting.test.js` literals implement
+one method each), and (2) whether the fake's `matches()` can evaluate the selector actually
+used in production. Three of the five fakes only match bare class selectors — every row
+above flagged `attribute`, `tag`, `pseudo-class`, or `:scope` in "Selector kind" would fail
+to match against those fakes even if the method were present and called unconditionally.
+`nativeTableInstanceInfo`, `activeGridUid`/`activeMount`, `uidFromFocusTarget`, and
+`portalOwnerUid` are the sites most exposed to this, since their selectors are
+attribute-based (`[data-uid]`, `[data-rg-owner]`, `[data-roam-grid-uid]`,
+`[id^='block-input-']`).
+
+### What a real fix would require
+
+1. **One shared DOM test double**, not five. Consolidate on `keyboard-ownership.test.js`'s
+   `Node` (the only one with attribute-selector and tag-name support) as the base, move it
+   to a shared test helper module, and migrate `comments.test.js`, `editor-dom.test.js`,
+   `range-reference.test.js`, and the ad hoc `mounting.test.js` literals onto it. Without
+   this, dropping any of the ~40 `?.`s below just trades a silent no-op for a crash the
+   first time a test exercises the path against an under-featured fake.
+2. **Add `closest` to `editor-dom.test.js`'s `MiniNode`** (or replace it with the shared
+   double) before touching the two sites that route through it — otherwise removing the
+   `?.` turns every editor-dom test that reaches those call paths red for a reason unrelated
+   to the bug being tested.
+3. **Extend `matches()`/selector support** to cover attribute and tag selectors everywhere
+   the shared double is used — `startsWith(".")`-only matching silently mismatches
+   `[data-uid]`, `[data-rg-owner]`, `[id^='block-input-']`, `[data-roam-grid-uid]`,
+   `[role='gridcell']`, and bare tag names (`td`, `th`), all of which appear in the
+   production selectors above.
+4. **Then drop each `?.`** (`receiver.method?.()` → `receiver.method()`), one group at a
+   time as in Group 1, running the gate after each group — a test that goes red at that
+   point was relying on the vacuity and is a real finding, not a regression to paper over.
+5. **Re-verify intent, not just green.** Because the second `?.` has been masking whether
+   these branches were ever really exercised, a currently-passing test suite is not proof
+   the branch behavior is correct — each site's test coverage should be checked for a
+   positive control (a fixture that should match) in addition to the existing negative
+   cases, the same requirement GOAL-2F's capture test already established for ordering
+   traps.
+6. **Literal fixtures in `mounting.test.js` need the most care**: because each is
+   purpose-built with exactly the one method its test expects, migrating them to the shared
+   double will change what other methods on the same object resolve to (from `undefined`
+   under `?.` to a real implementation) — existing assertions should be re-read against the
+   new behavior, not just re-run.

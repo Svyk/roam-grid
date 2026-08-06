@@ -59,17 +59,17 @@ const SETTING_DESCRIPTORS = [
   { key: NATIVE_BUDGET_KEY, group: "Writes", name: "Native write budget", description: "Maximum Roam block mutations in one structural operation. Larger operations should use large-grid mode.", control: "input", type: "int", default: MAX_NATIVE_MUTATIONS, min: 50, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "writes-content-debounce-ms", group: "Writes", name: "Content save delay (ms)", description: "How long typing settles before edited cells are written back to Roam.", control: "input", type: "int", default: DEFAULT_CONTENT_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "writes-large-debounce-ms", group: "Writes", name: "Large-grid save delay (ms)", description: "How long a large grid settles before its chunks are uploaded.", control: "input", type: "int", default: DEFAULT_LARGE_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "session-idle-ms", group: "Writes", name: "Session idle timeout (ms)", description: "How long an unmounted grid session stays warm before it is released.", control: "input", type: "int", default: SESSION_IDLE_MS, min: 200, max: 60000, scope: "graph", apply: "immediate", stage: "live", onSession: (session) => session.rescheduleIdle?.() },
+  { key: "session-idle-ms", group: "Writes", name: "Session idle timeout (ms)", description: "How long an unmounted grid session stays warm before it is released.", control: "input", type: "int", default: SESSION_IDLE_MS, min: 200, max: 60000, scope: "graph", apply: "immediate", stage: "live", onSession: (session) => session.rescheduleIdle() },
   { key: "editing-autocomplete-debounce-ms", group: "Editing", name: "Autocomplete delay (ms)", description: "How long a reference query settles before Roam is searched.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_MS, min: 0, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "editing-autocomplete-limit", group: "Editing", name: "Autocomplete results", description: "How many suggestions the formula and reference pickers offer.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_LIMIT, min: 1, max: 25, scope: "graph", apply: "next-op", stage: "live" },
   { key: "editing-capture-undo", group: "Editing", name: "Capture grid undo history", description: "Record grid edits in the extension's own undo history so ⌘Z reverses them.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-enter-direction", group: "Editing", name: "Enter moves", description: "Where the selection lands after Enter finishes a cell edit.", control: "select", type: "enum", default: "Down", items: ["Down", "Right", "Stay"], scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-tab-direction", group: "Editing", name: "Tab moves", description: "Where the selection lands after Tab finishes a cell edit.", control: "select", type: "enum", default: "Right", items: ["Right", "Down"], scope: "graph", apply: "immediate", stage: "live" },
   { key: "conflict-restore-prompt", group: "Editing", name: "Offer to restore edits a reload discarded", description: "When a table changes elsewhere and Roam Grid reloads it, show a Restore action for the unsaved edits that reload dropped. The “Roam Grid: Restore discarded edits” command stays available with this off.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
-  { key: "appearance-formula-tinting", group: "Appearance", name: "Tint formula cells", description: "Give cells that hold a formula their own background tint. Turning this off suppresses tinting on every grid at once; turning it back on returns each grid to its own “fx” setting.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshFormulaTint?.(), onLarge: (mount) => mount.scheduleRender?.() },
+  { key: "appearance-formula-tinting", group: "Appearance", name: "Tint formula cells", description: "Give cells that hold a formula their own background tint. Turning this off suppresses tinting on every grid at once; turning it back on returns each grid to its own “fx” setting.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshFormulaTint(), onLarge: (mount) => mount.scheduleRender() },
   { key: "appearance-show-headers", group: "Appearance", name: "Show row and column headers", description: "Show the A/B/C and 1/2/3 axis headers on new grids.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
   { key: "appearance-fit-to-width", group: "Appearance", name: "Fit grids to the block width", description: "Scale columns so a new grid fills the width of its block instead of scrolling.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "appearance-reference-badges", group: "Appearance", name: "Show cell reference badges", description: "Show the linked-reference count badge on cells that other blocks reference.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges?.() },
+  { key: "appearance-reference-badges", group: "Appearance", name: "Show cell reference badges", description: "Show the linked-reference count badge on cells that other blocks reference.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges() },
   { key: "appearance-toolbar-preset", group: "Appearance", name: "Toolbar", description: "How much of the grid toolbar is shown.", control: "select", type: "enum", default: "Full", items: ["Full", "Compact", "Minimal", "Hidden"], scope: "device", apply: "immediate", stage: "live", onView: (view) => applyToolbarPreset(view.root), onLarge: (mount) => applyToolbarPreset(mount.root) },
   { key: "appearance-theme", group: "Appearance", name: "Theme", description: "Follow the Roam theme or pin the grid to light or dark.", control: "select", type: "enum", default: "Follow Roam", items: ["Follow Roam", "Light", "Dark"], scope: "device", apply: "immediate", stage: "live", onView: (view) => resyncGridTheme(view), onLarge: (mount) => resyncGridTheme(mount) },
   { key: "appearance-max-width", group: "Appearance", name: "Maximum grid width (px)", description: "Widest a grid may grow before it scrolls horizontally.", control: "input", type: "int", default: DEFAULT_GRID_MAX_WIDTH, min: 480, max: 4000, scope: "device", apply: "immediate", stage: "live", onView: (view) => applyGridMaxWidth(view.root), onLarge: (mount) => applyGridMaxWidth(mount.root) },
@@ -82,10 +82,10 @@ const SETTING_DESCRIPTORS = [
   { key: "sizing-max-col-width", group: "Sizing", name: "Maximum column width (px)", description: "Largest width a column may be dragged to.", control: "input", type: "int", default: MAX_COL_WIDTH, min: 56, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "new-grid-rows", group: "New grids", name: "Rows in a new large grid", description: "How many rows a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_ROWS, min: 1, max: 100000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "new-grid-cols", group: "New grids", name: "Columns in a new large grid", description: "How many columns a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_COLS, min: 1, max: 702, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "large-overscan-rows", group: "Large grids", name: "Overscan rows", description: "Extra rows rendered above and below a large grid's viewport.", control: "input", type: "int", default: DEFAULT_LARGE_OVERSCAN_ROWS, min: 0, max: 200, scope: "device", apply: "immediate", stage: "live", onLarge: (mount) => mount.scheduleRender?.() },
+  { key: "large-overscan-rows", group: "Large grids", name: "Overscan rows", description: "Extra rows rendered above and below a large grid's viewport.", control: "input", type: "int", default: DEFAULT_LARGE_OVERSCAN_ROWS, min: 0, max: 200, scope: "device", apply: "immediate", stage: "live", onLarge: (mount) => mount.scheduleRender() },
   { key: "large-chunk-rows", group: "Large grids", name: "Rows per chunk file", description: "How many rows each chunk file holds. Applies to newly created large grids only — an existing grid keeps the chunk size it was written with, because changing it would misaddress every chunk.", control: "input", type: "int", default: CHUNK_ROWS, min: 50, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "comments-enabled", group: "Comments", name: "Enable cell comments", description: "Read and write native Roam comment threads from grid cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges?.() },
-  { key: "comments-badges", group: "Comments", name: "Show comment badges", description: "Mark cells that carry a comment thread.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges?.() },
+  { key: "comments-enabled", group: "Comments", name: "Enable cell comments", description: "Read and write native Roam comment threads from grid cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges() },
+  { key: "comments-badges", group: "Comments", name: "Show comment badges", description: "Mark cells that carry a comment thread.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges() },
   { key: "comments-open-in-sidebar", group: "Comments", name: "Open comment threads in the right sidebar", description: "Open a cell's comment thread in the right sidebar instead of inline.", control: "switch", type: "bool", default: false, scope: "device", apply: "immediate", stage: "live" },
   { key: "ranges-live-references", group: "Ranges", name: "Render live range references", description: "Render {{roam-grid-range: …}} components as a live view of the source cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
   { key: "ranges-read-only", group: "Ranges", name: "Rendered ranges are read-only", description: "Block edits inside a rendered range so the source table stays authoritative.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
@@ -3255,6 +3255,7 @@ export class NativeGridSession {
     this.commentThreads = next;
     for (const view of this.views) {
       view.commentThreads = next;
+      // RangeGridView deliberately omits updateCommentBadges — this `?.` is what lets a range excerpt skip comment chrome. Keep it.
       if (changed.size) view.updateCommentBadges?.(changed);
     }
     this.lastCommentThreadChanges = changed;
@@ -3271,6 +3272,7 @@ export class NativeGridSession {
     mergeCommentThread(this.commentThreads, String(targetUid), applied.anchorUid);
     for (const view of this.views) {
       view.commentThreads = this.commentThreads;
+      // RangeGridView deliberately omits updateCommentBadges — this `?.` is what lets a range excerpt skip comment chrome. Keep it.
       view.updateCommentBadges?.([String(targetUid)]);
     }
     return applied;
@@ -3982,6 +3984,7 @@ export function setCommentArming(armed) {
   const next = Boolean(armed);
   if (runtime.commentArmed === next) return next;
   runtime.commentArmed = next;
+  // RangeGridView deliberately omits setCommentArmed — this `?.` is what lets a range excerpt skip comment chrome. Keep it.
   for (const view of runtime.views) view.setCommentArmed?.(next);
   return next;
 }
@@ -7881,16 +7884,16 @@ export function applyDisplayDefaultsToOpenGrids() {
   for (const session of runtime.sessions.values()) {
     if (!session?.model) continue;
     applyDisplayDefaults(session.model); grids += 1;
-    try { session.markChanged?.(true); } catch (error) { console.warn("[roam-grid] Could not persist display defaults", error); }
+    try { session.markChanged(true); } catch (error) { console.warn("[roam-grid] Could not persist display defaults", error); }
     for (const view of session.views || []) {
-      try { view.render?.(); } catch (error) { console.warn("[roam-grid] Could not repaint a grid view", error); }
+      try { view.render(); } catch (error) { console.warn("[roam-grid] Could not repaint a grid view", error); }
     }
   }
   for (const mount of runtime.largeMounts.values()) {
     if (!mount?.store?.manifest) continue;
     applyDisplayDefaults(mount.store.manifest); grids += 1;
     mount.store.metadataDirty = true; mount.rowMetricsKey = null;
-    try { mount.scheduleSave?.(true); mount.scheduleRender?.(); } catch (error) { console.warn("[roam-grid] Could not repaint a large grid", error); }
+    try { mount.scheduleSave(true); mount.scheduleRender(); } catch (error) { console.warn("[roam-grid] Could not repaint a large grid", error); }
   }
   toast(grids ? `Applied display defaults to ${grids} open grid${grids === 1 ? "" : "s"}.` : "No grids are open right now.", grids ? "success" : "warning");
   return grids;
