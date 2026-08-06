@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { enrichRoamSuggestions, exactBlockSuggestion, roamEditorTriggerContext, roamSuggestionPlainText, roamTriggerInsertion, searchRoamReferenceSuggestions, withCreatePageSuggestion } from "../src/extension.js";
+import { ROAM_COMPONENT_CATALOG, enrichRoamSuggestions, exactBlockSuggestion, roamComponentInsertion, roamComponentSuggestions, roamEditorTriggerContext, roamSuggestionPlainText, roamTriggerInsertion, searchRoamReferenceSuggestions, withCreatePageSuggestion } from "../src/extension.js";
 
 test("the trigger context resolves six types against the nearest unclosed opener", () => {
   assert.deepEqual(roamEditorTriggerContext("See [[Proj", 10), {
@@ -278,6 +278,81 @@ test("a [[ opened inside an alias target is flagged, and the ) is not swallowed"
   assert.equal(roamEditorTriggerContext("[[Proj", 6).aliasTarget, undefined, "and neither does one with no room for a ]( in front of it");
   assert.equal(roamEditorTriggerContext("](((uid", 7).aliasTarget, undefined, "a block opener after ]( is not an alias target — Roam aliases point at pages");
   assert.equal(roamEditorTriggerContext("](((uid", 7).type, "block");
+});
+
+/**
+ * The caret offset is the whole substance of a catalog entry: a template inserted with the caret
+ * past `}}` is worse than typing the component by hand. Rather than restating the sixteen numbers —
+ * which would only mirror the source — this simulates the gesture: split the template at its own
+ * offset, type a character there, and require the result to still be one well-formed component with
+ * the typed character INSIDE its braces and after the component's own name.
+ */
+test("every catalog entry leaves the caret inside its braces, ready for what is typed next", () => {
+  assert.equal(ROAM_COMPONENT_CATALOG.length, 16);
+  for (const entry of ROAM_COMPONENT_CATALOG) {
+    const { template, caret, name } = entry;
+    const typed = `${template.slice(0, caret)}X${template.slice(caret)}`;
+    assert.ok(caret >= 0 && caret <= template.length, `${name}: the offset is inside its own template`);
+    assert.ok(template.startsWith("{{") && template.endsWith("}}"), `${name}: the template is a component`);
+    assert.ok(template.includes(name), `${name}: the template names the component it inserts`);
+    assert.ok(/^\{\{.*\}\}$|^\{\{.*\}\}X$/.test(typed), `${name}: typing at the offset cannot break the braces`);
+    const tail = template.slice(caret);
+    assert.ok(/^\}*$/.test(tail), `${name}: nothing but closing braces may follow the caret — ${JSON.stringify(tail)}`);
+    if (tail) {
+      assert.ok(typed.endsWith(tail), `${name}: what is typed stays inside the braces`);
+      assert.ok(template.slice(0, caret).endsWith(": ") || template.slice(0, caret).endsWith(" "),
+        `${name}: an argument component parks the caret after its separator`);
+    } else {
+      assert.equal(typed, `${template}X`, `${name}: a component with no argument parks the caret at the end`);
+    }
+    assert.ok(entry.description.length <= 26, `${name}: the detail track ellipsizes past 26ch — ${entry.description}`);
+  }
+
+  const query = ROAM_COMPONENT_CATALOG.find((entry) => entry.name === "query");
+  assert.equal(`${query.template.slice(0, query.caret)}{and: [[A]]}${query.template.slice(query.caret)}`.length, query.template.length + 12);
+  assert.equal(`${query.template.slice(0, query.caret)}[[A]]${query.template.slice(query.caret)}`, "{{[[query]]: {and: [[A]]}}}");
+  const todo = ROAM_COMPONENT_CATALOG.find((entry) => entry.name === "TODO");
+  assert.equal(`${todo.template.slice(0, todo.caret)} buy milk`, "{{[[TODO]]}} buy milk");
+});
+
+/** Roam renders a cell through `renderString`, which carries no block uid, so a component that reads
+ *  its own block or its children cannot work there. The rows say so rather than letting the grid
+ *  take the blame. Verified live on 2026-08-06 through that same call — see the catalog comment. */
+test("components that misbehave inside a grid cell say so in their own row", () => {
+  const described = (name) => ROAM_COMPONENT_CATALOG.find((entry) => entry.name === name).description;
+  assert.equal(described("kanban"), "Needs child bullets");
+  assert.equal(described("mermaid"), "Needs child bullets");
+  assert.equal(described("attr-table"), "Does not render in a cell");
+  assert.equal(described("word-count"), "Fails to render in a cell");
+  assert.equal(described("diagram"), "Fails to render in a cell");
+  assert.equal(described("TODO"), "Checkbox", "a component that works carries no warning it does not deserve");
+  assert.equal(described("calc"), "Inline calculation");
+});
+
+test("the component catalog filters on what was typed, prefix first, and bounds itself", () => {
+  const names = (query, limit) => roamComponentSuggestions(query, limit).map((row) => row.name);
+  assert.deepEqual(names("", 100), ROAM_COMPONENT_CATALOG.map((entry) => entry.name), "a bare {{ offers the whole catalog — there is no query to run");
+  assert.deepEqual(names("", 3), ["TODO", "DONE", "query"], "and the results setting bounds it");
+  // `e` is the discriminator: `query` comes before `embed` in the catalog and only `embed` starts
+  // with it, so catalog order alone would put `query` first. `ta` cannot tell the two rules apart.
+  assert.deepEqual(names("e", 100), ["embed", "DONE", "query", "mentions", "slider", "video", "table", "attr-table", "mermaid", "roam/render"],
+    "a name that starts with the query leads one that merely contains it, and catalog order breaks both ties");
+  assert.deepEqual(names("ta", 100), ["table", "attr-table"]);
+  assert.deepEqual(names("QUER", 100), ["query"], "matching is case-insensitive");
+  assert.deepEqual(names("todo", 100), ["TODO"]);
+  assert.deepEqual(names("  calc  ", 100), ["calc"], "a query is trimmed the same way every other trigger trims it");
+  assert.deepEqual(names("count", 100), ["word-count"]);
+  assert.deepEqual(names("roam/", 100), ["roam/render"]);
+  assert.deepEqual(names("zzz", 100), []);
+  assert.deepEqual(names("[[query]]: {and: ", 100), [], "the query typed after an accepted component matches nothing, so the menu stays shut");
+
+  const row = roamComponentSuggestions("kan", 8)[0];
+  assert.deepEqual(row, { kind: "roam-component", name: "kanban", description: "Needs child bullets", template: "{{[[kanban]]}}", caret: 14 });
+  assert.equal(roamTriggerInsertion("component", row), "{{[[kanban]]}}", "the generic insertion path returns the template unchanged");
+  assert.deepEqual(roamComponentInsertion(row), { text: "{{[[kanban]]}}", caret: 14 });
+  assert.deepEqual(roamComponentInsertion({ template: "{{x}}" }), { text: "{{x}}", caret: 5 }, "an entry with no offset parks the caret at the end rather than at zero");
+  assert.deepEqual(roamComponentInsertion({ template: "{{x}}", caret: 900 }), { text: "{{x}}", caret: 5 }, "and an offset past the template is clamped into it");
+  assert.deepEqual(roamComponentInsertion(null), { text: "", caret: 0 });
 });
 
 /**

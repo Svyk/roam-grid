@@ -913,11 +913,12 @@ test("a page name with no hits still offers to create it, inserting [[Name]] and
 
 /**
  * `#` and `#[[` reuse the page search and recents paths verbatim; only detection and insertion
- * differ. `{{` and `/` are recognised so that `[[` and `((` stop firing inside them, but they have no
- * catalog until U9 and U10 — so they must render nothing, query nothing, and leave the popover shut,
- * which is the never-empty invariant doing its job rather than a special case bolted onto it.
+ * differ. `/` is recognised so that `[[` and `((` stop firing inside it, but it has no catalog until
+ * U10 — so it must render nothing, query nothing, and leave the popover shut, which is the
+ * never-empty invariant doing its job rather than a special case bolted onto it. (`{{` was in this
+ * loop until U9 gave it one; its rows are covered by the component tests below.)
  */
-test("# and #[[ take the page path while {{ and / are recognised and answer nothing", async (t) => {
+test("# and #[[ take the page path while / is recognised and answers nothing", async (t) => {
   t.after(() => { resetRoamRecents(); settingsCache.clear(); });
   resetRoamRecents(); settingsCache.clear();
   let queries = 0; const searched = [];
@@ -944,7 +945,7 @@ test("# and #[[ take the page path while {{ and / are recognised and answer noth
   controller.onKeydown({ key: "Enter", preventDefault() {}, stopPropagation() {}, isComposing: false }); flush();
   assert.equal(editor.value, "#[[Name With Spaces]]", "#[[ replaces its own # rather than doubling it");
 
-  for (const [raw, type] of [["{{ta", "component"], ["/dat", "command"]]) {
+  for (const [raw, type] of [["/dat", "command"]]) {
     editor.value = raw; editor.setSelectionRange(raw.length, raw.length); editor.dispatch("input"); flush(); await waitForSearch();
     assert.equal(controller.referenceContext.type, type, `${raw} is recognised`);
     assert.deepEqual(controller.suggestions, [], `${raw} has no catalog yet`);
@@ -954,6 +955,78 @@ test("# and #[[ take the page path while {{ and / are recognised and answer noth
   }
   assert.equal(queries, 1, "a trigger with no catalog issues no recents query");
   assert.deepEqual(searched, ["tag", "tag-page"], "and no search either");
+  controller.dispose();
+});
+
+/**
+ * The `{{` catalog end to end, through the same controller path every other trigger uses. Two things
+ * it pins that the pure catalog tests cannot: the rows resolve with NO Roam call at all — no search,
+ * no recents, no `q` — and the caret after an accept lands where the argument is typed, which is
+ * checked by typing one and reading the finished cell rather than by reading `selectionStart`.
+ */
+test("{{ offers the component catalog with no Roam call, and accepting parks the caret inside the braces", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents(); settingsCache.clear();
+  let searches = 0; let recents = 0; let queries = 0;
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async () => { searches += 1; return []; },
+    searchRecents: async () => { recents += 1; return []; },
+  });
+  globalThis.window.roamAlphaAPI = { q: () => { queries += 1; return []; } };
+
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "{{", floating: false });
+  flush(); await waitForSearch();
+  assert.equal(controller.referenceContext.type, "component");
+  assert.deepEqual(controller.suggestions.slice(0, 3).map((row) => row.name), ["TODO", "DONE", "query"], "a bare {{ opens on the catalog");
+  assert.equal(controller.suggestions.length, 8, "bounded by the same results setting as every other menu");
+  assert.equal(controller.popover.hidden, false);
+  assert.equal(editor.getAttribute("aria-expanded"), "true");
+  assert.equal(controller.suggestionList.children[0].textContent, "TODOCheckbox");
+  assert.equal(searches + recents + queries, 0, "a static catalog asks Roam nothing");
+
+  editor.value = "{{quer"; editor.setSelectionRange(6, 6); editor.dispatch("input"); flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions.map((row) => row.name), ["query"]);
+  controller.onKeydown({ key: "Enter", preventDefault() {}, stopPropagation() {}, isComposing: false }); flush();
+  assert.equal(editor.value, "{{[[query]]: {and: }}}");
+  editor.setRangeText("[[Alpha]]", editor.selectionStart, editor.selectionEnd, "end");
+  assert.equal(editor.value, "{{[[query]]: {and: [[Alpha]]}}}", "what is typed next lands inside the braces, not after them");
+
+  editor.value = "{{tod"; editor.setSelectionRange(5, 5); editor.dispatch("input"); flush(); await waitForSearch();
+  controller.onKeydown({ key: "Enter", preventDefault() {}, stopPropagation() {}, isComposing: false }); flush();
+  assert.equal(editor.value, "{{[[TODO]]}}");
+  editor.setRangeText(" buy milk", editor.selectionStart, editor.selectionEnd, "end");
+  assert.equal(editor.value, "{{[[TODO]]}} buy milk", "a component with no argument parks the caret past its own closing braces");
+  assert.deepEqual(controller.suggestions, [], "and the menu closes on the component it just inserted");
+  assert.equal(searches + recents + queries, 0);
+
+  editor.value = "{{zzzz"; editor.setSelectionRange(6, 6); editor.dispatch("input"); flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions, [], "a name no component matches opens nothing");
+  assert.equal(controller.popover.hidden, true, "and opens no empty shell either");
+  controller.dispose();
+});
+
+test("both switches over the component catalog gate it ahead of the rows", async (t) => {
+  t.after(() => { resetRoamRecents(); settingsCache.clear(); });
+  resetRoamRecents(); settingsCache.clear();
+  const { controller, cells, flush } = makeController({ referenceSearchDelay: 0 });
+  globalThis.window.roamAlphaAPI = { q: () => [] };
+
+  settingsCache.set("editing-autocomplete-components", false);
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "{{ta", floating: false });
+  flush(); await waitForSearch();
+  assert.equal(controller.referenceContext.type, "component", "the trigger is still recognised, so [[ and (( stay suppressed inside it");
+  assert.deepEqual(controller.suggestions, [], "its own switch silences the catalog");
+  assert.equal(controller.popover.hidden, true);
+
+  settingsCache.set("editing-autocomplete-components", true);
+  editor.dispatch("input"); flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions.map((row) => row.name), ["table", "attr-table"], "and a switch moved mid-edit lands on the next keystroke");
+
+  settingsCache.set("editing-autocomplete", false);
+  editor.dispatch("input"); flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions, [], "the master switch covers the catalog too");
+  assert.equal(controller.popover.hidden, true);
   controller.dispose();
 });
 

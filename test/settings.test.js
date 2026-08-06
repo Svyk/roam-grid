@@ -61,6 +61,7 @@ const TODAYS_CONSTANTS = {
   "editing-autocomplete-limit": 8,
   "editing-autocomplete-empty-opener": true,
   "editing-autocomplete-render-rows": true,
+  "editing-autocomplete-components": true,
   "editing-capture-undo": true,
   "editing-enter-direction": "Down",
   "editing-tab-direction": "Right",

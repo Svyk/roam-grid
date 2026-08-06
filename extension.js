@@ -108,6 +108,7 @@ const SETTING_DESCRIPTORS = [
   { key: "editing-autocomplete-limit", group: "Editing", name: "Autocomplete results", description: "How many suggestions the formula and reference pickers offer.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_LIMIT, min: 1, max: 25, scope: "graph", apply: "next-op", stage: "live" },
   { key: "editing-autocomplete-empty-opener", group: "Editing", name: "Open the reference menu on a bare [[ or ((", description: "Offer recently edited pages the moment you type [[ and recently edited blocks the moment you type ((, the way Roam’s own menu does, before you have typed anything to search for. With this off the menu waits for a query.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-autocomplete-render-rows", group: "Editing", name: "Render ((block)) suggestions the way Roam does", description: "Show block suggestions as Roam renders them — page links, bold, refs — instead of the raw markdown behind them. Page, tag and create-page rows are plain text either way. Rendering pauses itself for the rest of the session if it turns out to be slow on this graph.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
+  { key: "editing-autocomplete-components", group: "Editing", name: "Complete {{components}} in cells", description: "Offer Roam's own components — TODO, query, embed, calc, video and the rest — the moment you type {{ in a cell. The list is a fixed catalog, so it costs no graph read and opens with no delay. Rows say where a component needs child bullets or does not render inside a cell at all.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-capture-undo", group: "Editing", name: "Capture grid undo history", description: "Record grid edits in the extension's own undo history so ⌘Z reverses them.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-enter-direction", group: "Editing", name: "Enter moves", description: "Where the selection lands after Enter finishes a cell edit.", control: "select", type: "enum", default: "Down", items: ["Down", "Right", "Stay"], scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-tab-direction", group: "Editing", name: "Tab moves", description: "Where the selection lands after Tab finishes a cell edit.", control: "select", type: "enum", default: "Right", items: ["Right", "Down"], scope: "graph", apply: "immediate", stage: "live" },
@@ -456,6 +457,12 @@ export function autocompleteEnabled() {
 /** True while a bare `[[` / `((` may open on recents. Read live for the same reason. */
 export function emptyOpenerEnabled() {
   return getSetting("editing-autocomplete-empty-opener") !== false;
+}
+
+/** True while a `{{` may offer the component catalog. Independent of the bare-opener switch above,
+ *  which governs a Roam READ: this catalog is static, so there is nothing to budget or debounce. */
+export function componentSuggestionsEnabled() {
+  return getSetting("editing-autocomplete-components") !== false;
 }
 
 /** Session-scoped budget switch — see RECENTS_BUDGET_MS. */
@@ -6337,9 +6344,72 @@ export function roamEditorTriggerContext(raw, caret = String(raw ?? "").length, 
  *  and a bare `#` falls back to `#[[Name]]` for any name Roam could not read unbracketed. */
 export function roamTriggerInsertion(type, suggestion) {
   if (suggestion?.kind === "roam-block") return `((${suggestion.uid}))`;
+  if (suggestion?.kind === "roam-component") return String(suggestion.template ?? "");
   const name = String(suggestion?.name ?? "");
   if (type === "tag") return BARE_TAG_NAME.test(name) ? `#${name}` : `#[[${name}]]`;
   return type === "tag-page" ? `#[[${name}]]` : `[[${name}]]`;
+}
+
+/**
+ * Roam's `{{component}}` set, as a fixed catalog. There is no search API behind `{{` — Roam's own
+ * menu is a hard-coded list too — so this needs no query, no debounce and no budget switch.
+ *
+ * `caret` is an offset INTO `template`, not into the cell, and it is the whole point of the entry:
+ * a component that takes an argument must leave the caret between the colon and the closing braces,
+ * because dropping it after `}}` makes the completion worse than typing the thing by hand. A
+ * component that takes no argument puts the caret at the end, where there is nothing left to type.
+ *
+ * The descriptions are what the live graph does, not what the docs claim. A cell renders through
+ * `renderString` (see `paintRichCellContent`), which carries a string and no block uid, so every
+ * component that reads its own block or its children degrades in a cell. Probed against Roam on
+ * 2026-08-06 through that exact call: `kanban` and `mermaid` render a "nest a bullet under here"
+ * hint, `attr-table` comes back as literal text with no component at all, `word-count` and `diagram`
+ * render a "Failed to render" button, and `roam/render` errors without a component-definition uid.
+ * Saying so costs one short line and stops the grid being blamed for Roam's own context requirement.
+ */
+export const ROAM_COMPONENT_CATALOG = [
+  { name: "TODO", template: "{{[[TODO]]}}", caret: 12, description: "Checkbox" },
+  { name: "DONE", template: "{{[[DONE]]}}", caret: 12, description: "Checked checkbox" },
+  { name: "query", template: "{{[[query]]: {and: }}}", caret: 19, description: "Query builder" },
+  { name: "embed", template: "{{[[embed]]: }}", caret: 13, description: "Embed a block or page" },
+  { name: "mentions", template: "{{[[mentions]]: }}", caret: 16, description: "Linked references" },
+  { name: "calc", template: "{{[[calc]]: }}", caret: 12, description: "Inline calculation" },
+  { name: "POMO", template: "{{[[POMO]]}}", caret: 12, description: "Pomodoro timer" },
+  { name: "slider", template: "{{[[slider]]}}", caret: 14, description: "Drag slider" },
+  { name: "video", template: "{{[[video]]: }}", caret: 13, description: "Video player" },
+  { name: "table", template: "{{[[table]]}}", caret: 13, description: "Table creator" },
+  { name: "kanban", template: "{{[[kanban]]}}", caret: 14, description: "Needs child bullets" },
+  { name: "attr-table", template: "{{[[attr-table]]}}", caret: 18, description: "Does not render in a cell" },
+  { name: "word-count", template: "{{[[word-count]]}}", caret: 18, description: "Fails to render in a cell" },
+  { name: "diagram", template: "{{[[diagram]]}}", caret: 15, description: "Fails to render in a cell" },
+  { name: "mermaid", template: "{{[[mermaid]]}}", caret: 15, description: "Needs child bullets" },
+  { name: "roam/render", template: "{{[[roam/render]]: }}", caret: 19, description: "Needs a component uid" },
+];
+
+/** The catalog filtered by what has been typed after `{{`. A name that STARTS with the query leads,
+ *  because that is what the typist is aiming at; a name that merely contains it follows. Catalog
+ *  order breaks both ties, so the everyday components stay near the top. A bare `{{` offers the
+ *  whole catalog, which costs nothing here — there is no graph read to open on. */
+export function roamComponentSuggestions(query, limit = getSetting("editing-autocomplete-limit")) {
+  const folded = String(query ?? "").trim().toLowerCase();
+  const leading = []; const trailing = [];
+  for (const entry of ROAM_COMPONENT_CATALOG) {
+    const name = entry.name.toLowerCase();
+    if (!folded) leading.push(entry);
+    else if (name.startsWith(folded)) leading.push(entry);
+    else if (name.includes(folded)) trailing.push(entry);
+  }
+  return [...leading, ...trailing]
+    .slice(0, clamp(Math.floor(Number(limit) || 8), 1, 25))
+    .map((entry) => ({ kind: "roam-component", name: entry.name, description: entry.description, template: entry.template, caret: entry.caret }));
+}
+
+/** The text a component row inserts and where the caret goes inside it, clamped so a malformed entry
+ *  can only ever land the caret inside its own template rather than out in the cell. */
+export function roamComponentInsertion(suggestion) {
+  const text = String(suggestion?.template ?? "");
+  const offset = Number.isFinite(suggestion?.caret) ? clamp(suggestion.caret, 0, text.length) : text.length;
+  return { text, caret: offset };
 }
 
 /**
@@ -6847,9 +6917,13 @@ export class GridEditorController {
     const state = this.state; const suggestion = this.suggestions[index]; const context = this.referenceContext;
     if (!state || !suggestion || !context) return;
     const page = suggestion.kind === "roam-page" || suggestion.kind === "roam-create-page";
-    const replacement = roamTriggerInsertion(context.type, suggestion);
+    // A component carries its own caret offset, so the caret lands where the argument is typed
+    // instead of past the closing braces — `"end"` would leave it after `}}` on every entry.
+    const component = suggestion.kind === "roam-component" ? roamComponentInsertion(suggestion) : null;
+    const replacement = component ? component.text : roamTriggerInsertion(context.type, suggestion);
     if (page) rememberAcceptedPage(suggestion.name);
     state.editor.setRangeText(replacement, context.startIndex, context.replaceEndIndex ?? context.endIndex, "end");
+    if (component) { const caret = context.startIndex + component.caret; state.editor.setSelectionRange(caret, caret); }
     state.referenceAutocompleteClosed = true;
     clearTimeout(this.referenceSearchTimer); this.referenceSearchToken += 1;
     this.suggestions = []; this.disposeSuggestionRows(); this.suggestionList.hidden = true; this.suggestionList.setAttribute("aria-hidden", "true");
@@ -7055,10 +7129,16 @@ export class GridEditorController {
     if (this.referenceContextKey === key && (this.referenceSearchTimer != null || this.suggestionKind === "roam-reference")) return;
     clearTimeout(this.referenceSearchTimer); const token = ++this.referenceSearchToken;
     this.referenceContext = context; this.referenceContextKey = key; this.autocompleteContext = null;
-    this.suggestions = []; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.renderSuggestionRows();
-    // `{{` and `/` are recognised so the page and block triggers stop firing inside them, but they
-    // have no catalog yet. Returning here renders nothing, which the never-empty popover invariant
-    // already handles correctly — it is an unanswerable trigger, not an empty result set.
+    // `{{` is answered from a static catalog, so it resolves right here — no debounce to wait out,
+    // no token to fence and no Roam read to budget. It is folded into the same assignment as the
+    // clear so a component context paints its rows once rather than blanking and refilling them.
+    const components = context.type === "component" && !state.referenceAutocompleteClosed && componentSuggestionsEnabled()
+      ? roamComponentSuggestions(context.query)
+      : [];
+    this.suggestions = components; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.renderSuggestionRows();
+    // `/` is recognised so the page and block triggers stop firing inside it, but it has no catalog
+    // yet. Returning here renders nothing, which the never-empty popover invariant already handles
+    // correctly — it is an unanswerable trigger, not an empty result set.
     if (!SUGGESTIBLE_EDITOR_TRIGGERS.has(context.type)) return;
     if (state.referenceAutocompleteClosed) return;
     // A bare opener takes the recents path instead of the search path. Its own switch and the
