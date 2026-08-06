@@ -1,205 +1,176 @@
 # Roam Grid
 
-Native-first advanced tables for Roam Research.
+Turn a native Roam table into a real spreadsheet — formulas, merges, sorting,
+resizing, charts, comments — without moving a single cell out of your graph.
 
-## Status
+Version 0.9.0. Your table's rows and columns stay ordinary nested Roam blocks,
+so links, `((block references))`, search, exports, and the plain Roam renderer
+keep working exactly as before. Turn Roam Grid off and the table is still there.
 
-Version 0.8.2 is a functional public-source beta and live demo. Native
-opt-in tables, safe merges, core formulas, interactions, imports/exports,
-charts, chunked large-grid persistence, the public API, and clean fallback are
-implemented. Before a public Depot release, the project still needs the full
-Thymer formula-function vocabulary, broader browser interaction automation, and
-a measured 100,000 × 26 live 50+ FPS acceptance run. See
-[Testing](docs/TESTING.md) for the exact evidence already collected.
+## Install
 
-Roam Grid enhances only the native `{{[[table]]}}` blocks you explicitly opt in.
-The original nested Roam blocks remain the source of truth, so links, references,
-search, exports, and native fallback continue to work. A separate
-`{{[[roam/grid]]}}` component provides virtualized, file-backed storage for very
-large datasets.
+**Roam Depot → Roam Grid → Install.** No account, no key, no configuration.
 
-## Install from the auto-updating URL
+## Quick start
 
-The public repository deploys a Roam-ready build to GitHub Pages after every
-push to `main`. The extension root is:
+1. Put the cursor in any native `{{[[table]]}}` block.
+2. Run **Roam Grid: Enhance this table** from the command palette.
 
-[`https://svyk.github.io/roam-grid/`](https://svyk.github.io/roam-grid/)
+That's it — the table becomes a grid. Arrow keys navigate, typing edits, `Enter`
+commits, `F2` opens the larger editor, `=` starts a formula. `Cmd/Ctrl-Z` undoes.
 
-In Roam, open **Settings → Roam Depot → Developer Extensions**, choose
-**Load extension → URL**, and paste that root URL. URL extensions auto-start on
-later Roam launches, so a pushed build does not require choosing the local
-folder again. Developer extensions remain local to each Roam client.
+To go back, run **Roam Grid: Restore native table**. Nothing about your content
+changes; only the layout notes Roam Grid kept for that table are dropped.
 
-For an immediate update after a push, wait for the GitHub Pages deployment and
-press the circular reload button beside this URL. Hover the grid-size badge to
-confirm the running version (for example, `Roam Grid v0.8.2`). Roam can reuse a
-cached remote bundle during the same app session; if the badge still shows the
-older version, remove only this developer-extension URL and add the same URL
-again. The reinstall remounts the renderer and does not alter any table blocks,
-saved templates, or `[[roam/grid/metadata]]`.
+Other commands, all under **Roam Grid:** in the palette — Save current grid as
+template · New from saved template · New large grid · Copy/convert table ·
+Import · Export · Insert chart · Merge · Unmerge · Undo · Redo · Restore
+discarded edits.
 
-The four public files at that URL are `README.md`, `extension.js`,
-`extension.css`, and `CHANGELOG.md`. `npm run build` assembles those exact files
-in `deploy/`, and GitHub Actions publishes that directory without any deploy
-keys or long-lived secrets.
+## What it writes to your graph
 
-The release workflow is: run the tests and `npm run build`, push the release
-branch, wait for the GitHub Pages workflow to complete, then reload the same URL
-entry in Depot developer mode. No reinstall or graph migration is required for
-v0.6, and a reload preserves native cell blocks, table metadata, and large-grid
-manifests.
+This is the short version of everything Roam Grid can put in your graph. There
+is nothing else.
 
-## Install for local development
+| What | Where | When |
+| --- | --- | --- |
+| Cell contents | The original Roam blocks, unchanged in structure | Whenever you edit a cell |
+| Table layout (column widths, row heights, merges, alignment, header visibility, chart specs) | Blocks on the `[[roam/grid/metadata]]` page, one per table | The page is created **on the first table you enhance**, never on install |
+| Saved templates | Blocks on the `[[roam/grid/templates]]` page | Only when you run **Save current grid as template** |
+| Comment threads | A collapsed `[[roam/comments]]` block on the **commented cell's own page**, exactly the structure Roam's own comments use | Only when you add a comment to a cell |
+| Large-grid data | JSON files in Roam's file storage, pointed at by a manifest block under the `{{[[roam/grid]]}}` block | Only for large grids you explicitly create |
+| Live range views | The `{{roam-grid-range: ((uid)) A1:D5}}` text you type into a block | Only when you paste a range reference |
 
-1. Run `npm run build` in this folder.
-2. In Roam, open **Settings → Roam Depot → Developer Extensions**.
-3. Load this folder once as a local extension.
-4. After later builds, press `Ctrl-D`, then `Ctrl-R`, or reload developer
-   extensions from the Roam Depot settings panel.
+Cell contents never leave the blocks they already live in. Layout is kept
+separately so that turning Roam Grid off leaves a normal Roam table.
 
-For continuous builds, run `npm run dev` and use the same reload shortcut after
-an edit. Roam intentionally cannot auto-start a local-folder extension after a
-full page/app reload because the browser requires a fresh user gesture for file
-access. Press `Ctrl-D`, then `Ctrl-R`, or use the URL install above. This is an
-installation-mode limitation—not lost table data or metadata.
+Locally, on your device only: two `localStorage` keys per graph —
+`roam-grid:enhanced-uids:<graph>` (which tables you enhanced, so they render
+without a flash) and `roam-grid:settings:<graph>` (the device-only settings
+below) — and, if you use large grids, an IndexedDB database named
+`roam-grid-chunks` caching downloaded chunks. None of it is data: deleting any
+of it costs speed, not content. **Settings → Roam Grid → Clear local caches**
+clears the enhanced-table list and the cached theme palette; **Forget this
+device's overrides** clears the device settings; the chunk cache is bounded by
+its own size setting and evicts itself.
 
-The extension deliberately does not use `roam/js`.
+## Privacy and network
 
-## Start
+- **No network requests.** No `fetch`, no `XMLHttpRequest`, no WebSocket, no
+  external `import`. Every read and write goes through `roamAlphaAPI`, including
+  large-grid files.
+- **No telemetry, no analytics, no error reporting.** Nothing is measured and
+  nothing is sent.
+- **No external dependencies.** One dependency-free source file, no bundler, no
+  runtime downloads.
+- **No `eval`, no `new Function`.** Formulas are parsed and evaluated by Roam
+  Grid's own expression engine, which can call only the built-in functions and
+  any functions an extension explicitly registers. Arbitrary JavaScript and
+  `=elisp:` are not supported and never will be.
+- Every database query binds its parameters; no block uid is ever concatenated
+  into a query string.
 
-- Focus an existing native table and run **Roam Grid: Enhance this table**.
-- Enhanced tables also render inside editable block references and inline
-  reference views. Every visible instance shares one table session, model,
-  persistence queue, formula cache, and undo history while retaining its own
-  selection and scroll state. The compact reference toolbar includes a source
-  button that opens the canonical table block.
-- Focus any enhanced table and run **Roam Grid: Save current grid as template**.
-  Reinsert it later with **Roam Grid: New from saved template**. Saved templates
-  keep formulas, merges, sizing, alignment, headers, charts, and visual options
-  on `[[roam/grid/templates]]`; the public extension does not ship personal
-  recipe or meal-prep data.
-- Run **Roam Grid: New large grid** to insert a file-backed grid.
-- Enhanced-table metadata is stored on `[[roam/grid/metadata]]`; cell contents
-  stay in their original Roam blocks.
-- Use the `⋯` menu → **Hide row/column labels** for a clean native-table look.
-  The choice is stored per table and can be reversed at any time.
+## Using it
 
-## Interaction
+### Editing
 
-- Arrow keys navigate. Typing, Enter, and double-click keep the fast in-cell
-  editor; F2 opens the shared floating editor and focuses its textarea at the
-  end of the current value. The same floating editor is used by enhanced native
-  tables and large grids. Enter or Tab commits, while Escape closes the active
-  suggestion list first and then cancels the edit.
-- Type `[[` followed by text to search Roam pages, or `((` to search blocks,
-  from either the in-cell or F2 editor. Arrow keys choose a result; Enter, Tab,
-  or a click inserts complete native `[[page]]` or `((block UID))` syntax
-  without moving focus. Committed references use Roam's normal rich rendering,
-  so they remain clickable and participate in the graph like ordinary table
-  block content.
-- The assistant is contextual: ordinary text never opens a menu, formulas use
-  the `fx` label and function help, and page/block completion appears only once
-  a non-empty `[[query` or `((query` has results. The editor and every menu or
-  dialog inherit the table's resolved Blueprint light/dark palette even though
-  those surfaces are mounted outside the grid.
-- Drag across cells to select a rectangle. Drag headers to reorder, any vertical
-  gridline or a selected cell's right edge to resize its column, and the
-  selected cell's bottom edge or any horizontal boundary to resize its row.
-  These grips remain available when A/B/C and row labels are hidden. On a
-  merged cell they control the merge's outermost row or column. Double-click a
-  resize edge to restore automatic sizing.
-- In fit-to-window mode, a dragged column now follows the pointer in pixels while
-  adjacent columns contract proportionally. The final proportions are persisted,
-  so the resized column stays the same after a developer-extension reload. If
-  every neighboring column is already at its minimum, dragging wider switches
-  that table to fixed-width horizontal scrolling so the requested size still wins.
-- Row heights and column widths are stored per table. Row sizes follow their
-  stable Roam row UID through sorting and reordering; both dimensions survive
-  extension reloads, native/large-grid copies, and large-grid manifest saves.
-- The `⋯` menu can set exact pixel sizes, compact selected rows to 24 px, or
-  reset selected rows/columns to automatic sizing—even when labels are hidden.
-- Selecting a cell also reveals Roam-style column and row grabbers. Their menus
-  retain the familiar header, sorting, insertion, clearing, and deletion
-  actions, then add a separate **Roam Grid** section for merges, sizing,
-  alignment, references, charts, and conversion. The menu exposes the native
-  compatibility hooks used by Live AI, whose injected table commands continue
-  to write through `window.roamGrid.v1`.
-- Selecting a rectangular range replaces the single-cell grabbers with one
-  outlined selection and a compact `rows × columns` badge. Click the badge for
-  range actions; drag the bottom-right square to fill. Choose **Copy selected
-  cells as block references** to copy a TSV-shaped matrix of live native
-  `((uid))` references. Paste it into another native or enhanced table to reuse
-  the selected range without duplicating its content. Merged anchors are copied
-  once and their covered coordinates remain blank.
-- Tables fit the available Roam pane by default, preserving saved column-width
-  ratios so every stage stays visible in a smaller window. The `⋯` menu can
-  switch back to fixed widths and horizontal scrolling when preferred.
-- The same menu applies persistent left, center, or right alignment and copies
-  either the active cell's or the whole table's native `((block reference))`.
-- A cell referenced elsewhere in the graph shows Roam's familiar superscript
-  linked-reference count beside its rendered content. Counts are batched once
-  per table session after paint and shared by source and referenced grid views,
-  so they do not enter the typing or rich-render path.
-- Formula cells use a subtle blue Blueprint-aware treatment by default. Toggle
-  **Hide formula coloring** in the table menu; the choice persists per grid.
-- Editing a formula opens a compact `fx` expression bar above the cell. Cell and
-  range references are colored in the expression and outlined with the same
-  colors in the grid. Click a cell while editing to insert its A1 reference;
-  Shift-click after a reference to extend it into a range without moving focus
-  away from the formula.
-- Formula point mode also supports an Excel-style keyboard-only flow. Type `=`,
-  use the arrow keys to choose a cell, type an operator such as `+`, then use the
-  arrows again to choose the next cell. The chosen A1 reference is inserted or
-  moved in place; Shift+Arrow extends it into a range, Enter commits, and Escape
-  cancels. Point mode promotes the draft to the floating `fx` bar so focus stays
-  stable while the grid scrolls. Arrow keys retain ordinary caret behavior when
-  the formula is not currently waiting for a reference.
-- Formula assistance suggests functions after `=` or while a function name is
-  being typed. Arrow keys choose a suggestion; Enter, Tab, or a click inserts
-  it. Signature help shows the active function and argument, including inside
-  nested calls. Press F4 with the caret on a reference to cycle
-  `A1 → $A$1 → A$1 → $A1 → A1`; both ends of a selected range lock together.
-- Inserting or deleting a row/column rewrites formulas transactionally. Relative
-  and `$`-absolute references follow structural moves, ranges expand or shrink,
-  and `#REF!` appears only when the referenced cell or complete range was
-  deleted. Inserting an item row directly above an adjacent total also expands
-  that total's range, which keeps saved calculators practical to modify. A
-  native row deletion stages only the removed row roots and updates only formula
-  blocks whose text changed; surviving row chains are left in place, and a
-  failed save attempts to restore the staged rows and formula text before
-  reporting the error. If that restoration is interrupted too, Roam Grid keeps
-  the staging block rather than deleting the recoverable row data.
-- Copy/cut/paste understands matrices and TSV/CSV text. Pasting image files
-  uploads them through Roam and stores ordinary `![](url)` markup in the cell.
-- Merged regions are one navigation stop. Partial-merge moves and destructive
-  merges are rejected with the blocking coordinates. Enhanced rendering hides
-  internal cell seams so a merge reads as one surface, while its outer-right
-  and outer-bottom edges remain available for column and row resizing.
-- Known enhanced table UIDs are hidden before Roam paints their native renderer.
-  Added-node mounting then claims canonical and referenced instances without a
-  delayed document scan, preventing the native-table flash during navigation.
-  The guard is automatically released on restore, unload, stale metadata, or a
-  failed mount so native fallback remains intact.
+Arrow keys navigate; typing, `Enter`, or a double-click opens the fast in-cell
+editor; `F2` opens the shared floating editor with the caret at the end of the
+value. `Enter` and `Tab` commit — where the selection lands afterwards is a
+setting. `Escape` closes an open suggestion list first, then cancels the edit.
 
-## Formats and charts
+`Cmd/Ctrl-Z` and `Cmd/Ctrl-Shift-Z` undo and redo inside the grid, including
+structural changes such as inserting or deleting rows. Roam Grid takes the
+keyboard only while a grid genuinely has focus and hands it straight back to
+Roam when you click into an ordinary block.
 
-CSV, TSV, Markdown, Org, reStructuredText, Roam Grid JSON, and the documented
-grid-table v1/v2 interchange shapes are supported. Deterministic SVG charts
-include bar, column, line, multiline, scatter, histogram, boxplot, density,
-count, and sparklines.
+Type `[[` or `((` in any cell editor to search pages or blocks; the picker
+inserts real `[[page]]` and `((uid))` syntax, so the reference behaves like any
+other Roam reference. Copy, cut, and paste understand rectangular ranges and
+TSV/CSV text. Pasted images upload through Roam and become ordinary `![](url)`
+markup.
+
+### Formulas
+
+`=SUM(A1:A10)` and friends. Function autocomplete appears after `=`, signature
+help shows the active argument including inside nested calls, and `F4` cycles
+`A1 → $A$1 → A$1 → $A1`. Click or arrow to a cell while editing to insert its
+reference; `Shift` extends it to a range. Inserting or deleting rows and columns
+rewrites every affected formula in the same transaction — ranges grow and
+shrink, and `#REF!` appears only when the target really was deleted.
+
+### Layout
+
+Drag headers to reorder, gridlines to resize, the selection's corner to fill.
+Merge a rectangle into one cell; covered cells must be empty and stay empty, and
+a merge is one navigation stop. Set exact pixel sizes, compact rows, or reset to
+automatic sizing from the `⋯` menu. Hide the A/B/C and 1/2/3 headers for a table
+that still looks native. Tables fit their block width by default and can be
+switched to fixed widths with horizontal scrolling.
+
+### Comments
+
+Hold `Cmd`/`Ctrl` and hover a cell to reveal a 💬; click it (or press
+`Cmd/Ctrl-Alt-=`) to start a comment thread on that cell. Threads are **real
+Roam comment threads** — the same `[[roam/comments]]` structure Roam writes
+itself, on the cell's own page — so they appear in Roam's own comment UI and
+survive uninstalling this extension. Commented cells get their own badge, kept
+separate from the linked-reference count so neither number is inflated.
+
+### Live range references
+
+Paste `{{roam-grid-range: ((tableUid)) B2:D5}}` into any block to embed a
+read-only, live view of part of another grid. It follows the source as the
+source changes and can never write back to it. Because the `((uid))` is a real
+reference, every live view shows up in the source table's linked references.
+
+### Charts and formats
+
+Deterministic SVG charts: bar, column, line, multiline, scatter, histogram,
+boxplot, density, count, and sparklines. Import and export CSV, TSV, Markdown,
+Org, reStructuredText, and Roam Grid JSON.
+
+### Large grids
+
+Run **Roam Grid: New large grid** for datasets too big to keep as blocks. Rows
+and columns are virtualized and stored as immutable JSON chunk files in Roam's
+file storage. Each chunk carries a SHA-256 digest that is verified before the
+data is trusted, chunks are cached on your device, and two people editing
+different parts of the same large grid are merged rather than refused.
+
+## Where grids appear
+
+An enhanced table renders in the main pane, in linked references, inside block
+references and inline reference views, in the right sidebar, and inside block
+embeds. Every visible copy shares one model and one undo history while keeping
+its own selection and scroll position. Grids inside hover previews and other
+popovers render too, but are strictly read-only — a surface that disappears on
+mouse-out is not a safe place to edit.
+
+## Settings
+
+**Settings → Roam Depot → Roam Grid.** Thirty-five controls in seven groups —
+Writes, Editing, Appearance, Sizing, New grids, Large grids, Comments — plus
+four maintenance actions: apply display defaults to open grids, forget this
+device's overrides, clear local caches, and reset every setting.
+
+Most settings sync with your graph. Presentation choices that are properly
+per-device — toolbar density, theme, maximum grid width, large-grid overscan,
+chunk cache size, and whether comment threads open in the right sidebar — are
+stored on the device instead.
+
+Two settings deserve a note. **Capture grid undo history** (on) is what makes
+`Cmd/Ctrl-Z` reverse grid edits. **Permanently delete superseded large-grid
+files** is **off** by default and is irreversible when on; it deletes only chunk
+and manifest files that no revision still references, only on grids nothing has
+saved for an hour, and only once a file has been superseded for seven days.
 
 ## Public API
 
-`window.roamGrid.v1` exposes disposable registration methods for safe formula
-functions, renderers/editors, importers/exporters, data sources, and reusable
-templates, plus `listTemplates`, `saveTemplate`, `createFromTemplate`,
-`getTableModel`, and transactional `applyPatch`. Registered templates live only
-for the current extension session; `saveTemplate` writes a reusable graph-owned
-copy to `[[roam/grid/templates]]`. Cell editors return an input or
-textarea-like element whose `value` is committed through the normal transaction
-path. Registered formula functions
-receive evaluated values only; arbitrary JavaScript or `=elisp:` execution is
-never allowed.
+`window.roamGrid.v1` lets other extensions register formula functions,
+renderers, editors, importers, exporters, data sources, and templates, and
+exposes `listTemplates`, `saveTemplate`, `createFromTemplate`, `getTableModel`,
+and transactional `applyPatch`. Every registration returns a disposer.
 
 ```js
 const dispose = window.roamGrid.v1.registerTemplate("MY_MEAL", () => ({
@@ -209,12 +180,6 @@ const dispose = window.roamGrid.v1.registerTemplate("MY_MEAL", () => ({
 await window.roamGrid.v1.createFromTemplate("MY_MEAL");
 dispose();
 ```
-
-Formula functions can optionally provide metadata for autocomplete and
-signature help. Existing two-argument registrations remain compatible. Built-in
-functions are known to be non-volatile; third-party functions default to
-`volatile: true` so dependency invalidation stays safe. Calling the returned
-disposer removes both the implementation and its assistant metadata.
 
 ```js
 const disposeFormula = window.roamGrid.v1.registerFormulaFunction(
@@ -230,46 +195,32 @@ const disposeFormula = window.roamGrid.v1.registerFormulaFunction(
 disposeFormula();
 ```
 
-Plain values are painted synchronously into stable cell-content elements, so a
-commit is visible without an empty frame. Roam's richer renderer is reserved for
-page links, block references, images, embeds, and other detected rich content.
-Formula and reverse-dependency caches repaint only changed results and their
-transitive dependents. Rich-rendered hosts remain connected during structural
-grid swaps and are explicitly unmounted before a native or virtualized surface
-is discarded.
+Registered formula functions receive evaluated values only. Session
+registrations last for the current extension session; `saveTemplate` writes a
+reusable copy to `[[roam/grid/templates]]`. Third-party functions default to
+`volatile: true` so dependency invalidation stays safe.
 
-Blueprint compatibility is extension-owned. Each table samples the actual host
-palette once, stores it in scoped `--rg-*` tokens, and reuses that palette for
-body-mounted editors and menus without forcing a style read during route
-mounting. Runtime theme changes are frame-coalesced; no global Blueprint rule or
-personal `roam/css` patch is required.
+The native column and row menus expose the compatibility hooks used by Live AI,
+whose injected table commands write through `window.roamGrid.v1`.
 
-Ordinary edits travel through a coalesced content-only persistence lane: only
-dirty cell blocks are validated and updated, matching pull-watch events from the
-extension's own writes are consumed, and layout metadata is not rewritten.
-Non-conflicting external cell edits are merged; a same-cell or structural
-conflict uses the full repull/rollback path. Structural operations continue to
-use the serialized full reconciliation path.
+## Known limitations
 
-## Showcase
+- Large-grid cells are JSON rows, not Roam blocks, so they have no block uid:
+  comments, block references, and reference counts are native-table features
+  only. Use **Copy/convert table** to get a native copy.
+- Grids in hover previews are read-only by design.
+- Formula coverage is broad but not exhaustive; unknown functions evaluate to an
+  error value rather than failing the grid.
+- A cell whose content Roam renders richly (page links, block references,
+  images, embeds) is painted by Roam's own renderer, so it inherits Roam's
+  rendering behaviour for that content.
 
-The development smoke page `[[roam-grid/dev]]` contains a merged-cell brownie
-workflow based on [King Arthur Baking's Fudge Brownies](https://www.kingarthurbaking.com/recipes/fudge-brownies-recipe).
-It demonstrates hidden labels, full-width preparation bands, multi-row action
-stages, source links, and safe empty covered cells without modifying any of the
-graph's existing native tables.
+## License
 
-## Safety
-
-- Merging never overwrites covered content.
-- Covered coordinates are semantically empty in formulas and flat exports.
-- Structural writes are serialized and refresh from Roam after a failed write.
-- Arbitrary JavaScript formulas are not supported.
-
-Roam Grid is an independent MIT implementation. The GPL-licensed
+MIT. Roam Grid is an independent MIT implementation. The GPL-licensed
 [`yibie/grid-table`](https://github.com/yibie/grid-table) project is used only as
 a behavioral reference; no source code is copied.
 
-See [Architecture](docs/ARCHITECTURE.md), [Testing](docs/TESTING.md), and the
-[Live AI compatibility adapter](docs/LIVE_AI.md) for the persistence contracts,
-verification matrix, and integration details.
+Developers: see [Architecture](docs/ARCHITECTURE.md),
+[Development](docs/DEVELOPMENT.md), [Testing](docs/TESTING.md), and the
+[Live AI compatibility adapter](docs/LIVE_AI.md).

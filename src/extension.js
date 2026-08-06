@@ -1,4 +1,4 @@
-const VERSION = "0.8.2";
+const VERSION = "0.9.0";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const RANGE_COMPONENT_NAME = "roam-grid-range";

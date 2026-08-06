@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.9.0
+
+The first release intended for Roam Depot. Nothing about the storage model
+changed: your cells are still ordinary Roam blocks, and uninstalling still
+leaves a working native table.
+
+### New capabilities that touch your graph
+
+- **Comments on cells.** Hold `Cmd`/`Ctrl` and hover a cell for a 💬, or press
+  `Cmd/Ctrl-Alt-=`. A comment is a **real Roam comment thread** — the same
+  `[[roam/comments]]` structure Roam writes itself, placed on the commented
+  cell's own page — so it shows up in Roam's own comment UI and outlives this
+  extension. Nothing is written until you actually add a comment. Commented
+  cells get their own badge; the linked-reference count now subtracts comment
+  anchors, so neither number is inflated any more (they were, in 0.8.2).
+- **Live range references.** Paste `{{roam-grid-range: ((tableUid)) A1:D5}}` into
+  a block and it renders a read-only mini-grid that follows the source. The
+  `((uid))` is a real reference, so every live view appears in the source
+  table's linked references. A range view can never write to its source.
+- **Large-grid storage v2.** Rows now carry stable ids, every chunk file carries
+  a SHA-256 digest that is checked before the data is trusted, uploads run in
+  parallel, and two people editing different parts of the same large grid are
+  merged instead of one being refused. New: an optional, **off by default**,
+  clearly irreversible cleanup that deletes chunk and manifest files no revision
+  still references — only on grids untouched for an hour, and only once a file
+  has been superseded for seven days.
+
+### Fixes that prevented data loss
+
+- **Undo now survives the write path.** Grid `Cmd/Ctrl-Z` used to be invalidated
+  by Roam echoing back the extension's own writes, by Roam minting a different
+  block uid than the one requested, and by a session being disposed on idle. All
+  three are handled: echoes are absorbed, entries are remapped, and a table's
+  history is recovered when you return to it. Structural operations undo as one
+  step. Keyboard ownership is now explicit — `Cmd/Ctrl-Z` falls through to Roam
+  the moment a grid is not genuinely in control, instead of being guessed at.
+- **Read-only surfaces are now genuinely read-only.** A grid rendered inside a
+  hover preview shares the real table's data. Editing one — clicking a cell in
+  the popover and pressing Delete, using the fill handle, or using a context
+  menu — could permanently overwrite the source blocks. Preview grids can no
+  longer take the keyboard or reach the write path at all.
+- **Grids inside hover previews render again.** Blueprint mounts popovers
+  outside the area the extension was watching, so an enhanced table in a hover
+  preview was hidden but never claimed — it appeared as blank space. Previews,
+  block embeds, and the right sidebar are all claimed now.
+- **The right table wins.** When enhanced tables were nested, the extension
+  could resolve to the wrong one depending on internal map ordering; it now
+  always picks the nearest enclosing table.
+- **Edits discarded by a conflict reload can be recovered.** When someone else
+  changes a table and the grid reloads it, your unsaved edits used to vanish
+  silently. You are now offered a Restore action, and **Roam Grid: Restore
+  discarded edits** stays in the command palette either way. Restore refuses to
+  resurrect a block the other change deleted.
+- **A keystroke landing mid-save is no longer lost.** In large grids, an edit
+  made while a save was in flight was wiped when that save finished.
+
+### Settings
+
+A real settings panel at **Settings → Roam Depot → Roam Grid**: 35 controls in
+seven groups (Writes, Editing, Appearance, Sizing, New grids, Large grids,
+Comments) plus four maintenance actions — apply display defaults to open grids,
+forget this device's overrides, clear local caches, and reset everything.
+Presentation choices that are properly per-device (toolbar, theme, maximum
+width, overscan, chunk cache size) are stored per device; the rest sync with
+your graph.
+
+### Notes for review
+
+- **No graph writes on install.** `[[roam/grid/metadata]]` is created on the
+  first table you enhance, not during load. This changed in this release.
+- **Local storage on your device only:** two `localStorage` keys per graph
+  (`roam-grid:enhanced-uids:<graph>`, `roam-grid:settings:<graph>`) and, for
+  large grids, an IndexedDB database named `roam-grid-chunks` that caches
+  downloaded chunks under a size limit you set. The maintenance actions clear
+  the first two; nothing in the graph changes either way.
+- **Still no network, no telemetry, no dependencies, no `eval`.** There is no
+  `fetch`, `XMLHttpRequest`, `WebSocket`, or external `import` anywhere in the
+  source; all file transfer goes through `roamAlphaAPI`. Every database query
+  binds its parameters — no block uid is concatenated into a query string.
+- **Full teardown.** `onunload` removes every command, listener, observer, pull
+  watch, timer, dialog, style guard, and the public API, and restores the native
+  Roam renderer.
+- Formula evaluation still cannot run arbitrary JavaScript. Registered functions
+  receive evaluated values only; `=elisp:` is not supported.
+- Removed a dead persistence path that could write without an owning session.
+
 ## 0.8.2
 
 - Replaced the hidden-native-count bridge with a view-local inline references
