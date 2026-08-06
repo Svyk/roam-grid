@@ -3589,11 +3589,11 @@ function rawRows(model) {
   return model.rows.map((row) => row.map((cell) => cell.raw));
 }
 
-function rowHeightsForManifest(model) {
+function rowHeightsForManifest(model, chunkRows, revision) {
   const rowHeights = {};
   for (let row = 0; row < model.rowCount; row += 1) {
     const height = model.getRowHeight(row);
-    if (height != null) rowHeights[row] = height;
+    if (height != null) rowHeights[deriveRowId(revision, Math.floor(row / chunkRows), row % chunkRows)] = height;
   }
   return rowHeights;
 }
@@ -3606,11 +3606,11 @@ function applyManifestRowHeights(model, rowHeights = {}) {
   return model;
 }
 
-function alignmentsForManifest(model) {
+function alignmentsForManifest(model, chunkRows, revision) {
   const alignments = {};
   for (let row = 0; row < model.rowCount; row += 1) for (let col = 0; col < model.colCount; col += 1) {
     const value = model.alignments[model.getCell(row, col).uid];
-    if (value) alignments[`${row}:${col}`] = value;
+    if (value) alignments[alignmentKey(deriveRowId(revision, Math.floor(row / chunkRows), row % chunkRows), model.columnIds[col])] = value;
   }
   return alignments;
 }
@@ -3635,6 +3635,96 @@ export function chunkRowsFor(manifest) {
   return Number.isInteger(value) && value > 0 ? value : CHUNK_ROWS;
 }
 
+/**
+ * Row ids are *derived* from position, never minted: two clients that migrate the same v1 manifest
+ * independently produce byte-identical ids without exchanging anything, which is what lets a later
+ * disjoint-chunk merge trust that their per-row state describes the same rows. A chunk is therefore
+ * never uploaded just to carry ids — they ride along the next time its cells change, and until then
+ * every reader re-derives them.
+ */
+export function deriveRowId(revision, chunkIndex, localIndex) { return `r_${revision}_${chunkIndex}_${localIndex}`; }
+
+export function parseRowId(rowId, revision) {
+  const prefix = `r_${revision}_`;
+  if (typeof rowId !== "string" || !rowId.startsWith(prefix)) return null;
+  const tail = rowId.slice(prefix.length);
+  const split = tail.lastIndexOf("_");
+  if (split <= 0) return null;
+  const chunk = Number(tail.slice(0, split));
+  const local = Number(tail.slice(split + 1));
+  if (!Number.isInteger(chunk) || chunk < 0 || !Number.isInteger(local) || local < 0) return null;
+  return { chunk, local };
+}
+
+/**
+ * A stored id wins at every position it covers and the rest are derived, so a chunk that has never
+ * been rewritten still resolves and a chunk whose rows moved keeps the ids its rows carried.
+ */
+export function synthesizeChunkRowIds(chunk, revision, length = chunk?.rows?.length ?? 0) {
+  const stored = Array.isArray(chunk?.rowIds) ? chunk.rowIds : [];
+  const index = Number.isInteger(chunk?.index) ? chunk.index : 0;
+  return Array.from({ length }, (_, local) => (typeof stored[local] === "string" && stored[local] ? stored[local] : deriveRowId(revision, index, local)));
+}
+
+export function alignmentKey(rowId, columnId) { return `${rowId}::${columnId}`; }
+
+export function splitAlignmentKey(key) {
+  const split = String(key).lastIndexOf("::");
+  return split <= 0 ? null : { rowId: String(key).slice(0, split), columnId: String(key).slice(split + 2) };
+}
+
+/** The id namespace is pinned once and carried forward, so a later revision never re-derives ids. */
+export function rowIdRevisionFor(manifest) {
+  for (const candidate of [manifest?.rowIdRevision, manifest?.revision]) if (typeof candidate === "string" && candidate) return candidate;
+  return "v1";
+}
+
+/**
+ * v1 keyed `rowHeights` by array index and `alignments` by `"row:col"` — rule-10 positional state
+ * that a single row insert silently reassigns to whichever row slides into the vacated index. v2
+ * keys both by stable id and keeps the original maps verbatim as `*ByIndex`, so nothing is lost and
+ * the migration is a pure function of the v1 manifest.
+ */
+export function migrateManifestToV2(manifest) {
+  const chunkRows = chunkRowsFor(manifest);
+  const revision = rowIdRevisionFor(manifest);
+  const columnIds = Array.isArray(manifest.columnIds) ? manifest.columnIds : [];
+  const rowHeightsByIndex = { ...manifest.rowHeightsByIndex, ...manifest.rowHeights };
+  const alignmentsByIndex = { ...manifest.alignmentsByIndex, ...manifest.alignments };
+  const idFor = (row) => deriveRowId(revision, Math.floor(row / chunkRows), row % chunkRows);
+  const rowHeights = {};
+  for (const [key, value] of Object.entries(rowHeightsByIndex)) {
+    const row = Number(key);
+    if (Number.isInteger(row) && row >= 0) rowHeights[idFor(row)] = value;
+  }
+  const alignments = {};
+  for (const [key, value] of Object.entries(alignmentsByIndex)) {
+    const [row, col] = String(key).split(":").map(Number);
+    if (!Number.isInteger(row) || row < 0 || !Number.isInteger(col) || col < 0 || !columnIds[col]) continue;
+    alignments[alignmentKey(idFor(row), columnIds[col])] = value;
+  }
+  return { ...manifest, version: 2, chunkRows, rowIdRevision: revision, rowHeights, rowHeightsByIndex, alignments, alignmentsByIndex };
+}
+
+/**
+ * Accepts v1 and v2 and always hands back v2. Migration happens in memory only — the upgraded
+ * manifest is written the next time something is actually saved, so opening a v1 grid read-only
+ * rewrites nothing and loses nothing.
+ */
+export function normalizeManifest(manifest) {
+  if (!manifest || manifest.schema !== "roam-grid/manifest" || (manifest.version !== 1 && manifest.version !== 2) || !Number.isInteger(manifest.rowCount) || !Number.isInteger(manifest.colCount) || !Array.isArray(manifest.chunks)) throw new GridError("UNSUPPORTED_SCHEMA", "Unsupported or malformed large-grid manifest");
+  const normalized = manifest.version === 2 ? { ...manifest } : migrateManifestToV2(manifest);
+  normalized.widths ||= {};
+  normalized.rowHeights ||= {};
+  normalized.alignments ||= {};
+  normalized.rowHeightsByIndex ||= {};
+  normalized.alignmentsByIndex ||= {};
+  normalized.chunkRows = chunkRowsFor(normalized);
+  normalized.rowIdRevision = rowIdRevisionFor(normalized);
+  normalized.colorFormulaCells = normalized.colorFormulaCells !== false;
+  return normalized;
+}
+
 export class LargeGridStore {
   constructor(anchorUid, pointerUid = null) {
     this.anchorUid = anchorUid;
@@ -3642,8 +3732,11 @@ export class LargeGridStore {
     this.manifestUrl = null;
     this.manifest = null;
     this.cache = new Map();
+    this.rowIds = new Map();
+    this.rowIndexById = new Map();
     this.dirty = new Set();
     this.metadataDirty = false;
+    this.metricsVersion = 0;
     this.disposed = false;
     this.queue = new MutationQueue();
   }
@@ -3656,8 +3749,8 @@ export class LargeGridStore {
     if (pointer) {
       this.pointerUid = pointer.uid;
       this.manifestUrl = extractUrl(pointer.string.slice(MANIFEST_PREFIX.length));
-      this.manifest = await downloadJson(this.manifestUrl);
-      this.validateManifest(this.manifest);
+      this.manifest = normalizeManifest(await downloadJson(this.manifestUrl));
+      this.metricsVersion += 1;
       return this;
     }
     if (!model) {
@@ -3670,15 +3763,6 @@ export class LargeGridStore {
     return this;
   }
 
-  validateManifest(manifest) {
-    if (!manifest || manifest.schema !== "roam-grid/manifest" || manifest.version !== 1 || !Number.isInteger(manifest.rowCount) || !Number.isInteger(manifest.colCount) || !Array.isArray(manifest.chunks)) throw new GridError("UNSUPPORTED_SCHEMA", "Unsupported or malformed large-grid manifest");
-    manifest.widths ||= {};
-    manifest.rowHeights ||= {};
-    manifest.alignments ||= {};
-    manifest.chunkRows = chunkRowsFor(manifest);
-    manifest.colorFormulaCells = manifest.colorFormulaCells !== false;
-  }
-
   async seed(model) {
     const rows = rawRows(model);
     const chunkSize = this.manifest ? chunkRowsFor(this.manifest) : chunkRowsFor({ chunkRows: getSetting("large-chunk-rows") });
@@ -3688,20 +3772,69 @@ export class LargeGridStore {
       const url = await uploadJson({ schema: "roam-grid/chunk", version: 1, index, startRow: start, rows: chunkRows }, `roam-grid-${this.anchorUid}-${index}.json`);
       chunks.push({ index, startRow: start, rowCount: chunkRows.length, url });
     }
+    // A fresh grid is born in the id namespace of its own first revision, and the chunks carry no
+    // ids: every reader derives the same ones from position until a row actually moves.
+    const revision = cryptoId();
     const manifest = {
-      schema: "roam-grid/manifest", version: 1, revision: cryptoId(), previous: null, createdAt: new Date().toISOString(),
-      rowCount: model.rowCount, colCount: model.colCount, chunkRows: chunkSize, columnIds: model.columnIds, widths: model.widths, rowHeights: rowHeightsForManifest(model), alignments: alignmentsForManifest(model),
+      schema: "roam-grid/manifest", version: 2, revision, rowIdRevision: revision, previous: null, createdAt: new Date().toISOString(),
+      rowCount: model.rowCount, colCount: model.colCount, chunkRows: chunkSize, columnIds: model.columnIds, widths: model.widths,
+      rowHeights: rowHeightsForManifest(model, chunkSize, revision), rowHeightsByIndex: {}, alignments: alignmentsForManifest(model, chunkSize, revision), alignmentsByIndex: {},
       frozenRows: model.frozenRows, frozenCols: model.frozenCols, merges: model.merges, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, colorFormulaCells: model.colorFormulaCells !== false, chunks, retained: [],
     };
     const url = await uploadJson(manifest, `roam-grid-${this.anchorUid}-manifest.json`);
-    const verified = await downloadJson(url);
-    this.validateManifest(verified);
+    const verified = normalizeManifest(await downloadJson(url));
     await updateBlock(this.pointerUid, `${MANIFEST_PREFIX} ${url}`);
     this.manifestUrl = url;
     this.manifest = verified;
+    this.metricsVersion += 1;
   }
 
   chunkIndexForRow(row) { return Math.floor(row / chunkRowsFor(this.manifest)); }
+
+  /**
+   * Ids are synthesized when a chunk is read and re-synthesized whenever its rows move, so a row
+   * carries its height and alignment across an insert instead of handing them to whoever slides into
+   * its old index. They are attached to the cached chunk, so a chunk that is uploaded because its
+   * cells changed makes them durable — nothing is ever uploaded just to add them.
+   */
+  syncRowIds(index, chunk = this.cache.get(index)) {
+    if (!chunk) return [];
+    const ids = synthesizeChunkRowIds(chunk, rowIdRevisionFor(this.manifest), chunk.rows.length);
+    chunk.rowIds = ids;
+    this.rowIds.set(index, ids);
+    const chunkRows = chunkRowsFor(this.manifest);
+    for (const [id, row] of this.rowIndexById) if (Math.floor(row / chunkRows) === index) this.rowIndexById.delete(id);
+    ids.forEach((id, local) => this.rowIndexById.set(id, index * chunkRows + local));
+    this.metricsVersion += 1;
+    return ids;
+  }
+
+  rowIdAt(row) {
+    const chunkRows = chunkRowsFor(this.manifest);
+    const index = Math.floor(row / chunkRows);
+    const local = row - index * chunkRows;
+    return this.rowIds.get(index)?.[local] ?? deriveRowId(rowIdRevisionFor(this.manifest), index, local);
+  }
+
+  /**
+   * `*ByIndex` is only trustworthy for a row still sitting where its id was derived. Once a row
+   * moves, its state travelled with its id and the legacy index describes a different row entirely.
+   */
+  unmovedRowId(row) {
+    const chunkRows = chunkRowsFor(this.manifest);
+    const index = Math.floor(row / chunkRows);
+    const derived = deriveRowId(rowIdRevisionFor(this.manifest), index, row - index * chunkRows);
+    return this.rowIdAt(row) === derived ? derived : null;
+  }
+
+  rowIndexForRowId(rowId) {
+    const known = this.rowIndexById.get(rowId);
+    if (known != null) return known;
+    const parsed = parseRowId(rowId, rowIdRevisionFor(this.manifest));
+    if (!parsed || this.rowIds.has(parsed.chunk)) return null;
+    const row = parsed.chunk * chunkRowsFor(this.manifest) + parsed.local;
+    return row < this.manifest.rowCount ? row : null;
+  }
 
   async loadChunk(index) {
     if (this.cache.has(index)) return this.cache.get(index);
@@ -3709,24 +3842,36 @@ export class LargeGridStore {
     if (!descriptor) {
       const empty = { schema: "roam-grid/chunk", version: 1, index, startRow: index * chunkRowsFor(this.manifest), rows: [] };
       this.cache.set(index, empty);
+      this.syncRowIds(index, empty);
       return empty;
     }
     const chunk = await downloadJson(descriptor.url);
     if (chunk.schema !== "roam-grid/chunk" || chunk.version !== 1 || chunk.index !== index || !Array.isArray(chunk.rows)) throw new GridError("CHUNK_CORRUPT", `Large-grid chunk ${index} is malformed`);
     if (this.disposed) return chunk;
     this.cache.set(index, chunk);
+    this.syncRowIds(index, chunk);
     return chunk;
   }
 
-  async getRows(start, end) {
-    const first = this.chunkIndexForRow(start);
-    const last = this.chunkIndexForRow(Math.max(start, end - 1));
+  async ensureRows(start, end) {
+    const limit = Math.min(end, this.manifest.rowCount);
+    if (limit <= start) return;
+    const first = this.chunkIndexForRow(Math.max(0, start));
+    const last = this.chunkIndexForRow(limit - 1);
     await Promise.all(Array.from({ length: last - first + 1 }, (_, offset) => this.loadChunk(first + offset)));
+  }
+
+  /** Synchronous read of an already-resident row, so a render pass never materializes a matrix. */
+  peekRaw(row, col) {
+    if (row < 0 || col < 0 || row >= this.manifest.rowCount || col >= this.manifest.colCount) return "";
+    const chunk = this.cache.get(this.chunkIndexForRow(row));
+    return chunk?.rows[row - chunk.startRow]?.[col] ?? "";
+  }
+
+  async getRows(start, end) {
+    await this.ensureRows(start, end);
     const rows = [];
-    for (let row = start; row < Math.min(end, this.manifest.rowCount); row += 1) {
-      const chunk = this.cache.get(this.chunkIndexForRow(row));
-      rows.push(Array.from({ length: this.manifest.colCount }, (_, col) => chunk.rows[row - chunk.startRow]?.[col] ?? ""));
-    }
+    for (let row = start; row < Math.min(end, this.manifest.rowCount); row += 1) rows.push(Array.from({ length: this.manifest.colCount }, (_, col) => this.peekRaw(row, col)));
     return rows;
   }
 
@@ -3737,28 +3882,71 @@ export class LargeGridStore {
   }
 
   ensureSize(rowCount, colCount) {
-    if (rowCount > this.manifest.rowCount) { this.manifest.rowCount = rowCount; this.metadataDirty = true; }
+    if (rowCount > this.manifest.rowCount) { this.manifest.rowCount = rowCount; this.metadataDirty = true; this.metricsVersion += 1; }
     if (colCount > this.manifest.colCount) {
       for (let col = this.manifest.colCount; col < colCount; col += 1) this.manifest.columnIds.push(makeLocalUid());
-      this.manifest.colCount = colCount; this.metadataDirty = true;
+      this.manifest.colCount = colCount; this.metadataDirty = true; this.metricsVersion += 1;
     }
   }
 
+  rowHeightRaw(row) {
+    const byId = this.manifest.rowHeights?.[this.rowIdAt(row)];
+    if (byId != null) return byId;
+    return this.unmovedRowId(row) ? this.manifest.rowHeightsByIndex?.[row] : undefined;
+  }
+
   rowHeight(row) {
-    const value = Number(this.manifest.rowHeights?.[row]);
+    const value = Number(this.rowHeightRaw(row));
     return Number.isFinite(value) ? clamp(Math.round(value), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height")) : getSetting("sizing-default-row-height");
   }
 
   setRowHeight(row, height) {
     if (!Number.isInteger(row) || row < 0 || row >= this.manifest.rowCount) throw new GridError("OUT_OF_BOUNDS", `Row ${row + 1} is outside the grid`);
     this.manifest.rowHeights ||= {};
-    if (height == null || height === "") delete this.manifest.rowHeights[row];
+    this.manifest.rowHeightsByIndex ||= {};
+    const id = this.rowIdAt(row);
+    // The legacy entry has to go with the write, or clearing a height would let the index-keyed
+    // fallback resurrect the value the user just removed.
+    delete this.manifest.rowHeightsByIndex[row];
+    if (height == null || height === "") delete this.manifest.rowHeights[id];
     else {
       const value = Number(height);
       if (!Number.isFinite(value)) throw new GridError("ROW_HEIGHT", "Row height must be a number");
-      this.manifest.rowHeights[row] = clamp(Math.round(value), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height"));
+      this.manifest.rowHeights[id] = clamp(Math.round(value), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height"));
     }
     this.metadataDirty = true;
+    this.metricsVersion += 1;
+  }
+
+  /** The v1 shape on demand, for the two paths that rebuild a native `GridModel` from a manifest. */
+  rowHeightIndexMap() {
+    const out = {};
+    for (const [id, value] of Object.entries(this.manifest.rowHeights || {})) {
+      const row = this.rowIndexForRowId(id);
+      if (row != null) out[row] = value;
+    }
+    for (const [key, value] of Object.entries(this.manifest.rowHeightsByIndex || {})) {
+      const row = Number(key);
+      if (Number.isInteger(row) && row >= 0 && !(row in out) && this.unmovedRowId(row)) out[row] = value;
+    }
+    return out;
+  }
+
+  alignmentIndexMap() {
+    const columns = new Map((this.manifest.columnIds || []).map((id, col) => [id, col]));
+    const out = {};
+    for (const [key, value] of Object.entries(this.manifest.alignments || {})) {
+      const parts = splitAlignmentKey(key);
+      if (!parts) continue;
+      const row = this.rowIndexForRowId(parts.rowId);
+      const col = columns.get(parts.columnId);
+      if (row != null && col != null) out[`${row}:${col}`] = value;
+    }
+    for (const [key, value] of Object.entries(this.manifest.alignmentsByIndex || {})) {
+      const [row, col] = String(key).split(":").map(Number);
+      if (Number.isInteger(row) && row >= 0 && Number.isInteger(col) && col >= 0 && !(key in out) && this.unmovedRowId(row)) out[key] = value;
+    }
+    return out;
   }
 
   setColumnWidth(col, width) {
@@ -3774,14 +3962,27 @@ export class LargeGridStore {
     this.metadataDirty = true;
   }
 
-  getAlignment(row, col) { return this.manifest.alignments?.[`${row}:${col}`] || null; }
+  getAlignment(row, col) {
+    const columnId = this.manifest.columnIds[col];
+    const byId = columnId ? this.manifest.alignments?.[alignmentKey(this.rowIdAt(row), columnId)] : null;
+    if (byId) return byId;
+    return (this.unmovedRowId(row) ? this.manifest.alignmentsByIndex?.[`${row}:${col}`] : null) || null;
+  }
 
   setAlignment(row, col, alignment) {
     if (row < 0 || col < 0 || row >= this.manifest.rowCount || col >= this.manifest.colCount) throw new GridError("OUT_OF_BOUNDS", `Cell ${cellLabel(row, col)} is outside the grid`);
-    const merge = this.mergeAt(row, col); const anchorRow = merge?.row ?? row; const anchorCol = merge?.col ?? col; const key = `${anchorRow}:${anchorCol}`;
+    const merge = this.mergeAt(row, col); const anchorRow = merge?.row ?? row; const anchorCol = merge?.col ?? col; const indexKey = `${anchorRow}:${anchorCol}`;
+    const columnId = this.manifest.columnIds[anchorCol];
+    const key = columnId ? alignmentKey(this.rowIdAt(anchorRow), columnId) : null;
     this.manifest.alignments ||= {};
-    if (alignment == null || alignment === "auto") delete this.manifest.alignments[key];
-    else if (["left", "center", "right"].includes(alignment)) this.manifest.alignments[key] = alignment;
+    this.manifest.alignmentsByIndex ||= {};
+    if (alignment == null || alignment === "auto") { if (key) delete this.manifest.alignments[key]; delete this.manifest.alignmentsByIndex[indexKey]; }
+    else if (["left", "center", "right"].includes(alignment)) {
+      // A manifest whose `columnIds` is short of `colCount` has no stable key to write, so the
+      // legacy index map stays the store of record for that column rather than losing the value.
+      if (key) { this.manifest.alignments[key] = alignment; delete this.manifest.alignmentsByIndex[indexKey]; }
+      else this.manifest.alignmentsByIndex[indexKey] = alignment;
+    }
     else throw new GridError("ALIGNMENT", `Unsupported alignment: ${alignment}`);
     this.metadataDirty = true;
   }
@@ -3793,9 +3994,11 @@ export class LargeGridStore {
     const index = this.chunkIndexForRow(row);
     const chunk = await this.loadChunk(index);
     const local = row - chunk.startRow;
+    const grew = chunk.rows.length <= local;
     while (chunk.rows.length <= local) chunk.rows.push(Array.from({ length: this.manifest.colCount }, () => ""));
     while (chunk.rows[local].length < this.manifest.colCount) chunk.rows[local].push("");
     chunk.rows[local][col] = String(raw ?? "");
+    if (grew) this.syncRowIds(index, chunk);
     this.dirty.add(index);
   }
 
@@ -3849,14 +4052,14 @@ export class LargeGridStore {
       }
       const next = { ...deepClone(this.manifest), revision: cryptoId(), previous: this.manifestUrl, updatedAt: new Date().toISOString(), chunks, retained: [this.manifestUrl, ...(this.manifest.retained || []).slice(0, 1), ...replaced] };
       const url = await uploadJson(next, `roam-grid-${this.anchorUid}-manifest-${next.revision}.json`);
-      const verified = await downloadJson(url);
-      this.validateManifest(verified);
+      const verified = normalizeManifest(await downloadJson(url));
       if (this.disposed) throw new GridError("DISPOSED", "Roam Grid unloaded before this large grid finished saving");
       await updateBlock(this.pointerUid, `${MANIFEST_PREFIX} ${url}`);
       this.manifest = verified;
       this.manifestUrl = url;
       this.dirty.clear();
       this.metadataDirty = false;
+      this.metricsVersion += 1;
       return verified;
     });
   }
@@ -3864,7 +4067,7 @@ export class LargeGridStore {
   async saveAsCopy(newAnchorUid) {
     const rows = []; const chunkSize = chunkRowsFor(this.manifest);
     for (let start = 0; start < this.manifest.rowCount; start += chunkSize) rows.push(...await this.getRows(start, Math.min(this.manifest.rowCount, start + chunkSize)));
-    const model = applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false, colorFormulaCells: this.manifest.colorFormulaCells !== false }), this.manifest.rowHeights), this.manifest.alignments);
+    const model = applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false, colorFormulaCells: this.manifest.colorFormulaCells !== false }), this.rowHeightIndexMap()), this.alignmentIndexMap());
     return new LargeGridStore(newAnchorUid).initialize(model);
   }
 
@@ -3872,7 +4075,7 @@ export class LargeGridStore {
     if (this.manifest.rowCount * this.manifest.colCount > limit) throw new GridError("MUTATION_BUDGET", "Large grid exceeds the safe native-table conversion budget");
     const rows = []; const chunkSize = chunkRowsFor(this.manifest);
     for (let start = 0; start < this.manifest.rowCount; start += chunkSize) rows.push(...await this.getRows(start, Math.min(this.manifest.rowCount, start + chunkSize)));
-    return applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false, colorFormulaCells: this.manifest.colorFormulaCells !== false }), this.manifest.rowHeights), this.manifest.alignments);
+    return applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false, colorFormulaCells: this.manifest.colorFormulaCells !== false }), this.rowHeightIndexMap()), this.alignmentIndexMap());
   }
 }
 
@@ -7166,7 +7369,8 @@ export class LargeGridView {
     this.cells = new Map(); this.cellValueTokens = new WeakMap(); this.editorController = null;
     this.formulaEngine = new AsyncFormulaEngine(this.store, runtime.registries.formulaFunctions, runtime.registries.formulaFunctionMetadata);
     this.saveTimer = null; this.renderToken = 0; this.dragSelecting = false; this.boundUp = () => { this.dragSelecting = false; };
-    this.rowOffsets = null; this.rowMetricsKey = null; this.rowResizePreview = null; this.columnResizePreview = null; this.resizeCleanup = null;
+    this.metricsRows = []; this.metricsExtra = new Float64Array(1); this.metricsDefaultHeight = 0;
+    this.rowMetricsKey = null; this.rowResizePreview = null; this.columnResizePreview = null; this.resizeCleanup = null;
     this.disposed = false; this.root.__rgView = this;
     this.mount();
   }
@@ -7222,19 +7426,41 @@ export class LargeGridView {
   columnWidth(col) { const id = this.store.manifest.columnIds[col]; return this.columnResizePreview?.col === col ? this.columnResizePreview.width : this.store.manifest.widths[id] || getSetting("sizing-default-col-width"); }
   totalWidth() { return this.headerWidth() + this.store.manifest.columnIds.reduce((sum, _id, col) => sum + this.columnWidth(col), 0); }
   colLeft(col) { let left = this.headerWidth(); for (let index = 0; index < col; index += 1) left += this.columnWidth(index); return left; }
+  /**
+   * The key carries `store.metricsVersion`, which every height write bumps — without it a resized
+   * row kept the offsets computed before the resize until the row count happened to change. The
+   * prefix sum is sparse: rows are the default height unless the manifest says otherwise, so a
+   * 100k-row grid costs one entry per override instead of an 800 KB `Float64Array`.
+   */
   rebuildRowMetrics() {
     const preview = this.rowResizePreview ? `${this.rowResizePreview.row}:${this.rowResizePreview.height}` : "";
-    const key = `${this.store.manifest.rowCount}:${preview}`;
+    const key = `${this.store.manifest.rowCount}:${this.store.metricsVersion}:${preview}`;
     if (key === this.rowMetricsKey) return;
-    this.rowOffsets = new Float64Array(this.store.manifest.rowCount + 1);
-    for (let row = 0; row < this.store.manifest.rowCount; row += 1) this.rowOffsets[row + 1] = this.rowOffsets[row] + (this.rowResizePreview?.row === row ? this.rowResizePreview.height : this.store.rowHeight(row));
+    const heights = new Map();
+    for (const [key2, value] of Object.entries(this.store.rowHeightIndexMap())) {
+      const row = Number(key2);
+      if (Number.isInteger(row) && row >= 0 && row < this.store.manifest.rowCount) heights.set(row, this.store.rowHeight(row));
+    }
+    if (this.rowResizePreview && this.rowResizePreview.row < this.store.manifest.rowCount) heights.set(this.rowResizePreview.row, this.rowResizePreview.height);
+    const overrides = [...heights].sort((a, b) => a[0] - b[0]);
+    this.metricsDefaultHeight = getSetting("sizing-default-row-height");
+    this.metricsRows = overrides.map(([row]) => row);
+    this.metricsExtra = new Float64Array(overrides.length + 1);
+    overrides.forEach(([, height], index) => { this.metricsExtra[index + 1] = this.metricsExtra[index] + (height - this.metricsDefaultHeight); });
     this.rowMetricsKey = key;
   }
-  rowTop(row) { this.rebuildRowMetrics(); return this.headerHeight() + this.rowOffsets[clamp(row, 0, this.store.manifest.rowCount)]; }
-  rowSpanHeight(row, span = 1) { this.rebuildRowMetrics(); return this.rowOffsets[Math.min(this.store.manifest.rowCount, row + span)] - this.rowOffsets[row]; }
+  rowOffset(row) {
+    this.rebuildRowMetrics();
+    const target = clamp(row, 0, this.store.manifest.rowCount);
+    let low = 0; let high = this.metricsRows.length;
+    while (low < high) { const middle = Math.floor((low + high) / 2); if (this.metricsRows[middle] < target) low = middle + 1; else high = middle; }
+    return target * this.metricsDefaultHeight + this.metricsExtra[low];
+  }
+  rowTop(row) { return this.headerHeight() + this.rowOffset(row); }
+  rowSpanHeight(row, span = 1) { return this.rowOffset(Math.min(this.store.manifest.rowCount, row + span)) - this.rowOffset(row); }
   rowAtOffset(offset) {
     this.rebuildRowMetrics(); const target = Math.max(0, offset - this.headerHeight()); let low = 0; let high = this.store.manifest.rowCount;
-    while (low < high) { const middle = Math.floor((low + high) / 2); if (this.rowOffsets[middle + 1] <= target) low = middle + 1; else high = middle; }
+    while (low < high) { const middle = Math.floor((low + high) / 2); if (this.rowOffset(middle + 1) <= target) low = middle + 1; else high = middle; }
     return clamp(low, 0, Math.max(0, this.store.manifest.rowCount - 1));
   }
   scheduleRender() {
@@ -7248,32 +7474,34 @@ export class LargeGridView {
     if (this.editorController?.state && !this.editorController.state.floating) return;
     const { rowCount, colCount } = this.store.manifest; this.status.textContent = `${rowCount.toLocaleString()} × ${colCount}`;
     const headerHeight = this.headerHeight(); const headerWidth = this.headerWidth();
-    this.rebuildRowMetrics(); this.canvas.style.width = `${this.totalWidth()}px`; this.canvas.style.height = `${headerHeight + this.rowOffsets[rowCount]}px`;
+    this.rebuildRowMetrics(); this.canvas.style.width = `${this.totalWidth()}px`; this.canvas.style.height = `${headerHeight + this.rowOffset(rowCount)}px`;
     const overscan = Math.max(0, Math.round(Number(getSetting("large-overscan-rows"))) || 0);
     const startRow = clamp(this.rowAtOffset(this.viewport.scrollTop) - overscan, 0, Math.max(0, rowCount - 1));
     const endRow = clamp(this.rowAtOffset(this.viewport.scrollTop + this.viewport.clientHeight) + overscan + 1, 0, rowCount);
     let startCol = 0; let x = headerWidth; while (startCol < colCount && x + this.columnWidth(startCol) < this.viewport.scrollLeft) x += this.columnWidth(startCol++);
     let endCol = startCol; let visibleWidth = x; while (endCol < colCount && visibleWidth < this.viewport.scrollLeft + this.viewport.clientWidth + getSetting("sizing-default-col-width") * 2) visibleWidth += this.columnWidth(endCol++);
     startCol = Math.max(0, startCol - 1);
-    const rows = await this.store.getRows(startRow, endRow);
+    // Resident rows are read one cell at a time through `peekRaw`, so scrolling no longer allocates
+    // an array-of-arrays of the whole visible band on every frame.
+    await this.store.ensureRows(startRow, endRow);
     if (token !== this.renderToken) return;
     releaseRichCellHosts(this.canvas); this.canvas.replaceChildren(); this.cells.clear();
     if (this.store.manifest.showHeaders !== false) for (let col = startCol; col < endCol; col += 1) {
       const header = document.createElement("div"); header.className = "rg-header rg-large-col-header"; header.textContent = columnLabel(col); header.style.left = `${this.colLeft(col)}px`; header.style.width = `${this.columnWidth(col)}px`;
-      const resize = document.createElement("span"); resize.className = "rg-col-resize"; resize.title = "Drag to resize column · double-click to reset"; resize.addEventListener("pointerdown", (event) => this.startColumnResize(col, event)); resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.store.setColumnWidth(col, null); this.rowMetricsKey = null; this.scheduleSave(true); this.scheduleRender(); }); header.appendChild(resize); this.canvas.appendChild(header);
+      const resize = document.createElement("span"); resize.className = "rg-col-resize"; resize.title = "Drag to resize column · double-click to reset"; resize.addEventListener("pointerdown", (event) => this.startColumnResize(col, event)); resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.store.setColumnWidth(col, null); this.scheduleSave(true); this.scheduleRender(); }); header.appendChild(resize); this.canvas.appendChild(header);
     }
     const engine = this.formulaEngine;
     for (let row = startRow; row < endRow; row += 1) {
       if (this.store.manifest.showHeaders !== false) {
         const rowHeader = document.createElement("div"); rowHeader.className = "rg-header rg-large-row-header"; rowHeader.textContent = String(row + 1); rowHeader.style.top = `${this.rowTop(row)}px`; rowHeader.style.height = `${this.rowSpanHeight(row)}px`;
-        const resize = document.createElement("span"); resize.className = "rg-large-row-resize"; resize.title = "Drag to resize row · double-click to reset"; resize.addEventListener("pointerdown", (event) => this.startRowResize(row, event)); resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.store.setRowHeight(row, null); this.rowMetricsKey = null; this.scheduleSave(true); this.scheduleRender(); }); rowHeader.appendChild(resize); this.canvas.appendChild(rowHeader);
+        const resize = document.createElement("span"); resize.className = "rg-large-row-resize"; resize.title = "Drag to resize row · double-click to reset"; resize.addEventListener("pointerdown", (event) => this.startRowResize(row, event)); resize.addEventListener("dblclick", (event) => { event.preventDefault(); event.stopPropagation(); this.store.setRowHeight(row, null); this.scheduleSave(true); this.scheduleRender(); }); rowHeader.appendChild(resize); this.canvas.appendChild(rowHeader);
       }
       for (let col = startCol; col < endCol; col += 1) {
         const merge = this.store.mergeAt(row, col); if (merge && (merge.row !== row || merge.col !== col)) continue;
         const cell = document.createElement("div"); cell.className = "rg-cell rg-large-cell"; cell.classList.toggle("rg-cell--merged", Boolean(merge)); const alignment = this.store.getAlignment(row, col); if (alignment) cell.classList.add(`rg-cell--align-${alignment}`); cell.dataset.row = String(row); cell.dataset.col = String(col); cell.style.left = `${this.colLeft(col)}px`; cell.style.top = `${this.rowTop(row)}px`;
         let width = 0; for (let offset = 0; offset < (merge?.colSpan || 1); offset += 1) width += this.columnWidth(col + offset);
         cell.style.width = `${width}px`; cell.style.height = `${this.rowSpanHeight(row, merge?.rowSpan || 1)}px`;
-        const raw = rows[row - startRow]?.[col] ?? "";
+        const raw = this.store.peekRaw(row, col);
         void this.renderLargeCellValue(cell, raw, row, col, engine);
         if (rangeContains(this.selection, row, col)) cell.classList.add("rg-cell--selected");
         cell.addEventListener("pointerdown", (event) => { if (event.button !== 0) return; if (event.target.closest?.(".rg-editor")) return; const anchorMerge = this.store.mergeAt(row, col); const anchorRow = anchorMerge?.row ?? row; const anchorCol = anchorMerge?.col ?? col; if (this.editorController?.insertReference(anchorRow, anchorCol, event)) return; this.anchor = { row: anchorRow, col: anchorCol }; this.selection = { startRow: anchorRow, endRow: anchorRow, startCol: anchorCol, endCol: anchorCol }; this.dragSelecting = true; this.root.focus(); claimKeyboard(this); this.updateLargeSelection(); event.preventDefault(); });
@@ -7337,7 +7565,7 @@ export class LargeGridView {
   startRowResize(row, event) {
     event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.(); const startY = event.clientY; const startHeight = this.store.rowHeight(row); let moved = false;
     const move = (moveEvent) => { moved = true; this.rowResizePreview = { row, height: clamp(Math.round(startHeight + moveEvent.clientY - startY), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height")) }; this.rowMetricsKey = null; this.scheduleRender(); };
-    const up = () => { const height = this.rowResizePreview?.height ?? startHeight; cleanup(); this.rowResizePreview = null; if (!moved) return; this.store.setRowHeight(row, height); this.rowMetricsKey = null; this.scheduleSave(true); this.scheduleRender(); };
+    const up = () => { const height = this.rowResizePreview?.height ?? startHeight; cleanup(); this.rowResizePreview = null; if (!moved) return; this.store.setRowHeight(row, height); this.scheduleSave(true); this.scheduleRender(); };
     const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
     this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
   }
