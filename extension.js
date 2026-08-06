@@ -2,6 +2,9 @@
 const VERSION = "0.8.2";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
+const RANGE_COMPONENT_NAME = "roam-grid-range";
+const RANGE_BUTTON_SELECTOR = `.rm-xparser-default-${RANGE_COMPONENT_NAME}`;
+const RANGE_MARKER = /\{\{\s*roam-grid-range\s*:\s*\(\(([^()\s]+)\)\)\s*(\$?[A-Z]+\$?\d+)(?:\s*:\s*(\$?[A-Z]+\$?\d+))?\s*\}\}/i;
 const METADATA_PAGE = "roam/grid/metadata";
 const METADATA_PREFIX = "roam-grid/table::";
 const TEMPLATE_PAGE = "roam/grid/templates";
@@ -698,6 +701,32 @@ function rangesOverlap(a, b) {
   const x = normalizeRange(a);
   const y = normalizeRange(b);
   return x.startRow <= y.endRow && x.endRow >= y.startRow && x.startCol <= y.endCol && x.endCol >= y.startCol;
+}
+
+function rangeLabel(range) {
+  const start = cellLabel(range.startRow, range.startCol);
+  const end = cellLabel(range.endRow, range.endCol);
+  return start === end ? start : `${start}:${end}`;
+}
+
+export function formatRangeComponent(model, selection) {
+  const tableUid = model?.tableUid;
+  if (!tableUid || String(tableUid).startsWith("rg_")) {
+    throw new GridError("REFERENCE_PENDING", "This grid does not have a persisted Roam UID yet");
+  }
+  return `{{${RANGE_COMPONENT_NAME}: ((${tableUid})) ${rangeLabel(normalizeRange(selection))}}}`;
+}
+
+export function parseRangeComponent(text) {
+  if (typeof text !== "string") return null;
+  const match = RANGE_MARKER.exec(text);
+  if (!match) return null;
+  const tableUid = match[1];
+  const start = parseCellReference(match[2]);
+  const end = parseCellReference(match[3] || match[2]);
+  if (!start || !end) return null;
+  const range = normalizeRange({ startRow: start.row, endRow: end.row, startCol: start.col, endCol: end.col });
+  return { tableUid, range, label: rangeLabel(range) };
 }
 
 function numeric(value) {
@@ -5668,6 +5697,7 @@ export class GridView {
     if (event.target.matches("textarea,input")) return;
     event.stopPropagation();
     const command = event.metaKey || event.ctrlKey;
+    if (command && event.shiftKey && event.key.toLowerCase() === "c") { event.preventDefault(); this.copyRoamReferences(); return; }
     if (command && event.key.toLowerCase() === "c") { event.preventDefault(); this.copy(false); return; }
     if (command && event.key.toLowerCase() === "x") { event.preventDefault(); this.copy(true); return; }
     if (command && event.key.toLowerCase() === "z") { event.preventDefault(); event.shiftKey ? this.redo() : this.undo(); return; }
@@ -5713,7 +5743,25 @@ export class GridView {
       return;
     }
     const text = event.clipboardData?.getData("text/plain"); if (!text) return;
+    const referenced = parseRangeComponent(text);
+    if (referenced) { event.preventDefault(); await this.pasteReferencedRange(referenced); return; }
     event.preventDefault(); const matrix = parseDelimited(text, text.includes("\t") ? "\t" : detectDelimiter(text));
+    await this.pasteMatrix(matrix);
+  }
+
+  async pasteReferencedRange(spec) {
+    let sourceModel = runtime.sessions.get(spec.tableUid)?.model || null;
+    if (!sourceModel) {
+      try { sourceModel = new NativeTableAdapter(spec.tableUid).load(); }
+      catch (error) { return toast(`Could not read the referenced grid: ${error.message}`, "danger"); }
+    }
+    let matrix;
+    try { matrix = selectionBlockReferenceMatrix(sourceModel, spec.range); }
+    catch (error) { return toast(error.message, "warning"); }
+    await this.pasteMatrix(matrix);
+  }
+
+  async pasteMatrix(matrix) {
     const width = Math.max(...matrix.map((row) => row.length));
     const structural = this.selection.startRow + matrix.length > this.model.rowCount || this.selection.startCol + width > this.model.colCount;
     await this.commitMutation("Paste cells", () => {
@@ -5808,7 +5856,8 @@ export class GridView {
       item("Align right", () => this.alignSelection("right")),
       item("Reset alignment", () => this.alignSelection(null)),
       item("Copy Roam block reference", () => this.copyRoamReference(false)),
-      item("Copy selected cells as block references", () => this.copyRoamReferences()),
+      item("Copy live range reference", () => this.copyRoamReferences()),
+      item("Copy cell references as a table", () => this.copyRoamReferenceMatrix()),
       item("Copy table block reference", () => this.copyRoamReference(true)),
       item("Save as grid template…", () => saveModelAsTemplate(this.model)),
       item("Insert saved template after this grid…", () => newFromSavedTemplate()),
@@ -5892,7 +5941,8 @@ export class GridView {
       item("Align right", () => this.alignSelection("right")),
       item("Reset alignment", () => this.alignSelection(null)),
       item("Copy Roam block reference", () => this.copyRoamReference(false)),
-      item("Copy selected cells as block references", () => this.copyRoamReferences()),
+      item("Copy live range reference", () => this.copyRoamReferences()),
+      item("Copy cell references as a table", () => this.copyRoamReferenceMatrix()),
       item("Copy table block reference", () => this.copyRoamReference(true)),
       item(this.model.colorFormulaCells ? "Hide formula coloring" : "Color formula cells", () => this.commitMutation("Toggle formula coloring", () => { this.model.colorFormulaCells = !this.model.colorFormulaCells; }, true)),
       item(this.model.showHeaders ? "Hide row/column labels" : "Show row/column labels", () => this.commitMutation("Toggle row and column labels", () => { this.model.showHeaders = !this.model.showHeaders; }, true)),
@@ -5972,6 +6022,17 @@ export class GridView {
   }
 
   copyRoamReferences() {
+    let text;
+    try { text = formatRangeComponent(this.model, this.selection); }
+    catch (error) { return toast(error.message, "warning"); }
+    const copied = navigator.clipboard?.writeText(text);
+    if (!copied) return toast("Clipboard access is unavailable", "warning");
+    const range = normalizeRange(this.selection);
+    const rows = range.endRow - range.startRow + 1; const cols = range.endCol - range.startCol + 1;
+    copied.then(() => toast(`Live ${rows} × ${cols} range reference copied`, "success", 1800)).catch((error) => toast(`Copy failed: ${error.message}`, "danger"));
+  }
+
+  copyRoamReferenceMatrix() {
     let text;
     try { text = selectionBlockReferenceText(this.model, this.selection); }
     catch (error) { return toast(error.message, "warning"); }
