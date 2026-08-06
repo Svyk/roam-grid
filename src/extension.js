@@ -19,8 +19,14 @@ const PREPAINT_STYLE_ID = "roam-grid-prepaint-guard";
 const ENHANCED_UID_CACHE_PREFIX = "roam-grid:enhanced-uids:";
 const SESSION_IDLE_MS = 1500;
 const MAX_GUARD_UIDS = 2000;
+const MAX_UNDO_ENTRIES = 100;
+const MAX_UNDO_CHECKPOINTS = 8;
+const MAX_UNDO_HISTORIES = 24;
+
+export const undoHistories = new Map();
 
 const runtime = {
+  undoHistories,
   extensionAPI: null,
   observer: null,
   metadata: null,
@@ -887,8 +893,327 @@ function normalizeCells(rows, width) {
   }));
 }
 
+export function gridShapeSignature(model) {
+  return [...model.rows.map((row) => row[0]?.uid || ""), "::", ...model.columnIds].join("\u0001");
+}
+
+const UNDO_SHAPE_OPS = new Set(["insertRowAt", "removeRowByUid", "insertColAt", "removeColById", "orderRows", "orderCols"]);
+let undoEntrySequence = 0;
+
+function rowIndexForUid(model, rowUid) {
+  return model.rows.findIndex((row) => row[0]?.uid === rowUid);
+}
+
+function cellCoordinateForUid(model, uid) {
+  for (let row = 0; row < model.rows.length; row += 1) {
+    const col = model.rows[row].findIndex((cell) => cell.uid === uid);
+    if (col >= 0) return { row, col };
+  }
+  return null;
+}
+
+function undoOpWriteUids(op) {
+  switch (op.op) {
+    case "setRaw": return [op.uid];
+    case "setAlignment": return [op.uid];
+    case "setRowHeight": return [op.rowUid];
+    case "removeRowByUid": return [op.rowUid];
+    case "insertRowAt": return op.cells.map((cell) => cell.uid);
+    case "insertColAt": return op.cells.map((cell) => cell.uid);
+    case "removeColById": return [op.columnId];
+    default: return [];
+  }
+}
+
+function remapUndoOp(op, uidMap) {
+  const swap = (value) => (value != null && uidMap.has(value) ? uidMap.get(value) : value);
+  switch (op.op) {
+    case "setRaw": return { ...op, uid: swap(op.uid) };
+    case "setAlignment": return { ...op, uid: swap(op.uid) };
+    case "setRowHeight": return { ...op, rowUid: swap(op.rowUid) };
+    case "setWidth": return { ...op, columnId: swap(op.columnId) };
+    case "removeRowByUid": return { ...op, rowUid: swap(op.rowUid) };
+    case "removeColById": return { ...op, columnId: swap(op.columnId) };
+    case "insertRowAt": return { ...op, afterRowUid: swap(op.afterRowUid), cells: op.cells.map((cell) => ({ ...cell, uid: swap(cell.uid) })), alignments: Object.fromEntries(Object.entries(op.alignments || {}).map(([uid, value]) => [swap(uid), value])) };
+    case "insertColAt": return { ...op, afterColumnId: swap(op.afterColumnId), columnId: swap(op.columnId), cells: op.cells.map((cell) => ({ ...cell, uid: swap(cell.uid) })) };
+    case "orderRows": return { ...op, rowUids: op.rowUids.map(swap) };
+    case "orderCols": return { ...op, columnIds: op.columnIds.map(swap) };
+    case "setHeaderRows": return { ...op, rowUids: op.rowUids.map(swap) };
+    case "setHeaderCols": return { ...op, columnIds: op.columnIds.map(swap) };
+    default: return op;
+  }
+}
+
+function remapUndoSnapshot(snapshot, uidMap) {
+  const swap = (value) => (value != null && uidMap.has(value) ? uidMap.get(value) : value);
+  const swapKeys = (record) => Object.fromEntries(Object.entries(record || {}).map(([key, value]) => [swap(key), value]));
+  return {
+    ...snapshot, rows: snapshot.rows.map((row) => row.map((cell) => ({ ...cell, uid: swap(cell.uid) }))), columnIds: snapshot.columnIds.map(swap),
+    rowHeights: swapKeys(snapshot.rowHeights), alignments: swapKeys(snapshot.alignments), widths: swapKeys(snapshot.widths),
+    headerRows: (snapshot.headerRows || []).map(swap), headerColumns: (snapshot.headerColumns || []).map(swap),
+  };
+}
+
+export function applyUndoOp(model, op) {
+  switch (op.op) {
+    case "setRaw": {
+      const at = cellCoordinateForUid(model, op.uid);
+      if (!at) return false;
+      const cell = model.rows[at.row][at.col];
+      if (cell.raw === op.raw) return false;
+      cell.raw = op.raw;
+      model.collectingChangedCells?.add(`${at.row}:${at.col}`);
+      return true;
+    }
+    case "insertRowAt": {
+      const index = op.afterRowUid ? rowIndexForUid(model, op.afterRowUid) + 1 : 0;
+      if (op.afterRowUid && index === 0) return false;
+      const cells = deepClone(op.cells);
+      model.rows.splice(clamp(index, 0, model.rows.length), 0, cells);
+      if (op.rowHeight != null && cells[0]) model.rowHeights[cells[0].uid] = op.rowHeight;
+      for (const [uid, alignment] of Object.entries(op.alignments || {})) if (alignment) model.alignments[uid] = alignment;
+      return true;
+    }
+    case "removeRowByUid": {
+      const index = rowIndexForUid(model, op.rowUid);
+      if (index < 0) return false;
+      const [removed] = model.rows.splice(index, 1);
+      delete model.rowHeights[op.rowUid];
+      for (const cell of removed) delete model.alignments[cell.uid];
+      return true;
+    }
+    case "insertColAt": {
+      const index = op.afterColumnId ? model.columnIds.indexOf(op.afterColumnId) + 1 : 0;
+      if (op.afterColumnId && index === 0) return false;
+      const at = clamp(index, 0, model.columnIds.length);
+      const cells = deepClone(op.cells);
+      model.columnIds.splice(at, 0, op.columnId);
+      for (let row = 0; row < model.rows.length; row += 1) model.rows[row].splice(at, 0, cells[row] || { uid: makeLocalUid(), raw: "" });
+      if (op.width != null) model.widths[op.columnId] = op.width;
+      return true;
+    }
+    case "removeColById": {
+      const index = model.columnIds.indexOf(op.columnId);
+      if (index < 0) return false;
+      model.columnIds.splice(index, 1);
+      for (const row of model.rows) { const [cell] = row.splice(index, 1); if (cell) delete model.alignments[cell.uid]; }
+      delete model.widths[op.columnId];
+      return true;
+    }
+    case "orderRows": {
+      const byUid = new Map(model.rows.map((row) => [row[0]?.uid, row]));
+      const next = op.rowUids.map((uid) => byUid.get(uid)).filter(Boolean);
+      if (next.length !== model.rows.length) return false;
+      model.rows = next;
+      return true;
+    }
+    case "orderCols": {
+      const positions = op.columnIds.map((id) => model.columnIds.indexOf(id));
+      if (positions.length !== model.columnIds.length || positions.some((position) => position < 0)) return false;
+      model.rows = model.rows.map((row) => positions.map((position) => row[position]));
+      model.columnIds = [...op.columnIds];
+      return true;
+    }
+    case "setRowHeight": {
+      if (op.height == null) delete model.rowHeights[op.rowUid]; else model.rowHeights[op.rowUid] = op.height;
+      return true;
+    }
+    case "setAlignment": {
+      if (op.alignment == null) delete model.alignments[op.uid]; else model.alignments[op.uid] = op.alignment;
+      return true;
+    }
+    case "setWidth": {
+      if (op.width == null) delete model.widths[op.columnId]; else model.widths[op.columnId] = op.width;
+      return true;
+    }
+    case "setMerges": model.merges = deepClone(op.merges); return true;
+    case "setHeaderRows": model.headerRows = [...op.rowUids]; return true;
+    case "setHeaderCols": model.headerColumns = [...op.columnIds]; return true;
+    case "setCharts": model.charts = deepClone(op.charts); return true;
+    case "setFlags": {
+      for (const [key, value] of Object.entries(op.flags || {})) model[key] = value;
+      return true;
+    }
+    default: throw new GridError("UNDO_OP", `Unknown grid undo operation ${op.op}`);
+  }
+}
+
+export function applyUndoOps(model, ops, entry = null) {
+  const dropped = [];
+  for (const op of ops) {
+    if (op.op === "setRaw" && entry?.stale?.has(op.uid)) { dropped.push(op.uid); continue; }
+    applyUndoOp(model, op);
+  }
+  return { dropped };
+}
+
+function undoFieldOps(before, model) {
+  const inverse = []; const forward = [];
+  const keyed = (name, keyName, valueName, previousMap, nextMap) => {
+    for (const key of new Set([...Object.keys(previousMap || {}), ...Object.keys(nextMap || {})])) {
+      const previous = previousMap?.[key] ?? null; const next = nextMap?.[key] ?? null;
+      if (previous === next) continue;
+      inverse.push({ op: name, [keyName]: key, [valueName]: previous });
+      forward.push({ op: name, [keyName]: key, [valueName]: next });
+    }
+  };
+  keyed("setRowHeight", "rowUid", "height", before.rowHeights, model.rowHeights);
+  keyed("setAlignment", "uid", "alignment", before.alignments, model.alignments);
+  keyed("setWidth", "columnId", "width", before.widths, model.widths);
+  const listed = (name, keyName, previousList, nextList) => {
+    if (JSON.stringify(previousList) === JSON.stringify(nextList)) return;
+    inverse.push({ op: name, [keyName]: [...previousList] });
+    forward.push({ op: name, [keyName]: [...nextList] });
+  };
+  listed("setHeaderRows", "rowUids", before.headerRows || [], model.headerRows);
+  listed("setHeaderCols", "columnIds", before.headerColumns || [], model.headerColumns);
+  if (JSON.stringify(before.merges) !== JSON.stringify(model.merges)) {
+    inverse.push({ op: "setMerges", merges: deepClone(before.merges) });
+    forward.push({ op: "setMerges", merges: deepClone(model.merges) });
+  }
+  if (JSON.stringify(before.charts) !== JSON.stringify(model.charts)) {
+    inverse.push({ op: "setCharts", charts: deepClone(before.charts) });
+    forward.push({ op: "setCharts", charts: deepClone(model.charts) });
+  }
+  const previousFlags = {}; const nextFlags = {};
+  for (const key of ["frozenRows", "frozenCols", "showHeaders", "fitToWidth", "colorFormulaCells", "revision"]) {
+    if (before[key] === model[key]) continue;
+    previousFlags[key] = before[key]; nextFlags[key] = model[key];
+  }
+  if (Object.keys(previousFlags).length) { inverse.push({ op: "setFlags", flags: previousFlags }); forward.push({ op: "setFlags", flags: nextFlags }); }
+  return { inverse, forward };
+}
+
+function buildUndoEntry(model, { label = "", before, beforeShape, afterShape, recorded = [], hard = false }) {
+  const pairs = recorded.filter((pair) => pair.inverse.op !== pair.forward.op || JSON.stringify(pair.inverse) !== JSON.stringify(pair.forward));
+  const completion = undoFieldOps(before, model);
+  const inverse = pairs.map((pair) => pair.inverse).reverse().concat(completion.inverse);
+  const forward = pairs.map((pair) => pair.forward).concat(completion.forward);
+  const reshaped = beforeShape !== afterShape && !pairs.some((pair) => UNDO_SHAPE_OPS.has(pair.inverse.op) || UNDO_SHAPE_OPS.has(pair.forward.op));
+  const checkpointed = hard || reshaped;
+  if (!inverse.length && !checkpointed) return null;
+  const structural = checkpointed || inverse.some((op) => op.op !== "setRaw");
+  const touched = [...new Set([...inverse, ...forward].flatMap(undoOpWriteUids).filter(Boolean))];
+  undoEntrySequence += 1;
+  return {
+    id: `ue${undoEntrySequence}`, label, at: Date.now(), lane: structural ? "structural" : "content", metadata: structural,
+    inverse, forward, touched, shapeSignature: afterShape, checkpoint: checkpointed ? deepClone(before) : null,
+    forwardCheckpoint: checkpointed ? model.snapshot() : null, trashUid: null, stale: new Set(),
+  };
+}
+
+export class UndoHistory {
+  constructor({ limit = MAX_UNDO_ENTRIES, checkpointLimit = MAX_UNDO_CHECKPOINTS } = {}) {
+    this.entries = [];
+    this.redoEntries = [];
+    this.limit = limit;
+    this.checkpointLimit = checkpointLimit;
+    this.lastInvalidation = null;
+  }
+
+  get canUndo() { return this.entries.length > 0; }
+  get canRedo() { return this.redoEntries.length > 0; }
+
+  enforceLimits() {
+    while (this.entries.length > this.limit) this.entries.shift();
+    const checkpoints = this.entries.filter((entry) => entry.checkpoint);
+    if (checkpoints.length <= this.checkpointLimit) return;
+    const evicted = checkpoints[checkpoints.length - this.checkpointLimit - 1];
+    this.entries.splice(0, this.entries.indexOf(evicted) + 1);
+  }
+
+  push(entry) {
+    this.entries.push(entry);
+    this.redoEntries.length = 0;
+    this.enforceLimits();
+    return entry;
+  }
+
+  pushUndo(entry) { this.entries.push(entry); this.enforceLimits(); return entry; }
+  pushRedo(entry) { this.redoEntries.push(entry); return entry; }
+  popUndo() { return this.entries.pop() || null; }
+  popRedo() { return this.redoEntries.pop() || null; }
+  clear() { this.entries.length = 0; this.redoEntries.length = 0; }
+
+  invalidateRedo(reason = "") {
+    const dropped = this.redoEntries.length;
+    this.redoEntries.length = 0;
+    this.lastInvalidation = dropped ? reason : this.lastInvalidation;
+    return dropped;
+  }
+
+  applyInverse(model, entry) {
+    if (entry.checkpoint) { model.restore(entry.checkpoint); return { dropped: [] }; }
+    return applyUndoOps(model, entry.inverse, entry);
+  }
+
+  applyForward(model, entry) {
+    if (entry.forwardCheckpoint) { model.restore(entry.forwardCheckpoint); return { dropped: [] }; }
+    return applyUndoOps(model, entry.forward, entry);
+  }
+
+  remapUids(uidMap) {
+    if (!uidMap?.size) return 0;
+    let remapped = 0;
+    for (const entry of [...this.entries, ...this.redoEntries]) {
+      entry.inverse = entry.inverse.map((op) => remapUndoOp(op, uidMap));
+      entry.forward = entry.forward.map((op) => remapUndoOp(op, uidMap));
+      entry.touched = entry.touched.map((uid) => uidMap.get(uid) || uid);
+      entry.stale = new Set([...entry.stale].map((uid) => uidMap.get(uid) || uid));
+      entry.shapeSignature = entry.shapeSignature.split("\u0001").map((token) => uidMap.get(token) || token).join("\u0001");
+      if (entry.checkpoint) entry.checkpoint = remapUndoSnapshot(entry.checkpoint, uidMap);
+      if (entry.forwardCheckpoint) entry.forwardCheckpoint = remapUndoSnapshot(entry.forwardCheckpoint, uidMap);
+      remapped += 1;
+    }
+    return remapped;
+  }
+
+  onExternalContent(changes = []) {
+    const uids = new Set((changes || []).map((change) => change?.uid).filter(Boolean));
+    if (!uids.size) return { marked: 0, redoInvalidated: false };
+    let marked = 0;
+    for (const entry of [...this.entries, ...this.redoEntries]) {
+      for (const op of entry.inverse) {
+        if (op.op !== "setRaw" || !uids.has(op.uid) || entry.stale.has(op.uid)) continue;
+        entry.stale.add(op.uid); marked += 1;
+      }
+    }
+    const redoInvalidated = this.redoEntries.some((entry) => entry.touched.some((uid) => uids.has(uid)));
+    if (redoInvalidated) this.invalidateRedo("external-content");
+    return { marked, redoInvalidated };
+  }
+
+  onExternalStructural(model) {
+    const signature = gridShapeSignature(model);
+    let keep = 0;
+    for (let index = this.entries.length - 1; index >= 0; index -= 1) {
+      if (this.entries[index].shapeSignature !== signature) break;
+      keep += 1;
+    }
+    const dropped = this.entries.length - keep;
+    if (dropped) this.entries.splice(0, dropped);
+    const redoInvalidated = dropped > 0 || !this.redoEntries.every((entry) => entry.shapeSignature === signature);
+    if (redoInvalidated) this.invalidateRedo("external-structural");
+    return { signature, dropped, redoInvalidated };
+  }
+}
+
+export function undoHistoryFor(tableUid, histories = undoHistories) {
+  if (!tableUid) return null;
+  const existing = histories.get(tableUid);
+  if (existing) { histories.delete(tableUid); histories.set(tableUid, existing); return existing; }
+  const history = new UndoHistory();
+  histories.set(tableUid, history);
+  while (histories.size > MAX_UNDO_HISTORIES) histories.delete(histories.keys().next().value);
+  return history;
+}
+
+export function releaseUndoHistory(tableUid, histories = undoHistories) { return histories.delete(tableUid); }
+
+export function clearUndoHistories(histories = undoHistories) { histories.clear(); }
+
 export class GridModel {
-  constructor({ rows = [[]], tableUid = null, columnIds = [], merges = [], widths = {}, rowHeights = {}, alignments = {}, headerColumns = [], headerRows = [], frozenRows = 1, frozenCols = 0, charts = [], showHeaders = true, fitToWidth = true, colorFormulaCells = true, revision = null } = {}) {
+  constructor({ rows = [[]], tableUid = null, columnIds = [], merges = [], widths = {}, rowHeights = {}, alignments = {}, headerColumns = [], headerRows = [], frozenRows = 1, frozenCols = 0, charts = [], showHeaders = true, fitToWidth = true, colorFormulaCells = true, revision = null, history = null } = {}) {
     const width = Math.max(1, columnIds.length, ...rows.map((row) => row.length));
     this.tableUid = tableUid;
     this.rows = normalizeCells(rows.length ? rows : [[]], width);
@@ -907,13 +1232,18 @@ export class GridModel {
     this.fitToWidth = fitToWidth !== false;
     this.colorFormulaCells = colorFormulaCells !== false;
     this.revision = revision;
-    this.undoStack = [];
-    this.redoStack = [];
+    this.history = history instanceof UndoHistory ? history : new UndoHistory();
     this.lastChangedCells = [];
     this.lastChangedCellUids = [];
     this.collectingChangedCells = null;
+    this.collectingInverse = null;
     this.validateMerges({ repair: true });
   }
+
+  get undoStack() { return this.history.entries; }
+  get redoStack() { return this.history.redoEntries; }
+
+  #record(inverse, forward) { this.collectingInverse?.push({ inverse, forward }); }
 
   get rowCount() { return this.rows.length; }
   get colCount() { return this.columnIds.length; }
@@ -989,19 +1319,24 @@ export class GridModel {
     this.revision = snapshot.revision;
   }
 
-  transact(label, mutation) {
+  #run(mutation, { record = false, label = "", hard = false } = {}) {
     const before = this.snapshot();
+    const beforeShape = gridShapeSignature(this);
     const previousCollector = this.collectingChangedCells;
+    const previousInverse = this.collectingInverse;
     const changedCells = new Set();
+    const recorded = record ? [] : null;
     this.collectingChangedCells = changedCells;
+    this.collectingInverse = recorded;
     try {
       const result = mutation(this);
       this.validateMerges();
-      this.undoStack.push({ label, snapshot: before });
-      if (this.undoStack.length > 100) this.undoStack.shift();
-      this.redoStack.length = 0;
       this.lastChangedCells = [...changedCells].map((key) => key.split(":").map(Number));
       this.lastChangedCellUids = this.lastChangedCells.map(([row, col]) => this.getCell(row, col)?.uid).filter(Boolean);
+      const afterShape = gridShapeSignature(this);
+      if (!record) return { result, changedCoordinates: this.lastChangedCells, changedUids: this.lastChangedCellUids, structural: beforeShape !== afterShape };
+      const entry = buildUndoEntry(this, { label, before, beforeShape, afterShape, recorded, hard });
+      if (entry) this.history.push(entry);
       return result;
     } catch (error) {
       this.restore(before);
@@ -1010,22 +1345,27 @@ export class GridModel {
       throw error;
     } finally {
       this.collectingChangedCells = previousCollector;
+      this.collectingInverse = previousInverse;
     }
   }
 
+  transact(label, mutation, { hard = false } = {}) { return this.#run(mutation, { record: true, label, hard }); }
+
+  transactSilently(mutation) { return this.#run(mutation, { record: false }); }
+
   undo() {
-    const entry = this.undoStack.pop();
+    const entry = this.history.popUndo();
     if (!entry) return false;
-    this.redoStack.push({ label: entry.label, snapshot: this.snapshot() });
-    this.restore(entry.snapshot);
+    this.transactSilently(() => this.history.applyInverse(this, entry));
+    this.history.pushRedo(entry);
     return true;
   }
 
   redo() {
-    const entry = this.redoStack.pop();
+    const entry = this.history.popRedo();
     if (!entry) return false;
-    this.undoStack.push({ label: entry.label, snapshot: this.snapshot() });
-    this.restore(entry.snapshot);
+    this.transactSilently(() => this.history.applyForward(this, entry));
+    this.history.pushUndo(entry);
     return true;
   }
 
@@ -1042,8 +1382,10 @@ export class GridModel {
     if (!this.inBounds(row, col)) throw new GridError("OUT_OF_BOUNDS", `Cell ${cellLabel(row, col)} is outside the grid`);
     if (this.isCovered(row, col)) throw new GridError("MERGE_COVERED", `Cell ${cellLabel(row, col)} is covered by a merge`);
     const value = String(raw ?? "");
-    if (this.rows[row][col].raw === value) return false;
-    this.rows[row][col].raw = value;
+    const cell = this.rows[row][col];
+    if (cell.raw === value) return false;
+    this.#record({ op: "setRaw", uid: cell.uid, raw: cell.raw }, { op: "setRaw", uid: cell.uid, raw: value });
+    cell.raw = value;
     this.collectingChangedCells?.add(`${row}:${col}`);
     return true;
   }
@@ -1054,6 +1396,7 @@ export class GridModel {
       if (cell.raw.startsWith("=") && !cell.raw.startsWith("==")) {
         const rewritten = rewriteFormulaForStructure(cell.raw, { ...change, formulaRow: row, formulaCol: col });
         if (rewritten !== cell.raw) {
+          this.#record({ op: "setRaw", uid: cell.uid, raw: cell.raw }, { op: "setRaw", uid: cell.uid, raw: rewritten });
           cell.raw = rewritten;
           this.collectingChangedCells?.add(`${row}:${col}`);
         }
@@ -1123,6 +1466,10 @@ export class GridModel {
     const at = clamp(index, 0, this.rowCount);
     const additions = Array.from({ length: count }, () => normalizeCells([[]], this.colCount)[0]);
     this.rewriteStructuralFormulas({ axis: "row", index: at, insertCount: count });
+    for (let offset = 0; offset < count; offset += 1) {
+      const afterRowUid = offset === 0 ? this.rows[at - 1]?.[0]?.uid || null : additions[offset - 1][0].uid;
+      this.#record({ op: "removeRowByUid", rowUid: additions[offset][0].uid }, { op: "insertRowAt", afterRowUid, cells: deepClone(additions[offset]), rowHeight: null, alignments: {} });
+    }
     this.rows.splice(at, 0, ...additions);
     for (const merge of this.merges) {
       if (at <= merge.row) merge.row += count;
@@ -1137,6 +1484,13 @@ export class GridModel {
     const removedRows = this.rows.slice(start, end + 1);
     const removedRowKeys = removedRows.map((row) => row[0]?.uid).filter(Boolean);
     const removedCellKeys = removedRows.flat().map((cell) => cell.uid);
+    for (let offset = removedRows.length - 1; offset >= 0; offset -= 1) {
+      const cells = deepClone(removedRows[offset]);
+      const rowUid = cells[0]?.uid || null;
+      const afterRowUid = offset === 0 ? this.rows[start - 1]?.[0]?.uid || null : removedRows[offset - 1][0]?.uid || null;
+      const alignments = Object.fromEntries(cells.map((cell) => [cell.uid, this.alignments[cell.uid] ?? null]).filter(([, value]) => value != null));
+      this.#record({ op: "insertRowAt", afterRowUid, cells, rowHeight: this.rowHeights[rowUid] ?? null, alignments }, { op: "removeRowByUid", rowUid });
+    }
     this.rows.splice(start, end - start + 1);
     this.rewriteStructuralFormulas({ axis: "row", index: start, deleteCount: end - start + 1 });
     for (const key of removedRowKeys) delete this.rowHeights[key];
@@ -1164,8 +1518,13 @@ export class GridModel {
     const at = clamp(index, 0, this.colCount);
     const ids = Array.from({ length: count }, makeLocalUid);
     this.rewriteStructuralFormulas({ axis: "col", index: at, insertCount: count });
+    const additions = this.rows.map(() => Array.from({ length: count }, () => ({ uid: makeLocalUid(), raw: "" })));
+    for (let offset = 0; offset < count; offset += 1) {
+      const afterColumnId = offset === 0 ? this.columnIds[at - 1] || null : ids[offset - 1];
+      this.#record({ op: "removeColById", columnId: ids[offset] }, { op: "insertColAt", afterColumnId, columnId: ids[offset], width: null, cells: additions.map((cells) => ({ ...cells[offset] })) });
+    }
     this.columnIds.splice(at, 0, ...ids);
-    for (const row of this.rows) row.splice(at, 0, ...Array.from({ length: count }, () => ({ uid: makeLocalUid(), raw: "" })));
+    for (let rowIndex = 0; rowIndex < this.rows.length; rowIndex += 1) this.rows[rowIndex].splice(at, 0, ...additions[rowIndex]);
     for (const merge of this.merges) {
       if (at <= merge.col) merge.col += count;
       else if (at <= merge.col + merge.colSpan - 1) merge.colSpan += count;
@@ -1183,8 +1542,17 @@ export class GridModel {
       if (start <= mStart && end >= mStart && end < mEnd) {
         const survivingCol = end + 1;
         const anchorRaw = this.getRaw(merge.row, mStart);
-        this.rows[merge.row][survivingCol].raw = anchorRaw;
+        const surviving = this.rows[merge.row][survivingCol];
+        this.#record({ op: "setRaw", uid: surviving.uid, raw: surviving.raw }, { op: "setRaw", uid: surviving.uid, raw: anchorRaw });
+        surviving.raw = anchorRaw;
       }
+    }
+    for (let offset = end - start; offset >= 0; offset -= 1) {
+      const columnIndex = start + offset;
+      const columnId = this.columnIds[columnIndex];
+      const afterColumnId = offset === 0 ? this.columnIds[start - 1] || null : this.columnIds[columnIndex - 1];
+      const cells = this.rows.map((row) => ({ ...row[columnIndex] }));
+      this.#record({ op: "insertColAt", afterColumnId, columnId, width: this.widths[columnId] ?? null, cells }, { op: "removeColById", columnId });
     }
     const removedCellKeys = this.rows.flatMap((row) => row.slice(start, end + 1).map((cell) => cell.uid));
     const removedIds = this.columnIds.splice(start, removed);
@@ -1227,6 +1595,14 @@ export class GridModel {
       sourceCells.push(this.rows[row].slice(source.startCol, source.endCol + 1).map((cell) => ({ ...cell })));
       sourceAlignments.push(Array.from({ length: width }, (_, col) => this.alignments[this.rows[row][source.startCol + col].uid] || null));
     }
+    for (let row = 0; row < height; row += 1) for (let col = 0; col < width; col += 1) {
+      const sourceCell = this.rows[source.startRow + row][source.startCol + col];
+      this.#record({ op: "setRaw", uid: sourceCell.uid, raw: sourceCell.raw }, { op: "setRaw", uid: sourceCell.uid, raw: "" });
+    }
+    for (let row = 0; row < height; row += 1) for (let col = 0; col < width; col += 1) {
+      const destinationCell = this.rows[targetRow + row][targetCol + col];
+      this.#record({ op: "setRaw", uid: destinationCell.uid, raw: destinationCell.raw }, { op: "setRaw", uid: destinationCell.uid, raw: rewriteFormula(sourceCells[row][col].raw, targetRow - source.startRow, targetCol - source.startCol) });
+    }
     const sourceMerges = this.merges.filter((merge) => rangeContains(source, merge.row, merge.col));
     this.merges = this.merges.filter((merge) => !sourceMerges.includes(merge) && !rangesOverlap(destination, { startRow: merge.row, endRow: merge.row + merge.rowSpan - 1, startCol: merge.col, endCol: merge.col + merge.colSpan - 1 }));
     for (let row = 0; row < height; row += 1) for (let col = 0; col < width; col += 1) {
@@ -1244,6 +1620,9 @@ export class GridModel {
   reorderRows(from, to) {
     if (from === to) return;
     if (this.merges.some((merge) => merge.rowSpan > 1)) throw new GridError("VERTICAL_MERGE_REORDER", "Unmerge multi-row regions before reordering rows");
+    const previousOrder = this.rows.map((item) => item[0]?.uid || null);
+    const nextOrder = [...previousOrder]; nextOrder.splice(to, 0, nextOrder.splice(from, 1)[0]);
+    this.#record({ op: "orderRows", rowUids: previousOrder }, { op: "orderRows", rowUids: nextOrder });
     const row = this.rows.splice(from, 1)[0];
     this.rows.splice(to, 0, row);
     const map = Array.from({ length: this.rowCount }, (_, index) => index);
@@ -1256,6 +1635,9 @@ export class GridModel {
   reorderCols(from, to) {
     if (from === to) return;
     if (this.merges.some((merge) => merge.colSpan > 1 && (from >= merge.col && from < merge.col + merge.colSpan || to >= merge.col && to < merge.col + merge.colSpan))) throw new GridError("MERGED_COLUMN_REORDER", "Move the complete merged region instead of one of its columns");
+    const previousOrder = [...this.columnIds];
+    const nextOrder = [...previousOrder]; nextOrder.splice(to, 0, nextOrder.splice(from, 1)[0]);
+    this.#record({ op: "orderCols", columnIds: previousOrder }, { op: "orderCols", columnIds: nextOrder });
     const id = this.columnIds.splice(from, 1)[0];
     this.columnIds.splice(to, 0, id);
     for (const row of this.rows) {
@@ -1279,7 +1661,9 @@ export class GridModel {
       return (direction === "desc" ? -comparison : comparison) || a.index - b.index;
     });
     const oldToNew = new Map(data.map((entry, index) => [entry.index + headerRows, index + headerRows]));
+    const previousOrder = this.rows.map((row) => row[0]?.uid || null);
     this.rows = [...this.rows.slice(0, headerRows), ...data.map((entry) => entry.row)];
+    this.#record({ op: "orderRows", rowUids: previousOrder }, { op: "orderRows", rowUids: this.rows.map((row) => row[0]?.uid || null) });
     for (const merge of this.merges) if (merge.row >= headerRows) merge.row = oldToNew.get(merge.row);
   }
 
@@ -5852,7 +6236,7 @@ async function restoreFocusedTable() {
   if (!uid || !runtime.metadata.has(uid)) return toast("Focus an enhanced Roam Grid first.", "warning");
   const entry = runtime.metadata.entries.get(uid);
   if (entry?.value?.mode === "large") return toast("Large grids cannot become native fallback without creating a native copy.", "warning");
-  disposeNativeSession(uid, true); await runtime.metadata.remove(uid); syncEnhancedUidGuard(); toast("Restored the native Roam table.", "success");
+  disposeNativeSession(uid, true); releaseUndoHistory(uid); await runtime.metadata.remove(uid); syncEnhancedUidGuard(); toast("Restored the native Roam table.", "success");
 }
 
 async function newLargeGrid() {
@@ -6110,6 +6494,7 @@ async function onunload() {
   runtime.observer?.disconnect(); runtime.observer = null; runtime.pendingScanRoots.clear(); runtime.scanQueued = false;
   for (const uid of [...runtime.sessions.keys()]) disposeNativeSession(uid, true);
   for (const mount of runtime.largeMounts.values()) mount.dispose(); runtime.largeMounts.clear(); mounting.clear();
+  clearUndoHistories();
   runtime.guardStyle?.remove(); runtime.guardStyle = null;
   for (const dispose of runtime.disposers.splice(0)) try { dispose(); } catch { /* no-op */ }
   clearTrackedTimers();
