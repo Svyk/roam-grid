@@ -73,6 +73,7 @@ const TODAYS_CONSTANTS = {
   "large-overscan-rows": 8,
   "large-chunk-rows": 500,
   "comments-enabled": true,
+  "comments-affordance-trigger": "Hover",
   "comments-badges": true,
   "comments-open-in-sidebar": false,
   "ranges-live-references": true,
@@ -90,7 +91,7 @@ const TODAYS_CONSTANTS = {
  */
 const PENDING_KEYS = [];
 
-const COMMENT_KEYS = ["comments-enabled", "comments-badges", "comments-open-in-sidebar"];
+const COMMENT_KEYS = ["comments-enabled", "comments-affordance-trigger", "comments-badges", "comments-open-in-sidebar"];
 
 const RANGE_KEYS = ["ranges-live-references", "ranges-max-rendered-cells"];
 
@@ -411,6 +412,8 @@ test("the panel omits pending rows but the schema still resolves them", async ()
     assert.ok(ids.includes(key), `${key} ships with the comments feature and must be rendered`);
     assert.equal(SETTINGS[key].stage, "live");
   }
+  assert.deepEqual([...SETTINGS["comments-affordance-trigger"].items], ["Hover", "Cmd/Ctrl + hover"]);
+  assert.equal(SETTINGS["comments-affordance-trigger"].default, "Hover", "GOAL-2H: plain hover is what the user asked for");
   // Their features landed in the 3B/3C/3F storage chain. A setting whose feature ships but whose
   // control stays hidden is the mirror image of the defect this schema replaced, so the visibility
   // of these four is asserted directly rather than only implied by their absence from PENDING_KEYS.

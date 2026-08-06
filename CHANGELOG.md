@@ -8,8 +8,10 @@ leaves a working native table.
 
 ### New capabilities that touch your graph
 
-- **Comments on cells.** Hold `Cmd`/`Ctrl` and hover a cell for a 💬, or press
-  `Cmd/Ctrl-Alt-=`. A comment is a **real Roam comment thread** — the same
+- **Comments on cells.** Hover a cell for a 💬, or press `Cmd/Ctrl-Alt-=`. A
+  grid cell is a much denser target than a block, so plain hover is the default;
+  **Comments — Show the comment button** switches it back to `Cmd/Ctrl + hover`,
+  Roam's own gesture. A comment is a **real Roam comment thread** — the same
   `[[roam/comments]]` structure Roam writes itself, placed on the commented
   cell's own page — so it shows up in Roam's own comment UI and outlives this
   extension. Nothing is written until you actually add a comment. Commented

@@ -378,7 +378,9 @@ test("mounted views register no window keydown listener; the module registers ex
   const mounted = [];
   for (let index = 0; index < 3; index += 1) {
     const root = new Node("section"); root.className = "rg-root";
-    const fake = { nativeElement: null, host: dom.body, root, boundPaste: () => {}, boundPointerUp: () => {}, renders: 0, render() { this.renders += 1; } };
+    // Real prototype, stubbed `render`: `mount` also syncs the comment affordance, and a plain object
+    // would only prove that a hand-rolled fake happens to lack the method.
+    const fake = Object.assign(Object.create(GridView.prototype), { nativeElement: null, host: dom.body, root, boundPaste: () => {}, boundPointerUp: () => {}, renders: 0, render() { this.renders += 1; } });
     GridView.prototype.mount.call(fake);
     mounted.push(fake);
   }

@@ -222,17 +222,31 @@ linked-reference count. The badge partition subtracts the thread count from the
 reference count and renders a separate comment badge; when the remainder is
 zero, the reference badge is removed entirely and only the comment badge stays.
 
-The hover affordance costs nothing when disarmed. Two window listeners on
-Meta/Control keydown/keyup (plus `blur` and `visibilitychange` to disarm) toggle
-`runtime.commentArmed`. Arming adds one delegated `pointerover` per visible grid
-and moves one reused button node into the hovered cell; disarmed means zero
-listeners and zero nodes. There is no `mousemove` and no per-cell listener.
+`comments-affordance-trigger` chooses between `Hover` (the default) and
+`Cmd/Ctrl + hover`. `GridView.commentAffordanceWanted()` is the only place that
+decides, so the modifier keyup path cannot tear down a listener `Hover` mode
+wants permanent; `syncCommentAffordance()` applies that decision and is what
+`mount`, `setCommentArming`, and the two Comments settings hooks all call.
+
+Either way the affordance is one delegated `pointerover` per visible grid and
+one reused button node moved into the hovered cell. There is no `mousemove` and
+no per-cell listener. In `Hover` mode that listener is permanent for the life of
+the mount, which is affordable only because `onCommentPointerOver` does nothing
+but `closest(".rg-cell")` and a move, and short-circuits when the node already
+sits in the hovered cell — `pointerover` bubbles, so crossing a cell's children
+re-fires it. In `Cmd/Ctrl + hover` mode two window listeners on Meta/Control
+keydown/keyup (plus `blur` and `visibilitychange` to disarm) toggle
+`runtime.commentArmed`, and disarmed still means zero listeners and zero nodes.
+
+A `preview`-surface view installs nothing in either mode: it is read-only, and a
+write affordance on a read-only surface is the defect GOAL-R1 closed.
 
 Comment writes land on the page rather than the table subtree, so the table's
 pull watch never sees them. The new anchor uid is merged optimistically into
 `session.commentThreads`, and the later datalog refresh diffs to an empty set.
 
-`LargeGridView` intentionally does not implement `setCommentArmed`: large-grid
+`LargeGridView` intentionally implements neither `syncCommentAffordance` nor
+`setCommentArmed`: large-grid
 cells are JSON rows with no block uid, so there is nothing to anchor a native
 thread to. The status element explains this and points at **Copy/convert table**.
 No alternate comment store exists.

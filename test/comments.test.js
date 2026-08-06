@@ -4,17 +4,22 @@ import {
   GridModel,
   GridView,
   NativeGridSession,
+  SETTINGS,
   applyCommentThreadPlan,
+  applySettingsChange,
   clearUndoHistories,
   commentAnchorString,
   commentArmingState,
+  commentHoverAlways,
   commentThreadCount,
   commentThreadPlan,
   diffCommentThreadIndex,
+  gridViews,
   installCommentAffordance,
   mergeCommentThread,
   queryCommentThreadIndex,
   setCommentArming,
+  settingsCache,
 } from "../src/extension.js";
 
 class MiniClassList {
@@ -99,6 +104,8 @@ function installMiniDom() {
     body,
     documentListenerCount: () => [...documentListeners.values()].reduce((total, list) => total + list.length, 0),
     windowListenerCount: () => [...windowListeners.values()].reduce((total, list) => total + list.length, 0),
+    documentListenerCountFor: (type) => (documentListeners.get(type) || []).length,
+    windowListenerCountFor: (type) => (windowListeners.get(type) || []).length,
     fireWindow(type, fields = {}) {
       const event = { type, key: "", ...fields };
       for (const listener of [...(windowListeners.get(type) || [])]) listener(event);
@@ -343,7 +350,7 @@ test("a cell referenced only by its comment thread loses the reference badge and
   assert.equal(cell.querySelector(".rg-cell-reference-count").textContent, "1", "the ref badge returns once the thread is gone");
 });
 
-function armableView() {
+function armableView({ surface = "document" } = {}) {
   const rows = [];
   for (let row = 0; row < 3; row += 1) rows.push([{ uid: `u${row}00001`, raw: `r${row}` }]);
   const model = new GridModel({ rows });
@@ -355,9 +362,24 @@ function armableView() {
   }
   globalThis.document.body.appendChild(root);
   const view = Object.assign(Object.create(GridView.prototype), {
-    model, root, disposed: false, commentArmed: false, commentAddButton: null, boundCommentPointerOver: null,
+    model, root, surface, disposed: false, commentArmed: false, commentAddButton: null, boundCommentPointerOver: null,
   });
   return { view, root, cells };
+}
+
+/** Drives the real `mount()` so the affordance decision is exercised where production makes it,
+ *  not through a hand-called helper. Only `render` is stubbed — it needs the whole DOM adapter. */
+function mountableView({ surface = "document" } = {}) {
+  const built = armableView({ surface });
+  const host = new MiniNode("div");
+  globalThis.document.body.appendChild(host);
+  Object.assign(built.view, { host, nativeElement: null, render: () => {}, boundPaste: () => {}, boundPointerUp: () => {} });
+  return { ...built, host };
+}
+
+function useTrigger(mode) {
+  settingsCache.set("comments-affordance-trigger", mode);
+  return applySettingsChange(SETTINGS["comments-affordance-trigger"], mode);
 }
 
 test("arming adds exactly one delegated pointerover to the view root and nothing to document or window", () => {
@@ -428,6 +450,7 @@ test("disarmed means zero listeners and zero nodes", () => {
 test("the affordance installer flips arming on the modifier and disarms on keyup, blur and visibilitychange", () => {
   const dom = installMiniDom();
   setCommentArming(false);
+  useTrigger("Cmd/Ctrl + hover");
   const uninstall = installCommentAffordance();
   try {
     assert.equal(commentArmingState(), false);
@@ -447,11 +470,32 @@ test("the affordance installer flips arming on the modifier and disarms on keyup
     dom.fireWindow("visibilitychange");
     assert.equal(commentArmingState(), false, "a hidden tab must disarm");
     assert.equal(dom.documentListenerCount(), 0, "the affordance owns no document listeners");
-  } finally { uninstall(); }
+  } finally { uninstall(); useTrigger("Hover"); }
   const after = dom.windowListenerCount();
   assert.equal(after, 0, "uninstalling removes every window listener it installed");
   dom.fireWindow("keydown", { key: "Meta" });
   assert.equal(commentArmingState(), false);
+});
+
+test("in Hover mode the modifier is not a gesture and must never flip the global arming flag", () => {
+  const dom = installMiniDom();
+  setCommentArming(false);
+  useTrigger("Cmd/Ctrl + hover");
+  const uninstall = installCommentAffordance();
+  try {
+    // Positive control: the assertion after the mode switch is only meaningful because the very same
+    // keydown really does arm in the other mode.
+    dom.fireWindow("keydown", { key: "Meta" });
+    assert.equal(commentArmingState(), true, "control: the modifier arms in Cmd/Ctrl + hover mode");
+    dom.fireWindow("keyup", { key: "Meta" });
+
+    useTrigger("Hover");
+    assert.equal(commentHoverAlways(), true);
+    dom.fireWindow("keydown", { key: "Meta" });
+    assert.equal(commentArmingState(), false, "a keyup would otherwise tear down the permanent listener");
+    dom.fireWindow("keyup", { key: "Meta" });
+    assert.equal(commentArmingState(), false);
+  } finally { uninstall(); useTrigger("Hover"); }
 });
 
 function commentSession({ pageUid = PAGE_UID, threadRows = [] } = {}) {
@@ -517,9 +561,148 @@ test("diffCommentThreadIndex reports additions, removals, count changes and noth
   assert.equal(diffCommentThreadIndex(new Map(), new Map()).size, 0);
 });
 
-test("LargeGridView deliberately has no setCommentArmed and the call site tolerates that", () => {
+test("LargeGridView deliberately has no comment affordance methods and the call sites tolerate that", () => {
   const large = { root: new MiniNode("section") };
   assert.equal(typeof GridView.prototype.setCommentArmed, "function");
+  assert.equal(typeof GridView.prototype.syncCommentAffordance, "function");
   assert.equal(large.setCommentArmed, undefined);
+  assert.equal(large.syncCommentAffordance, undefined);
   assert.doesNotThrow(() => large.setCommentArmed?.(true));
+  assert.doesNotThrow(() => large.syncCommentAffordance?.());
+});
+
+test("Hover mode: mounting installs exactly one delegated pointerover on the root and none on document or window", () => {
+  const dom = installMiniDom();
+  setCommentArming(false);
+  useTrigger("Hover");
+  const { view, root } = mountableView();
+  try {
+    assert.equal(commentArmingState(), false, "no arming gesture happened — Hover mode does not need one");
+    GridView.prototype.mount.call(view);
+    assert.equal(view.commentArmed, true);
+    assert.equal(root.listenerCount("pointerover"), 1);
+    assert.equal(dom.documentListenerCountFor("pointerover"), 0, "the affordance never listens on document");
+    assert.equal(dom.windowListenerCountFor("pointerover"), 0, "the affordance never listens on window");
+    assert.equal(root.querySelectorAll(".rg-cell-comment-add").length, 0, "a mounted-but-unhovered grid still has zero nodes");
+  } finally { view.setCommentArmed(false); }
+});
+
+test("Hover mode: hovering three cells moves ONE node, and re-entering a cell allocates nothing", () => {
+  installMiniDom();
+  setCommentArming(false);
+  useTrigger("Hover");
+  const { view, root, cells } = mountableView();
+  try {
+    GridView.prototype.mount.call(view);
+    cells.get(0).dispatch("pointerover");
+    const first = cells.get(0).querySelector(".rg-cell-comment-add");
+    assert.ok(first, "plain hover — no modifier held — must produce the affordance");
+    cells.get(1).dispatch("pointerover");
+    const second = cells.get(1).querySelector(".rg-cell-comment-add");
+    cells.get(2).dispatch("pointerover");
+    const third = cells.get(2).querySelector(".rg-cell-comment-add");
+
+    assert.equal(second, first, "the affordance is moved, never cloned");
+    assert.equal(third, first);
+    assert.equal(root.querySelectorAll(".rg-cell-comment-add").length, 1);
+    assert.equal(third.dataset.row, "2");
+    assert.equal(third.getAttribute("aria-label"), "Comment on A3");
+
+    // The permanent listener is only affordable if a repeat hover on the settled cell short-circuits.
+    third.setAttribute("aria-label", "sentinel");
+    cells.get(2).dispatch("pointerover");
+    assert.equal(third.getAttribute("aria-label"), "sentinel", "re-entering the settled cell must not relabel or reparent");
+    cells.get(0).dispatch("pointerover");
+    assert.equal(cells.get(0).querySelector(".rg-cell-comment-add"), first, "leaving and returning still reuses the same node");
+    assert.equal(root.querySelectorAll(".rg-cell-comment-add").length, 1);
+  } finally { view.setCommentArmed(false); }
+});
+
+test("switching to Cmd/Ctrl + hover strips the listener and the node from an already-mounted view until the modifier is held", () => {
+  installMiniDom();
+  setCommentArming(false);
+  useTrigger("Hover");
+  const { view, root, cells } = mountableView();
+  gridViews.add(view);
+  try {
+    GridView.prototype.mount.call(view);
+    cells.get(1).dispatch("pointerover");
+    // Positive control: the two assertions after the switch are only meaningful because both are
+    // non-zero here.
+    assert.equal(root.listenerCount("pointerover"), 1, "control: Hover mode really does carry one listener");
+    assert.equal(root.querySelectorAll(".rg-cell-comment-add").length, 1, "control: it really does carry one node");
+
+    const counts = useTrigger("Cmd/Ctrl + hover");
+    assert.equal(counts.views, 1, "the switch reached the mounted view through applySettingsChange, not a remount");
+    assert.equal(root.listenerCount("pointerover"), 0);
+    assert.equal(root.querySelectorAll(".rg-cell-comment-add").length, 0);
+    cells.get(0).dispatch("pointerover");
+    assert.equal(root.querySelectorAll(".rg-cell-comment-add").length, 0, "plain hover does nothing once the modifier is required");
+
+    setCommentArming(true);
+    assert.equal(root.listenerCount("pointerover"), 1, "holding the modifier re-installs it");
+    cells.get(0).dispatch("pointerover");
+    assert.equal(root.querySelectorAll(".rg-cell-comment-add").length, 1);
+
+    setCommentArming(false);
+    assert.equal(root.listenerCount("pointerover"), 0, "releasing it in modifier mode still means zero listeners");
+    assert.equal(root.querySelectorAll(".rg-cell-comment-add").length, 0, "and zero nodes");
+
+    useTrigger("Hover");
+    assert.equal(root.listenerCount("pointerover"), 1, "switching back re-installs without a remount");
+  } finally { gridViews.delete(view); view.setCommentArmed(false); setCommentArming(false); useTrigger("Hover"); }
+});
+
+test("a preview-surface view installs nothing in either mode", () => {
+  installMiniDom();
+  setCommentArming(false);
+  useTrigger("Hover");
+  const preview = mountableView({ surface: "preview" });
+  const writable = mountableView({ surface: "document" });
+  gridViews.add(preview.view);
+  try {
+    GridView.prototype.mount.call(preview.view);
+    // Positive control: an identical view that is NOT a preview does install, so zero below is a guard
+    // firing rather than a broken fixture.
+    GridView.prototype.mount.call(writable.view);
+    assert.equal(writable.root.listenerCount("pointerover"), 1, "control: a document-surface view installs in Hover mode");
+
+    assert.equal(writable.view.commentAffordanceWanted(), true, "control: the decision really is true for a writable surface");
+    assert.equal(preview.view.commentAffordanceWanted(), false);
+    assert.equal(preview.view.commentArmed, false);
+    assert.equal(preview.root.listenerCount("pointerover"), 0);
+    preview.cells.get(0).dispatch("pointerover");
+    assert.equal(preview.root.querySelectorAll(".rg-cell-comment-add").length, 0);
+
+    useTrigger("Cmd/Ctrl + hover");
+    setCommentArming(true);
+    assert.equal(writable.view.commentAffordanceWanted(), true, "control: the modifier really is held");
+    assert.equal(preview.view.commentAffordanceWanted(), false, "the decision refuses a read-only surface in modifier mode too");
+    assert.equal(preview.root.listenerCount("pointerover"), 0, "a read-only surface gets no write affordance in modifier mode either");
+    preview.cells.get(0).dispatch("pointerover");
+    assert.equal(preview.root.querySelectorAll(".rg-cell-comment-add").length, 0);
+    assert.equal(preview.view.setCommentArmed(true), false, "the boundary refuses even a direct arm");
+  } finally { gridViews.delete(preview.view); writable.view.setCommentArmed(false); setCommentArming(false); useTrigger("Hover"); }
+});
+
+test("turning cell comments off removes the hover affordance, and turning them back on restores it", () => {
+  installMiniDom();
+  setCommentArming(false);
+  useTrigger("Hover");
+  const { view, root, cells } = mountableView();
+  gridViews.add(view);
+  try {
+    GridView.prototype.mount.call(view);
+    cells.get(0).dispatch("pointerover");
+    assert.equal(root.querySelectorAll(".rg-cell-comment-add").length, 1, "control: comments are on, so the affordance is present");
+
+    settingsCache.set("comments-enabled", false);
+    applySettingsChange(SETTINGS["comments-enabled"], false);
+    assert.equal(root.listenerCount("pointerover"), 0, "an affordance for a disabled feature is a dead control");
+    assert.equal(root.querySelectorAll(".rg-cell-comment-add").length, 0);
+
+    settingsCache.set("comments-enabled", true);
+    applySettingsChange(SETTINGS["comments-enabled"], true);
+    assert.equal(root.listenerCount("pointerover"), 1);
+  } finally { gridViews.delete(view); settingsCache.delete("comments-enabled"); view.setCommentArmed(false); useTrigger("Hover"); }
 });

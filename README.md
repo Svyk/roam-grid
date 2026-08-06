@@ -110,8 +110,10 @@ switched to fixed widths with horizontal scrolling.
 
 ### Comments
 
-Hold `Cmd`/`Ctrl` and hover a cell to reveal a 💬; click it (or press
-`Cmd/Ctrl-Alt-=`) to start a comment thread on that cell. Threads are **real
+Hover a cell to reveal a 💬; click it (or press `Cmd/Ctrl-Alt-=`) to start a
+comment thread on that cell. If you would rather the button stayed out of the
+way, **Comments — Show the comment button** switches it to `Cmd/Ctrl + hover`,
+which is Roam's own gesture for a block. Threads are **real
 Roam comment threads** — the same `[[roam/comments]]` structure Roam writes
 itself, on the cell's own page — so they appear in Roam's own comment UI and
 survive uninstalling this extension. Commented cells get their own badge, kept
@@ -149,7 +151,7 @@ mouse-out is not a safe place to edit.
 
 ## Settings
 
-**Settings → Roam Depot → Roam Grid.** Thirty-seven controls in eight groups —
+**Settings → Roam Depot → Roam Grid.** Thirty-eight controls in eight groups —
 Writes, Editing, Appearance, Sizing, New grids, Large grids, Comments, Ranges —
 plus four maintenance actions: apply display defaults to open grids, forget this
 device's overrides, clear local caches, and reset every setting.

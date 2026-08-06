@@ -39,6 +39,8 @@ const DEFAULT_NEW_GRID_COLS = 26;
 const DEFAULT_LARGE_OVERSCAN_ROWS = 8;
 const DEFAULT_RANGE_RENDERED_CELLS = 2000;
 const DEFAULT_LARGE_CACHE_MB = 256;
+const COMMENT_TRIGGER_HOVER = "Hover";
+const COMMENT_TRIGGER_MODIFIER = "Cmd/Ctrl + hover";
 const LARGE_RESIDENT_MIN_CHUNKS = 8;
 const LARGE_RESIDENT_MAX_CHUNKS = 32;
 const LARGE_UPLOAD_CONCURRENCY = 4;
@@ -102,7 +104,8 @@ const SETTING_DESCRIPTORS = [
   { key: "new-grid-cols", group: "New grids", name: "Columns in a new large grid", description: "How many columns a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_COLS, min: 1, max: 702, scope: "graph", apply: "next-op", stage: "live" },
   { key: "large-overscan-rows", group: "Large grids", name: "Overscan rows", description: "Extra rows rendered above and below a large grid's viewport.", control: "input", type: "int", default: DEFAULT_LARGE_OVERSCAN_ROWS, min: 0, max: 200, scope: "device", apply: "immediate", stage: "live", onLarge: (mount) => mount.scheduleRender() },
   { key: "large-chunk-rows", group: "Large grids", name: "Rows per chunk file", description: "How many rows each chunk file holds. Applies to newly created large grids only — an existing grid keeps the chunk size it was written with, because changing it would misaddress every chunk.", control: "input", type: "int", default: CHUNK_ROWS, min: 50, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "comments-enabled", group: "Comments", name: "Enable cell comments", description: "Read and write native Roam comment threads from grid cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges() },
+  { key: "comments-enabled", group: "Comments", name: "Enable cell comments", description: "Read and write native Roam comment threads from grid cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => { view.updateReferenceCountBadges(); view.syncCommentAffordance?.(); } },
+  { key: "comments-affordance-trigger", group: "Comments", name: "Show the comment button", description: "Whether the 💬 button appears as soon as the pointer enters a cell, or only while Cmd/Ctrl is held — Roam's own gesture for a block. Hover is the default because a grid cell is a much denser, more deliberate target than a block.", control: "select", type: "enum", default: COMMENT_TRIGGER_HOVER, items: [COMMENT_TRIGGER_HOVER, COMMENT_TRIGGER_MODIFIER], scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.syncCommentAffordance?.() },
   { key: "comments-badges", group: "Comments", name: "Show comment badges", description: "Mark cells that carry a comment thread.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges() },
   { key: "comments-open-in-sidebar", group: "Comments", name: "Open comment threads in the right sidebar", description: "Open a cell's comment thread in the right sidebar instead of inline.", control: "switch", type: "bool", default: false, scope: "device", apply: "immediate", stage: "live" },
   { key: "ranges-live-references", group: "Ranges", name: "Render live range references", description: "Render {{roam-grid-range: …}} components as a live view of the source cells. With this off the component stays as its raw text; views already on screen keep rendering until Roam next redraws their block.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
@@ -5209,24 +5212,31 @@ export function installKeyboardOwnership() {
 
 export function commentArmingState() { return Boolean(runtime.commentArmed); }
 
-/** Flips every mounted native grid into (or out of) the hover-affordance state.  Large grids do not
- *  implement `setCommentArmed` at all — their cells are JSON rows with no block uid to comment on. */
+/** `Hover` is the default the user asked for: on a grid cell — a much denser, more deliberate target
+ *  than a Roam block — the modifier that makes sense for a block is friction.  `Cmd/Ctrl + hover`
+ *  stays available for anyone who finds a permanent hover target noisy, and for Roam-native parity. */
+export function commentHoverAlways() { return getSetting("comments-affordance-trigger") === COMMENT_TRIGGER_HOVER; }
+
+/** Records the modifier state and lets every mounted grid recompute what it wants.  Large grids do not
+ *  implement `syncCommentAffordance` at all — their cells are JSON rows with no block uid to comment on. */
 export function setCommentArming(armed) {
   const next = Boolean(armed);
   if (runtime.commentArmed === next) return next;
   runtime.commentArmed = next;
-  // RangeGridView deliberately omits setCommentArmed — this `?.` is what lets a range excerpt skip comment chrome. Keep it.
-  for (const view of runtime.views) view.setCommentArmed?.(next);
+  // RangeGridView deliberately omits syncCommentAffordance — this `?.` is what lets a range excerpt skip comment chrome. Keep it.
+  for (const view of runtime.views) view.syncCommentAffordance?.();
   return next;
 }
 
 /**
- * The whole hover affordance costs four window listeners and one flag.  No `mousemove`, no per-cell
- * listeners, and nothing at all in the DOM until the modifier is actually held.
+ * The modifier lane costs four window listeners and one flag.  No `mousemove`, no per-cell listeners,
+ * and in `Cmd/Ctrl + hover` mode nothing at all in the DOM until the modifier is actually held.  In
+ * `Hover` mode the modifier is not a gesture at all, so it must not arm — a keyup would otherwise tear
+ * down the very listener that mode wants permanent.
  */
 export function installCommentAffordance({ target = globalThis.window } = {}) {
   const isModifier = (event) => event?.key === "Meta" || event?.key === "Control";
-  const onKeydown = (event) => { if (isModifier(event) && getSetting("comments-enabled")) setCommentArming(true); };
+  const onKeydown = (event) => { if (isModifier(event) && getSetting("comments-enabled") && !commentHoverAlways()) setCommentArming(true); };
   const onKeyup = (event) => { if (isModifier(event)) setCommentArming(false); };
   const disarm = () => setCommentArming(false);
   target?.addEventListener?.("keydown", onKeydown, true);
@@ -6744,7 +6754,7 @@ export class GridView {
     this.root.addEventListener("paste", this.boundPaste);
     document.addEventListener("pointerup", this.boundPointerUp, true);
     this.render();
-    if (runtime.commentArmed) this.setCommentArmed(true);
+    this.syncCommentAffordance();
   }
 
   toolbar() {
@@ -7451,11 +7461,25 @@ export class GridView {
   }
 
   /**
+   * The one place that decides whether this view carries the affordance, so the modifier keyup path
+   * cannot tear down a listener that `Hover` mode still wants.  A preview mount is read-only
+   * (GOAL-R1) and gets no write affordance in either mode.
+   */
+  commentAffordanceWanted() {
+    if (this.disposed || this.surface === "preview" || !getSetting("comments-enabled")) return false;
+    return commentHoverAlways() || Boolean(runtime.commentArmed);
+  }
+
+  syncCommentAffordance() { return this.setCommentArmed(this.commentAffordanceWanted()); }
+
+  /**
    * Arming installs exactly ONE delegated `pointerover` on this view's root and reuses ONE button
    * node.  No `mousemove`, no per-cell listeners.  Disarmed means zero listeners and zero nodes.
+   * In `Hover` mode that one listener is permanent for the life of the mount, which is affordable
+   * only because `onCommentPointerOver` stays a `closest` plus a move.
    */
   setCommentArmed(armed) {
-    const next = Boolean(armed) && !this.disposed;
+    const next = Boolean(armed) && !this.disposed && this.surface !== "preview";
     if (Boolean(this.commentArmed) === next) return next;
     this.commentArmed = next;
     this.root.classList?.toggle?.("rg-root--comment-armed", next);
@@ -7490,6 +7514,9 @@ export class GridView {
     if (!this.commentArmed) return null;
     const cell = event?.target?.closest?.(".rg-cell");
     if (!cell || !this.root.contains?.(cell)) return null;
+    // `pointerover` bubbles, so crossing the children of one cell re-fires it. Settling for the cell
+    // the node already sits in is what keeps a permanent `Hover`-mode listener allocation-free.
+    if (this.commentAddButton && this.commentAddButton.parentElement === cell) return this.commentAddButton;
     const row = Number(cell.dataset.row); const col = Number(cell.dataset.col);
     if (!Number.isInteger(row) || !Number.isInteger(col) || this.model.isCovered(row, col)) return null;
     const affordance = this.commentAffordance();
