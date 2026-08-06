@@ -14,6 +14,7 @@ import {
   coerceSetting,
   deviceSettingsKey,
   enterMovement,
+  formulaTintEnabled,
   getSetting,
   graphCacheKey,
   gridSessions,
@@ -25,6 +26,7 @@ import {
   readDeviceSettings,
   readEnhancedUidCache,
   refreshSettingsCache,
+  repaintFormulaTint,
   resolveSettingValue,
   runMaintenanceAction,
   setSetting,
@@ -117,7 +119,13 @@ function makeStorage(initial = {}) {
 
 function makeClassList() {
   const names = new Set();
-  return { names, add: (name) => names.add(name), remove: (name) => names.delete(name), contains: (name) => names.has(name) };
+  return {
+    names,
+    add: (name) => names.add(name),
+    remove: (name) => names.delete(name),
+    contains: (name) => names.has(name),
+    toggle: (name, on) => { if (on) names.add(name); else names.delete(name); return names.has(name); },
+  };
 }
 
 function makeElement() {
@@ -572,12 +580,78 @@ test("display defaults are stamped, never inherited", (t) => {
   t.after(() => settingsCache.clear());
   refreshSettingsCache(makeApi({ values: { "appearance-show-headers": false, "appearance-fit-to-width": false, "appearance-formula-tinting": false } }).api, makeStorage());
   const target = { showHeaders: true, fitToWidth: true, colorFormulaCells: true, rowCount: 3 };
-  assert.deepEqual(displayDefaults(), { showHeaders: false, fitToWidth: false, colorFormulaCells: false });
+  assert.deepEqual(displayDefaults(), { showHeaders: false, fitToWidth: false });
   assert.equal(applyDisplayDefaults(target), target);
-  assert.deepEqual(target, { showHeaders: false, fitToWidth: false, colorFormulaCells: false, rowCount: 3 });
+  assert.deepEqual(target, { showHeaders: false, fitToWidth: false, colorFormulaCells: true, rowCount: 3 }, "tinting is masked live, so creation must not stamp it");
   assert.equal(applyDisplayDefaults(null), null);
   refreshSettingsCache(makeApi().api, makeStorage());
-  assert.deepEqual(applyDisplayDefaults({}), { showHeaders: true, fitToWidth: true, colorFormulaCells: true });
+  assert.deepEqual(applyDisplayDefaults({}), { showHeaders: true, fitToWidth: true });
+});
+
+/**
+ * The mask must read BOTH inputs. Each row below is failed by an implementation that degrades to
+ * reading only the global (rows 3-4) or only the per-grid flag (rows 1-2).
+ */
+test("formula tinting is the AND of the global setting and the grid's own flag", (t) => {
+  t.after(() => settingsCache.clear());
+  const cases = [
+    { global: true, grid: true, tinted: true },
+    { global: true, grid: false, tinted: false },
+    { global: false, grid: true, tinted: false },
+    { global: false, grid: false, tinted: false },
+  ];
+  for (const { global, grid, tinted } of cases) {
+    refreshSettingsCache(makeApi({ values: { "appearance-formula-tinting": global } }).api, makeStorage());
+    assert.equal(formulaTintEnabled(grid), tinted, `global ${global} × grid ${grid} must tint: ${tinted}`);
+  }
+  // An absent per-grid flag is "explicitly true" everywhere else in the file; the mask must agree.
+  refreshSettingsCache(makeApi().api, makeStorage());
+  assert.equal(formulaTintEnabled(undefined), true);
+  assert.equal(formulaTintEnabled(null), true);
+});
+
+test("toggling the global setting suppresses and restores tinting without touching the grid", (t) => {
+  t.after(() => { clearRegistries(); settingsCache.clear(); });
+  clearRegistries();
+  const cells = new Map([
+    ["0:0", { dataset: { rgRaw: "=SUM(A1:A2)" }, classList: makeClassList() }],
+    ["0:1", { dataset: { rgRaw: "plain text" }, classList: makeClassList() }],
+    ["1:0", { dataset: { rgRaw: "==literal" }, classList: makeClassList() }],
+  ]);
+  const model = { colorFormulaCells: true };
+  const view = { cells, model, refreshFormulaTint() { return repaintFormulaTint(this.cells, this.model.colorFormulaCells); } };
+  gridViews.add(view);
+  const tinted = () => [...cells].filter(([, cell]) => cell.classList.contains("rg-cell--formula")).map(([key]) => key);
+
+  refreshSettingsCache(makeApi({ values: { "appearance-formula-tinting": true } }).api, makeStorage());
+  view.refreshFormulaTint();
+  assert.deepEqual(tinted(), ["0:0"], "only the formula cell tints; == is an escaped literal");
+
+  settingsCache.set("appearance-formula-tinting", false);
+  applySettingsChange(SETTINGS["appearance-formula-tinting"], false);
+  assert.deepEqual(tinted(), [], "global off must suppress tinting immediately, with no re-render");
+  assert.equal(model.colorFormulaCells, true, "suppressing must not write the grid's own flag");
+
+  settingsCache.set("appearance-formula-tinting", true);
+  applySettingsChange(SETTINGS["appearance-formula-tinting"], true);
+  assert.deepEqual(tinted(), ["0:0"], "global on must return the grid to its own choice");
+  assert.equal(model.colorFormulaCells, true);
+
+  // The grid's own opt-out still wins while the global is on.
+  model.colorFormulaCells = false;
+  applySettingsChange(SETTINGS["appearance-formula-tinting"], true);
+  assert.deepEqual(tinted(), []);
+});
+
+test("the tinting setting reaches live views through a repaint, not a value-diff refresh", () => {
+  const descriptor = SETTINGS["appearance-formula-tinting"];
+  assert.equal(typeof descriptor.onView, "function");
+  assert.equal(typeof descriptor.onLarge, "function");
+  const calls = [];
+  descriptor.onView({ refreshFormulaTint: () => calls.push("tint"), refreshValues: () => calls.push("values") });
+  assert.deepEqual(calls, ["tint"], "refreshValues short-circuits when no cell changed, so it cannot carry this setting");
+  descriptor.onLarge({ scheduleRender: () => calls.push("large") });
+  assert.deepEqual(calls, ["tint", "large"]);
 });
 
 test("the display-defaults button rewrites open grids and repaints them", (t) => {

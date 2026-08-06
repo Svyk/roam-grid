@@ -64,7 +64,7 @@ const SETTING_DESCRIPTORS = [
   { key: "editing-capture-undo", group: "Editing", name: "Capture grid undo history", description: "Record grid edits in the extension's own undo history so ⌘Z reverses them.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-enter-direction", group: "Editing", name: "Enter moves", description: "Where the selection lands after Enter finishes a cell edit.", control: "select", type: "enum", default: "Down", items: ["Down", "Right", "Stay"], scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-tab-direction", group: "Editing", name: "Tab moves", description: "Where the selection lands after Tab finishes a cell edit.", control: "select", type: "enum", default: "Right", items: ["Right", "Down"], scope: "graph", apply: "immediate", stage: "live" },
-  { key: "appearance-formula-tinting", group: "Appearance", name: "Tint formula cells", description: "Give cells that hold a formula their own background tint on new grids.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshValues?.(), onLarge: (mount) => mount.scheduleRender?.() },
+  { key: "appearance-formula-tinting", group: "Appearance", name: "Tint formula cells", description: "Give cells that hold a formula their own background tint. Turning this off suppresses tinting on every grid at once; turning it back on returns each grid to its own “fx” setting.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshFormulaTint?.(), onLarge: (mount) => mount.scheduleRender?.() },
   { key: "appearance-show-headers", group: "Appearance", name: "Show row and column headers", description: "Show the A/B/C and 1/2/3 axis headers on new grids.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
   { key: "appearance-fit-to-width", group: "Appearance", name: "Fit grids to the block width", description: "Scale columns so a new grid fills the width of its block instead of scrolling.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
   { key: "appearance-reference-badges", group: "Appearance", name: "Show cell reference badges", description: "Show the linked-reference count badge on cells that other blocks reference.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges?.() },
@@ -99,7 +99,7 @@ const SETTING_DESCRIPTORS = [
  * (nothing to seed, cache, coerce, or reset) and are appended to the rendered panel instead.
  */
 const MAINTENANCE_ACTIONS = Object.freeze([
-  { key: "maintenance-apply-display", group: "Maintenance", name: "Apply display defaults to open grids", description: "Rewrite headers, fit-to-width, and formula tinting on every grid currently on screen to match the Appearance defaults above. Existing grids keep their own settings until you press this.", control: "button", type: "string", default: "", scope: "graph", apply: "immediate", stage: "live" },
+  { key: "maintenance-apply-display", group: "Maintenance", name: "Apply display defaults to open grids", description: "Rewrite headers and fit-to-width on every grid currently on screen to match the Appearance defaults above. Existing grids keep their own settings until you press this.", control: "button", type: "string", default: "", scope: "graph", apply: "immediate", stage: "live" },
   { key: "maintenance-forget-device", group: "Maintenance", name: "Forget this device's overrides", description: "Drop the device-only values (toolbar, theme, maximum width, overscan) and fall back to the graph-synced ones.", control: "button", type: "string", default: "", scope: "device", apply: "immediate", stage: "live" },
   { key: "maintenance-clear-caches", group: "Maintenance", name: "Clear local caches", description: "Forget the cached enhanced-table list and the theme palette. Nothing in your graph changes.", control: "button", type: "string", default: "", scope: "device", apply: "immediate", stage: "live" },
   { key: "maintenance-reset", group: "Maintenance", name: "Reset all Roam Grid settings", description: "Restore every setting on this page to its default.", control: "button", type: "string", default: "", scope: "graph", apply: "immediate", stage: "live" },
@@ -321,18 +321,41 @@ export function applySettingsChange(descriptor, value) {
   return counts;
 }
 
-/** Display flags use `!== false` semantics in ~30 places, so "absent" cannot be told apart from
- *  "explicitly true". The global default is therefore stamped at creation only, never inherited. */
+/** `showHeaders` and `fitToWidth` use `!== false` semantics in ~30 places, so "absent" cannot be told
+ *  apart from "explicitly true". They are therefore stamped at creation only, never inherited.
+ *  `colorFormulaCells` is deliberately absent: it is masked live by `formulaTintEnabled`, and a value
+ *  cannot be both an inherited creation default and a live override without the two disagreeing —
+ *  a grid created while the master switch was off would stay untinted after it was switched back on. */
 export function displayDefaults() {
   return {
     showHeaders: getSetting("appearance-show-headers") !== false,
     fitToWidth: getSetting("appearance-fit-to-width") !== false,
-    colorFormulaCells: getSetting("appearance-formula-tinting") !== false,
   };
 }
 
 export function applyDisplayDefaults(target) {
   return target ? Object.assign(target, displayDefaults()) : target;
+}
+
+/**
+ * Formula tinting is a live global override, not a creation default: `renderCellValue` reads it per
+ * render, so the mask costs one `Map.get` and is instantly reversible. Global off suppresses tinting
+ * everywhere; global on hands each grid back to its own `colorFormulaCells`. Neither input is
+ * written, so no metadata migration is involved.
+ */
+export function formulaTintEnabled(gridFlag) {
+  return getSetting("appearance-formula-tinting") !== false && gridFlag !== false;
+}
+
+/** Toggles the tint class on already-mounted cells from their stored raw text — no re-render, no
+ *  formula evaluation, and no write to the model. */
+export function repaintFormulaTint(cells, gridFlag) {
+  const enabled = formulaTintEnabled(gridFlag);
+  for (const cell of cells?.values?.() || []) {
+    const raw = cell?.dataset?.rgRaw ?? "";
+    cell?.classList?.toggle("rg-cell--formula", enabled && raw.startsWith("=") && !raw.startsWith("=="));
+  }
+  return enabled;
 }
 
 export function applyGridMaxWidth(root, value = getSetting("appearance-max-width")) {
@@ -5893,7 +5916,7 @@ export class GridView {
     const formula = raw.startsWith("=") && !raw.startsWith("==");
     const content = ensureCellContent(cell);
     cell.dataset.rgRaw = raw;
-    cell.classList.toggle("rg-cell--formula", formula && this.model.colorFormulaCells);
+    cell.classList.toggle("rg-cell--formula", formula && formulaTintEnabled(this.model.colorFormulaCells));
     cell.classList.toggle("rg-cell--error", formula && String(value).startsWith("#"));
     cell.title = formula ? raw : "";
     for (const [name, renderer] of runtime.registries.cellRenderers) {
@@ -6685,6 +6708,12 @@ export class GridView {
     }
   }
 
+  /** Re-evaluates the tint mask on mounted cells only. `refreshValues` cannot do this: it
+   *  short-circuits when no cell changed, and a settings flip changes no cell. */
+  refreshFormulaTint() {
+    return repaintFormulaTint(this.cells, this.model?.colorFormulaCells);
+  }
+
   applyPatch(patch) {
     return this.session.applyPatch(patch, this);
   }
@@ -6814,7 +6843,7 @@ export class RangeGridView {
     const formula = raw.startsWith("=") && !raw.startsWith("==");
     const content = ensureCellContent(cell);
     cell.dataset.rgRaw = raw;
-    cell.classList.toggle("rg-cell--formula", formula && this.model.colorFormulaCells);
+    cell.classList.toggle("rg-cell--formula", formula && formulaTintEnabled(this.model.colorFormulaCells));
     cell.classList.toggle("rg-cell--error", formula && String(value).startsWith("#"));
     return renderStableCellContent(content, { raw, value, formula, renderRich: paintRichCellContent });
   }
@@ -6865,6 +6894,10 @@ export class RangeGridView {
       const [row, col] = key.split(":").map(Number);
       this.renderRangeCellValue(cell, row, col, engine);
     }
+  }
+
+  refreshFormulaTint() {
+    return repaintFormulaTint(this.cells, this.model?.colorFormulaCells);
   }
 
   /** Row-deletion patching is a `GridView` optimisation; a range excerpt simply re-renders. */
@@ -7133,7 +7166,7 @@ export class LargeGridView {
   async renderLargeCellValue(cell, raw, row, col, engine = this.formulaEngine) {
     const key = `${row}:${col}`; const token = (this.cellValueTokens.get(cell) || 0) + 1; this.cellValueTokens.set(cell, token);
     const formula = raw.startsWith("=") && !raw.startsWith("=="); const content = ensureCellContent(cell);
-    cell.dataset.rgRaw = raw; cell.classList.toggle("rg-cell--formula", formula && this.store.manifest.colorFormulaCells !== false);
+    cell.dataset.rgRaw = raw; cell.classList.toggle("rg-cell--formula", formula && formulaTintEnabled(this.store.manifest.colorFormulaCells));
     if (formula) {
       const value = await engine.evaluateCell(row, col);
       if (this.cellValueTokens.get(cell) !== token || this.cells.get(key) !== cell) return;
