@@ -6428,6 +6428,25 @@ export async function searchRoamRecentSuggestions(context, { limit = getSetting(
   return page ? recentPageSuggestions(rows, boundedLimit) : recentBlockSuggestions(rows, boundedLimit, excludeUids);
 }
 
+/** Caret moves a `<textarea>` reports through neither `select` nor `input`, so the trigger context
+ *  has to be re-derived from a keyup instead. Without them a menu opened on `[[Pro` stays up against
+ *  a caret that has already walked out of the query it belongs to. */
+const CARET_MOVE_KEYS = new Set(["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
+/** The pairs Roam wraps a selection in. `[` twice over a label is how an aliased ref is built by hand. */
+const SELECTION_WRAP_PAIRS = new Map([["[", "]"], ["(", ")"], ["{", "}"], ['"', '"']]);
+
+/** Wraps the selection in `key` and its partner, leaving the original text selected so the gesture
+ *  repeats. Returns false and touches nothing when the key is not a pair or there is no selection. */
+export function wrapSelectionOnPair(editor, key) {
+  const closer = SELECTION_WRAP_PAIRS.get(key);
+  if (!closer || !editor) return false;
+  const start = editor.selectionStart ?? 0; const end = editor.selectionEnd ?? start;
+  if (end <= start) return false;
+  editor.setRangeText(`${key}${editor.value.slice(start, end)}${closer}`, start, end, "preserve");
+  editor.setSelectionRange(start + 1, end + 1);
+  return true;
+}
+
 export class GridEditorController {
   constructor(view, { cellAt, dimensions, mountedCells = null, cellRange = null, navigateReference = null, revealReference = null, searchReferences = searchRoamReferenceSuggestions, searchRecents = searchRoamRecentSuggestions, referenceSearchDelay = null, onFinish, viewport }) {
     this.view = view;
@@ -6507,6 +6526,7 @@ export class GridEditorController {
     this.input.addEventListener("click", () => this.onEditorSelection());
     this.input.addEventListener("select", () => this.onEditorSelection());
     this.input.addEventListener("keydown", (event) => this.onKeydown(event));
+    this.input.addEventListener("keyup", (event) => this.onKeyup(event));
     this.input.addEventListener("blur", (event) => {
       if (!this.state || this.state.transitioning || this.popover.contains(event.relatedTarget)) return;
       this.finish(true);
@@ -6537,6 +6557,7 @@ export class GridEditorController {
     this.portalTheme.sync();
     if (!floating) {
       editor.addEventListener("keydown", (event) => this.onKeydown(event));
+      editor.addEventListener("keyup", (event) => this.onKeyup(event));
       editor.addEventListener("compositionstart", () => { if (this.state) this.state.composing = true; });
       editor.addEventListener("compositionend", () => { if (this.state) this.state.composing = false; this.schedulePresentation(); });
       editor.addEventListener("input", () => { this.onEditorInput(); });
@@ -6599,6 +6620,14 @@ export class GridEditorController {
       event.preventDefault();
       return;
     }
+    // Ahead of the menu branches, and off inside a formula where `(` opens a call and `"` opens a
+    // string literal — the same boundary the trigger-context formula guards draw.
+    const formula = state.editor.value.startsWith("=") && !state.editor.value.startsWith("==");
+    if (!formula && wrapSelectionOnPair(state.editor, event.key)) {
+      event.preventDefault();
+      this.schedulePresentation();
+      return;
+    }
     const hasSuggestions = !this.suggestionList.hidden && this.suggestions.length;
     if (hasSuggestions && ["ArrowDown", "ArrowUp"].includes(event.key)) {
       event.preventDefault();
@@ -6623,6 +6652,15 @@ export class GridEditorController {
     }
     if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); this.finish(true, enterMovement()); return; }
     if (event.key === "Tab") { event.preventDefault(); this.finish(true, tabMovement(undefined, event.shiftKey)); }
+  }
+
+  /** The caret half of the presentation loop. `select` and `input` cover pointer selection and
+   *  typing; a bare caret move fires neither, so the menu would otherwise outlive its own query. */
+  onKeyup(event) {
+    const state = this.state;
+    if (!state || state.composing || event.isComposing) return;
+    if (!CARET_MOVE_KEYS.has(event.key)) return;
+    this.schedulePresentation();
   }
 
   acceptSuggestion(index) {
@@ -6921,6 +6959,10 @@ export class GridEditorController {
       const detail = document.createElement("span"); detail.textContent = suggestion.description;
       option.append(name, detail);
       option.addEventListener("pointerdown", (event) => event.preventDefault());
+      // Hover moves the real active index, not just a CSS state, or Enter accepts a different row
+      // than the one under the pointer. A repaint, never a rebuild — a rebuild here would drop the
+      // row the pointer is sitting on, on every mouse move.
+      option.addEventListener("mouseenter", () => { this.suggestionIndex = index; this.paintActiveSuggestion(); });
       option.addEventListener("click", () => this.acceptSuggestion(index));
       this.suggestionList.appendChild(option);
     });

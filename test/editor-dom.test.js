@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { FormulaEngine, GridEditorController, GridModel, GridView, NativeGridSession, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, queryBlockReferenceSources, recentsCacheReady, recentsDisabled, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, resetRoamRecents, searchRoamRecentSuggestions, settingsCache, syncPortalThemeFromRoot } from "../src/extension.js";
+import { FormulaEngine, GridEditorController, GridModel, GridView, NativeGridSession, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, queryBlockReferenceSources, recentsCacheReady, recentsDisabled, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, resetRoamRecents, searchRoamRecentSuggestions, settingsCache, syncPortalThemeFromRoot, wrapSelectionOnPair } from "../src/extension.js";
 
 class MiniClassList {
   constructor() { this.values = new Set(); }
@@ -1142,6 +1142,113 @@ test("Roam reference suggestions take keyboard precedence and Escape closes them
   controller.onKeydown({ key: "Escape", preventDefault() {}, stopPropagation() {}, isComposing: false }); await Promise.resolve();
   assert.equal(controller.state, null); assert.equal(finishes.at(-1).commit, false); assert.equal(editor.value, '=SUM(A1)&"[[Pro');
   controller.dispose();
+});
+
+/**
+ * A `<textarea>` fires neither `select` nor `input` for a caret move, so before the keyup path
+ * existed the menu opened on `[[Pro` survived arrow keys that had walked the caret out of its query.
+ */
+test("an arrow key that walks the caret out of the query closes the menu", async () => {
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async () => [{ kind: "roam-page", name: "Project Alpha", description: "Page" }],
+  });
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "[[Pro", floating: false });
+  flush(); await waitForSearch();
+  assert.equal(controller.suggestionList.hidden, false, "the open menu is the baseline this test closes");
+  assert.equal(editor.getAttribute("aria-expanded"), "true");
+
+  editor.setSelectionRange(1, 1);
+  editor.dispatch("keyup", { key: "ArrowLeft" });
+  flush(); await waitForSearch();
+  assert.deepEqual(controller.suggestions, []);
+  assert.equal(controller.suggestionList.hidden, true, "the menu must not outlive the caret leaving its query");
+  assert.equal(editor.getAttribute("aria-expanded"), "false");
+  assert.equal(controller.popover.hidden, true);
+
+  editor.setSelectionRange(5, 5);
+  editor.dispatch("keyup", { key: "End" });
+  flush(); await waitForSearch();
+  assert.equal(controller.suggestionList.hidden, false, "a caret move back into the query reopens it");
+
+  editor.dispatch("keyup", { key: "Shift" });
+  flush(); await waitForSearch();
+  assert.equal(controller.suggestionList.hidden, false, "a key that cannot move the caret changes nothing");
+  controller.dispose();
+});
+
+/**
+ * Hover used to be CSS-only while `suggestionIndex` stayed put, so the row that looked selected and
+ * the row Enter accepted were different rows. Node identity is asserted alongside because a rebuild
+ * on mouse movement would undo the split painting this repaint depends on.
+ */
+test("hovering a row moves the highlight, and Enter accepts the row that looks selected", async () => {
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async () => [
+      { kind: "roam-page", name: "Alpha", description: "Page" },
+      { kind: "roam-page", name: "Beta", description: "Page" },
+    ],
+  });
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "[[A", floating: false });
+  flush(); await waitForSearch();
+  const [first, second] = controller.suggestionList.children;
+  assert.equal(controller.suggestionIndex, 0);
+  assert.equal(first.getAttribute("aria-selected"), "true");
+
+  second.dispatch("mouseenter");
+  assert.equal(controller.suggestionIndex, 1, "hover owns the active index, not just a hover tint");
+  assert.equal(second.getAttribute("aria-selected"), "true");
+  assert.equal(second.classList.contains("rg-formula-suggestion--active"), true);
+  assert.equal(first.getAttribute("aria-selected"), "false");
+  assert.equal(editor.getAttribute("aria-activedescendant"), second.id);
+  assert.equal(controller.suggestionList.children[0], first, "hover repaints row 0, it must not rebuild it");
+  assert.equal(controller.suggestionList.children[1], second, "hover repaints row 1, it must not rebuild it");
+
+  controller.onKeydown({ key: "Enter", preventDefault() {}, stopPropagation() {}, isComposing: false });
+  flush();
+  assert.equal(editor.value, "[[Beta]]", "Enter takes the hovered row, not the one the keyboard left behind");
+  controller.dispose();
+});
+
+test("a pair key over a selection wraps it, and a formula keeps its own brackets", async () => {
+  const { controller, cells, flush } = makeController();
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "sel", floating: false });
+  flush();
+
+  editor.setSelectionRange(0, 3);
+  let prevented = false;
+  controller.onKeydown({ key: "[", preventDefault() { prevented = true; }, stopPropagation() {}, isComposing: false });
+  assert.equal(prevented, true);
+  assert.equal(editor.value, "[sel]");
+  assert.equal(editor.selectionStart, 1); assert.equal(editor.selectionEnd, 4, "the selection survives so the gesture repeats");
+  controller.onKeydown({ key: "[", preventDefault() {}, stopPropagation() {}, isComposing: false });
+  assert.equal(editor.value, "[[sel]]", "which is how an aliased ref gets built by hand");
+
+  editor.setSelectionRange(3, 3);
+  let collapsedPrevented = false;
+  controller.onKeydown({ key: "[", preventDefault() { collapsedPrevented = true; }, stopPropagation() {}, isComposing: false });
+  assert.equal(collapsedPrevented, false, "with nothing selected the key types normally");
+  assert.equal(editor.value, "[[sel]]");
+  await controller.finish(false);
+
+  const formulaEditor = await controller.start({ row: 1, col: 0, cell: cells.get("1:0"), raw: "=SUM(A1)", floating: false });
+  flush();
+  formulaEditor.setSelectionRange(5, 7);
+  let formulaPrevented = false;
+  controller.onKeydown({ key: "(", preventDefault() { formulaPrevented = true; }, stopPropagation() {}, isComposing: false });
+  assert.equal(formulaPrevented, false, "inside a formula `(` opens a call and must not wrap");
+  assert.equal(formulaEditor.value, "=SUM(A1)");
+  controller.dispose();
+
+  for (const [key, wrapped] of [["(", "(sel)"], ["{", "{sel}"], ['"', '"sel"']]) {
+    const node = new MiniNode("textarea"); node.value = "sel"; node.setSelectionRange(0, 3);
+    assert.equal(wrapSelectionOnPair(node, key), true);
+    assert.equal(node.value, wrapped);
+  }
+  const untouched = new MiniNode("textarea"); untouched.value = "sel"; untouched.setSelectionRange(0, 3);
+  assert.equal(wrapSelectionOnPair(untouched, "a"), false, "only the four pair keys wrap");
+  assert.equal(untouched.value, "sel");
 });
 
 test("inline editing keeps its custom editor in-cell and commits movement", async () => {
