@@ -1,6 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { GridModel, LargeGridStore } from "../src/extension.js";
+import { GridModel, LargeGridStore, chunkRowsFor, refreshSettingsCache, settingsCache } from "../src/extension.js";
+
+const NO_STORAGE = { getItem: () => null, setItem: () => {} };
+
+/** Seeds the settings cache the way `refreshSettingsCache` does at load, without any Roam API. */
+function withSettings(values) {
+  refreshSettingsCache({ settings: { getAll: () => ({ ...values }) } }, NO_STORAGE);
+}
 
 function installRoamMock(initial = {}) {
   let uidCounter = 0;
@@ -116,6 +123,59 @@ test("large grid merge enforces non-destructive issue #9 invariant", async (t) =
   await store.merge({ startRow: 0, endRow: 1, startCol: 0, endCol: 1 });
   assert.equal(store.mergeAt(1, 1).rowSpan, 2);
   await assert.rejects(store.setCell(1, 1, "hidden"), { code: "MERGE_COVERED" });
+});
+
+test("chunkRowsFor pins a legacy manifest to 500 even when the setting says otherwise", async (t) => {
+  const chunks = [
+    { index: 0, startRow: 0, rowCount: 500, url: "https://mock/legacy-0" },
+    { index: 1, startRow: 500, rowCount: 100, url: "https://mock/legacy-1" },
+  ];
+  // Deliberately no `chunkRows` key — this is what every manifest written before 0.9.0 looks like.
+  const manifest = { schema: "roam-grid/manifest", version: 1, revision: "rev", rowCount: 600, colCount: 1, columnIds: ["col0"], widths: {}, frozenRows: 1, frozenCols: 0, merges: [], charts: [], chunks, retained: [] };
+  const mock = installRoamMock({
+    blocks: { anchor007: { string: "{{[[roam/grid]]}}", children: [{ uid: "pointer07", string: "roam-grid/manifest:: https://mock/legacy-manifest", order: 0, children: [] }] } },
+    files: {
+      "https://mock/legacy-manifest": manifest,
+      "https://mock/legacy-1": { schema: "roam-grid/chunk", version: 1, index: 1, startRow: 500, rows: [["five-hundred"]] },
+    },
+  });
+  t.after(() => { mock.dispose(); settingsCache.clear(); });
+  // A live global would address row 500 as chunk 2 — which does not exist — and silently read "".
+  withSettings({ "large-chunk-rows": 250 });
+  const store = await new LargeGridStore("anchor007").initialize();
+  assert.equal(chunkRowsFor(store.manifest), 500, "an absent chunkRows is always 500, never the setting");
+  assert.equal(store.manifest.chunkRows, 500, "loading normalizes the legacy manifest in place");
+  assert.equal(store.chunkIndexForRow(500), 1);
+  assert.equal(store.chunkIndexForRow(499), 0);
+  assert.equal(await store.getRaw(500, 0), "five-hundred");
+  assert.deepEqual(mock.downloads.filter((url) => url === "https://mock/legacy-1").length, 1);
+});
+
+test("chunkRowsFor falls back for every shape a manifest field can arrive in", () => {
+  assert.equal(chunkRowsFor(undefined), 500);
+  assert.equal(chunkRowsFor(null), 500);
+  assert.equal(chunkRowsFor({}), 500);
+  for (const raw of [0, -1, 1.5, "", " ", "abc", Number.NaN, Infinity, null, true, [], {}]) {
+    assert.equal(chunkRowsFor({ chunkRows: raw }), 500, `${String(raw)} must fall back to 500`);
+  }
+  assert.equal(chunkRowsFor({ chunkRows: 250 }), 250);
+  assert.equal(chunkRowsFor({ chunkRows: "250" }), 250, "a JSON round-trip may hand back a string");
+});
+
+test("a new large grid records its own chunk size and takes its dimensions from the settings", async (t) => {
+  const mock = installRoamMock({ blocks: { anchor008: { string: "{{[[roam/grid]]}}", children: [] } } });
+  t.after(() => { mock.dispose(); settingsCache.clear(); });
+  withSettings({ "new-grid-rows": 130, "new-grid-cols": 4, "large-chunk-rows": 50 });
+  const store = await new LargeGridStore("anchor008").initialize();
+  assert.equal(store.manifest.rowCount, 130);
+  assert.equal(store.manifest.colCount, 4);
+  assert.equal(store.manifest.chunkRows, 50, "the seeding size is persisted, not re-derived");
+  assert.equal(store.manifest.chunks.length, 3);
+  assert.equal(store.chunkIndexForRow(125), 2);
+  // Moving the setting afterwards must not re-address the grid that was already written.
+  withSettings({ "large-chunk-rows": 500 });
+  assert.equal(store.chunkIndexForRow(125), 2);
+  assert.equal(chunkRowsFor(store.manifest), 50);
 });
 
 test("100k-row manifest loads only the visible chunk", async (t) => {

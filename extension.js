@@ -50,24 +50,28 @@ const NATIVE_BUDGET_KEY = "writes-native-budget";
  * the `"<group> — <name>"` label convention plus a per-row className. `stage: "pending"` rows are
  * reachable through `getSetting` but are never rendered — a visible control that does nothing is
  * exactly the defect this schema replaces.
+ *
+ * `onView` / `onLarge` / `onSession` are the propagation callbacks `applySettingsChange` invokes for
+ * each registered surface. A missing callback means the value is read live at its use site, so no
+ * propagation is needed — one source of truth instead of a flag plus a separate handler table.
  */
 const SETTING_DESCRIPTORS = [
   { key: NATIVE_BUDGET_KEY, group: "Writes", name: "Native write budget", description: "Maximum Roam block mutations in one structural operation. Larger operations should use large-grid mode.", control: "input", type: "int", default: MAX_NATIVE_MUTATIONS, min: 50, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "writes-content-debounce-ms", group: "Writes", name: "Content save delay (ms)", description: "How long typing settles before edited cells are written back to Roam.", control: "input", type: "int", default: DEFAULT_CONTENT_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live", onSession: true },
-  { key: "writes-large-debounce-ms", group: "Writes", name: "Large-grid save delay (ms)", description: "How long a large grid settles before its chunks are uploaded.", control: "input", type: "int", default: DEFAULT_LARGE_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live", onLarge: true },
-  { key: "session-idle-ms", group: "Writes", name: "Session idle timeout (ms)", description: "How long an unmounted grid session stays warm before it is released.", control: "input", type: "int", default: SESSION_IDLE_MS, min: 200, max: 60000, scope: "graph", apply: "next-op", stage: "live", onSession: true },
-  { key: "editing-autocomplete-debounce-ms", group: "Editing", name: "Autocomplete delay (ms)", description: "How long a reference query settles before Roam is searched.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_MS, min: 0, max: 2000, scope: "graph", apply: "next-op", stage: "live", onView: true },
-  { key: "editing-autocomplete-limit", group: "Editing", name: "Autocomplete results", description: "How many suggestions the formula and reference pickers offer.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_LIMIT, min: 1, max: 25, scope: "graph", apply: "next-op", stage: "live", onView: true },
-  { key: "editing-capture-undo", group: "Editing", name: "Capture grid undo history", description: "Record grid edits in the extension's own undo history so ⌘Z reverses them.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onSession: true },
-  { key: "editing-enter-direction", group: "Editing", name: "Enter moves", description: "Where the selection lands after Enter finishes a cell edit.", control: "select", type: "enum", default: "Down", items: ["Down", "Right", "Stay"], scope: "graph", apply: "immediate", stage: "live", onView: true },
-  { key: "editing-tab-direction", group: "Editing", name: "Tab moves", description: "Where the selection lands after Tab finishes a cell edit.", control: "select", type: "enum", default: "Right", items: ["Right", "Down"], scope: "graph", apply: "immediate", stage: "live", onView: true },
-  { key: "appearance-formula-tinting", group: "Appearance", name: "Tint formula cells", description: "Give cells that hold a formula their own background tint.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: true, onLarge: true },
-  { key: "appearance-show-headers", group: "Appearance", name: "Show row and column headers", description: "Show the A/B/C and 1/2/3 axis headers on new grids.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: true, onLarge: true },
-  { key: "appearance-fit-to-width", group: "Appearance", name: "Fit grids to the block width", description: "Scale columns so a grid fills the width of its block instead of scrolling.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: true },
-  { key: "appearance-reference-badges", group: "Appearance", name: "Show cell reference badges", description: "Show the linked-reference count badge on cells that other blocks reference.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: true },
-  { key: "appearance-toolbar-preset", group: "Appearance", name: "Toolbar", description: "How much of the grid toolbar is shown.", control: "select", type: "enum", default: "Full", items: ["Full", "Compact", "Minimal", "Hidden"], scope: "device", apply: "immediate", stage: "live", onView: true, onLarge: true },
-  { key: "appearance-theme", group: "Appearance", name: "Theme", description: "Follow the Roam theme or pin the grid to light or dark.", control: "select", type: "enum", default: "Follow Roam", items: ["Follow Roam", "Light", "Dark"], scope: "device", apply: "immediate", stage: "live", onView: true, onLarge: true },
-  { key: "appearance-max-width", group: "Appearance", name: "Maximum grid width (px)", description: "Widest a grid may grow before it scrolls horizontally.", control: "input", type: "int", default: DEFAULT_GRID_MAX_WIDTH, min: 480, max: 4000, scope: "device", apply: "immediate", stage: "live", onView: true },
+  { key: "writes-content-debounce-ms", group: "Writes", name: "Content save delay (ms)", description: "How long typing settles before edited cells are written back to Roam.", control: "input", type: "int", default: DEFAULT_CONTENT_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "writes-large-debounce-ms", group: "Writes", name: "Large-grid save delay (ms)", description: "How long a large grid settles before its chunks are uploaded.", control: "input", type: "int", default: DEFAULT_LARGE_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "session-idle-ms", group: "Writes", name: "Session idle timeout (ms)", description: "How long an unmounted grid session stays warm before it is released.", control: "input", type: "int", default: SESSION_IDLE_MS, min: 200, max: 60000, scope: "graph", apply: "immediate", stage: "live", onSession: (session) => session.rescheduleIdle?.() },
+  { key: "editing-autocomplete-debounce-ms", group: "Editing", name: "Autocomplete delay (ms)", description: "How long a reference query settles before Roam is searched.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_MS, min: 0, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "editing-autocomplete-limit", group: "Editing", name: "Autocomplete results", description: "How many suggestions the formula and reference pickers offer.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_LIMIT, min: 1, max: 25, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "editing-capture-undo", group: "Editing", name: "Capture grid undo history", description: "Record grid edits in the extension's own undo history so ⌘Z reverses them.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
+  { key: "editing-enter-direction", group: "Editing", name: "Enter moves", description: "Where the selection lands after Enter finishes a cell edit.", control: "select", type: "enum", default: "Down", items: ["Down", "Right", "Stay"], scope: "graph", apply: "immediate", stage: "live" },
+  { key: "editing-tab-direction", group: "Editing", name: "Tab moves", description: "Where the selection lands after Tab finishes a cell edit.", control: "select", type: "enum", default: "Right", items: ["Right", "Down"], scope: "graph", apply: "immediate", stage: "live" },
+  { key: "appearance-formula-tinting", group: "Appearance", name: "Tint formula cells", description: "Give cells that hold a formula their own background tint on new grids.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshValues?.(), onLarge: (mount) => mount.scheduleRender?.() },
+  { key: "appearance-show-headers", group: "Appearance", name: "Show row and column headers", description: "Show the A/B/C and 1/2/3 axis headers on new grids.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "appearance-fit-to-width", group: "Appearance", name: "Fit grids to the block width", description: "Scale columns so a new grid fills the width of its block instead of scrolling.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "appearance-reference-badges", group: "Appearance", name: "Show cell reference badges", description: "Show the linked-reference count badge on cells that other blocks reference.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges?.() },
+  { key: "appearance-toolbar-preset", group: "Appearance", name: "Toolbar", description: "How much of the grid toolbar is shown.", control: "select", type: "enum", default: "Full", items: ["Full", "Compact", "Minimal", "Hidden"], scope: "device", apply: "immediate", stage: "live", onView: (view) => applyToolbarPreset(view.root), onLarge: (mount) => applyToolbarPreset(mount.root) },
+  { key: "appearance-theme", group: "Appearance", name: "Theme", description: "Follow the Roam theme or pin the grid to light or dark.", control: "select", type: "enum", default: "Follow Roam", items: ["Follow Roam", "Light", "Dark"], scope: "device", apply: "immediate", stage: "live", onView: (view) => resyncGridTheme(view), onLarge: (mount) => resyncGridTheme(mount) },
+  { key: "appearance-max-width", group: "Appearance", name: "Maximum grid width (px)", description: "Widest a grid may grow before it scrolls horizontally.", control: "input", type: "int", default: DEFAULT_GRID_MAX_WIDTH, min: 480, max: 4000, scope: "device", apply: "immediate", stage: "live", onView: (view) => applyGridMaxWidth(view.root), onLarge: (mount) => applyGridMaxWidth(mount.root) },
   { key: "sizing-default-row-height", group: "Sizing", name: "Default row height (px)", description: "Height a row starts at before it is resized.", control: "input", type: "int", default: DEFAULT_ROW_HEIGHT, min: 22, max: 480, scope: "graph", apply: "next-op", stage: "live" },
   { key: "sizing-compact-row-height", group: "Sizing", name: "Compact row height (px)", description: "Height applied by the “Compact selected rows” menu item.", control: "input", type: "int", default: DEFAULT_COMPACT_ROW_HEIGHT, min: 22, max: 480, scope: "graph", apply: "next-op", stage: "live" },
   { key: "sizing-default-col-width", group: "Sizing", name: "Default column width (px)", description: "Width a column starts at before it is resized.", control: "input", type: "int", default: DEFAULT_COL_WIDTH, min: 56, max: 640, scope: "graph", apply: "next-op", stage: "live" },
@@ -77,18 +81,32 @@ const SETTING_DESCRIPTORS = [
   { key: "sizing-max-col-width", group: "Sizing", name: "Maximum column width (px)", description: "Largest width a column may be dragged to.", control: "input", type: "int", default: MAX_COL_WIDTH, min: 56, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "new-grid-rows", group: "New grids", name: "Rows in a new large grid", description: "How many rows a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_ROWS, min: 1, max: 100000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "new-grid-cols", group: "New grids", name: "Columns in a new large grid", description: "How many columns a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_COLS, min: 1, max: 702, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "large-overscan-rows", group: "Large grids", name: "Overscan rows", description: "Extra rows rendered above and below a large grid's viewport.", control: "input", type: "int", default: DEFAULT_LARGE_OVERSCAN_ROWS, min: 0, max: 200, scope: "device", apply: "next-op", stage: "live", onLarge: true },
-  { key: "comments-enabled", group: "Comments", name: "Enable cell comments", description: "Read and write native Roam comment threads from grid cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: true },
-  { key: "comments-badges", group: "Comments", name: "Show comment badges", description: "Mark cells that carry a comment thread.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: true },
-  { key: "comments-open-in-sidebar", group: "Comments", name: "Open comment threads in the right sidebar", description: "Open a cell's comment thread in the right sidebar instead of inline.", control: "switch", type: "bool", default: false, scope: "device", apply: "immediate", stage: "live", onView: true },
-  { key: "ranges-live-references", group: "Ranges", name: "Render live range references", description: "Render {{roam-grid-range: …}} components as a live view of the source cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending", onView: true },
-  { key: "ranges-read-only", group: "Ranges", name: "Rendered ranges are read-only", description: "Block edits inside a rendered range so the source table stays authoritative.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending", onView: true },
-  { key: "ranges-max-rendered-cells", group: "Ranges", name: "Maximum cells in a rendered range", description: "Ranges larger than this render as a link instead of a grid.", control: "input", type: "int", default: DEFAULT_RANGE_RENDERED_CELLS, min: 1, max: 50000, scope: "graph", apply: "next-op", stage: "pending", onView: true },
-  { key: "large-cache-enabled", group: "Large grids", name: "Cache large-grid chunks on this device", description: "Keep downloaded chunks in IndexedDB so reopening a large grid is instant.", control: "switch", type: "bool", default: true, scope: "device", apply: "immediate", stage: "pending", onLarge: true },
-  { key: "large-cache-max-mb", group: "Large grids", name: "Chunk cache size (MB)", description: "How much device storage the large-grid chunk cache may use.", control: "input", type: "int", default: DEFAULT_LARGE_CACHE_MB, min: 8, max: 4096, scope: "device", apply: "next-op", stage: "pending", onLarge: true },
-  { key: "large-verify-checksums", group: "Large grids", name: "Verify chunk checksums", description: "Re-hash each downloaded chunk before trusting it.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "pending", onLarge: true },
-  { key: "large-gc-orphans", group: "Large grids", name: "Permanently delete superseded large-grid files (irreversible)", description: "Delete chunk and manifest files that no revision references any more. This cannot be undone.", control: "switch", type: "bool", default: false, scope: "graph", apply: "next-op", stage: "pending", onLarge: true },
+  { key: "large-overscan-rows", group: "Large grids", name: "Overscan rows", description: "Extra rows rendered above and below a large grid's viewport.", control: "input", type: "int", default: DEFAULT_LARGE_OVERSCAN_ROWS, min: 0, max: 200, scope: "device", apply: "immediate", stage: "live", onLarge: (mount) => mount.scheduleRender?.() },
+  { key: "large-chunk-rows", group: "Large grids", name: "Rows per chunk file", description: "How many rows each chunk file holds. Applies to newly created large grids only — an existing grid keeps the chunk size it was written with, because changing it would misaddress every chunk.", control: "input", type: "int", default: CHUNK_ROWS, min: 50, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "comments-enabled", group: "Comments", name: "Enable cell comments", description: "Read and write native Roam comment threads from grid cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges?.() },
+  { key: "comments-badges", group: "Comments", name: "Show comment badges", description: "Mark cells that carry a comment thread.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges?.() },
+  { key: "comments-open-in-sidebar", group: "Comments", name: "Open comment threads in the right sidebar", description: "Open a cell's comment thread in the right sidebar instead of inline.", control: "switch", type: "bool", default: false, scope: "device", apply: "immediate", stage: "live" },
+  { key: "ranges-live-references", group: "Ranges", name: "Render live range references", description: "Render {{roam-grid-range: …}} components as a live view of the source cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
+  { key: "ranges-read-only", group: "Ranges", name: "Rendered ranges are read-only", description: "Block edits inside a rendered range so the source table stays authoritative.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
+  { key: "ranges-max-rendered-cells", group: "Ranges", name: "Maximum cells in a rendered range", description: "Ranges larger than this render as a link instead of a grid.", control: "input", type: "int", default: DEFAULT_RANGE_RENDERED_CELLS, min: 1, max: 50000, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "large-cache-enabled", group: "Large grids", name: "Cache large-grid chunks on this device", description: "Keep downloaded chunks in IndexedDB so reopening a large grid is instant.", control: "switch", type: "bool", default: true, scope: "device", apply: "immediate", stage: "pending" },
+  { key: "large-cache-max-mb", group: "Large grids", name: "Chunk cache size (MB)", description: "How much device storage the large-grid chunk cache may use.", control: "input", type: "int", default: DEFAULT_LARGE_CACHE_MB, min: 8, max: 4096, scope: "device", apply: "next-op", stage: "pending" },
+  { key: "large-verify-checksums", group: "Large grids", name: "Verify chunk checksums", description: "Re-hash each downloaded chunk before trusting it.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "large-gc-orphans", group: "Large grids", name: "Permanently delete superseded large-grid files (irreversible)", description: "Delete chunk and manifest files that no revision references any more. This cannot be undone.", control: "switch", type: "bool", default: false, scope: "graph", apply: "next-op", stage: "pending" },
 ];
+
+/**
+ * Maintenance rows are actions, not settings: they hold no value, so they stay out of `SETTINGS`
+ * (nothing to seed, cache, coerce, or reset) and are appended to the rendered panel instead.
+ */
+const MAINTENANCE_ACTIONS = Object.freeze([
+  { key: "maintenance-apply-display", group: "Maintenance", name: "Apply display defaults to open grids", description: "Rewrite headers, fit-to-width, and formula tinting on every grid currently on screen to match the Appearance defaults above. Existing grids keep their own settings until you press this.", control: "button", type: "string", default: "", scope: "graph", apply: "immediate", stage: "live" },
+  { key: "maintenance-forget-device", group: "Maintenance", name: "Forget this device's overrides", description: "Drop the device-only values (toolbar, theme, maximum width, overscan) and fall back to the graph-synced ones.", control: "button", type: "string", default: "", scope: "device", apply: "immediate", stage: "live" },
+  { key: "maintenance-clear-caches", group: "Maintenance", name: "Clear local caches", description: "Forget the cached enhanced-table list and the theme palette. Nothing in your graph changes.", control: "button", type: "string", default: "", scope: "device", apply: "immediate", stage: "live" },
+  { key: "maintenance-reset", group: "Maintenance", name: "Reset all Roam Grid settings", description: "Restore every setting on this page to its default.", control: "button", type: "string", default: "", scope: "graph", apply: "immediate", stage: "live" },
+].map((descriptor) => Object.freeze(descriptor)));
+
+export const SETTINGS_MAINTENANCE = Object.freeze(Object.fromEntries(MAINTENANCE_ACTIONS.map((descriptor) => [descriptor.key, descriptor])));
 
 export const SETTINGS = Object.freeze(Object.fromEntries(SETTING_DESCRIPTORS.map((descriptor, index) => {
   if (SETTING_DESCRIPTORS.findIndex((other) => other.key === descriptor.key) !== index) throw new Error(`Duplicate Roam Grid setting key: ${descriptor.key}`);
@@ -101,6 +119,12 @@ export const settingsCache = new Map();
 export const undoHistories = new Map();
 export const portalObservers = new Map();
 
+/** The three live-surface registries `applySettingsChange` walks. Exported so a test can drive the
+ *  real propagation path instead of an injected stand-in; `onunload` clears them, never reassigns. */
+export const gridSessions = new Map();
+export const largeGridMounts = new Map();
+export const gridViews = new Set();
+
 const runtime = {
   undoHistories,
   portalObservers,
@@ -109,9 +133,9 @@ const runtime = {
   portalBodyObserver: null,
   metadata: null,
   templates: null,
-  sessions: new Map(),
-  largeMounts: new Map(),
-  views: new Set(),
+  sessions: gridSessions,
+  largeMounts: largeGridMounts,
+  views: gridViews,
   viewsByNative: new WeakMap(),
   guardStyle: null,
   pendingScanRoots: new Set(),
@@ -277,9 +301,72 @@ export async function setSetting(key, value, { extensionAPI = runtime.extensionA
   return coerced;
 }
 
-/** Propagation to live views, sessions, and large mounts is wired in a later goal. */
+/**
+ * Walks the three registries that are already maintained by the mount pipeline. It must never call
+ * `scanMounts()` — a settings change is not a discovery event, and a scan from here would tear down
+ * and remount every grid on the page.
+ */
 export function applySettingsChange(descriptor, value) {
-  return { key: descriptor?.key ?? null, value };
+  const resolved = typeof descriptor === "string" ? SETTINGS[descriptor] : descriptor;
+  const counts = { key: resolved?.key ?? null, value, views: 0, largeMounts: 0, sessions: 0, failed: 0 };
+  if (!resolved) return counts;
+  counts.value = value === undefined ? getSetting(resolved.key) : value;
+  const visit = (surface, handler, field) => {
+    counts[field] += 1;
+    try { handler(surface, counts.value); }
+    catch (error) { counts.failed += 1; console.warn("[roam-grid] A setting could not reach a live grid", resolved.key, error); }
+  };
+  if (resolved.onView) for (const view of runtime.views) visit(view, resolved.onView, "views");
+  if (resolved.onLarge) for (const mount of runtime.largeMounts.values()) visit(mount, resolved.onLarge, "largeMounts");
+  if (resolved.onSession) for (const session of runtime.sessions.values()) visit(session, resolved.onSession, "sessions");
+  return counts;
+}
+
+/** Display flags use `!== false` semantics in ~30 places, so "absent" cannot be told apart from
+ *  "explicitly true". The global default is therefore stamped at creation only, never inherited. */
+export function displayDefaults() {
+  return {
+    showHeaders: getSetting("appearance-show-headers") !== false,
+    fitToWidth: getSetting("appearance-fit-to-width") !== false,
+    colorFormulaCells: getSetting("appearance-formula-tinting") !== false,
+  };
+}
+
+export function applyDisplayDefaults(target) {
+  return target ? Object.assign(target, displayDefaults()) : target;
+}
+
+export function applyGridMaxWidth(root, value = getSetting("appearance-max-width")) {
+  if (!root?.style?.setProperty) return null;
+  const width = Math.round(Number(value) || DEFAULT_GRID_MAX_WIDTH);
+  root.style.setProperty("--rg-max-width", `${width}px`);
+  return width;
+}
+
+const TOOLBAR_PRESETS = Object.freeze(["Full", "Compact", "Minimal", "Hidden"]);
+
+export function toolbarPresetClass(preset) {
+  const match = TOOLBAR_PRESETS.find((item) => item.toLowerCase() === String(preset ?? "").trim().toLowerCase()) || "Full";
+  return `rg-root--toolbar-${match.toLowerCase()}`;
+}
+
+export function applyToolbarPreset(root, preset = getSetting("appearance-toolbar-preset")) {
+  if (!root?.classList) return null;
+  const next = toolbarPresetClass(preset);
+  for (const name of TOOLBAR_PRESETS) root.classList.remove(`rg-root--toolbar-${name.toLowerCase()}`);
+  root.classList.add(next);
+  return next;
+}
+
+export function enterMovement(direction = getSetting("editing-enter-direction")) {
+  if (direction === "Right") return [0, 1];
+  if (direction === "Stay") return null;
+  return [1, 0];
+}
+
+export function tabMovement(direction = getSetting("editing-tab-direction"), shiftKey = false) {
+  const step = shiftKey ? -1 : 1;
+  return direction === "Down" ? [step, 0] : [0, step];
 }
 
 function settingsGroupClass(group) {
@@ -306,6 +393,7 @@ export function buildSettingsPanelConfig(handlers = {}) {
     if (descriptor.stage === "pending") continue;
     settings.push(settingsPanelRow(descriptor, handlers));
   }
+  for (const descriptor of MAINTENANCE_ACTIONS) settings.push(settingsPanelRow(descriptor, handlers));
   return { tabTitle: "Roam Grid", settings };
 }
 
@@ -346,12 +434,12 @@ const cryptoId = () => {
 };
 const cellLabel = (row, col) => `${columnLabel(col)}${row + 1}`;
 
-export function fittedTrackResize(widths, targetId, requestedWidth, minimum = MIN_COL_WIDTH) {
+export function fittedTrackResize(widths, targetId, requestedWidth, minimum = getSetting("sizing-min-col-width")) {
   const ids = Object.keys(widths);
   if (!ids.includes(targetId)) return { ...widths };
-  if (ids.length === 1) return { [targetId]: clamp(requestedWidth, minimum, MAX_COL_WIDTH) };
+  if (ids.length === 1) return { [targetId]: clamp(requestedWidth, minimum, getSetting("sizing-max-col-width")) };
   const total = ids.reduce((sum, id) => sum + Math.max(minimum, Number(widths[id]) || minimum), 0);
-  const requested = clamp(requestedWidth, minimum, MAX_COL_WIDTH);
+  const requested = clamp(requestedWidth, minimum, getSetting("sizing-max-col-width"));
   const target = Math.min(requested, Math.max(minimum, total - minimum * (ids.length - 1)));
   const result = { [targetId]: target };
   let remaining = total - target;
@@ -1552,7 +1640,7 @@ export class GridModel {
   rowKey(row) { return this.rows[row]?.[0]?.uid || null; }
   getRowHeight(row) {
     const value = Number(this.rowHeights[this.rowKey(row)]);
-    return Number.isFinite(value) ? clamp(Math.round(value), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT) : null;
+    return Number.isFinite(value) ? clamp(Math.round(value), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height")) : null;
   }
   setRowHeight(row, height) {
     const key = this.rowKey(row);
@@ -1561,7 +1649,7 @@ export class GridModel {
     else {
       const value = Number(height);
       if (!Number.isFinite(value)) throw new GridError("ROW_HEIGHT", "Row height must be a number");
-      this.rowHeights[key] = clamp(Math.round(value), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT);
+      this.rowHeights[key] = clamp(Math.round(value), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height"));
     }
   }
   alignmentKey(row, col) {
@@ -1633,7 +1721,7 @@ export class GridModel {
       this.lastChangedCellUids = this.lastChangedCells.map(([row, col]) => this.getCell(row, col)?.uid).filter(Boolean);
       const afterShape = gridShapeSignature(this);
       if (!record) return { result, changedCoordinates: this.lastChangedCells, changedUids: this.lastChangedCellUids, structural: beforeShape !== afterShape };
-      const entry = buildUndoEntry(this, { label, before, beforeShape, afterShape, recorded, hard });
+      const entry = getSetting("editing-capture-undo") ? buildUndoEntry(this, { label, before, beforeShape, afterShape, recorded, hard }) : null;
       if (entry) this.history.push(entry);
       return result;
     } catch (error) {
@@ -2468,7 +2556,7 @@ export function templateModelFromValue(value) {
     colorFormulaCells: value.colorFormulaCells !== false,
   });
   (value.widths || []).forEach((width, col) => {
-    if (model.columnIds[col] && Number.isFinite(width)) model.widths[model.columnIds[col]] = clamp(Math.round(width), MIN_COL_WIDTH, MAX_COL_WIDTH);
+    if (model.columnIds[col] && Number.isFinite(width)) model.widths[model.columnIds[col]] = clamp(Math.round(width), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width"));
   });
   (value.rowHeights || []).forEach((height, row) => { if (row < model.rowCount && Number.isFinite(height)) model.setRowHeight(row, height); });
   (value.alignments || []).forEach((alignments, row) => (alignments || []).forEach((alignment, col) => {
@@ -2583,7 +2671,7 @@ class GridTemplateStore {
   async save(name, model) {
     const cleanName = String(name || "").trim();
     if (!cleanName) throw new GridError("TEMPLATE_NAME", "Give this grid template a name");
-    if (model.rowCount * model.colCount > MAX_NATIVE_MUTATIONS) throw new GridError("TEMPLATE_SIZE", "Saved templates must fit within the native-table write budget");
+    if (model.rowCount * model.colCount > getSetting("writes-native-budget")) throw new GridError("TEMPLATE_SIZE", "Saved templates must fit within the native-table write budget");
     const value = { ...serializeTemplateModel(model, cleanName), updatedAt: new Date().toISOString() };
     const string = `${TEMPLATE_PREFIX} ${JSON.stringify(value)}`;
     const key = cleanName.toUpperCase();
@@ -2622,10 +2710,12 @@ export class NativeTableAdapter {
     this.watchCallback = null;
   }
 
-  load() {
+  /** `defaults` is only ever supplied on a first enhancement, where there is no stored layout yet;
+   *  stored metadata always wins, so a grid's own display flags are never overwritten on reload. */
+  load(defaults = null) {
     const tree = getTree(this.tableUid);
     if (!tree || !NATIVE_MARKER.test(tree.string)) throw new GridError("NOT_TABLE", "Focused block is not a native Roam table");
-    this.model = nativeTreeToModel(tree, this.metadataStore.get(this.tableUid) || {});
+    this.model = nativeTreeToModel(tree, { ...(defaults || {}), ...(this.metadataStore.get(this.tableUid) || {}) });
     this.adoptBaseTree(tree);
     return this.model;
   }
@@ -2871,7 +2961,7 @@ export class NativeTableAdapter {
     if (sameShape) {
       const updates = [];
       currentCells.forEach((row, rowIndex) => row.forEach((cell, colIndex) => { const desired = model.getRaw(rowIndex, colIndex) === "" ? " " : model.getRaw(rowIndex, colIndex); if (cell.string !== desired) updates.push([cell.uid, desired]); }));
-      if (updates.length > MAX_NATIVE_MUTATIONS) throw new GridError("MUTATION_BUDGET", `This edit requires ${updates.length} Roam writes; copy to a large grid instead`);
+      if (updates.length > getSetting("writes-native-budget")) throw new GridError("MUTATION_BUDGET", `This edit requires ${updates.length} Roam writes; copy to a large grid instead`);
       for (const [uid, raw] of updates) await updateBlock(uid, raw);
       return;
     }
@@ -2899,7 +2989,7 @@ export class NativeTableAdapter {
       if (desired !== current) updates.push({ uid: survivors[row][col].uid, from: current, raw: desired });
     }
     const mutationEstimate = 2 + removed.length * 2 + updates.length * 2;
-    if (mutationEstimate > MAX_NATIVE_MUTATIONS) throw new GridError("MUTATION_BUDGET", `Row deletion requires about ${mutationEstimate} Roam writes; copy to a large grid instead`);
+    if (mutationEstimate > getSetting("writes-native-budget")) throw new GridError("MUTATION_BUDGET", `Row deletion requires about ${mutationEstimate} Roam writes; copy to a large grid instead`);
     return this.createDeletionTransaction(removed, updates);
   }
 
@@ -2942,7 +3032,7 @@ export class NativeTableAdapter {
     const currentRows = tableCells(currentTree);
     const current = currentRows.flat();
     const mutationEstimate = current.length * 2 + model.rowCount * model.colCount;
-    if (!force && mutationEstimate > MAX_NATIVE_MUTATIONS) throw new GridError("MUTATION_BUDGET", `Structural edit requires about ${mutationEstimate} Roam writes; copy to a large grid instead`);
+    if (!force && mutationEstimate > getSetting("writes-native-budget")) throw new GridError("MUTATION_BUDGET", `Structural edit requires about ${mutationEstimate} Roam writes; copy to a large grid instead`);
     const stagingUid = await this.metadataStore.createStaging(this.tableUid);
     try {
       for (const row of currentRows) for (const cell of [...row].reverse()) await moveBlock(cell.uid, stagingUid, "last");
@@ -3036,8 +3126,11 @@ export class NativeGridSession {
       if (this.views.size) return;
       if (this.contentSavePromise || this.structuralPending || this.dirtyCells.size) return this.scheduleIdle();
       this.onIdle?.(this);
-    }, SESSION_IDLE_MS);
+    }, getSetting("session-idle-ms"));
   }
+
+  /** Re-arms an already-running idle timer against the new timeout; never starts one. */
+  rescheduleIdle() { if (this.idleTimer != null) this.scheduleIdle(); }
 
   async beginEdit(view, start) {
     const previous = this.activeEditorView;
@@ -3176,7 +3269,7 @@ export class NativeGridSession {
     this.metadataDirty ||= layoutChanged; this.structuralPending ||= layoutChanged;
     clearTimeout(this.saveTimer);
     if (!layoutChanged && !this.dirtyCells.size) { this.savedVersion = this.changeVersion; return; }
-    this.saveTimer = setTimeout(() => layoutChanged ? this.flushSave() : this.flushContentSave(), layoutChanged ? 0 : 220);
+    this.saveTimer = setTimeout(() => layoutChanged ? this.flushSave() : this.flushContentSave(), layoutChanged ? 0 : getSetting("writes-content-debounce-ms"));
   }
 
   coordinateForUid(uid) {
@@ -3216,7 +3309,7 @@ export class NativeGridSession {
     } finally {
       if (this.contentSavePromise === task) this.contentSavePromise = null;
       if (!this.disposed && !this.structuralPending && this.dirtyCells.size) {
-        clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flushContentSave(), 220);
+        clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flushContentSave(), getSetting("writes-content-debounce-ms"));
       }
     }
   }
@@ -3260,7 +3353,7 @@ export class NativeGridSession {
       this.structuralPending = false;
       if (uidMap.size) for (const view of this.views) view.render();
       if (version !== this.changeVersion) {
-        clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.structuralPending ? this.flushSave() : this.flushContentSave(), 220);
+        clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.structuralPending ? this.flushSave() : this.flushContentSave(), getSetting("writes-content-debounce-ms"));
       }
     } catch (error) {
       this.metadataDirty ||= saveMetadata;
@@ -3417,6 +3510,18 @@ function applyManifestAlignments(model, alignments = {}) {
   return model;
 }
 
+/**
+ * Chunk size is a property of the manifest, never a live global: `chunkIndexForRow` and `loadChunk`
+ * derive addresses from it, so changing it under an existing manifest misaddresses every chunk.
+ * Manifests written before it was recorded are always 500 — the setting only seeds new grids.
+ */
+export function chunkRowsFor(manifest) {
+  const raw = manifest?.chunkRows;
+  if (typeof raw !== "number" && typeof raw !== "string") return CHUNK_ROWS;
+  const value = Number(raw);
+  return Number.isInteger(value) && value > 0 ? value : CHUNK_ROWS;
+}
+
 export class LargeGridStore {
   constructor(anchorUid, pointerUid = null) {
     this.anchorUid = anchorUid;
@@ -3442,7 +3547,11 @@ export class LargeGridStore {
       this.validateManifest(this.manifest);
       return this;
     }
-    if (!model) model = new GridModel({ rows: Array.from({ length: 100 }, (_, row) => Array.from({ length: 26 }, (_, col) => row === 0 ? columnLabel(col) : "")), frozenRows: 1 });
+    if (!model) {
+      const newRows = Math.max(1, Math.round(Number(getSetting("new-grid-rows")) || DEFAULT_NEW_GRID_ROWS));
+      const newCols = Math.max(1, Math.round(Number(getSetting("new-grid-cols")) || DEFAULT_NEW_GRID_COLS));
+      model = applyDisplayDefaults(new GridModel({ rows: Array.from({ length: newRows }, (_, row) => Array.from({ length: newCols }, (_, col) => row === 0 ? columnLabel(col) : "")), frozenRows: 1 }));
+    }
     this.pointerUid = await createBlock(this.anchorUid, `${MANIFEST_PREFIX} pending`);
     await this.seed(model);
     return this;
@@ -3453,20 +3562,22 @@ export class LargeGridStore {
     manifest.widths ||= {};
     manifest.rowHeights ||= {};
     manifest.alignments ||= {};
+    manifest.chunkRows = chunkRowsFor(manifest);
     manifest.colorFormulaCells = manifest.colorFormulaCells !== false;
   }
 
   async seed(model) {
     const rows = rawRows(model);
+    const chunkSize = this.manifest ? chunkRowsFor(this.manifest) : chunkRowsFor({ chunkRows: getSetting("large-chunk-rows") });
     const chunks = [];
-    for (let start = 0, index = 0; start < rows.length; start += CHUNK_ROWS, index += 1) {
-      const chunkRows = rows.slice(start, start + CHUNK_ROWS);
+    for (let start = 0, index = 0; start < rows.length; start += chunkSize, index += 1) {
+      const chunkRows = rows.slice(start, start + chunkSize);
       const url = await uploadJson({ schema: "roam-grid/chunk", version: 1, index, startRow: start, rows: chunkRows }, `roam-grid-${this.anchorUid}-${index}.json`);
       chunks.push({ index, startRow: start, rowCount: chunkRows.length, url });
     }
     const manifest = {
       schema: "roam-grid/manifest", version: 1, revision: cryptoId(), previous: null, createdAt: new Date().toISOString(),
-      rowCount: model.rowCount, colCount: model.colCount, columnIds: model.columnIds, widths: model.widths, rowHeights: rowHeightsForManifest(model), alignments: alignmentsForManifest(model),
+      rowCount: model.rowCount, colCount: model.colCount, chunkRows: chunkSize, columnIds: model.columnIds, widths: model.widths, rowHeights: rowHeightsForManifest(model), alignments: alignmentsForManifest(model),
       frozenRows: model.frozenRows, frozenCols: model.frozenCols, merges: model.merges, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, colorFormulaCells: model.colorFormulaCells !== false, chunks, retained: [],
     };
     const url = await uploadJson(manifest, `roam-grid-${this.anchorUid}-manifest.json`);
@@ -3477,13 +3588,13 @@ export class LargeGridStore {
     this.manifest = verified;
   }
 
-  chunkIndexForRow(row) { return Math.floor(row / CHUNK_ROWS); }
+  chunkIndexForRow(row) { return Math.floor(row / chunkRowsFor(this.manifest)); }
 
   async loadChunk(index) {
     if (this.cache.has(index)) return this.cache.get(index);
     const descriptor = this.manifest.chunks.find((chunk) => chunk.index === index);
     if (!descriptor) {
-      const empty = { schema: "roam-grid/chunk", version: 1, index, startRow: index * CHUNK_ROWS, rows: [] };
+      const empty = { schema: "roam-grid/chunk", version: 1, index, startRow: index * chunkRowsFor(this.manifest), rows: [] };
       this.cache.set(index, empty);
       return empty;
     }
@@ -3522,7 +3633,7 @@ export class LargeGridStore {
 
   rowHeight(row) {
     const value = Number(this.manifest.rowHeights?.[row]);
-    return Number.isFinite(value) ? clamp(Math.round(value), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT) : DEFAULT_ROW_HEIGHT;
+    return Number.isFinite(value) ? clamp(Math.round(value), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height")) : getSetting("sizing-default-row-height");
   }
 
   setRowHeight(row, height) {
@@ -3532,7 +3643,7 @@ export class LargeGridStore {
     else {
       const value = Number(height);
       if (!Number.isFinite(value)) throw new GridError("ROW_HEIGHT", "Row height must be a number");
-      this.manifest.rowHeights[row] = clamp(Math.round(value), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT);
+      this.manifest.rowHeights[row] = clamp(Math.round(value), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height"));
     }
     this.metadataDirty = true;
   }
@@ -3545,7 +3656,7 @@ export class LargeGridStore {
     else {
       const value = Number(width);
       if (!Number.isFinite(value)) throw new GridError("COLUMN_WIDTH", "Column width must be a number");
-      this.manifest.widths[id] = clamp(Math.round(value), MIN_COL_WIDTH, MAX_COL_WIDTH);
+      this.manifest.widths[id] = clamp(Math.round(value), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width"));
     }
     this.metadataDirty = true;
   }
@@ -3638,16 +3749,16 @@ export class LargeGridStore {
   }
 
   async saveAsCopy(newAnchorUid) {
-    const rows = [];
-    for (let start = 0; start < this.manifest.rowCount; start += CHUNK_ROWS) rows.push(...await this.getRows(start, Math.min(this.manifest.rowCount, start + CHUNK_ROWS)));
+    const rows = []; const chunkSize = chunkRowsFor(this.manifest);
+    for (let start = 0; start < this.manifest.rowCount; start += chunkSize) rows.push(...await this.getRows(start, Math.min(this.manifest.rowCount, start + chunkSize)));
     const model = applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false, colorFormulaCells: this.manifest.colorFormulaCells !== false }), this.manifest.rowHeights), this.manifest.alignments);
     return new LargeGridStore(newAnchorUid).initialize(model);
   }
 
-  async toModel(limit = MAX_NATIVE_MUTATIONS) {
+  async toModel(limit = getSetting("writes-native-budget")) {
     if (this.manifest.rowCount * this.manifest.colCount > limit) throw new GridError("MUTATION_BUDGET", "Large grid exceeds the safe native-table conversion budget");
-    const rows = [];
-    for (let start = 0; start < this.manifest.rowCount; start += CHUNK_ROWS) rows.push(...await this.getRows(start, Math.min(this.manifest.rowCount, start + CHUNK_ROWS)));
+    const rows = []; const chunkSize = chunkRowsFor(this.manifest);
+    for (let start = 0; start < this.manifest.rowCount; start += chunkSize) rows.push(...await this.getRows(start, Math.min(this.manifest.rowCount, start + chunkSize)));
     return applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false, colorFormulaCells: this.manifest.colorFormulaCells !== false }), this.manifest.rowHeights), this.manifest.alignments);
   }
 }
@@ -3941,6 +4052,33 @@ const GRID_THEME_FALLBACKS = Object.freeze({
   "--rg-active": "#2d72d2",
 });
 
+const GRID_THEME_DARK = Object.freeze({
+  "--rg-bg": "#1c2127",
+  "--rg-color": "#f6f7f9",
+  "--rg-toolbar": "#1c2127",
+  "--rg-header": "#252a31",
+  "--rg-border": "#404854",
+  "--rg-border-strong": "#5f6b7c",
+  "--rg-muted": "#abb3bf",
+  "--rg-active": "#48aff0",
+});
+
+/** `Follow Roam` derives the palette from the host; the other two pin it and skip the host read. */
+export function pinnedGridThemePalette(mode = getSetting("appearance-theme")) {
+  if (mode === "Light") return GRID_THEME_FALLBACKS;
+  if (mode === "Dark") return GRID_THEME_DARK;
+  return null;
+}
+
+function resyncGridTheme(surface) {
+  runtime.gridThemePalette = null;
+  runtime.gridThemeSignature = null;
+  if (surface?.session) surface.session.themePalette = null;
+  if (typeof surface?.themeBridge?.sync === "function") return surface.themeBridge.sync();
+  const pinned = pinnedGridThemePalette();
+  return pinned ? applyGridThemeValues(surface?.root, pinned) : null;
+}
+
 function applyGridThemeValues(gridRoot, values) {
   if (!gridRoot?.style) return false;
   const previous = gridRoot.__rgGridPalette || {};
@@ -3985,6 +4123,8 @@ function nearestOpaqueBackground(element, getStyle) {
 /** Copies resolved host colors into extension-owned tokens before the native table is hidden. */
 export function syncGridThemeFromHost(nativeElement, gridRoot, getStyle = globalThis.getComputedStyle) {
   if (!gridRoot?.style) return { changed: false, values: { ...GRID_THEME_FALLBACKS } };
+  const pinned = pinnedGridThemePalette();
+  if (pinned) return { changed: applyGridThemeValues(gridRoot, pinned), values: { ...pinned } };
   const host = nativeElement?.parentElement || gridRoot.parentElement || globalThis.document?.body || null;
   const cell = nativeElement?.querySelector?.("td,th,[role='gridcell']") || null;
   const hostStyle = computedStyleOf(host, getStyle);
@@ -4539,14 +4679,14 @@ export function gridTrackTemplate(model, axis, from = 0, to = (axis === "col" ? 
   if (axis === "col") {
     for (let col = from; col <= to; col += 1) {
       const id = model.columnIds[col];
-      const width = widths?.[id] != null ? widths[id] : (model.widths[id] || DEFAULT_COL_WIDTH);
-      tracks.push(fit ? `minmax(${MIN_COL_WIDTH}px, ${width}fr)` : `${width}px`);
+      const width = widths?.[id] != null ? widths[id] : (model.widths[id] || getSetting("sizing-default-col-width"));
+      tracks.push(fit ? `minmax(${getSetting("sizing-min-col-width")}px, ${width}fr)` : `${width}px`);
     }
     return tracks.join(" ");
   }
   for (let row = from; row <= to; row += 1) {
     const height = heights?.row === row ? heights.height : model.getRowHeight(row);
-    tracks.push(height == null ? `minmax(${DEFAULT_ROW_HEIGHT}px, auto)` : `${height}px`);
+    tracks.push(height == null ? `minmax(${getSetting("sizing-default-row-height")}px, auto)` : `${height}px`);
   }
   return tracks.join(" ");
 }
@@ -4641,7 +4781,7 @@ export function roamReferenceAutocompleteContext(raw, caret = String(raw ?? "").
   return { type: match.type, query, startIndex: match.startIndex, queryStart, endIndex, replaceEndIndex };
 }
 
-export async function searchRoamReferenceSuggestions(context, limit = 8, api = globalThis.window?.roamAlphaAPI) {
+export async function searchRoamReferenceSuggestions(context, limit = getSetting("editing-autocomplete-limit"), api = globalThis.window?.roamAlphaAPI) {
   if (!context || !api?.data?.search) return [];
   const query = String(context.query || "").trim(); if (!query) return [];
   const boundedLimit = clamp(Math.floor(Number(limit) || 8), 1, 20);
@@ -4668,7 +4808,7 @@ export async function searchRoamReferenceSuggestions(context, limit = 8, api = g
 }
 
 export class GridEditorController {
-  constructor(view, { cellAt, dimensions, mountedCells = null, cellRange = null, navigateReference = null, revealReference = null, searchReferences = searchRoamReferenceSuggestions, referenceSearchDelay = 90, onFinish, viewport }) {
+  constructor(view, { cellAt, dimensions, mountedCells = null, cellRange = null, navigateReference = null, revealReference = null, searchReferences = searchRoamReferenceSuggestions, referenceSearchDelay = null, onFinish, viewport }) {
     this.view = view;
     this.cellAt = cellAt;
     this.dimensions = dimensions;
@@ -4682,7 +4822,7 @@ export class GridEditorController {
     this.onFinish = onFinish;
     this.viewport = viewport;
     this.searchReferences = searchReferences;
-    this.referenceSearchDelay = Math.max(0, Number(referenceSearchDelay) || 0);
+    this.referenceSearchDelay = referenceSearchDelay == null ? null : Math.max(0, Number(referenceSearchDelay) || 0);
     this.referenceSearchTimer = null;
     this.referenceSearchToken = 0;
     this.referenceContext = null;
@@ -4858,8 +4998,8 @@ export class GridEditorController {
       }
       this.finish(false); return;
     }
-    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); this.finish(true, [1, 0]); return; }
-    if (event.key === "Tab") { event.preventDefault(); this.finish(true, [0, event.shiftKey ? -1 : 1]); }
+    if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); this.finish(true, enterMovement()); return; }
+    if (event.key === "Tab") { event.preventDefault(); this.finish(true, tabMovement(undefined, event.shiftKey)); }
   }
 
   acceptSuggestion(index) {
@@ -5058,7 +5198,7 @@ export class GridEditorController {
     const context = formula ? formulaAutocompleteContext(editor.value, editor.selectionStart) : null;
     this.autocompleteContext = context;
     const catalog = runtime.registries?.formulaFunctionMetadata || defaultFormulaFunctionMetadata();
-    this.suggestions = context && !state.autocompleteClosed ? rankFormulaFunctions(context.query, catalog) : [];
+    this.suggestions = context && !state.autocompleteClosed ? rankFormulaFunctions(context.query, catalog, getSetting("editing-autocomplete-limit")) : [];
     this.suggestionKind = this.suggestions.length ? "formula" : null;
     this.suggestionIndex = clamp(this.suggestionIndex, 0, Math.max(0, this.suggestions.length - 1));
     this.paintSuggestions();
@@ -5080,7 +5220,13 @@ export class GridEditorController {
       this.suggestions = results; this.suggestionKind = "roam-reference"; this.suggestionIndex = 0; this.paintSuggestions();
       if (!this.state.floating) this.setPopoverHidden(!this.suggestions.length && !(this.state.editor.value.startsWith("=") && !this.state.editor.value.startsWith("==")));
       this.position();
-    }, this.referenceSearchDelay);
+    }, this.searchDelay());
+  }
+
+  /** An explicit constructor delay wins; otherwise the setting is read live, so no live controller
+   *  has to be rebuilt when the user changes it. */
+  searchDelay() {
+    return this.referenceSearchDelay ?? Math.max(0, Number(getSetting("editing-autocomplete-debounce-ms")) || 0);
   }
 
   clearReferenceAutocomplete() {
@@ -5247,6 +5393,7 @@ export class GridView {
 
   mount() {
     if (this.nativeElement) this.nativeElement.classList.add("rg-native-hidden");
+    applyToolbarPreset(this.root); applyGridMaxWidth(this.root);
     this.host.appendChild(this.root);
     this.root.addEventListener("paste", this.boundPaste);
     document.addEventListener("pointerup", this.boundPointerUp, true);
@@ -5615,10 +5762,10 @@ export class GridView {
     this.root.classList.add("rg-root--resizing");
     const offset = this.model.showHeaders ? 1 : 0;
     const resolvedTracks = getComputedStyle(this.gridElement).gridTemplateColumns.split(/\s+/);
-    const baseWidths = Object.fromEntries(this.model.columnIds.map((columnId, col) => [columnId, Number.parseFloat(resolvedTracks[col + offset]) || this.model.widths[columnId] || DEFAULT_COL_WIDTH]));
+    const baseWidths = Object.fromEntries(this.model.columnIds.map((columnId, col) => [columnId, Number.parseFloat(resolvedTracks[col + offset]) || this.model.widths[columnId] || getSetting("sizing-default-col-width")]));
     const startX = event.clientX; const startWidth = baseWidths[id]; let moved = false;
     const move = (moveEvent) => {
-      const requested = clamp(Math.round(startWidth + moveEvent.clientX - startX), MIN_COL_WIDTH, MAX_COL_WIDTH);
+      const requested = clamp(Math.round(startWidth + moveEvent.clientX - startX), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width"));
       moved ||= requested !== startWidth;
       const widths = this.model.fitToWidth ? fittedTrackResize(baseWidths, id, requested) : { ...baseWidths, [id]: requested };
       this.columnResizePreview = { id, widths };
@@ -5682,11 +5829,11 @@ export class GridView {
     this.root.classList.add("rg-root--resizing");
     const offset = this.model.showHeaders ? 1 : 0;
     const resolvedTracks = getComputedStyle(this.gridElement).gridTemplateRows.split(/\s+/);
-    const startHeight = Number.parseFloat(resolvedTracks[row + offset]) || this.model.getRowHeight(row) || DEFAULT_ROW_HEIGHT;
+    const startHeight = Number.parseFloat(resolvedTracks[row + offset]) || this.model.getRowHeight(row) || getSetting("sizing-default-row-height");
     const startY = event.clientY; let moved = false;
     const move = (moveEvent) => {
       moved = true;
-      this.rowResizePreview = { row, height: clamp(Math.round(startHeight + moveEvent.clientY - startY), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT) };
+      this.rowResizePreview = { row, height: clamp(Math.round(startHeight + moveEvent.clientY - startY), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height")) };
       this.applyGridTemplateRows();
     };
     const up = () => {
@@ -5781,7 +5928,7 @@ export class GridView {
     // commented cells.  Partition it: refs keep the remainder, comments get their own badge.
     const count = Math.max(0, (Math.max(0, Number(this.referenceCounts?.get(uid)) || 0)) - threads.length);
     let badge = cell.querySelector?.(".rg-cell-reference-count") || null;
-    if (!count) badge?.remove();
+    if (!count || !getSetting("appearance-reference-badges")) badge?.remove();
     else {
       if (!badge) {
         badge = document.createElement("button");
@@ -6326,7 +6473,7 @@ export class GridView {
       item("Delete selected rows", () => { const range = normalizeRange(this.selection); this.commitMutation("Delete rows", () => this.model.deleteRows(range.startRow, range.endRow - range.startRow + 1), true, { rowDeletion: true }); }),
       item("Delete selected columns", () => { const range = normalizeRange(this.selection); this.commitMutation("Delete columns", () => this.model.deleteCols(range.startCol, range.endCol - range.startCol + 1), true); }),
       item("Set selected row height…", () => this.setSelectedRowHeight()),
-      item("Compact selected rows", () => this.resizeSelectedRows(24)),
+      item("Compact selected rows", () => this.resizeSelectedRows(getSetting("sizing-compact-row-height"))),
       item("Auto-fit selected rows", () => this.resizeSelectedRows(null)),
       item("Set selected column width…", () => this.setSelectedColumnWidth()),
       item("Reset selected column widths", () => this.resizeSelectedColumns(null)),
@@ -6411,7 +6558,7 @@ export class GridView {
       item("Merge selection", () => this.mergeSelection()), item("Unmerge", () => this.unmergeSelection()),
       item("Insert chart", () => this.insertChart()),
       item("Set selected row height…", () => this.setSelectedRowHeight()),
-      item("Compact selected rows", () => this.resizeSelectedRows(24)),
+      item("Compact selected rows", () => this.resizeSelectedRows(getSetting("sizing-compact-row-height"))),
       item("Auto-fit selected rows", () => this.resizeSelectedRows(null)),
       item("Set selected column width…", () => this.setSelectedColumnWidth()),
       item("Reset selected column widths", () => this.resizeSelectedColumns(null)),
@@ -6454,8 +6601,8 @@ export class GridView {
   }
 
   setSelectedRowHeight() {
-    const current = this.model.getRowHeight(this.selection.startRow) || DEFAULT_ROW_HEIGHT;
-    const value = globalThis.prompt?.(`Row height in pixels (${MIN_ROW_HEIGHT}–${MAX_ROW_HEIGHT})`, String(current));
+    const current = this.model.getRowHeight(this.selection.startRow) || getSetting("sizing-default-row-height");
+    const value = globalThis.prompt?.(`Row height in pixels (${getSetting("sizing-min-row-height")}–${getSetting("sizing-max-row-height")})`, String(current));
     if (value == null) return;
     const height = Number(value);
     if (!Number.isFinite(height)) return toast("Row height must be a number", "warning");
@@ -6468,15 +6615,15 @@ export class GridView {
       for (let col = range.startCol; col <= range.endCol; col += 1) {
         const id = this.model.columnIds[col];
         if (width == null) delete this.model.widths[id];
-        else this.model.widths[id] = clamp(Math.round(width), MIN_COL_WIDTH, MAX_COL_WIDTH);
+        else this.model.widths[id] = clamp(Math.round(width), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width"));
       }
     }, true);
   }
 
   setSelectedColumnWidth() {
     const id = this.model.columnIds[this.selection.startCol];
-    const current = this.model.widths[id] || DEFAULT_COL_WIDTH;
-    const value = globalThis.prompt?.(`Column width in pixels (${MIN_COL_WIDTH}–${MAX_COL_WIDTH})`, String(current));
+    const current = this.model.widths[id] || getSetting("sizing-default-col-width");
+    const value = globalThis.prompt?.(`Column width in pixels (${getSetting("sizing-min-col-width")}–${getSetting("sizing-max-col-width")})`, String(current));
     if (value == null) return;
     const width = Number(value);
     if (!Number.isFinite(width)) return toast("Column width must be a number", "warning");
@@ -6614,6 +6761,7 @@ export class RangeGridView {
   }
 
   mount() {
+    applyToolbarPreset(this.root); applyGridMaxWidth(this.root);
     this.host.appendChild(this.root);
     this.root.addEventListener("click", this.boundClick);
     this.render();
@@ -6870,7 +7018,10 @@ export class LargeGridView {
     this.mount();
   }
   mount() {
-    this.markerElement?.classList.add("rg-large-marker-hidden"); this.host.appendChild(this.root);
+    this.markerElement?.classList.add("rg-large-marker-hidden");
+    applyToolbarPreset(this.root); applyGridMaxWidth(this.root);
+    const pinnedTheme = pinnedGridThemePalette(); if (pinnedTheme) applyGridThemeValues(this.root, pinnedTheme);
+    this.host.appendChild(this.root);
     const toolbar = document.createElement("div"); toolbar.className = "rg-toolbar";
     toolbar.append(button("Merge", "Safely merge selection", () => this.merge()), button("Unmerge", "Unmerge selection", () => this.unmerge()), button("⇤", "Align selection left", () => this.alignSelection("left")), button("≡", "Center selection", () => this.alignSelection("center")), button("⇥", "Align selection right", () => this.alignSelection("right")), button("fx", "Show or hide formula-cell coloring", () => this.toggleFormulaColors()), button("Labels", "Show or hide row and column labels", () => this.toggleHeaders()), button("Save", "Commit dirty chunks", () => this.flush()), button("Export", "Export visible selection", () => this.exportSelection()), button("Native copy", "Copy to a native table when within the write budget", () => copyLargeToNative(this.store)));
     this.status = document.createElement("span"); this.status.className = "rg-status";
@@ -6915,7 +7066,7 @@ export class LargeGridView {
   }
   headerWidth() { return this.store.manifest.showHeaders === false ? 0 : 42; }
   headerHeight() { return this.store.manifest.showHeaders === false ? 0 : 28; }
-  columnWidth(col) { const id = this.store.manifest.columnIds[col]; return this.columnResizePreview?.col === col ? this.columnResizePreview.width : this.store.manifest.widths[id] || DEFAULT_COL_WIDTH; }
+  columnWidth(col) { const id = this.store.manifest.columnIds[col]; return this.columnResizePreview?.col === col ? this.columnResizePreview.width : this.store.manifest.widths[id] || getSetting("sizing-default-col-width"); }
   totalWidth() { return this.headerWidth() + this.store.manifest.columnIds.reduce((sum, _id, col) => sum + this.columnWidth(col), 0); }
   colLeft(col) { let left = this.headerWidth(); for (let index = 0; index < col; index += 1) left += this.columnWidth(index); return left; }
   rebuildRowMetrics() {
@@ -6945,10 +7096,11 @@ export class LargeGridView {
     const { rowCount, colCount } = this.store.manifest; this.status.textContent = `${rowCount.toLocaleString()} × ${colCount}`;
     const headerHeight = this.headerHeight(); const headerWidth = this.headerWidth();
     this.rebuildRowMetrics(); this.canvas.style.width = `${this.totalWidth()}px`; this.canvas.style.height = `${headerHeight + this.rowOffsets[rowCount]}px`;
-    const startRow = clamp(this.rowAtOffset(this.viewport.scrollTop) - 8, 0, Math.max(0, rowCount - 1));
-    const endRow = clamp(this.rowAtOffset(this.viewport.scrollTop + this.viewport.clientHeight) + 9, 0, rowCount);
+    const overscan = Math.max(0, Math.round(Number(getSetting("large-overscan-rows"))) || 0);
+    const startRow = clamp(this.rowAtOffset(this.viewport.scrollTop) - overscan, 0, Math.max(0, rowCount - 1));
+    const endRow = clamp(this.rowAtOffset(this.viewport.scrollTop + this.viewport.clientHeight) + overscan + 1, 0, rowCount);
     let startCol = 0; let x = headerWidth; while (startCol < colCount && x + this.columnWidth(startCol) < this.viewport.scrollLeft) x += this.columnWidth(startCol++);
-    let endCol = startCol; let visibleWidth = x; while (endCol < colCount && visibleWidth < this.viewport.scrollLeft + this.viewport.clientWidth + DEFAULT_COL_WIDTH * 2) visibleWidth += this.columnWidth(endCol++);
+    let endCol = startCol; let visibleWidth = x; while (endCol < colCount && visibleWidth < this.viewport.scrollLeft + this.viewport.clientWidth + getSetting("sizing-default-col-width") * 2) visibleWidth += this.columnWidth(endCol++);
     startCol = Math.max(0, startCol - 1);
     const rows = await this.store.getRows(startRow, endRow);
     if (token !== this.renderToken) return;
@@ -7031,14 +7183,14 @@ export class LargeGridView {
 
   startRowResize(row, event) {
     event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.(); const startY = event.clientY; const startHeight = this.store.rowHeight(row); let moved = false;
-    const move = (moveEvent) => { moved = true; this.rowResizePreview = { row, height: clamp(Math.round(startHeight + moveEvent.clientY - startY), MIN_ROW_HEIGHT, MAX_ROW_HEIGHT) }; this.rowMetricsKey = null; this.scheduleRender(); };
+    const move = (moveEvent) => { moved = true; this.rowResizePreview = { row, height: clamp(Math.round(startHeight + moveEvent.clientY - startY), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height")) }; this.rowMetricsKey = null; this.scheduleRender(); };
     const up = () => { const height = this.rowResizePreview?.height ?? startHeight; cleanup(); this.rowResizePreview = null; if (!moved) return; this.store.setRowHeight(row, height); this.rowMetricsKey = null; this.scheduleSave(true); this.scheduleRender(); };
     const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
     this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
   }
   startColumnResize(col, event) {
     event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.(); const startX = event.clientX; const startWidth = this.columnWidth(col); let moved = false;
-    const move = (moveEvent) => { moved = true; this.columnResizePreview = { col, width: clamp(Math.round(startWidth + moveEvent.clientX - startX), MIN_COL_WIDTH, MAX_COL_WIDTH) }; this.scheduleRender(); };
+    const move = (moveEvent) => { moved = true; this.columnResizePreview = { col, width: clamp(Math.round(startWidth + moveEvent.clientX - startX), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width")) }; this.scheduleRender(); };
     const up = () => { const width = this.columnResizePreview?.width ?? startWidth; cleanup(); this.columnResizePreview = null; if (!moved) return; this.store.setColumnWidth(col, width); this.scheduleSave(true); this.scheduleRender(); };
     const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
     this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
@@ -7104,7 +7256,7 @@ export class LargeGridView {
   alignSelection(alignment) { const range = normalizeRange(this.selection); for (let row = range.startRow; row <= range.endRow; row += 1) for (let col = range.startCol; col <= range.endCol; col += 1) this.store.setAlignment(row, col, alignment); this.scheduleSave(true); this.scheduleRender(); }
   toggleFormulaColors() { this.store.manifest.colorFormulaCells = this.store.manifest.colorFormulaCells === false; this.store.metadataDirty = true; this.scheduleSave(true); this.scheduleRender(); }
   toggleHeaders() { this.store.manifest.showHeaders = this.store.manifest.showHeaders === false; this.store.metadataDirty = true; this.scheduleSave(true); this.scheduleRender(); }
-  scheduleSave(immediate = false) { clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flush(), immediate ? 0 : 500); }
+  scheduleSave(immediate = false) { clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flush(), immediate ? 0 : getSetting("writes-large-debounce-ms")); }
   async flush() { clearTimeout(this.saveTimer); this.root.classList.add("rg-root--saving"); try { await this.store.commit(); toast("Large grid saved", "success", 1800); } catch (error) { toast(error.message, "danger", 8000); } finally { this.root.classList.remove("rg-root--saving"); } }
   async exportSelection() { const range = normalizeRange(this.selection); const rows = await this.store.getRows(range.startRow, range.endRow + 1); downloadText(rows.map((row) => row.slice(range.startCol, range.endCol + 1).map((value) => quoteDelimited(value, ",")).join(",")).join("\n"), "roam-grid-selection.csv", "text/csv"); }
   async applyPatch(patch) {
@@ -7138,7 +7290,7 @@ async function exportCommand(model) {
 
 async function createNativeTableFromModel(model, afterUid = null) {
   const mutations = model.rowCount * model.colCount;
-  if (mutations > MAX_NATIVE_MUTATIONS) throw new GridError("MUTATION_BUDGET", `Native conversion would create ${mutations} blocks, above the safe write budget`);
+  if (mutations > getSetting("writes-native-budget")) throw new GridError("MUTATION_BUDGET", `Native conversion would create ${mutations} blocks, above the safe write budget`);
   const tableUid = afterUid ? await insertAfterBlock(afterUid, "{{[[table]]}}") : await insertNearFocus("{{[[table]]}}");
   for (let row = 0; row < model.rowCount; row += 1) {
     let parentUid = tableUid;
@@ -7234,7 +7386,7 @@ async function enhanceFocusedTable() {
   if (!uid) return toast("Focus a cell in a native {{table}} first.", "warning");
   if (runtime.metadata.has(uid)) return toast("This table is already enhanced.", "warning");
   try {
-    const adapter = new NativeTableAdapter(uid); const model = adapter.load(); await runtime.metadata.set(uid, model, "native"); syncEnhancedUidGuard(); scheduleScan(document); toast("Enhanced this table. Its Roam blocks remain canonical.", "success");
+    const adapter = new NativeTableAdapter(uid); const model = adapter.load(displayDefaults()); await runtime.metadata.set(uid, model, "native"); syncEnhancedUidGuard(); scheduleScan(document); toast("Enhanced this table. Its Roam blocks remain canonical.", "success");
   } catch (error) { toast(error.message, "danger"); }
 }
 
@@ -7249,8 +7401,8 @@ async function restoreFocusedTable() {
 async function newLargeGrid() {
   try {
     const anchorUid = await insertNearFocus("{{[[roam/grid]]}}"); const store = await new LargeGridStore(anchorUid).initialize();
-    const metadataModel = new GridModel({ rows: [[""]], columnIds: store.manifest.columnIds, widths: store.manifest.widths, frozenRows: store.manifest.frozenRows, frozenCols: store.manifest.frozenCols, merges: store.manifest.merges, charts: store.manifest.charts, showHeaders: store.manifest.showHeaders !== false, colorFormulaCells: store.manifest.colorFormulaCells !== false });
-    await runtime.metadata.set(anchorUid, metadataModel, "large"); scheduleScan(); toast("Created a 100 × 26 large grid.", "success");
+    const metadataModel = applyDisplayDefaults(new GridModel({ rows: [[""]], columnIds: store.manifest.columnIds, widths: store.manifest.widths, frozenRows: store.manifest.frozenRows, frozenCols: store.manifest.frozenCols, merges: store.manifest.merges, charts: store.manifest.charts }));
+    await runtime.metadata.set(anchorUid, metadataModel, "large"); scheduleScan(); toast(`Created a ${store.manifest.rowCount.toLocaleString()} × ${store.manifest.colCount} large grid.`, "success");
   } catch (error) { toast(error.message, "danger", 8000); }
 }
 
@@ -7267,8 +7419,8 @@ async function importCommand() {
     const file = input.files?.[0]; if (!file) return;
     try {
       const extension = file.name.split(".").pop().toLowerCase(); const format = ({ md: "markdown", markdown: "markdown", el: "grid-table", sexp: "grid-table" })[extension] || extension;
-      const custom = runtime.registries.importers.get(format.toUpperCase()); const model = custom ? await custom(await file.text()) : importGrid(await file.text(), format);
-      if (model.rowCount * model.colCount <= MAX_NATIVE_MUTATIONS) await createNativeTableFromModel(model); else await copyNativeToLarge(model);
+      const custom = runtime.registries.importers.get(format.toUpperCase()); const model = applyDisplayDefaults(custom ? await custom(await file.text()) : importGrid(await file.text(), format));
+      if (model.rowCount * model.colCount <= getSetting("writes-native-budget")) await createNativeTableFromModel(model); else await copyNativeToLarge(model);
       toast(`Imported ${model.rowCount} × ${model.colCount} cells.`, "success");
     } catch (error) { toast(`Import failed: ${error.message}`, "danger", 8000); }
   });
@@ -7591,6 +7743,64 @@ function registerCommands(extensionAPI) {
   }
 }
 
+/** Rewrites the display flags of every grid already on screen. This is the only path that can
+ *  retro-apply them: `!== false` semantics mean an open grid's own flags are indistinguishable from
+ *  "never chosen", so nothing may change them behind the user's back. */
+export function applyDisplayDefaultsToOpenGrids() {
+  let grids = 0;
+  for (const session of runtime.sessions.values()) {
+    if (!session?.model) continue;
+    applyDisplayDefaults(session.model); grids += 1;
+    try { session.markChanged?.(true); } catch (error) { console.warn("[roam-grid] Could not persist display defaults", error); }
+    for (const view of session.views || []) {
+      try { view.render?.(); } catch (error) { console.warn("[roam-grid] Could not repaint a grid view", error); }
+    }
+  }
+  for (const mount of runtime.largeMounts.values()) {
+    if (!mount?.store?.manifest) continue;
+    applyDisplayDefaults(mount.store.manifest); grids += 1;
+    mount.store.metadataDirty = true; mount.rowMetricsKey = null;
+    try { mount.scheduleSave?.(true); mount.scheduleRender?.(); } catch (error) { console.warn("[roam-grid] Could not repaint a large grid", error); }
+  }
+  toast(grids ? `Applied display defaults to ${grids} open grid${grids === 1 ? "" : "s"}.` : "No grids are open right now.", grids ? "success" : "warning");
+  return grids;
+}
+
+export async function runMaintenanceAction(key, { extensionAPI = runtime.extensionAPI, storage = globalThis.localStorage, rebuildPanel = null } = {}) {
+  if (key === "maintenance-apply-display") return applyDisplayDefaultsToOpenGrids();
+  if (key === "maintenance-forget-device") {
+    writeDeviceSettings({}, storage);
+    refreshSettingsCache(extensionAPI, storage);
+    for (const descriptor of Object.values(SETTINGS)) if (descriptor.scope === "device") applySettingsChange(descriptor);
+    await rebuildPanel?.();
+    toast("Forgot this device's Roam Grid overrides.", "success");
+    return true;
+  }
+  if (key === "maintenance-clear-caches") {
+    try { storage?.removeItem?.(graphCacheKey()); } catch { /* localStorage can be unavailable in hardened browsers */ }
+    writeEnhancedUidCache([], storage);
+    runtime.gridThemePalette = null; runtime.gridThemeSignature = null;
+    for (const session of runtime.sessions.values()) session.themePalette = null;
+    toast("Cleared the local Roam Grid caches.", "success");
+    return true;
+  }
+  if (key === "maintenance-reset") {
+    // Pending rows are never rendered and never seeded, so a reset must not start writing them.
+    for (const descriptor of Object.values(SETTINGS)) {
+      if (descriptor.stage === "pending") continue;
+      await setSetting(descriptor.key, descriptor.default, { extensionAPI, storage });
+    }
+    // `setSetting` re-shadows each device key as it goes, so the shadow is emptied last: a reset
+    // should leave nothing device-local behind, not a device copy of every default.
+    writeDeviceSettings({}, storage);
+    refreshSettingsCache(extensionAPI, storage);
+    await rebuildPanel?.();
+    toast("Reset every Roam Grid setting to its default.", "success");
+    return true;
+  }
+  return false;
+}
+
 export async function initializeSettings(extensionAPI, { storage = globalThis.localStorage } = {}) {
   const stored = { ...readGraphSettings(extensionAPI) };
   const plan = planSettingsMigration(stored[SETTINGS_VERSION_KEY], stored);
@@ -7603,7 +7813,13 @@ export async function initializeSettings(extensionAPI, { storage = globalThis.lo
     }
   }
   refreshSettingsCache(extensionAPI, storage);
-  await extensionAPI.settings.panel.create(buildSettingsPanelConfig({ onChange: (key, value) => { void setSetting(key, value, { extensionAPI, storage }); } }));
+  // Roam renders each row's value once, so anything that rewrites values behind the panel's back
+  // has to hand it a fresh config rather than mutating the live rows.
+  const rebuildPanel = () => extensionAPI.settings.panel.create(buildSettingsPanelConfig({
+    onChange: (key, value) => { void setSetting(key, value, { extensionAPI, storage }); },
+    onClick: (key) => { void runMaintenanceAction(key, { extensionAPI, storage, rebuildPanel }); },
+  }));
+  await rebuildPanel();
 }
 
 let roamGridGlobalPreexisted = false;

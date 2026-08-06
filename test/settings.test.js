@@ -1,22 +1,40 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import {
   SETTINGS,
+  SETTINGS_MAINTENANCE,
+  applyDisplayDefaults,
+  applyDisplayDefaultsToOpenGrids,
+  displayDefaults,
+  applyGridMaxWidth,
+  applySettingsChange,
+  applyToolbarPreset,
   buildSettingsPanelConfig,
   coerceSetting,
   deviceSettingsKey,
+  enterMovement,
   getSetting,
   graphCacheKey,
+  gridSessions,
+  gridViews,
   initializeSettings,
+  largeGridMounts,
+  pinnedGridThemePalette,
   planSettingsMigration,
   readDeviceSettings,
+  readEnhancedUidCache,
   refreshSettingsCache,
   resolveSettingValue,
+  runMaintenanceAction,
   setSetting,
   settingDefaults,
   settingsCache,
   settingsPanelRow,
+  tabMovement,
+  toolbarPresetClass,
   writeDeviceSettings,
+  writeEnhancedUidCache,
 } from "../src/extension.js";
 
 /**
@@ -50,6 +68,7 @@ const TODAYS_CONSTANTS = {
   "new-grid-rows": 100,
   "new-grid-cols": 26,
   "large-overscan-rows": 8,
+  "large-chunk-rows": 500,
   "comments-enabled": true,
   "comments-badges": true,
   "comments-open-in-sidebar": false,
@@ -68,6 +87,8 @@ const PENDING_KEYS = [
 ];
 
 const COMMENT_KEYS = ["comments-enabled", "comments-badges", "comments-open-in-sidebar"];
+
+const MAINTENANCE_KEYS = ["maintenance-apply-display", "maintenance-forget-device", "maintenance-clear-caches", "maintenance-reset"];
 
 function makeApi({ values = {}, canSet = true, useGetAll = true } = {}) {
   const store = { ...values };
@@ -90,7 +111,24 @@ function makeStorage(initial = {}) {
     data,
     getItem: (key) => (data.has(key) ? data.get(key) : null),
     setItem: (key, value) => { data.set(key, String(value)); },
+    removeItem: (key) => { data.delete(key); },
   };
+}
+
+function makeClassList() {
+  const names = new Set();
+  return { names, add: (name) => names.add(name), remove: (name) => names.delete(name), contains: (name) => names.has(name) };
+}
+
+function makeElement() {
+  const properties = new Map();
+  return { classList: makeClassList(), style: { properties, setProperty: (name, value) => properties.set(name, value) } };
+}
+
+function clearRegistries() {
+  gridViews.clear();
+  gridSessions.clear();
+  largeGridMounts.clear();
 }
 
 test("every descriptor is well-formed", () => {
@@ -122,7 +160,10 @@ test("every descriptor is well-formed", () => {
       assert.ok(descriptor.min <= descriptor.default && descriptor.default <= descriptor.max, `${key}: default must sit inside [min,max]`);
     }
     for (const hook of ["onView", "onLarge", "onSession"]) {
-      if (descriptor[hook] !== undefined) assert.equal(descriptor[hook], true, `${key}: ${hook} must be omitted or true`);
+      if (descriptor[hook] !== undefined) assert.equal(typeof descriptor[hook], "function", `${key}: ${hook} must be omitted or a propagation callback`);
+    }
+    if (descriptor.stage === "pending") {
+      for (const hook of ["onView", "onLarge", "onSession"]) assert.equal(descriptor[hook], undefined, `${key}: a pending row must not claim a propagation callback`);
     }
   }
 });
@@ -130,8 +171,9 @@ test("every descriptor is well-formed", () => {
 test("schema keys are unique across the panel and the map", () => {
   const ids = buildSettingsPanelConfig().settings.map((row) => row.id);
   assert.equal(new Set(ids).size, ids.length, "panel row ids must be unique");
-  assert.equal(Object.keys(SETTINGS).length, ids.length + PENDING_KEYS.length);
+  assert.equal(Object.keys(SETTINGS).length, ids.length + PENDING_KEYS.length - MAINTENANCE_KEYS.length);
   for (const key of PENDING_KEYS) assert.ok(SETTINGS[key], `${key} must exist in the schema`);
+  for (const key of MAINTENANCE_KEYS) assert.ok(!SETTINGS[key], `${key} is an action, not a stored setting`);
 });
 
 test("settingDefaults equals today's constant values exactly", () => {
@@ -346,7 +388,8 @@ test("the panel omits pending rows but the schema still resolves them", async ()
   assert.equal(getSetting("comments-open-in-sidebar"), false);
   assert.equal(getSetting("large-cache-max-mb"), 256);
   assert.ok(ids.includes("writes-native-budget"));
-  assert.equal(ids.length, Object.keys(SETTINGS).length - PENDING_KEYS.length);
+  for (const key of MAINTENANCE_KEYS) assert.ok(ids.includes(key), `${key} must be rendered as a maintenance button`);
+  assert.equal(ids.length, Object.keys(SETTINGS).length - PENDING_KEYS.length + MAINTENANCE_KEYS.length);
 });
 
 test("panel rows carry the group naming convention, a className, and a supported action", () => {
@@ -420,7 +463,7 @@ test("initializeSettings performs zero writes when the graph forbids them and st
   assert.equal(fake.counters.set, 0);
   assert.equal(fake.counters.panel, 1);
   assert.equal(fake.panels[0].tabTitle, "Roam Grid");
-  assert.equal(fake.panels[0].settings.length, Object.keys(SETTINGS).length - PENDING_KEYS.length);
+  assert.equal(fake.panels[0].settings.length, Object.keys(SETTINGS).length - PENDING_KEYS.length + MAINTENANCE_KEYS.length);
   assert.equal(getSetting("writes-native-budget"), 1200, "an unwritable graph still resolves defaults");
 });
 
@@ -439,4 +482,259 @@ test("initializeSettings is a no-op on a second run and routes panel changes thr
   await Promise.resolve();
   assert.equal(getSetting("appearance-max-width"), 2000);
   assert.deepEqual(readDeviceSettings(storage), { "appearance-max-width": 2000 });
+});
+
+test("applySettingsChange reaches every registered view, large mount, and session", (t) => {
+  t.after(() => { clearRegistries(); settingsCache.clear(); });
+  clearRegistries();
+  refreshSettingsCache(makeApi().api, makeStorage());
+
+  const badgeCalls = [];
+  for (let index = 0; index < 5; index += 1) {
+    gridViews.add({ id: index, updateReferenceCountBadges() { badgeCalls.push(index); } });
+  }
+  const badges = applySettingsChange(SETTINGS["appearance-reference-badges"], false);
+  assert.equal(gridViews.size, 5);
+  assert.equal(badges.views, 5, "every registered view must be visited");
+  assert.deepEqual(badgeCalls, [0, 1, 2, 3, 4]);
+  assert.equal(badges.value, false);
+  assert.equal(badges.failed, 0);
+
+  const renders = [];
+  largeGridMounts.set("large-a", { scheduleRender: () => renders.push("a") });
+  largeGridMounts.set("large-b", { scheduleRender: () => renders.push("b") });
+  const overscan = applySettingsChange(SETTINGS["large-overscan-rows"], 20);
+  assert.equal(overscan.largeMounts, 2);
+  assert.deepEqual(renders, ["a", "b"]);
+  assert.equal(overscan.views, 0, "a large-only setting must not walk the view registry");
+
+  const rearmed = [];
+  gridSessions.set("t1", { rescheduleIdle: () => rearmed.push("t1") });
+  gridSessions.set("t2", { rescheduleIdle: () => rearmed.push("t2") });
+  const idle = applySettingsChange(SETTINGS["session-idle-ms"], 4000);
+  assert.equal(idle.sessions, 2);
+  assert.deepEqual(rearmed, ["t1", "t2"]);
+});
+
+test("a view that throws is counted, isolated, and does not truncate the walk", (t) => {
+  t.after(() => { clearRegistries(); settingsCache.clear(); });
+  clearRegistries();
+  refreshSettingsCache(makeApi().api, makeStorage());
+  const reached = [];
+  gridViews.add({ updateReferenceCountBadges() { reached.push("first"); } });
+  gridViews.add({ updateReferenceCountBadges() { reached.push("boom"); throw new Error("detached node"); } });
+  gridViews.add({ updateReferenceCountBadges() { reached.push("last"); } });
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    const result = applySettingsChange("appearance-reference-badges", true);
+    assert.deepEqual(reached, ["first", "boom", "last"], "the walk must continue past a failing surface");
+    assert.equal(result.views, 3);
+    assert.equal(result.failed, 1);
+  } finally { console.warn = warn; }
+});
+
+test("applySettingsChange resolves a key string, an unknown key, and an omitted value", (t) => {
+  t.after(() => { clearRegistries(); settingsCache.clear(); });
+  clearRegistries();
+  refreshSettingsCache(makeApi({ values: { "appearance-max-width": 1800 } }).api, makeStorage());
+  const seen = [];
+  gridViews.add({ root: makeElement() });
+  const resolved = applySettingsChange("appearance-max-width");
+  assert.equal(resolved.value, 1800, "an omitted value is read from the cache");
+  assert.equal(resolved.views, 1);
+  assert.deepEqual(applySettingsChange("not-a-setting", 1), { key: null, value: 1, views: 0, largeMounts: 0, sessions: 0, failed: 0 });
+  assert.deepEqual(seen, []);
+});
+
+test("applySettingsChange never reaches for the mount scanner", async (t) => {
+  t.after(() => { clearRegistries(); settingsCache.clear(); });
+  const source = await readFile(new URL("../src/extension.js", import.meta.url), "utf8");
+  const start = source.indexOf("export function applySettingsChange(");
+  assert.ok(start > 0, "applySettingsChange must exist");
+  const end = source.indexOf("\n}\n", start);
+  assert.ok(end > start, "the function body must be delimited");
+  const body = source.slice(start, end);
+  assert.doesNotMatch(body, /scanMounts|scheduleScan|claimNativeInstances|cleanupDisconnectedViews/, "a settings change is not a discovery event");
+
+  // The observable half: a scan evicts and disposes disconnected views. A settings change must not.
+  clearRegistries();
+  refreshSettingsCache(makeApi().api, makeStorage());
+  const disposals = [];
+  const orphan = { root: { isConnected: false }, nativeElement: { isConnected: false }, dispose: () => disposals.push("orphan"), updateReferenceCountBadges() {} };
+  gridViews.add(orphan);
+  applySettingsChange(SETTINGS["appearance-reference-badges"], true);
+  assert.equal(gridViews.size, 1, "a disconnected view survives a settings change");
+  assert.deepEqual(disposals, []);
+});
+
+test("display defaults are stamped, never inherited", (t) => {
+  t.after(() => settingsCache.clear());
+  refreshSettingsCache(makeApi({ values: { "appearance-show-headers": false, "appearance-fit-to-width": false, "appearance-formula-tinting": false } }).api, makeStorage());
+  const target = { showHeaders: true, fitToWidth: true, colorFormulaCells: true, rowCount: 3 };
+  assert.deepEqual(displayDefaults(), { showHeaders: false, fitToWidth: false, colorFormulaCells: false });
+  assert.equal(applyDisplayDefaults(target), target);
+  assert.deepEqual(target, { showHeaders: false, fitToWidth: false, colorFormulaCells: false, rowCount: 3 });
+  assert.equal(applyDisplayDefaults(null), null);
+  refreshSettingsCache(makeApi().api, makeStorage());
+  assert.deepEqual(applyDisplayDefaults({}), { showHeaders: true, fitToWidth: true, colorFormulaCells: true });
+});
+
+test("the display-defaults button rewrites open grids and repaints them", (t) => {
+  t.after(() => { clearRegistries(); settingsCache.clear(); });
+  clearRegistries();
+  refreshSettingsCache(makeApi({ values: { "appearance-show-headers": false } }).api, makeStorage());
+  const renders = [];
+  const view = { render: () => renders.push("view") };
+  const model = { showHeaders: true, fitToWidth: true, colorFormulaCells: true };
+  const marked = [];
+  gridSessions.set("t1", { model, views: [view], markChanged: (layout) => marked.push(layout) });
+  const manifest = { showHeaders: true, fitToWidth: true, colorFormulaCells: true };
+  const large = { store: { manifest, metadataDirty: false }, rowMetricsKey: "stale", scheduleSave: (immediate) => renders.push(`save:${immediate}`), scheduleRender: () => renders.push("large") };
+  largeGridMounts.set("l1", large);
+
+  assert.equal(applyDisplayDefaultsToOpenGrids(), 2);
+  assert.equal(model.showHeaders, false);
+  assert.equal(manifest.showHeaders, false);
+  assert.equal(large.store.metadataDirty, true);
+  assert.equal(large.rowMetricsKey, null);
+  assert.deepEqual(marked, [true], "the layout change has to reach the metadata save path");
+  assert.deepEqual(renders, ["view", "save:true", "large"]);
+  clearRegistries();
+  assert.equal(applyDisplayDefaultsToOpenGrids(), 0, "with nothing mounted the button is a reported no-op");
+});
+
+test("forgetting device overrides drops the shadow and rebuilds the panel", async (t) => {
+  t.after(() => { clearRegistries(); settingsCache.clear(); });
+  clearRegistries();
+  const fake = makeApi({ values: { "appearance-theme": "Light" } });
+  const storage = makeStorage({ [deviceSettingsKey()]: '{"appearance-theme":"Dark","appearance-max-width":2400}' });
+  refreshSettingsCache(fake.api, storage);
+  assert.equal(getSetting("appearance-theme"), "Dark");
+  const root = makeElement();
+  gridViews.add({ root });
+  let rebuilt = 0;
+  assert.equal(await runMaintenanceAction("maintenance-forget-device", { extensionAPI: fake.api, storage, rebuildPanel: () => { rebuilt += 1; } }), true);
+  assert.deepEqual(readDeviceSettings(storage), {});
+  assert.equal(getSetting("appearance-theme"), "Light", "the graph seed takes over");
+  assert.equal(getSetting("appearance-max-width"), 1200);
+  assert.equal(rebuilt, 1, "Roam renders row values once, so the panel must be rebuilt");
+  assert.equal(root.style.properties.get("--rg-max-width"), "1200px", "device-scoped changes are pushed to live grids");
+  assert.deepEqual(fake.writes, [], "forgetting a device override must not write to the graph");
+});
+
+test("clearing local caches empties the enhanced-uid cache and the theme palette", async (t) => {
+  t.after(() => { clearRegistries(); settingsCache.clear(); });
+  clearRegistries();
+  const storage = makeStorage();
+  writeEnhancedUidCache(["abc", "def"], storage);
+  assert.equal(readEnhancedUidCache(storage).size, 2);
+  const session = { themePalette: { "--rg-bg": "#000" } };
+  gridSessions.set("t1", session);
+  assert.equal(await runMaintenanceAction("maintenance-clear-caches", { extensionAPI: null, storage }), true);
+  assert.equal(readEnhancedUidCache(storage).size, 0);
+  assert.equal(session.themePalette, null);
+});
+
+test("resetting restores every default, clears the device shadow, and rebuilds the panel", async (t) => {
+  t.after(() => { clearRegistries(); settingsCache.clear(); });
+  clearRegistries();
+  const fake = makeApi({ values: { "writes-native-budget": 300, "editing-tab-direction": "Down" } });
+  const storage = makeStorage({ [deviceSettingsKey()]: '{"appearance-theme":"Dark"}' });
+  refreshSettingsCache(fake.api, storage);
+  assert.equal(getSetting("writes-native-budget"), 300);
+  let rebuilt = 0;
+  assert.equal(await runMaintenanceAction("maintenance-reset", { extensionAPI: fake.api, storage, rebuildPanel: () => { rebuilt += 1; } }), true);
+  assert.equal(rebuilt, 1);
+  assert.deepEqual(readDeviceSettings(storage), {});
+  const written = new Map(fake.writes);
+  for (const [key, descriptor] of Object.entries(SETTINGS)) {
+    assert.equal(getSetting(key), descriptor.default, `${key} must resolve to its default`);
+    if (PENDING_KEYS.includes(key)) assert.ok(!written.has(key), `${key} must not be written while it is pending`);
+    else assert.equal(written.get(key), descriptor.default, `${key} must be written back to its default`);
+  }
+  assert.equal(await runMaintenanceAction("not-an-action", { extensionAPI: fake.api, storage }), false);
+});
+
+test("maintenance rows are buttons that carry the group convention and an onClick", () => {
+  const clicks = [];
+  const rows = buildSettingsPanelConfig({ onClick: (key) => clicks.push(key) }).settings;
+  const byId = new Map(rows.map((row) => [row.id, row]));
+  for (const key of MAINTENANCE_KEYS) {
+    const row = byId.get(key);
+    assert.ok(row, `${key} must be rendered`);
+    assert.equal(row.action.type, "button");
+    assert.equal(row.className, "rg-settings-maintenance");
+    assert.match(row.name, /^Maintenance — /);
+    assert.equal(typeof row.action.onClick, "function");
+    row.action.onClick();
+  }
+  assert.deepEqual(clicks, MAINTENANCE_KEYS);
+  assert.equal(byId.get("maintenance-reset").action.content, "Reset all Roam Grid settings");
+  assert.deepEqual(Object.keys(SETTINGS_MAINTENANCE), MAINTENANCE_KEYS);
+  assert.match(SETTINGS_MAINTENANCE["maintenance-apply-display"].description, /Existing grids keep their own settings/);
+});
+
+test("the panel routes clicks through runMaintenanceAction and rebuilds itself", async () => {
+  const fake = makeApi();
+  const storage = makeStorage({ [deviceSettingsKey()]: '{"appearance-theme":"Dark"}' });
+  await initializeSettings(fake.api, { storage });
+  assert.equal(fake.counters.panel, 1);
+  const row = fake.panels[0].settings.find((entry) => entry.id === "maintenance-forget-device");
+  row.action.onClick();
+  for (let tick = 0; tick < 6; tick += 1) await Promise.resolve();
+  assert.deepEqual(readDeviceSettings(storage), {});
+  assert.equal(fake.counters.panel, 2, "the maintenance action rebuilt the panel");
+  settingsCache.clear();
+});
+
+test("Enter and Tab movements follow their direction settings", () => {
+  assert.deepEqual(enterMovement("Down"), [1, 0]);
+  assert.deepEqual(enterMovement("Right"), [0, 1]);
+  assert.equal(enterMovement("Stay"), null, "Stay must produce no movement at all");
+  assert.deepEqual(enterMovement("nonsense"), [1, 0]);
+  assert.deepEqual(tabMovement("Right", false), [0, 1]);
+  assert.deepEqual(tabMovement("Right", true), [0, -1]);
+  assert.deepEqual(tabMovement("Down", false), [1, 0]);
+  assert.deepEqual(tabMovement("Down", true), [-1, 0]);
+  refreshSettingsCache(makeApi({ values: { "editing-enter-direction": "stay", "editing-tab-direction": "down" } }).api, makeStorage());
+  assert.equal(enterMovement(), null);
+  assert.deepEqual(tabMovement(undefined, true), [-1, 0]);
+  settingsCache.clear();
+});
+
+test("toolbar presets swap one root class and never stack", () => {
+  assert.equal(toolbarPresetClass("Compact"), "rg-root--toolbar-compact");
+  assert.equal(toolbarPresetClass("hidden"), "rg-root--toolbar-hidden");
+  assert.equal(toolbarPresetClass("nonsense"), "rg-root--toolbar-full");
+  assert.equal(toolbarPresetClass(undefined), "rg-root--toolbar-full");
+  const root = makeElement();
+  applyToolbarPreset(root, "Minimal");
+  assert.deepEqual([...root.classList.names], ["rg-root--toolbar-minimal"]);
+  applyToolbarPreset(root, "Hidden");
+  assert.deepEqual([...root.classList.names], ["rg-root--toolbar-hidden"]);
+  assert.equal(applyToolbarPreset(null, "Full"), null);
+});
+
+test("the maximum-width setting becomes a custom property, not a stylesheet edit", async () => {
+  const root = makeElement();
+  assert.equal(applyGridMaxWidth(root, 2400), 2400);
+  assert.equal(root.style.properties.get("--rg-max-width"), "2400px");
+  assert.equal(applyGridMaxWidth(root, "not a number"), 1200);
+  assert.equal(root.style.properties.get("--rg-max-width"), "1200px");
+  assert.equal(applyGridMaxWidth(null), null);
+  const css = await readFile(new URL("../extension.css", import.meta.url), "utf8");
+  assert.match(css, /max-width: var\(--rg-max-width, 1200px\);/);
+});
+
+test("the theme setting pins a palette or defers to the host", () => {
+  assert.equal(pinnedGridThemePalette("Follow Roam"), null);
+  const light = pinnedGridThemePalette("Light");
+  const dark = pinnedGridThemePalette("Dark");
+  assert.equal(light["--rg-bg"], "#ffffff");
+  assert.equal(dark["--rg-bg"], "#1c2127");
+  for (const token of Object.keys(light)) assert.ok(dark[token], `${token} must exist in both pinned palettes`);
+  refreshSettingsCache(makeApi({ values: { "appearance-theme": "Dark" } }).api, makeStorage());
+  assert.equal(pinnedGridThemePalette()["--rg-color"], "#f6f7f9");
+  settingsCache.clear();
 });

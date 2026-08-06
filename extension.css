@@ -32,7 +32,7 @@
   position: relative;
   container-type: inline-size;
   width: 100%;
-  max-width: 1200px;
+  max-width: var(--rg-max-width, 1200px);
   min-width: 0;
   margin: 4px 0 10px;
   color: var(--rg-color, var(--cl-text-color, inherit));
@@ -151,6 +151,24 @@ body.roam-body.dark .rg-portal {
   font-weight: 600;
 }
 
+.rg-root--toolbar-hidden .rg-toolbar {
+  display: none;
+}
+
+.rg-root--toolbar-minimal .rg-toolbar .rg-toolbar-secondary {
+  display: none;
+}
+
+.rg-root--toolbar-compact .rg-toolbar {
+  min-height: 28px;
+  padding: 1px 3px;
+}
+
+.rg-root--toolbar-compact .rg-toolbar .rg-button.bp3-button {
+  min-height: 22px;
+  padding: 1px 5px;
+  font-size: 11px;
+}
 .rg-root--reference .rg-toolbar {
   box-shadow: inset 3px 0 0 color-mix(in srgb, var(--rg-active) 62%, transparent);
 }
