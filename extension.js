@@ -4062,14 +4062,6 @@ export class GridView {
     this.root.tabIndex = 0;
     this.cells = new Map();
     this.disposed = false;
-    this.changeVersion = 0;
-    this.savedVersion = 0;
-    this.saveTimer = null;
-    this.metadataDirty = false;
-    this.dirtyCells = new Map();
-    this.editRevisions = new Map();
-    this.structuralPending = false;
-    this.contentSavePromise = null;
     this.cellCoordinatesByUid = new Map();
     this.dragSelecting = false;
     this.fillStart = null;
@@ -4125,35 +4117,6 @@ export class GridView {
     this.root.addEventListener("paste", this.boundPaste);
     document.addEventListener("pointerup", this.boundPointerUp, true);
     this.render();
-    if (!this.session) this.adapter.watchExternal?.((model, event = { type: "structural", structural: true, changes: [] }) => this.handleExternalChange(model, event));
-  }
-
-  handleExternalChange(externalModel, event) {
-    const localPending = this.structuralPending || this.dirtyCells.size > 0 || this.contentSavePromise;
-    if (event.structural || event.type === "structural") {
-      this.dirtyCells.clear(); this.structuralPending = false; this.metadataDirty = false;
-      clearTimeout(this.saveTimer); this.changeVersion = this.savedVersion;
-      this.model = externalModel; this.adapter.acceptExternalTree?.(event.tree, this.model); this.render();
-      if (localPending || event.conflict) toast("Roam Grid reloaded because the table structure changed elsewhere.", "warning");
-      return;
-    }
-    const conflicts = (event.changes || []).filter((change) => this.dirtyCells.has(change.uid));
-    if (conflicts.length) {
-      this.dirtyCells.clear(); this.structuralPending = false; clearTimeout(this.saveTimer); this.changeVersion = this.savedVersion;
-      this.model = externalModel; this.adapter.acceptExternalTree?.(event.tree, this.model); this.render();
-      toast("Roam Grid reloaded because this cell changed elsewhere.", "warning");
-      return;
-    }
-    const changed = [];
-    for (const change of event.changes || []) {
-      const coordinate = this.cellCoordinatesByUid.get(change.uid); if (!coordinate) continue;
-      const cell = this.model.getCell(coordinate.row, coordinate.col); if (!cell || cell.raw === change.raw) continue;
-      cell.raw = change.raw; changed.push([coordinate.row, coordinate.col]);
-    }
-    this.model.lastChangedCells = changed;
-    this.model.lastChangedCellUids = changed.map(([row, col]) => this.model.getCell(row, col)?.uid).filter(Boolean);
-    this.adapter.acceptExternalTree?.(event.tree, this.model, externalModel);
-    if (changed.length) this.refreshValues();
   }
 
   toolbar() {
@@ -5042,8 +5005,8 @@ export class GridView {
   toggleAxisHeader(type, index) {
     return this.commitMutation(`Toggle header ${type}`, () => type === "row" ? this.model.toggleHeaderRow(index) : this.model.toggleHeaderColumn(index), true);
   }
-  undo() { if (this.session) return this.session.undo(); if (this.model.undo()) { this.render(); this.markChanged(true); } }
-  redo() { if (this.session) return this.session.redo(); if (this.model.redo()) { this.render(); this.markChanged(true); } }
+  undo() { return this.session.undo(); }
+  redo() { return this.session.redo(); }
 
   openSource() {
     const uid = this.model.tableUid;
@@ -5263,43 +5226,7 @@ export class GridView {
   }
 
   commitMutation(label, mutation, structural, { rowDeletion = false } = {}) {
-    if (this.session) return this.session.commitMutation(this, label, mutation, structural, { rowDeletion });
-    try {
-      const rowDeletionContext = structural && rowDeletion ? this.captureRowDeletionContext() : null;
-      this.model.transact(label, mutation);
-      if (!structural && !(this.model.lastChangedCells || []).length) return Promise.resolve(this.model);
-      if (structural) {
-        let patched = false;
-        try { patched = this.patchRowDeletion(rowDeletionContext); } catch (error) { console.warn("[roam-grid] Incremental row deletion failed; using a full render", error); }
-        if (!patched) this.render();
-      } else this.refreshValues();
-      if (!structural) this.queueChangedCells();
-      this.markChanged(structural);
-      globalThis.window?.dispatchEvent(new CustomEvent("roam-grid:changed", { detail: { tableUid: this.model.tableUid, label } }));
-      return Promise.resolve(this.model);
-    } catch (error) {
-      toast(error.message, "danger");
-      return Promise.resolve(null);
-    }
-  }
-
-  queueChangedCells() {
-    for (const [row, col] of this.model.lastChangedCells || []) {
-      const cell = this.model.getCell(row, col); if (!cell?.uid) continue;
-      const revision = (this.editRevisions.get(cell.uid) || 0) + 1;
-      this.editRevisions.set(cell.uid, revision);
-      const existing = this.dirtyCells.get(cell.uid);
-      const baseRaw = existing?.baseRaw ?? this.adapter.getBaseRaw?.(cell.uid) ?? cell.raw;
-      if (cell.raw === baseRaw) this.dirtyCells.delete(cell.uid);
-      else this.dirtyCells.set(cell.uid, { uid: cell.uid, baseRaw, raw: cell.raw, revision });
-    }
-  }
-
-  prunePersistenceUids() {
-    const valid = new Set(this.model.rows.flat().map((cell) => cell.uid));
-    for (const uid of this.dirtyCells.keys()) if (!valid.has(uid)) this.dirtyCells.delete(uid);
-    for (const uid of this.editRevisions.keys()) if (!valid.has(uid)) this.editRevisions.delete(uid);
-    for (const uid of this.cellCoordinatesByUid.keys()) if (!valid.has(uid)) this.cellCoordinatesByUid.delete(uid);
+    return this.session.commitMutation(this, label, mutation, structural, { rowDeletion });
   }
 
   refreshValues() {
@@ -5315,105 +5242,12 @@ export class GridView {
     }
   }
 
-  markChanged(layoutChanged = false) {
-    this.changeVersion += 1;
-    this.metadataDirty ||= layoutChanged; this.structuralPending ||= layoutChanged;
-    clearTimeout(this.saveTimer);
-    if (!layoutChanged && !this.dirtyCells.size) { this.savedVersion = this.changeVersion; return; }
-    this.saveTimer = setTimeout(() => layoutChanged ? this.flushSave() : this.flushContentSave(), layoutChanged ? 0 : 220);
-  }
-
-
-  async flushContentSave() {
-    if (this.disposed || this.structuralPending || !this.dirtyCells.size) return;
-    if (this.contentSavePromise) return this.contentSavePromise;
-    const batch = new Map([...this.dirtyCells].map(([uid, change]) => [uid, { ...change }]));
-    const task = this.adapter.saveContent(batch);
-    this.contentSavePromise = task;
-    try {
-      const result = await task;
-      for (const saved of result.saved || []) {
-        const coordinate = this.cellCoordinatesByUid.get(saved.uid);
-        const currentRaw = coordinate ? this.model.getRaw(coordinate.row, coordinate.col) : null;
-        const revision = this.editRevisions.get(saved.uid) || saved.revision;
-        if (currentRaw == null || currentRaw === saved.raw) this.dirtyCells.delete(saved.uid);
-        else this.dirtyCells.set(saved.uid, { uid: saved.uid, baseRaw: saved.raw, raw: currentRaw, revision });
-      }
-      if (!this.dirtyCells.size && !this.structuralPending) this.savedVersion = this.changeVersion;
-    } catch (error) {
-      toast(error.message, "danger", 8000);
-      this.dirtyCells.clear(); this.structuralPending = false; this.metadataDirty = false;
-      try { this.model = this.adapter.load(); this.changeVersion = this.savedVersion; this.render(); } catch { /* table may have disappeared */ }
-    } finally {
-      if (this.contentSavePromise === task) this.contentSavePromise = null;
-      if (!this.disposed && !this.structuralPending && this.dirtyCells.size) {
-        clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flushContentSave(), 220);
-      }
-    }
-  }
-
-  async flushSave() {
-    if (this.disposed || !this.structuralPending || this.savedVersion === this.changeVersion) return;
-    const version = this.changeVersion;
-    const payload = new GridModel({ ...this.model.snapshot(), tableUid: this.model.tableUid });
-    const pendingUids = payload.rows.map((row) => row.map((cell) => cell.uid));
-    const payloadRawByUid = new Map(payload.rows.flat().map((cell) => [cell.uid, cell.raw]));
-    const payloadEditRevisions = new Map(this.editRevisions);
-    payload.baseFingerprint = this.model.baseFingerprint; payload.baseSnapshot = this.model.baseSnapshot;
-    const saveMetadata = this.metadataDirty; this.metadataDirty = false;
-    this.root.classList.add("rg-root--saving");
-    try {
-      const saved = await this.adapter.save(payload, { saveMetadata });
-      this.savedVersion = version;
-      const uidMap = new Map();
-      for (let row = 0; row < Math.min(pendingUids.length, saved.rowCount); row += 1) for (let col = 0; col < Math.min(pendingUids[row].length, saved.colCount); col += 1) {
-        if (pendingUids[row][col] !== saved.rows[row][col].uid) uidMap.set(pendingUids[row][col], saved.rows[row][col].uid);
-      }
-      for (const row of this.model.rows) for (let col = 0; col < row.length; col += 1) {
-        const oldUid = row[col].uid; const newUid = uidMap.get(oldUid); if (!newUid) continue;
-        row[col].uid = newUid;
-        if (col === 0 && Object.hasOwn(this.model.rowHeights, oldUid)) { this.model.rowHeights[newUid] = this.model.rowHeights[oldUid]; delete this.model.rowHeights[oldUid]; }
-        if (Object.hasOwn(this.model.alignments, oldUid)) { this.model.alignments[newUid] = this.model.alignments[oldUid]; delete this.model.alignments[oldUid]; }
-      }
-      for (const [oldUid, newUid] of uidMap) {
-        if (this.cellCoordinatesByUid.has(oldUid)) { this.cellCoordinatesByUid.set(newUid, this.cellCoordinatesByUid.get(oldUid)); this.cellCoordinatesByUid.delete(oldUid); }
-        if (this.dirtyCells.has(oldUid)) {
-          const dirty = this.dirtyCells.get(oldUid); this.dirtyCells.delete(oldUid); this.dirtyCells.set(newUid, { ...dirty, uid: newUid });
-        }
-        if (this.editRevisions.has(oldUid)) { this.editRevisions.set(newUid, this.editRevisions.get(oldUid)); this.editRevisions.delete(oldUid); }
-        if (payloadRawByUid.has(oldUid)) payloadRawByUid.set(newUid, payloadRawByUid.get(oldUid));
-        if (payloadEditRevisions.has(oldUid)) payloadEditRevisions.set(newUid, payloadEditRevisions.get(oldUid));
-      }
-      this.prunePersistenceUids();
-      this.model.baseFingerprint = saved.baseFingerprint; this.model.baseSnapshot = saved.baseSnapshot;
-      this.adapter.model = this.model;
-      for (const [uid, dirty] of [...this.dirtyCells]) {
-        const savedRevision = payloadEditRevisions.get(uid) || 0;
-        if (dirty.revision <= savedRevision && dirty.raw === payloadRawByUid.get(uid)) this.dirtyCells.delete(uid);
-        else if (payloadRawByUid.has(uid)) this.dirtyCells.set(uid, { ...dirty, baseRaw: payloadRawByUid.get(uid) });
-      }
-      this.structuralPending = false;
-      if (version !== this.changeVersion) {
-        clearTimeout(this.saveTimer);
-        this.saveTimer = setTimeout(() => this.structuralPending ? this.flushSave() : this.flushContentSave(), 220);
-      }
-    } catch (error) {
-      this.metadataDirty ||= saveMetadata;
-      toast(error.message, "danger", 8000);
-      this.dirtyCells.clear(); this.structuralPending = false;
-      try { this.model = this.adapter.load(); this.changeVersion = this.savedVersion; this.render(); } catch { /* table may have disappeared */ }
-    } finally { this.root.classList.remove("rg-root--saving"); }
-  }
-
   applyPatch(patch) {
-    if (this.session) return this.session.applyPatch(patch, this);
-    const patches = Array.isArray(patch) ? patch : [patch];
-    const rowDeletion = patches.length > 0 && patches.every((item) => item?.op === "deleteRows");
-    return this.commitMutation("External patch", () => applyPatchToModel(this.model, patch, false), patchChangesLayout(patch), { rowDeletion }).then(() => this.model.toJSON());
+    return this.session.applyPatch(patch, this);
   }
 
   dispose({ releaseNative = true } = {}) {
-    this.disposed = true; clearTimeout(this.saveTimer); this.dirtyCells.clear(); this.resizeCleanup?.(); if (!this.session) this.adapter.dispose?.();
+    this.disposed = true; this.resizeCleanup?.(); if (!this.session) this.adapter.dispose?.();
     this.editorController?.dispose(); this.editorController = null;
     this.closeInlineReferences();
     this.clearSelectionPresentation();

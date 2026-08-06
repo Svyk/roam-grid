@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { deferredStructuralConflict, GridModel, GridView, NativeTableAdapter, nativeTreeToModel } from "../src/extension.js";
+import { deferredStructuralConflict, GridModel, NativeGridSession, NativeTableAdapter, nativeTreeToModel } from "../src/extension.js";
 
 const clone = (value) => structuredClone(value);
 const stored = (raw) => raw === "" ? " " : raw;
@@ -87,46 +87,49 @@ test("one content edit performs one selective pull/update and no full pull or me
   assert.deepEqual(calls.updates, [{ uid, string: "fast" }]); assert.equal(metadataWrites, 0);
 });
 
-test("GridView coalesces repeated UID edits and drops a revert to base", () => {
+test("the session coalesces repeated UID edits and drops a revert to base", () => {
   const model = new GridModel({ rows: [[{ uid: "cell00001", raw: "base" }]] });
-  const view = { model, adapter: { getBaseRaw: () => "base" }, dirtyCells: new Map(), editRevisions: new Map() };
-  model.transact("first", () => model.setRaw(0, 0, "one")); GridView.prototype.queueChangedCells.call(view);
-  model.transact("second", () => model.setRaw(0, 0, "two")); GridView.prototype.queueChangedCells.call(view);
-  assert.deepEqual([...view.dirtyCells.values()], [{ uid: "cell00001", baseRaw: "base", raw: "two", revision: 2 }]);
-  model.transact("revert", () => model.setRaw(0, 0, "base")); GridView.prototype.queueChangedCells.call(view);
-  assert.equal(view.dirtyCells.size, 0);
+  const session = { model, adapter: { getBaseRaw: () => "base" }, dirtyCells: new Map(), editRevisions: new Map() };
+  model.transact("first", () => model.setRaw(0, 0, "one")); NativeGridSession.prototype.queueChangedCells.call(session);
+  model.transact("second", () => model.setRaw(0, 0, "two")); NativeGridSession.prototype.queueChangedCells.call(session);
+  assert.deepEqual([...session.dirtyCells.values()], [{ uid: "cell00001", baseRaw: "base", raw: "two", revision: 2 }]);
+  model.transact("revert", () => model.setRaw(0, 0, "base")); NativeGridSession.prototype.queueChangedCells.call(session);
+  assert.equal(session.dirtyCells.size, 0);
 });
 
 test("an edit made during an in-flight save survives and is rebased", async () => {
   const model = new GridModel({ rows: [[{ uid: "cell00001", raw: "one" }]] });
   let resolveSave;
   const adapter = { saveContent: () => new Promise((resolve) => { resolveSave = resolve; }) };
-  const view = {
+  const session = {
     model, adapter, disposed: false, structuralPending: false,
     dirtyCells: new Map([["cell00001", { uid: "cell00001", baseRaw: "base", raw: "one", revision: 1 }]]),
-    editRevisions: new Map([["cell00001", 1]]), cellCoordinatesByUid: new Map([["cell00001", { row: 0, col: 0 }]]),
+    editRevisions: new Map([["cell00001", 1]]),
     changeVersion: 1, savedVersion: 0, contentSavePromise: null, saveTimer: null,
+    coordinateForUid: NativeGridSession.prototype.coordinateForUid, scheduleReferenceCountRefresh() {},
   };
-  const saving = GridView.prototype.flushContentSave.call(view);
-  model.rows[0][0].raw = "two"; view.editRevisions.set("cell00001", 2);
-  view.dirtyCells.set("cell00001", { uid: "cell00001", baseRaw: "base", raw: "two", revision: 2 });
+  const saving = NativeGridSession.prototype.flushContentSave.call(session);
+  model.rows[0][0].raw = "two"; session.editRevisions.set("cell00001", 2);
+  session.dirtyCells.set("cell00001", { uid: "cell00001", baseRaw: "base", raw: "two", revision: 2 });
   resolveSave({ saved: [{ uid: "cell00001", baseRaw: "base", raw: "one", revision: 1 }] });
-  await saving; clearTimeout(view.saveTimer);
-  assert.deepEqual(view.dirtyCells.get("cell00001"), { uid: "cell00001", baseRaw: "one", raw: "two", revision: 2 });
+  await saving; clearTimeout(session.saveTimer);
+  assert.deepEqual(session.dirtyCells.get("cell00001"), { uid: "cell00001", baseRaw: "one", raw: "two", revision: 2 });
 });
 
 test("a deferred scalar save never renders, focuses, or changes scroll", async () => {
   const model = new GridModel({ rows: [[{ uid: "cell00001", raw: "value" }]] });
   const viewport = { scrollLeft: 37, scrollTop: 91 }; let saves = 0;
-  const view = {
+  const view = { viewport, render: () => { throw new Error("rendered"); }, root: { focus: () => { throw new Error("focused"); } } };
+  const session = {
     model, adapter: { saveContent: async () => { saves += 1; return { saved: [{ uid: "cell00001", baseRaw: "base", raw: "value", revision: 1 }] }; } },
     disposed: false, structuralPending: false,
     dirtyCells: new Map([["cell00001", { uid: "cell00001", baseRaw: "base", raw: "value", revision: 1 }]]),
-    editRevisions: new Map([["cell00001", 1]]), cellCoordinatesByUid: new Map([["cell00001", { row: 0, col: 0 }]]),
-    changeVersion: 1, savedVersion: 0, contentSavePromise: null, saveTimer: null, viewport,
-    render: () => { throw new Error("rendered"); }, root: { focus: () => { throw new Error("focused"); } },
+    editRevisions: new Map([["cell00001", 1]]),
+    changeVersion: 1, savedVersion: 0, contentSavePromise: null, saveTimer: null, views: new Set([view]),
+    coordinateForUid: NativeGridSession.prototype.coordinateForUid, scheduleReferenceCountRefresh() {},
+    replaceModel: () => { throw new Error("replaced the model"); },
   };
-  await GridView.prototype.flushContentSave.call(view);
+  await NativeGridSession.prototype.flushContentSave.call(session);
   assert.equal(saves, 1); assert.deepEqual([viewport.scrollLeft, viewport.scrollTop], [37, 91]);
 });
 
@@ -135,35 +138,35 @@ test("a content edit made during a structural save is retained for a follow-up f
   model.baseSnapshot = model.snapshot(); model.baseFingerprint = "base";
   let resolveSave;
   const adapter = { model, save: () => new Promise((resolve) => { resolveSave = resolve; }) };
-  const view = {
-    model, adapter, disposed: false, structuralPending: true, metadataDirty: true,
+  const session = {
+    model, adapter, tableUid: "table0001", disposed: false, structuralPending: true, metadataDirty: true,
     dirtyCells: new Map([["cell00001", { uid: "cell00001", baseRaw: "base", raw: "one", revision: 1 }]]),
-    editRevisions: new Map([["cell00001", 1]]), cellCoordinatesByUid: new Map([["cell00001", { row: 0, col: 0 }]]),
-    changeVersion: 1, savedVersion: 0, saveTimer: null,
-    root: { classList: { add() {}, remove() {} } }, render() {}, prunePersistenceUids: GridView.prototype.prunePersistenceUids,
+    editRevisions: new Map([["cell00001", 1]]),
+    changeVersion: 1, savedVersion: 0, saveTimer: null, views: new Set(),
+    setSaving() {}, prunePersistenceUids: NativeGridSession.prototype.prunePersistenceUids,
   };
-  const saving = GridView.prototype.flushSave.call(view);
-  model.rows[0][0].raw = "two"; view.changeVersion = 2; view.editRevisions.set("cell00001", 2);
-  view.dirtyCells.set("cell00001", { uid: "cell00001", baseRaw: "base", raw: "two", revision: 2 });
+  const saving = NativeGridSession.prototype.flushSave.call(session);
+  model.rows[0][0].raw = "two"; session.changeVersion = 2; session.editRevisions.set("cell00001", 2);
+  session.dirtyCells.set("cell00001", { uid: "cell00001", baseRaw: "base", raw: "two", revision: 2 });
   const saved = new GridModel({ rows: [[{ uid: "cell00001", raw: "one" }]], tableUid: "table0001" });
   saved.baseSnapshot = saved.snapshot(); saved.baseFingerprint = "saved"; resolveSave(saved);
-  await saving; clearTimeout(view.saveTimer);
-  assert.equal(view.structuralPending, false);
-  assert.deepEqual(view.dirtyCells.get("cell00001"), { uid: "cell00001", baseRaw: "one", raw: "two", revision: 2 });
+  await saving; clearTimeout(session.saveTimer);
+  assert.equal(session.structuralPending, false);
+  assert.deepEqual(session.dirtyCells.get("cell00001"), { uid: "cell00001", baseRaw: "one", raw: "two", revision: 2 });
 });
 
 test("structural cleanup prunes persistence state for a subsequently deleted cell UID", () => {
   const model = new GridModel({ rows: [[{ uid: "keep00001", raw: "keep" }], [{ uid: "gone00001", raw: "local" }]] });
-  const view = {
+  const session = {
     model,
     dirtyCells: new Map([["gone00001", { uid: "gone00001", baseRaw: "base", raw: "local", revision: 1 }]]),
     editRevisions: new Map([["keep00001", 1], ["gone00001", 1]]),
-    cellCoordinatesByUid: new Map([["keep00001", { row: 0, col: 0 }], ["gone00001", { row: 1, col: 0 }]]),
   };
   model.transact("delete", () => model.deleteRows(1, 1));
-  GridView.prototype.prunePersistenceUids.call(view);
-  assert.deepEqual([...view.dirtyCells], []); assert.deepEqual([...view.editRevisions.keys()], ["keep00001"]);
-  assert.deepEqual([...view.cellCoordinatesByUid.keys()], ["keep00001"]);
+  NativeGridSession.prototype.prunePersistenceUids.call(session);
+  assert.deepEqual([...session.dirtyCells], []); assert.deepEqual([...session.editRevisions.keys()], ["keep00001"]);
+  assert.deepEqual(NativeGridSession.prototype.coordinateForUid.call(session, "keep00001"), { row: 0, col: 0 });
+  assert.equal(NativeGridSession.prototype.coordinateForUid.call(session, "gone00001"), null);
 });
 
 test("content save validates the whole batch before any write on a same-cell conflict", async (t) => {
@@ -254,27 +257,29 @@ test("a delayed committed structural echo keeps a newer local edit, DOM, and und
   model.transact("delete row", () => model.deleteRows(1, 1));
   await adapter.save(model, { saveMetadata: false });
   assert.equal(adapter.expectedStructuralTransitions.length, 1, "verified save captures one expected committed transition");
-  adapter.model = model; // GridView retains this local instance after flushSave.
+  adapter.model = model; // The session retains this local instance after flushSave.
   const surviving = model.getCell(0, 0); model.transact("newer local edit", () => model.setRaw(0, 0, "newer-local"));
   const undoDepth = model.undoStack.length; let renders = 0; let replacements = 0;
-  const view = {
+  const session = {
     model,
     adapter: { acceptExternalTree: () => { replacements += 1; } },
     dirtyCells: new Map([[surviving.uid, { uid: surviving.uid, baseRaw: "0:0", raw: "newer-local", revision: 1 }]]), structuralPending: false, contentSavePromise: null, metadataDirty: false, saveTimer: null,
-    changeVersion: 1, savedVersion: 0, cellCoordinatesByUid: new Map(), refreshValues() {}, render() { renders += 1; },
+    changeVersion: 1, savedVersion: 0, coordinateForUid: NativeGridSession.prototype.coordinateForUid,
+    refreshValues() {}, renderStructural() { renders += 1; },
+    replaceModel(next) { renders += 1; this.model = next; return next; },
   };
   adapter.watchExternal((external, event) => {
     replacements += 1;
-    GridView.prototype.handleExternalChange.call(view, external, event);
+    NativeGridSession.prototype.handleExternalChange.call(session, external, event);
   });
 
   emit(original, before);
 
-  assert.equal(replacements, 0, "matching self echo never reaches the view");
+  assert.equal(replacements, 0, "matching self echo never reaches the session");
   assert.equal(renders, 0, "matching self echo does not repaint the grid");
-  assert.strictEqual(view.model, model, "the live model object is retained");
+  assert.strictEqual(session.model, model, "the live model object is retained");
   assert.equal(model.getRaw(0, 0), "newer-local", "the post-save local edit survives");
-  assert.equal(view.dirtyCells.get(surviving.uid).raw, "newer-local", "the pending local persistence entry survives");
+  assert.equal(session.dirtyCells.get(surviving.uid).raw, "newer-local", "the pending local persistence entry survives");
   assert.equal(model.undoStack.length, undoDepth, "local structural undo remains available");
   assert.equal(model.undo(), true);
   assert.equal(model.getRaw(0, 0), "0:0");
@@ -349,22 +354,23 @@ test("external content merges by UID without a grid render; same-cell and struct
   t.after(() => { delete globalThis.document; });
   const model = new GridModel({ rows: [[{ uid: "cell00001", raw: "a" }, { uid: "cell00002", raw: "b" }]] });
   let renders = 0; let refreshes = 0; let accepted = 0;
-  const view = {
+  const session = {
     model, adapter: { acceptExternalTree: () => { accepted += 1; } }, dirtyCells: new Map(), structuralPending: false,
     contentSavePromise: null, metadataDirty: false, saveTimer: null, changeVersion: 0, savedVersion: 0,
-    cellCoordinatesByUid: new Map([["cell00001", { row: 0, col: 0 }], ["cell00002", { row: 0, col: 1 }]]),
-    refreshValues: () => { refreshes += 1; }, render: () => { renders += 1; },
+    coordinateForUid: NativeGridSession.prototype.coordinateForUid,
+    refreshValues: () => { refreshes += 1; }, renderStructural: () => { renders += 1; },
+    replaceModel(next) { this.model = next; return next; },
   };
   const external = new GridModel({ rows: [[{ uid: "cell00001", raw: "outside" }, { uid: "cell00002", raw: "b" }]] });
-  model.rows[0][1].raw = "local"; view.dirtyCells.set("cell00002", { uid: "cell00002", baseRaw: "b", raw: "local", revision: 1 });
-  GridView.prototype.handleExternalChange.call(view, external, { type: "content", structural: false, tree: {}, changes: [{ uid: "cell00001", raw: "outside" }] });
-  assert.equal(model.getRaw(0, 0), "outside"); assert.equal(model.getRaw(0, 1), "local"); assert.equal(view.dirtyCells.size, 1);
+  model.rows[0][1].raw = "local"; session.dirtyCells.set("cell00002", { uid: "cell00002", baseRaw: "b", raw: "local", revision: 1 });
+  NativeGridSession.prototype.handleExternalChange.call(session, external, { type: "content", structural: false, tree: {}, changes: [{ uid: "cell00001", raw: "outside" }] });
+  assert.equal(model.getRaw(0, 0), "outside"); assert.equal(model.getRaw(0, 1), "local"); assert.equal(session.dirtyCells.size, 1);
   assert.equal(refreshes, 1); assert.equal(renders, 0); assert.equal(accepted, 1);
-  GridView.prototype.handleExternalChange.call(view, external, { type: "content", structural: false, tree: {}, changes: [{ uid: "cell00002", raw: "conflict" }] });
-  assert.equal(renders, 1); assert.equal(view.dirtyCells.size, 0);
-  view.dirtyCells.set("cell00001", { uid: "cell00001" });
-  GridView.prototype.handleExternalChange.call(view, external, { type: "structural", structural: true, tree: {}, changes: [] });
-  assert.equal(renders, 2); assert.equal(view.dirtyCells.size, 0);
+  NativeGridSession.prototype.handleExternalChange.call(session, external, { type: "content", structural: false, tree: {}, changes: [{ uid: "cell00002", raw: "conflict" }] });
+  assert.equal(renders, 1); assert.equal(session.dirtyCells.size, 0);
+  session.dirtyCells.set("cell00001", { uid: "cell00001" });
+  NativeGridSession.prototype.handleExternalChange.call(session, external, { type: "structural", structural: true, tree: {}, changes: [] });
+  assert.equal(renders, 2); assert.equal(session.dirtyCells.size, 0);
 });
 
 test("deleting one native row moves only that row root and never survivors", async (t) => {

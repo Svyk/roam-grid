@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { FormulaEngine, GridEditorController, GridModel, GridView, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, queryBlockReferenceSources, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, syncPortalThemeFromRoot } from "../src/extension.js";
+import { FormulaEngine, GridEditorController, GridModel, GridView, NativeGridSession, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, queryBlockReferenceSources, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, syncPortalThemeFromRoot } from "../src/extension.js";
 
 class MiniClassList {
   constructor() { this.values = new Set(); }
@@ -494,7 +494,10 @@ test("native row deletion preserves surviving cell DOM and releases only deleted
     render: () => { fullRenders += 1; },
     renderCellValue: (_cell, row, col) => formulaPaints.push(model.getCell(row, col).uid),
     updateSelection: () => { selectionUpdates += 1; },
-    markChanged() {},
+  });
+  view.session = Object.assign(Object.create(NativeGridSession.prototype), {
+    model, adapter: {}, tableUid: model.tableUid, views: new Set([view]),
+    dirtyCells: new Map(), editRevisions: new Map(), markChanged() {},
   });
   const survivingCell = cells.get("2:0"); const survivingContent = contents.get("keep-value");
   const survivingRichHost = richHosts.get("keep-rich"); const removedRichHost = richHosts.get("remove-rich");
