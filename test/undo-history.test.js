@@ -5,10 +5,13 @@ import {
   NativeGridSession,
   NativeTableAdapter,
   UndoHistory,
+  captureDiscardedEdits,
   clearUndoHistories,
+  discardedRestorePrompt,
   externalContentUndoEntry,
   gridShapeSignature,
   releaseUndoHistory,
+  settingsCache,
   undoHistories,
   undoHistoryFor,
 } from "../src/extension.js";
@@ -627,6 +630,136 @@ test("the history outlives session dispose and remount as the same object", () =
   assert.equal(second.history.redoEntries.length, 1, "the entry moved to redo across the remount");
   second.dispose();
   clearUndoHistories();
+});
+
+function externalGrid(cells, tableUid = "table-undo") {
+  return new GridModel({ rows: [cells], columnIds: cells.map((_cell, col) => `col${col}`), tableUid });
+}
+
+test("a conflict reload captures the pending local values on both discard branches", () => {
+  for (const event of [
+    { type: "structural", structural: true, tree: {}, changes: [] },
+    { type: "content", structural: false, tree: {}, changes: [{ uid: "c00", raw: "remote" }] },
+  ]) {
+    const { model, session } = sessionHarness({ tableUid: `table-discard-${event.type}` });
+    model.transact("edit", () => model.setRaw(0, 0, "local"));
+    session.queueChangedCells();
+    assert.deepEqual([...session.dirtyCells.keys()], ["c00"], `${event.type}: the edit is pending`);
+
+    session.handleExternalChange(externalGrid([{ uid: "c00", raw: "remote" }, { uid: "c01", raw: "0:1" }]), event);
+
+    assert.equal(session.dirtyCells.size, 0, `${event.type}: the reload still discards the pending write`);
+    assert.equal(session.model.getRaw(0, 0), "remote", `${event.type}: the graph's value wins`);
+    assert.deepEqual(session.discardedEdits.edits, [{ uid: "c00", raw: "local", baseRaw: "0:0" }], `${event.type}: the discarded edit is set aside`);
+  }
+
+  // Positive control: replaying the branch body with the capture moved AFTER `dirtyCells.clear()`
+  // and `replaceModel` reports nothing, which is the ordering trap 8f68939 already hit once.
+  const control = sessionHarness({ tableUid: "table-discard-control" });
+  control.model.transact("edit", () => control.model.setRaw(0, 0, "local"));
+  control.session.queueChangedCells();
+  control.session.dirtyCells.clear();
+  NativeGridSession.prototype.replaceModel.call(control.session, externalGrid([{ uid: "c00", raw: "remote" }, { uid: "c01", raw: "0:1" }]), { render: false });
+  const late = captureDiscardedEdits(control.session.dirtyCells, control.session.model);
+  assert.throws(() => {
+    assert.deepEqual(late.edits, [{ uid: "c00", raw: "local", baseRaw: "0:0" }]);
+  }, "the capture assertion catches a capture moved after the clear and replaceModel");
+  assert.deepEqual(late.edits, [], "a late capture really does report nothing");
+});
+
+test("an edit that already matches the incoming value is not treated as discarded", () => {
+  const { model, session } = sessionHarness();
+  model.transact("edit", () => { model.setRaw(0, 0, "same"); model.setRaw(0, 1, "mine"); });
+  session.queueChangedCells();
+  assert.equal(session.dirtyCells.size, 2);
+
+  session.handleExternalChange(externalGrid([{ uid: "c00", raw: "same" }, { uid: "c01", raw: "theirs" }]), { type: "structural", structural: true, tree: {}, changes: [] });
+
+  assert.deepEqual(session.discardedEdits.edits.map((edit) => edit.uid), ["c01"], "only the value the reload actually replaced was lost");
+});
+
+test("restoring discarded edits commits like a normal edit and is itself undoable", () => {
+  const { model, session, history } = sessionHarness();
+  model.transact("edit", () => model.setRaw(0, 0, "local"));
+  session.queueChangedCells();
+  session.handleExternalChange(externalGrid([{ uid: "c00", raw: "remote" }, { uid: "c01", raw: "0:1" }]), { type: "content", structural: false, tree: {}, changes: [{ uid: "c00", raw: "remote" }] });
+  assert.equal(session.model.getRaw(0, 0), "remote");
+
+  const result = session.restoreDiscardedEdits();
+  clearTimeout(session.saveTimer);
+
+  assert.deepEqual(result, { restored: 1, skipped: 0 });
+  assert.equal(session.model.getRaw(0, 0), "local", "the captured value lands on top of the external model");
+  assert.deepEqual([...session.dirtyCells.keys()], ["c00"], "the restore is queued for persistence like any edit");
+  assert.equal(history.entries.at(-1).label, "Restore discarded edits", "the restore is a recorded transaction, not a raw write");
+  assert.equal(session.discardedEdits, null, "the payload is consumed");
+
+  assert.equal(session.undo(), true);
+  clearTimeout(session.saveTimer);
+  assert.equal(session.model.getRaw(0, 0), "remote", "undoing the restore returns the remote value");
+});
+
+test("a uid the external change deleted is skipped and counted rather than resurrected", () => {
+  const { model, session } = sessionHarness();
+  model.transact("edit", () => { model.setRaw(0, 0, "local-a"); model.setRaw(0, 1, "local-b"); });
+  session.queueChangedCells();
+
+  session.handleExternalChange(externalGrid([{ uid: "c00", raw: "remote" }]), { type: "structural", structural: true, tree: {}, changes: [] });
+  assert.deepEqual(session.discardedEdits.edits.map((edit) => edit.uid), ["c00", "c01"], "both pending values are captured");
+
+  const result = session.restoreDiscardedEdits();
+  clearTimeout(session.saveTimer);
+
+  assert.deepEqual(result, { restored: 1, skipped: 1 });
+  assert.equal(session.model.getRaw(0, 0), "local-a");
+  assert.equal(session.model.colCount, 1, "the deleted cell is not recreated");
+});
+
+test("the discarded payload is superseded by the next discard and cleared on dispose", () => {
+  const { model, session } = sessionHarness();
+  model.transact("first", () => model.setRaw(0, 0, "first-local"));
+  session.queueChangedCells();
+  session.handleExternalChange(externalGrid([{ uid: "c00", raw: "remote-a" }, { uid: "c01", raw: "0:1" }]), { type: "content", structural: false, tree: {}, changes: [{ uid: "c00", raw: "remote-a" }] });
+  assert.deepEqual(session.discardedEdits.edits.map((edit) => edit.raw), ["first-local"]);
+
+  session.model.transact("second", () => session.model.setRaw(0, 1, "second-local"));
+  session.queueChangedCells();
+  session.handleExternalChange(externalGrid([{ uid: "c00", raw: "remote-a" }, { uid: "c01", raw: "remote-b" }]), { type: "content", structural: false, tree: {}, changes: [{ uid: "c01", raw: "remote-b" }] });
+  assert.deepEqual(session.discardedEdits.edits.map((edit) => edit.raw), ["second-local"], "the second discard supersedes the first");
+
+  NativeGridSession.prototype.dispose.call(session);
+  assert.equal(session.discardedEdits, null, "dispose drops the payload");
+});
+
+test("captureDiscardedEdits caps the retained payload and reports what it dropped", () => {
+  const dirty = new Map();
+  for (let index = 0; index < 5; index += 1) dirty.set(`u${index}`, { uid: `u${index}`, baseRaw: "base", raw: `local-${index}`, revision: 1 });
+  const captured = captureDiscardedEdits(dirty, externalGrid([{ uid: "u0", raw: "remote" }]), 3);
+  assert.deepEqual(captured.edits.map((edit) => edit.uid), ["u0", "u1", "u2"]);
+  assert.equal(captured.truncated, 2);
+});
+
+test("the restore prompt honours its setting while the command path keeps working", (t) => {
+  settingsCache.set("conflict-restore-prompt", false);
+  t.after(() => settingsCache.delete("conflict-restore-prompt"));
+  const { model, session } = sessionHarness();
+  model.transact("edit", () => model.setRaw(0, 0, "local"));
+  session.queueChangedCells();
+  session.handleExternalChange(externalGrid([{ uid: "c00", raw: "remote" }, { uid: "c01", raw: "0:1" }]), { type: "content", structural: false, tree: {}, changes: [{ uid: "c00", raw: "remote" }] });
+
+  const record = session.discardedEdits;
+  assert.deepEqual(record.edits.map((edit) => edit.uid), ["c00"], "the payload is held even with the toast off");
+  assert.equal(discardedRestorePrompt(record), null, "the setting suppresses the prompt");
+  assert.equal(session.promptDiscardedEdits(record), false, "no toast is raised");
+
+  const result = session.restoreDiscardedEdits();
+  clearTimeout(session.saveTimer);
+  assert.deepEqual(result, { restored: 1, skipped: 0 }, "the command restores regardless of the toast setting");
+  assert.equal(session.model.getRaw(0, 0), "local");
+
+  settingsCache.set("conflict-restore-prompt", true);
+  assert.equal(discardedRestorePrompt(record).label, "Restore", "the prompt returns once the setting is back on");
+  assert.equal(session.promptDiscardedEdits(record), true);
 });
 
 function installGraphApi(t) {

@@ -27,6 +27,7 @@ const MAX_GUARD_UIDS = 2000;
 const MAX_UNDO_ENTRIES = 100;
 const MAX_UNDO_CHECKPOINTS = 8;
 const MAX_UNDO_HISTORIES = 24;
+const MAX_DISCARDED_EDITS = 200;
 const DEFAULT_CONTENT_SAVE_MS = 220;
 const DEFAULT_LARGE_SAVE_MS = 500;
 const DEFAULT_AUTOCOMPLETE_MS = 90;
@@ -64,6 +65,7 @@ const SETTING_DESCRIPTORS = [
   { key: "editing-capture-undo", group: "Editing", name: "Capture grid undo history", description: "Record grid edits in the extension's own undo history so ⌘Z reverses them.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-enter-direction", group: "Editing", name: "Enter moves", description: "Where the selection lands after Enter finishes a cell edit.", control: "select", type: "enum", default: "Down", items: ["Down", "Right", "Stay"], scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-tab-direction", group: "Editing", name: "Tab moves", description: "Where the selection lands after Tab finishes a cell edit.", control: "select", type: "enum", default: "Right", items: ["Right", "Down"], scope: "graph", apply: "immediate", stage: "live" },
+  { key: "conflict-restore-prompt", group: "Editing", name: "Offer to restore edits a reload discarded", description: "When a table changes elsewhere and Roam Grid reloads it, show a Restore action for the unsaved edits that reload dropped. The “Roam Grid: Restore discarded edits” command stays available with this off.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "appearance-formula-tinting", group: "Appearance", name: "Tint formula cells", description: "Give cells that hold a formula their own background tint. Turning this off suppresses tinting on every grid at once; turning it back on returns each grid to its own “fx” setting.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshFormulaTint?.(), onLarge: (mount) => mount.scheduleRender?.() },
   { key: "appearance-show-headers", group: "Appearance", name: "Show row and column headers", description: "Show the A/B/C and 1/2/3 axis headers on new grids.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
   { key: "appearance-fit-to-width", group: "Appearance", name: "Fit grids to the block width", description: "Scale columns so a new grid fills the width of its block instead of scrolling.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
@@ -3093,6 +3095,43 @@ export class NativeTableAdapter {
   dispose() { this.watchCallback = null; this.deferredStructuralWatches.length = 0; this.expectedStructuralTransitions.length = 0; this.selfWrites.clear(); return this.watch?.(); }
 }
 
+/**
+ * Pending local values a conflict reload is about to throw away, as `[{uid, raw, baseRaw}]`.
+ *
+ * ORDERING IS THE WHOLE CONTRACT: this must run BEFORE `dirtyCells.clear()` and BEFORE
+ * `replaceModel(externalModel)`. Afterwards the map is empty and the comparison is vacuous — it
+ * would report zero discarded edits for every conflict. `test/undo-history.test.js` keeps a
+ * positive control on that exact ordering.
+ *
+ * An entry whose pending value already equals the incoming one was not lost, so it is not captured.
+ * A uid the incoming model no longer holds WAS lost, so it is captured here and skipped later by
+ * `restoreDiscardedEdits`, which refuses to resurrect a block the external change deleted.
+ */
+export function captureDiscardedEdits(dirtyCells, externalModel, limit = MAX_DISCARDED_EDITS) {
+  const incoming = new Map((externalModel.rows || []).flat().map((cell) => [cell.uid, cell.raw]));
+  const edits = []; let truncated = 0;
+  for (const change of dirtyCells.values()) {
+    if (incoming.get(change.uid) === change.raw) continue;
+    if (edits.length >= limit) { truncated += 1; continue; }
+    edits.push({ uid: change.uid, raw: change.raw, baseRaw: change.baseRaw });
+  }
+  return { edits, truncated };
+}
+
+/**
+ * The toast the reload offers, or `null` when there is nothing to offer or the user turned the
+ * prompt off. Recovery is never bound to ⌘Z: a reload happens BECAUSE someone else wrote that cell,
+ * so a reflex undo would put the remote value straight back under a local one. Restoring is an
+ * explicit named act — this toast or the command palette — and it commits like any other edit.
+ */
+export function discardedRestorePrompt(record) {
+  if (!record || !record.edits.length) return null;
+  if (getSetting("conflict-restore-prompt") === false) return null;
+  const count = record.edits.length;
+  const capped = record.truncated ? ` ${record.truncated} older edit${record.truncated === 1 ? "" : "s"} could not be kept.` : "";
+  return { message: `Roam Grid set aside ${count} unsaved edit${count === 1 ? "" : "s"} the reload discarded.${capped}`, label: "Restore", timeout: 12000 };
+}
+
 /** One canonical native-table model/persistence lane shared by every visible DOM instance. */
 export class NativeGridSession {
   constructor(tableUid, { adapter = null, model = null, onIdle = null } = {}) {
@@ -3122,6 +3161,7 @@ export class NativeGridSession {
     this.commentPageUid = null;
     this.referenceCountFrame = null;
     this.referenceCountTimer = null;
+    this.discardedEdits = null;
     this.disposed = false;
     this.stopWatch = this.adapter.watchExternal?.((nextModel, event) => this.handleExternalChange(nextModel, event));
   }
@@ -3389,6 +3429,7 @@ export class NativeGridSession {
   handleExternalChange(externalModel, event) {
     const localPending = this.structuralPending || this.dirtyCells.size > 0 || this.contentSavePromise;
     if (event.structural || event.type === "structural") {
+      const discarded = captureDiscardedEdits(this.dirtyCells, externalModel);
       this.dirtyCells.clear(); this.structuralPending = false; this.metadataDirty = false;
       clearTimeout(this.saveTimer); this.changeVersion = this.savedVersion;
       // Truncate to the entries recorded under the incoming shape instead of
@@ -3396,10 +3437,12 @@ export class NativeGridSession {
       this.history?.onExternalStructural(externalModel);
       this.replaceModel(externalModel, { render: false }); this.adapter.acceptExternalTree?.(event.tree, this.model); this.renderStructural();
       if (localPending || event.conflict) toast("Roam Grid reloaded because the table structure changed elsewhere.", "warning");
+      this.rememberDiscardedEdits(discarded);
       return;
     }
     const conflicts = (event.changes || []).filter((change) => this.dirtyCells.has(change.uid));
     if (conflicts.length) {
+      const discarded = captureDiscardedEdits(this.dirtyCells, externalModel);
       // The reload adopts the graph's values wholesale, so every external change it
       // brings in — not just the conflicting subset — must be marked stale first.
       // Otherwise a later undo silently overwrites a value someone else wrote, the
@@ -3411,6 +3454,7 @@ export class NativeGridSession {
       this.dirtyCells.clear(); this.structuralPending = false; clearTimeout(this.saveTimer); this.changeVersion = this.savedVersion;
       this.replaceModel(externalModel, { render: false }); this.adapter.acceptExternalTree?.(event.tree, this.model); this.renderStructural();
       toast("Roam Grid reloaded because this cell changed elsewhere.", "warning");
+      this.rememberDiscardedEdits(discarded);
       return;
     }
     const rebasable = this.history?.rebasableUids() || new Set();
@@ -3431,6 +3475,41 @@ export class NativeGridSession {
     this.model.lastChangedCellUids = changed.map(([row, col]) => this.model.getCell(row, col)?.uid).filter(Boolean);
     this.adapter.acceptExternalTree?.(event.tree, this.model, externalModel);
     if (changed.length) this.refreshValues();
+  }
+
+  /** Holds one payload at a time: the next discard supersedes it, and `dispose` drops it. */
+  rememberDiscardedEdits({ edits, truncated }) {
+    this.discardedEdits = edits.length ? { tableUid: this.tableUid, edits, truncated } : null;
+    if (!this.discardedEdits) return false;
+    return this.promptDiscardedEdits(this.discardedEdits);
+  }
+
+  promptDiscardedEdits(record) {
+    const prompt = discardedRestorePrompt(record);
+    if (!prompt) return false;
+    toast(prompt.message, "warning", prompt.timeout, { action: { label: prompt.label, onClick: () => this.restoreDiscardedEdits() } });
+    return true;
+  }
+
+  /** Re-applies the set-aside values ON TOP OF the reloaded model through `commitMutation`, so the
+   *  overwrite is the user's deliberate choice, is persisted like any edit, and is itself undoable. */
+  restoreDiscardedEdits() {
+    const record = this.discardedEdits;
+    if (!record || !record.edits.length) { toast("Roam Grid has no discarded edits to restore.", "warning"); return { restored: 0, skipped: 0 }; }
+    this.discardedEdits = null;
+    const targets = []; let skipped = 0;
+    for (const edit of record.edits) {
+      const coordinate = this.coordinateForUid(edit.uid);
+      // The external change deleted that row, or a merge now covers the cell. Skip and count it —
+      // restoring must never resurrect a block someone else removed.
+      if (!coordinate || this.model.isCovered(coordinate.row, coordinate.col)) { skipped += 1; continue; }
+      targets.push({ row: coordinate.row, col: coordinate.col, raw: edit.raw });
+    }
+    if (targets.length) this.commitMutation(null, "Restore discarded edits", (model) => { for (const target of targets) model.setRaw(target.row, target.col, target.raw); }, false);
+    const tail = skipped ? ` ${skipped} could not be placed — the reload removed those cells.` : "";
+    if (targets.length) toast(`Restored ${targets.length} discarded edit${targets.length === 1 ? "" : "s"}.${tail}`, "success");
+    else toast(`No discarded edit could be placed — the reload removed those ${skipped} cell${skipped === 1 ? "" : "s"}.`, "warning");
+    return { restored: targets.length, skipped };
   }
 
   undo() {
@@ -3475,7 +3554,7 @@ export class NativeGridSession {
     this.disposed = true; clearTimeout(this.saveTimer); clearTimeout(this.idleTimer);
     clearTimeout(this.referenceCountTimer);
     if (this.referenceCountFrame != null) globalThis.cancelAnimationFrame?.(this.referenceCountFrame);
-    this.adapter.dispose?.(); this.stopWatch = null; this.views.clear(); this.activeEditorView = null; this.dirtyCells.clear();
+    this.adapter.dispose?.(); this.stopWatch = null; this.views.clear(); this.activeEditorView = null; this.dirtyCells.clear(); this.discardedEdits = null;
   }
 }
 
@@ -4038,7 +4117,7 @@ function createPublicApi() {
   };
 }
 
-export function toast(message, intent = "primary", timeout = 4500) {
+export function toast(message, intent = "primary", timeout = 4500, { action = null } = {}) {
   if (!runtime.extensionAPI) return;
   const container = document.querySelector(".rg-toasts") || (() => {
     const element = document.createElement("div");
@@ -4048,7 +4127,18 @@ export function toast(message, intent = "primary", timeout = 4500) {
   })();
   const item = document.createElement("div");
   item.className = `rg-toast rg-toast--${intent}`;
-  item.textContent = message;
+  if (!action) item.textContent = message;
+  else {
+    const text = document.createElement("span");
+    text.className = "rg-toast-message";
+    text.textContent = message;
+    const control = document.createElement("button");
+    control.type = "button";
+    control.className = "rg-toast-action";
+    control.textContent = action.label;
+    control.addEventListener("click", () => { item.remove(); action.onClick(); });
+    item.appendChild(text); item.appendChild(control);
+  }
   container.appendChild(item);
   trackedTimeout(() => item.remove(), timeout);
 }
@@ -7466,6 +7556,13 @@ async function exportFocusedCommand() {
   toast("Focus a Roam Grid first.", "warning");
 }
 
+/** The command half of conflict recovery: the toast can time out, this cannot. */
+function restoreDiscardedEditsCommand() {
+  const session = activeMount()?.session || runtime.sessions.get(activeGridUid());
+  if (!session) return toast("Focus a compatible Roam Grid first.", "warning");
+  return session.restoreDiscardedEdits();
+}
+
 function commandOnActive(nativeMethod, largeMethod = nativeMethod) {
   const mount = activeMount();
   const method = mount instanceof LargeGridView ? largeMethod : nativeMethod;
@@ -7763,6 +7860,7 @@ function registerCommands(extensionAPI) {
     ["Roam Grid: Copy/convert table", convertFocusedGrid],
     ["Roam Grid: Import", importCommand],
     ["Roam Grid: Export", exportFocusedCommand],
+    ["Roam Grid: Restore discarded edits", restoreDiscardedEditsCommand],
     ["Roam Grid: Undo", () => commandOnActive("undo")],
     ["Roam Grid: Redo", () => commandOnActive("redo")],
     ["Roam Grid: Insert chart", () => commandOnActive("insertChart")],

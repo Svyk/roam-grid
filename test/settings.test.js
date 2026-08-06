@@ -53,6 +53,7 @@ const TODAYS_CONSTANTS = {
   "editing-capture-undo": true,
   "editing-enter-direction": "Down",
   "editing-tab-direction": "Right",
+  "conflict-restore-prompt": true,
   "appearance-formula-tinting": true,
   "appearance-show-headers": true,
   "appearance-fit-to-width": true,

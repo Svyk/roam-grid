@@ -355,9 +355,11 @@ test("external content merges by UID without a grid render; same-cell and struct
   const model = new GridModel({ rows: [[{ uid: "cell00001", raw: "a" }, { uid: "cell00002", raw: "b" }]] });
   let renders = 0; let refreshes = 0; let accepted = 0;
   const session = {
-    model, adapter: { acceptExternalTree: () => { accepted += 1; } }, dirtyCells: new Map(), structuralPending: false,
-    contentSavePromise: null, metadataDirty: false, saveTimer: null, changeVersion: 0, savedVersion: 0,
+    tableUid: "table-external", model, adapter: { acceptExternalTree: () => { accepted += 1; } }, dirtyCells: new Map(), structuralPending: false,
+    contentSavePromise: null, metadataDirty: false, saveTimer: null, changeVersion: 0, savedVersion: 0, discardedEdits: null,
     coordinateForUid: NativeGridSession.prototype.coordinateForUid,
+    rememberDiscardedEdits: NativeGridSession.prototype.rememberDiscardedEdits,
+    promptDiscardedEdits: NativeGridSession.prototype.promptDiscardedEdits,
     refreshValues: () => { refreshes += 1; }, renderStructural: () => { renders += 1; },
     replaceModel(next) { this.model = next; return next; },
   };
@@ -368,6 +370,7 @@ test("external content merges by UID without a grid render; same-cell and struct
   assert.equal(refreshes, 1); assert.equal(renders, 0); assert.equal(accepted, 1);
   NativeGridSession.prototype.handleExternalChange.call(session, external, { type: "content", structural: false, tree: {}, changes: [{ uid: "cell00002", raw: "conflict" }] });
   assert.equal(renders, 1); assert.equal(session.dirtyCells.size, 0);
+  assert.deepEqual(session.discardedEdits.edits, [{ uid: "cell00002", raw: "local", baseRaw: "b" }], "the reload sets the discarded local value aside");
   session.dirtyCells.set("cell00001", { uid: "cell00001" });
   NativeGridSession.prototype.handleExternalChange.call(session, external, { type: "structural", structural: true, tree: {}, changes: [] });
   assert.equal(renders, 2); assert.equal(session.dirtyCells.size, 0);

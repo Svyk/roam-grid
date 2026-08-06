@@ -1184,6 +1184,26 @@ body.roam-body.dark .rg-portal {
 .rg-toast--warning { background: #a15c00; }
 .rg-toast--danger { background: #b42318; }
 
+.rg-toast-message {
+  display: block;
+}
+
+.rg-toast-action {
+  margin-top: 7px;
+  padding: 3px 10px;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  background: rgb(255 255 255 / 16%);
+  border: 1px solid rgb(255 255 255 / 40%);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.rg-toast-action:hover {
+  background: rgb(255 255 255 / 28%);
+}
+
 .rg-dialog-overlay {
   position: fixed;
   inset: 0;
