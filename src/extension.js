@@ -7025,7 +7025,11 @@ export class GridEditorController {
       option.id = `${this.suggestionList.id}-option-${index}`;
       option.setAttribute("role", "option");
       const name = document.createElement("strong");
-      const text = document.createElement("span"); text.className = "rg-suggestion-text"; text.textContent = roamSuggestionPlainText(suggestion.name);
+      // Block content genuinely IS Roam markdown, so it normalizes. A page title, a tag, a
+      // create-page name and a function name are names: their literal characters are part of what
+      // the row inserts, and a label that disagrees with the insertion is a defect, not a tidy-up.
+      const text = document.createElement("span"); text.className = "rg-suggestion-text";
+      text.textContent = suggestion.kind === "roam-block" ? roamSuggestionPlainText(suggestion.name) : String(suggestion.name ?? "");
       name.appendChild(text);
       const detail = document.createElement("span"); detail.textContent = suggestion.description;
       option.append(name, detail);

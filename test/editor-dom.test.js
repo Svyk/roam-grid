@@ -1246,9 +1246,34 @@ test("only block rows render through Roam — page, tag and create-page rows sta
   assert.equal(rendered.length, 1, "a page title and a create-page name are already their own labels — zero renders");
   assert.equal(rendered[0].string, richBlock(1).name);
   const [page, block, create] = controller.suggestionList.children;
-  assert.equal(page.querySelector(".rg-suggestion-text").textContent, "A Page link", "and they show the normalizer's output, not raw markdown");
-  assert.equal(create.querySelector(".rg-suggestion-text").textContent, "New Page");
+  assert.equal(page.querySelector(".rg-suggestion-text").textContent, "A **Page** [[link]]", "and they show their own name, verbatim");
+  assert.equal(create.querySelector(".rg-suggestion-text").textContent, "New **Page**");
   assert.equal(block.textContent.includes(`roam:${richBlock(1).name}`), true, "the block row shows what Roam rendered");
+  controller.dispose();
+});
+
+/**
+ * The normalizer makes block CONTENT legible, because block content genuinely is Roam markdown. A
+ * page title is a name: its literal characters are part of what the row inserts, and a label that
+ * disagrees with the insertion is the same class of defect as a setting that does not do what it
+ * says. So the normalizer stops at the row kind, not at the markdown.
+ */
+test("a page title is shown verbatim while a block row normalizes", async (t) => {
+  t.after(() => { resetSuggestionRendering(); settingsCache.clear(); });
+  const starred = { kind: "roam-page", name: "Notes on **emphasis**", description: "Page", uid: "pagestar1" };
+  const hashed = { kind: "roam-page", name: "#hashtag-named page", description: "Page", uid: "pagehash1" };
+  const block = { kind: "roam-block", name: "a block about **emphasis**", description: "Block · blkemph001", uid: "blkemph001" };
+  const { controller, cells, flush } = makeController({ referenceSearchDelay: 0, searchReferences: async () => [starred, hashed, block] });
+  installSuggestionRenderer();
+  settingsCache.set("editing-autocomplete-render-rows", false);
+  await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "((q", floating: false });
+  flush(); await waitForSearch(); await drainRenders();
+
+  const label = (index) => controller.suggestionList.children[index].querySelector(".rg-suggestion-text").textContent;
+  assert.equal(label(0), "Notes on **emphasis**", "the asterisks are part of the title the row inserts");
+  assert.equal(label(1), "#hashtag-named page", "and so is a leading #");
+  assert.equal(label(2), "a block about emphasis", "block content still normalizes — that is what it is for");
+  assert.equal(controller.suggestions[0].name, starred.name, "the insertion source is untouched either way");
   controller.dispose();
 });
 
