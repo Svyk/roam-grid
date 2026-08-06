@@ -8,6 +8,7 @@ import extension, {
   initializeSettings,
   mounting,
   pendingTimers,
+  settingsCache,
   toast,
 } from "../src/extension.js";
 
@@ -15,7 +16,7 @@ function installFakeDom() {
   const created = [];
   const appendedToBody = [];
   const makeElement = () => {
-    const element = { className: "", textContent: "", id: "", isConnected: false, children: [], style: { setProperty() {} }, classList: { add() {}, remove() {} } };
+    const element = { className: "", textContent: "", id: "", isConnected: false, children: [], style: { setProperty() {} }, classList: { add() {}, remove() {} }, addEventListener() {} };
     element.appendChild = (child) => { element.children.push(child); return child; };
     element.remove = () => {};
     element.querySelectorAll = () => [];
@@ -196,6 +197,51 @@ test("unload clears the tracked timer registry and the in-flight mount set", asy
     clearTimeout(timer);
     pendingTimers.clear();
     mounting.clear();
+    if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
+    if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
+  }
+});
+
+/**
+ * The read site, not the predicate. `toast` is where every message in the file converges, so the
+ * level has to be consulted there — a gate placed in any single caller would leave the other 70-odd
+ * unaffected. The actionable message is asserted separately because suppressing it would delete the
+ * only control the user has for that action.
+ */
+test("the notification level suppresses notices inside toast itself, but never an actionable one", async () => {
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  const previousObserver = globalThis.MutationObserver;
+  const mock = installMetadataRoamMock();
+  const dom = installFakeDom();
+  globalThis.document = dom.document;
+  globalThis.MutationObserver = class { observe() {} disconnect() {} };
+  const extensionAPI = {
+    settings: { canSet: false, get: () => null, set: async () => {}, panel: { create: async () => {} } },
+    ui: { commandPalette: { addCommand() {} }, slashCommand: { addCommand() {} } },
+  };
+  try {
+    await extension.onload({ extensionAPI });
+    await Promise.resolve();
+    settingsCache.set("appearance-notifications", "Errors only");
+    toast("saved", "success", 60_000);
+    toast("careful", "warning", 60_000);
+    toast("broke", "danger", 60_000);
+    toast("edits were discarded", "warning", 60_000, { action: { label: "Restore", onClick() {} } });
+    const container = dom.appendedToBody.find((node) => node.className === "rg-toasts");
+    assert.ok(container, "the error still had to paint, so the container exists");
+    assert.deepEqual(container.children.map((child) => child.className), ["rg-toast rg-toast--danger", "rg-toast rg-toast--warning"]);
+    assert.equal(container.children[0].textContent, "broke");
+
+    settingsCache.set("appearance-notifications", "All");
+    toast("saved", "success", 60_000);
+    assert.equal(container.children.length, 3, "restoring the default lets a success notice through again");
+  } finally {
+    await extension.onunload();
+    for (const id of pendingTimers) clearTimeout(id);
+    pendingTimers.clear();
+    mock.dispose();
+    if (previousObserver === undefined) delete globalThis.MutationObserver; else globalThis.MutationObserver = previousObserver;
     if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
     if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
   }

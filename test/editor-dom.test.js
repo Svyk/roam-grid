@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { FormulaEngine, GridEditorController, GridModel, GridView, NativeGridSession, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, queryBlockReferenceSources, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, syncPortalThemeFromRoot } from "../src/extension.js";
+import { FormulaEngine, GridEditorController, GridModel, GridView, NativeGridSession, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, queryBlockReferenceSources, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, settingsCache, syncPortalThemeFromRoot } from "../src/extension.js";
 
 class MiniClassList {
   constructor() { this.values = new Set(); }
@@ -756,6 +756,48 @@ test("Roam page and block suggestions insert native syntax without stealing edit
   const richCalls = []; const preview = { dataset: {} };
   renderStableCellContent(preview, { raw: editor.value, renderRich: (_target, raw) => richCalls.push(raw) });
   assert.deepEqual(richCalls, ["Use ((blockuid1))"]);
+  controller.dispose();
+});
+
+/**
+ * `editing-autocomplete` is the master switch over BOTH suggestion paths, and the reference half is
+ * asserted by call count rather than by the popover: gating after the debounced search would still
+ * hide the list while querying Roam on every keystroke, which is the cost the switch exists to avoid.
+ */
+test("the autocomplete switch silences the function list and stops the Roam query being issued", async (t) => {
+  t.after(() => settingsCache.clear());
+  let searches = 0;
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async () => { searches += 1; return [{ kind: "roam-page", name: "Project Alpha", description: "Page" }]; },
+  });
+
+  settingsCache.set("editing-autocomplete", true);
+  await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "=SU", floating: false });
+  flush();
+  assert.equal(controller.suggestionKind, "formula");
+  assert.ok(controller.suggestions.length > 0, "the function list is the baseline this test degrades from");
+  await controller.finish(false);
+
+  await controller.start({ row: 0, col: 1, cell: cells.get("0:1"), raw: "[[Proj", floating: false });
+  flush(); await waitForSearch();
+  assert.equal(searches, 1);
+  assert.equal(controller.suggestionKind, "roam-reference");
+  await controller.finish(false);
+
+  settingsCache.set("editing-autocomplete", false);
+  const editor = await controller.start({ row: 1, col: 0, cell: cells.get("1:0"), raw: "=SU", floating: false });
+  flush();
+  assert.deepEqual(controller.suggestions, []);
+  assert.equal(controller.suggestionList.hidden, true);
+  assert.equal(editor.getAttribute("aria-expanded"), "false");
+  await controller.finish(false);
+
+  await controller.start({ row: 1, col: 1, cell: cells.get("1:1"), raw: "[[Proj", floating: false });
+  flush(); await waitForSearch();
+  assert.equal(searches, 1, "the gate must sit ahead of the debounced query, not after its results");
+  assert.deepEqual(controller.suggestions, []);
+  assert.equal(controller.suggestionList.hidden, true);
   controller.dispose();
 });
 

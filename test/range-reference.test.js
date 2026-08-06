@@ -535,7 +535,8 @@ test("both paste paths resolve their source through the shared resolver", async 
   const largeView = {
     selection: { startRow: 2, endRow: 2, startCol: 1, endCol: 1 },
     // `applyMatrix` hands back one record per cell; this test is about routing, so it records none.
-    store: { applyMatrix: async (row, col, matrix) => { applied.push({ row, col, matrix }); return []; } },
+    // The manifest is real because the paste path reads its bounds before deciding whether to grow.
+    store: { manifest: { rowCount: 100, colCount: 26 }, applyMatrix: async (row, col, matrix) => { applied.push({ row, col, matrix }); return []; } },
     invalidateLargeCells: () => [], recordLargeEdit() {}, scheduleSave() {}, scheduleRender() {},
   };
   await LargeGridView.prototype.pasteReferencedRange.call(largeView, parseRangeComponent("{{roam-grid-range: ((tbl00001)) A1:B2}}"), resolve);
@@ -548,7 +549,7 @@ test("a range component pasted into a large grid pastes referenced values, not l
   const applied = [];
   const largeView = {
     selection: { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
-    store: { applyMatrix: async (row, col, matrix) => { applied.push({ row, col, matrix }); return []; } },
+    store: { manifest: { rowCount: 100, colCount: 26 }, applyMatrix: async (row, col, matrix) => { applied.push({ row, col, matrix }); return []; } },
     invalidateLargeCells: () => [], recordLargeEdit() {}, scheduleSave() {}, scheduleRender() {},
     pasteReferencedRange(spec) { return LargeGridView.prototype.pasteReferencedRange.call(this, spec, () => source); },
   };
@@ -564,6 +565,36 @@ test("a range component pasted into a large grid pastes referenced values, not l
   const tsv = pasteEvent("one\ttwo\nthree\tfour");
   await LargeGridView.prototype.onPaste.call(largeView, tsv);
   assert.deepEqual(applied, [{ row: 0, col: 0, matrix: [["one", "two"], ["three", "four"]] }], "a plain TSV still takes the delimited path");
+});
+
+/**
+ * The read sites, not the helper. Both paste paths grow their grid today; with
+ * `editing-paste-grows-grid` off neither may insert a row or a column, and the native path is checked
+ * by row/column count rather than by cell values so a clip that still grew and then overwrote would fail.
+ */
+test("the paste-growth switch stops both paste paths inserting rows and columns", async (t) => {
+  t.after(() => settingsCache.clear());
+  const grow = fakeView(new GridModel({ rows: [["", ""], ["", ""]] }));
+  settingsCache.set("editing-paste-grows-grid", true);
+  await GridView.prototype.pasteMatrix.call(grow, [["a", "b", "c"], ["d", "e", "f"], ["g", "h", "i"]]);
+  assert.deepEqual([grow.model.rowCount, grow.model.colCount], [3, 3], "growing is the default");
+  assert.deepEqual(grow.commits, [{ label: "Paste cells", structural: true }]);
+
+  const clamp = fakeView(new GridModel({ rows: [["", ""], ["", ""]] }));
+  settingsCache.set("editing-paste-grows-grid", false);
+  await GridView.prototype.pasteMatrix.call(clamp, [["a", "b", "c"], ["d", "e", "f"], ["g", "h", "i"]]);
+  assert.deepEqual([clamp.model.rowCount, clamp.model.colCount], [2, 2], "a clipped paste must not resize the grid");
+  assert.deepEqual(clamp.commits, [{ label: "Paste cells", structural: false }], "and must not claim a structural write");
+  assert.deepEqual(clamp.model.rows.map((row) => row.map((cell) => cell.raw)), [["a", "b"], ["d", "e"]]);
+
+  const applied = [];
+  const largeView = {
+    selection: { startRow: 1, endRow: 1, startCol: 1, endCol: 1 },
+    store: { manifest: { rowCount: 3, colCount: 3 }, applyMatrix: async (row, col, matrix) => { applied.push({ row, col, matrix }); return []; } },
+    invalidateLargeCells: () => [], recordLargeEdit() {}, scheduleSave() {}, scheduleRender() {},
+  };
+  await LargeGridView.prototype.onPaste.call(largeView, pasteEvent("a\tb\tc\nd\te\tf\ng\th\ti"));
+  assert.deepEqual(applied, [{ row: 1, col: 1, matrix: [["a", "b"], ["d", "e"]] }], "applyMatrix calls ensureSize, so the clip has to happen before it");
 });
 
 test("range buttons are discovered by their single Roam-rendered class", () => {

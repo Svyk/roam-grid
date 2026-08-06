@@ -60,13 +60,29 @@ leaves a working native table.
 
 ### Settings
 
-A real settings panel at **Settings → Roam Depot → Roam Grid**: 37 controls in
+A real settings panel at **Settings → Roam Depot → Roam Grid**: 41 controls in
 eight groups (Writes, Editing, Appearance, Sizing, New grids, Large grids,
 Comments, Ranges) plus four maintenance actions — apply display defaults to open
 grids, forget this device's overrides, clear local caches, and reset everything.
 Presentation choices that are properly per-device (toolbar, theme, maximum
-width, overscan, chunk cache size) are stored per device; the rest sync with
-your graph.
+width, overscan, notifications, chunk cache size) are stored per device; the rest
+sync with your graph.
+
+**Show row and column headers** is a live global. Turning it off hides the A/B/C
+and 1/2/3 labels on every grid at once — including large grids — and turning it
+back on returns each grid to its own **Labels** choice. Nothing per-grid is
+written either way, so it is instantly reversible. **Tint formula cells** works
+the same way. **Fit grids to the block width** stays a per-table decision (it
+depends on how many columns a particular table has, and a native grid's own
+resize handles turn it off), so it remains a creation default that
+**Apply display defaults to open grids** retro-applies.
+
+Also new: **Suggest functions and pages while typing** turns autocomplete off
+entirely rather than only tuning its delay and result count; **Grow the grid to
+fit a paste** can be turned off so an over-large paste is clipped to the grid's
+current size rather than inserting rows and columns; and **Notifications** cuts
+the corner messages down to warnings-and-errors or errors-only. A message that
+offers an action, such as Restore, is never suppressed.
 
 Every control does something. **Maximum cells in a rendered range** (2000) now
 bounds what a range reference paints — a bigger range renders whole rows up to

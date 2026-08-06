@@ -10,17 +10,24 @@ import {
   applyGridMaxWidth,
   applySettingsChange,
   applyToolbarPreset,
+  autocompleteEnabled,
   buildSettingsPanelConfig,
+  clipPasteMatrix,
   coerceSetting,
   deviceSettingsKey,
   enterMovement,
   formulaTintEnabled,
   getSetting,
   graphCacheKey,
+  GridModel,
   gridSessions,
+  GridView,
   gridViews,
+  headersVisible,
+  LargeGridView,
   initializeSettings,
   largeGridMounts,
+  notificationAllowed,
   pinnedGridThemePalette,
   planSettingsMigration,
   readDeviceSettings,
@@ -48,11 +55,13 @@ const TODAYS_CONSTANTS = {
   "writes-content-debounce-ms": 220,
   "writes-large-debounce-ms": 500,
   "session-idle-ms": 1500,
+  "editing-autocomplete": true,
   "editing-autocomplete-debounce-ms": 90,
   "editing-autocomplete-limit": 8,
   "editing-capture-undo": true,
   "editing-enter-direction": "Down",
   "editing-tab-direction": "Right",
+  "editing-paste-grows-grid": true,
   "conflict-restore-prompt": true,
   "appearance-formula-tinting": true,
   "appearance-show-headers": true,
@@ -61,6 +70,7 @@ const TODAYS_CONSTANTS = {
   "appearance-toolbar-preset": "Full",
   "appearance-theme": "Follow Roam",
   "appearance-max-width": 1200,
+  "appearance-notifications": "All",
   "sizing-default-row-height": 32,
   "sizing-compact-row-height": 24,
   "sizing-default-col-width": 160,
@@ -611,12 +621,12 @@ test("display defaults are stamped, never inherited", (t) => {
   t.after(() => settingsCache.clear());
   refreshSettingsCache(makeApi({ values: { "appearance-show-headers": false, "appearance-fit-to-width": false, "appearance-formula-tinting": false } }).api, makeStorage());
   const target = { showHeaders: true, fitToWidth: true, colorFormulaCells: true, rowCount: 3 };
-  assert.deepEqual(displayDefaults(), { showHeaders: false, fitToWidth: false });
+  assert.deepEqual(displayDefaults(), { fitToWidth: false });
   assert.equal(applyDisplayDefaults(target), target);
-  assert.deepEqual(target, { showHeaders: false, fitToWidth: false, colorFormulaCells: true, rowCount: 3 }, "tinting is masked live, so creation must not stamp it");
+  assert.deepEqual(target, { showHeaders: true, fitToWidth: false, colorFormulaCells: true, rowCount: 3 }, "tinting and headers are masked live, so creation must not stamp either");
   assert.equal(applyDisplayDefaults(null), null);
   refreshSettingsCache(makeApi().api, makeStorage());
-  assert.deepEqual(applyDisplayDefaults({}), { showHeaders: true, fitToWidth: true });
+  assert.deepEqual(applyDisplayDefaults({}), { fitToWidth: true });
 });
 
 /**
@@ -685,10 +695,128 @@ test("the tinting setting reaches live views through a repaint, not a value-diff
   assert.deepEqual(calls, ["tint", "large"]);
 });
 
+/**
+ * Same truth table as the tinting mask, for the same reason: an implementation that degrades to
+ * reading only the global fails rows 1-2, and one that reads only the per-grid flag fails rows 3-4.
+ */
+test("row and column labels are the AND of the global setting and the grid's own flag", (t) => {
+  t.after(() => settingsCache.clear());
+  const cases = [
+    { global: true, grid: true, shown: true },
+    { global: true, grid: false, shown: false },
+    { global: false, grid: true, shown: false },
+    { global: false, grid: false, shown: false },
+  ];
+  for (const { global, grid, shown } of cases) {
+    refreshSettingsCache(makeApi({ values: { "appearance-show-headers": global } }).api, makeStorage());
+    assert.equal(headersVisible(grid), shown, `global ${global} × grid ${grid} must show labels: ${shown}`);
+  }
+  refreshSettingsCache(makeApi().api, makeStorage());
+  assert.equal(headersVisible(undefined), true, "an absent per-grid flag is explicitly true everywhere else");
+  assert.equal(headersVisible(null), true);
+});
+
+test("the header setting reaches live views through refreshHeaders, and a range excerpt absorbs it", () => {
+  const descriptor = SETTINGS["appearance-show-headers"];
+  assert.equal(descriptor.apply, "immediate", "a creation-only header switch is the defect this replaces");
+  assert.equal(typeof descriptor.onView, "function");
+  assert.equal(typeof descriptor.onLarge, "function");
+  const calls = [];
+  descriptor.onView({ refreshHeaders: () => calls.push("headers"), render: () => calls.push("render") });
+  assert.deepEqual(calls, ["headers"], "the walk must go through refreshHeaders so an excerpt can decline it");
+  descriptor.onLarge({ scheduleRender: () => calls.push("large") });
+  assert.deepEqual(calls, ["headers", "large"]);
+});
+
+/**
+ * The real layout read sites, not the helper. `applyGridTemplate*` writes the axis gutter track into
+ * the grid element, and `headerWidth`/`headerHeight` are what every large-grid offset is measured
+ * from — an implementation that added `headersVisible` but left the render sites reading
+ * `this.model.showHeaders` passes every test above this one and fails this one.
+ */
+test("the global reaches the native grid tracks and the large-grid gutters", (t) => {
+  t.after(() => settingsCache.clear());
+  const model = new GridModel({ rows: [["a", "b"], ["c", "d"]] });
+  const view = { model, gridElement: { style: {} }, columnResizePreview: null, rowResizePreview: null, headersOn: GridView.prototype.headersOn, applyGridTemplateColumns: GridView.prototype.applyGridTemplateColumns, applyGridTemplateRows: GridView.prototype.applyGridTemplateRows };
+  const large = { store: { manifest: { showHeaders: true } }, headersOn: LargeGridView.prototype.headersOn, headerWidth: LargeGridView.prototype.headerWidth, headerHeight: LargeGridView.prototype.headerHeight };
+
+  refreshSettingsCache(makeApi().api, makeStorage());
+  view.applyGridTemplateColumns(); view.applyGridTemplateRows();
+  assert.match(view.gridElement.style.gridTemplateColumns, /^42px /, "the label gutter is the first column track");
+  assert.match(view.gridElement.style.gridTemplateRows, /^28px /);
+  assert.equal(large.headerWidth(), 42);
+  assert.equal(large.headerHeight(), 28);
+
+  refreshSettingsCache(makeApi({ values: { "appearance-show-headers": false } }).api, makeStorage());
+  view.applyGridTemplateColumns(); view.applyGridTemplateRows();
+  assert.doesNotMatch(view.gridElement.style.gridTemplateColumns, /42px/, "global off must drop the gutter track, not just hide it");
+  assert.doesNotMatch(view.gridElement.style.gridTemplateRows, /28px/);
+  assert.equal(large.headerWidth(), 0);
+  assert.equal(large.headerHeight(), 0);
+  assert.equal(model.showHeaders, true, "suppressing must not write the grid's own flag");
+  assert.equal(large.store.manifest.showHeaders, true);
+
+  // The per-table opt-out still wins while the global is on.
+  refreshSettingsCache(makeApi().api, makeStorage());
+  model.showHeaders = false; large.store.manifest.showHeaders = false;
+  view.applyGridTemplateColumns();
+  assert.doesNotMatch(view.gridElement.style.gridTemplateColumns, /42px/);
+  assert.equal(large.headerWidth(), 0);
+});
+
+test("fit-to-width stays creation-only and keeps the maintenance button", () => {
+  const descriptor = SETTINGS["appearance-fit-to-width"];
+  assert.equal(descriptor.apply, "next-op");
+  assert.equal(descriptor.onView, undefined, "a live mask here would apply to native grids only — LargeGridView never reads fitToWidth");
+  assert.equal(descriptor.onLarge, undefined);
+  assert.ok(Object.hasOwn(displayDefaults(), "fitToWidth"), "it is the one flag the display-defaults button still restamps");
+});
+
+test("the notification level suppresses notices by intent and never a message that carries an action", (t) => {
+  t.after(() => settingsCache.clear());
+  const intents = ["primary", "success", "warning", "danger"];
+  const expected = {
+    All: [true, true, true, true],
+    "Warnings and errors": [false, false, true, true],
+    "Errors only": [false, false, false, true],
+  };
+  for (const [level, allowed] of Object.entries(expected)) {
+    refreshSettingsCache(makeApi({ values: { "appearance-notifications": level } }).api, makeStorage());
+    assert.deepEqual(intents.map((intent) => notificationAllowed(intent)), allowed, `level ${level}`);
+    // An actionable message is a control, not a notice: suppressing it would remove the only way to
+    // run the action it offers, which is exactly what the Restore prompt depends on.
+    assert.deepEqual(intents.map((intent) => notificationAllowed(intent, true)), [true, true, true, true], `level ${level} with an action`);
+  }
+  refreshSettingsCache(makeApi().api, makeStorage());
+  assert.equal(notificationAllowed("success"), true, "the default level shows everything");
+});
+
+test("autocomplete has one master switch that both suggestion paths read", (t) => {
+  t.after(() => settingsCache.clear());
+  refreshSettingsCache(makeApi().api, makeStorage());
+  assert.equal(autocompleteEnabled(), true);
+  refreshSettingsCache(makeApi({ values: { "editing-autocomplete": false } }).api, makeStorage());
+  assert.equal(autocompleteEnabled(), false);
+});
+
+test("clipPasteMatrix grows by default and clips to the existing bounds when the switch is off", (t) => {
+  t.after(() => settingsCache.clear());
+  const matrix = [["a", "b", "c"], ["d", "e", "f"], ["g", "h", "i"]];
+
+  refreshSettingsCache(makeApi().api, makeStorage());
+  assert.equal(clipPasteMatrix(matrix, 0, 0, 2, 2), matrix, "growing is the default and hands the matrix back untouched");
+
+  refreshSettingsCache(makeApi({ values: { "editing-paste-grows-grid": false } }).api, makeStorage());
+  assert.deepEqual(clipPasteMatrix(matrix, 0, 0, 2, 2), [["a", "b"], ["d", "e"]]);
+  assert.deepEqual(clipPasteMatrix(matrix, 1, 1, 3, 3), [["a", "b"], ["d", "e"]], "the offset is the paste anchor, not the origin");
+  assert.deepEqual(clipPasteMatrix(matrix, 0, 0, 9, 9), matrix, "a paste that already fits is not rewritten");
+  assert.deepEqual(clipPasteMatrix(matrix, 3, 0, 3, 3), [], "an anchor past the last row clips to nothing");
+});
+
 test("the display-defaults button rewrites open grids and repaints them", (t) => {
   t.after(() => { clearRegistries(); settingsCache.clear(); });
   clearRegistries();
-  refreshSettingsCache(makeApi({ values: { "appearance-show-headers": false } }).api, makeStorage());
+  refreshSettingsCache(makeApi({ values: { "appearance-show-headers": false, "appearance-fit-to-width": false } }).api, makeStorage());
   const renders = [];
   const view = { render: () => renders.push("view") };
   const model = { showHeaders: true, fitToWidth: true, colorFormulaCells: true };
@@ -699,8 +827,12 @@ test("the display-defaults button rewrites open grids and repaints them", (t) =>
   largeGridMounts.set("l1", large);
 
   assert.equal(applyDisplayDefaultsToOpenGrids(), 2);
-  assert.equal(model.showHeaders, false);
-  assert.equal(manifest.showHeaders, false);
+  assert.equal(model.fitToWidth, false);
+  assert.equal(manifest.fitToWidth, false);
+  // Headers are a live mask now: the button must NOT write the per-grid flag, or a grid pressed while
+  // the global was off would stay headerless after the global came back on.
+  assert.equal(model.showHeaders, true, "the button must not restamp a live-masked flag");
+  assert.equal(manifest.showHeaders, true, "the button must not restamp a live-masked flag");
   assert.equal(large.store.metadataDirty, true);
   assert.equal(large.rowMetricsKey, null);
   assert.deepEqual(marked, [true], "the layout change has to reach the metadata save path");
@@ -777,7 +909,9 @@ test("maintenance rows are buttons that carry the group convention and an onClic
   assert.deepEqual(clicks, MAINTENANCE_KEYS);
   assert.equal(byId.get("maintenance-reset").action.content, "Reset all Roam Grid settings");
   assert.deepEqual(Object.keys(SETTINGS_MAINTENANCE), MAINTENANCE_KEYS);
-  assert.match(SETTINGS_MAINTENANCE["maintenance-apply-display"].description, /Existing grids keep their own settings/);
+  assert.match(SETTINGS_MAINTENANCE["maintenance-apply-display"].description, /Existing grids keep their own fit setting/);
+  // The two live-masked flags must not be advertised here, or the button promises work it no longer does.
+  assert.doesNotMatch(SETTINGS_MAINTENANCE["maintenance-apply-display"].description, /Rewrite headers/);
 });
 
 test("the panel routes clicks through runMaintenanceAction and rebuilds itself", async () => {
