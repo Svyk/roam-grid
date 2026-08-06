@@ -39,6 +39,13 @@ const DEFAULT_NEW_GRID_COLS = 26;
 const DEFAULT_LARGE_OVERSCAN_ROWS = 8;
 const DEFAULT_RANGE_RENDERED_CELLS = 2000;
 const DEFAULT_LARGE_CACHE_MB = 256;
+const LARGE_RESIDENT_MIN_CHUNKS = 8;
+const LARGE_RESIDENT_MAX_CHUNKS = 32;
+const CHUNK_CACHE_DB = "roam-grid-chunks";
+const CHUNK_CACHE_DB_VERSION = 1;
+const CHUNK_CACHE_BODIES = "bodies";
+const CHUNK_CACHE_META = "meta";
+const CHUNK_CACHE_OPEN_MS = 3000;
 const DEVICE_SETTINGS_PREFIX = "roam-grid:settings:";
 const SETTINGS_VERSION = 1;
 const SETTINGS_VERSION_KEY = "settingsVersion";
@@ -3618,6 +3625,222 @@ export function chunkDigestOf(descriptor) {
   return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : null;
 }
 
+/**
+ * A cached body earns no more trust than a downloaded one: it goes through the same digest check and
+ * the same parse, and anything that fails either is not a hit. Returns the parsed chunk or `null`.
+ */
+async function parseVerifiedChunk(text, expected) {
+  if (expected) {
+    const actual = await sha256Hex(text);
+    if (actual !== null && actual !== expected) return null;
+  }
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+function idbResult(request) {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("IndexedDB request failed"));
+  });
+}
+
+function idbSettled(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve(true);
+    transaction.onerror = () => reject(transaction.error || new Error("IndexedDB transaction failed"));
+    transaction.onabort = () => reject(transaction.error || new Error("IndexedDB transaction aborted"));
+  });
+}
+
+/**
+ * Bodies and their sizes live in separate stores so the byte budget can be rebuilt at open time from
+ * a small index instead of reading every cached chunk back into memory to find out how big it is.
+ */
+export class IndexedDbBackend {
+  constructor(db) { this.db = db; }
+
+  static async open(factory = globalThis.indexedDB, timeoutMs = CHUNK_CACHE_OPEN_MS) {
+    if (typeof factory?.open !== "function") return null;
+    const request = factory.open(CHUNK_CACHE_DB, CHUNK_CACHE_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(CHUNK_CACHE_BODIES)) db.createObjectStore(CHUNK_CACHE_BODIES);
+      if (!db.objectStoreNames.contains(CHUNK_CACHE_META)) db.createObjectStore(CHUNK_CACHE_META);
+    };
+    // A version-change block from another tab leaves `open` pending indefinitely, and a large grid
+    // must never wait on its own cache to finish mounting.
+    let timer = null;
+    const timeout = new Promise((_resolve, reject) => { timer = setTimeout(() => reject(new Error("IndexedDB open timed out")), timeoutMs); });
+    try { return new IndexedDbBackend(await Promise.race([idbResult(request), timeout])); }
+    finally { clearTimeout(timer); }
+  }
+
+  async get(url) {
+    const stored = await idbResult(this.db.transaction(CHUNK_CACHE_BODIES, "readonly").objectStore(CHUNK_CACHE_BODIES).get(url));
+    return stored ?? null;
+  }
+
+  async put(url, text, meta) {
+    const transaction = this.db.transaction([CHUNK_CACHE_BODIES, CHUNK_CACHE_META], "readwrite");
+    transaction.objectStore(CHUNK_CACHE_BODIES).put(text, url);
+    transaction.objectStore(CHUNK_CACHE_META).put(meta, url);
+    return idbSettled(transaction);
+  }
+
+  async delete(url) {
+    const transaction = this.db.transaction([CHUNK_CACHE_BODIES, CHUNK_CACHE_META], "readwrite");
+    transaction.objectStore(CHUNK_CACHE_BODIES).delete(url);
+    transaction.objectStore(CHUNK_CACHE_META).delete(url);
+    return idbSettled(transaction);
+  }
+
+  async entries() {
+    const store = this.db.transaction(CHUNK_CACHE_META, "readonly").objectStore(CHUNK_CACHE_META);
+    const [keys, values] = await Promise.all([idbResult(store.getAllKeys()), idbResult(store.getAll())]);
+    return keys.map((url, index) => [url, values[index]]);
+  }
+
+  close() { this.db.close(); }
+}
+
+/** The test-facing backend: the same contract as IndexedDB with none of the environment. */
+export class MemoryBackend {
+  constructor() { this.bodies = new Map(); this.meta = new Map(); }
+  async get(url) { return this.bodies.has(url) ? this.bodies.get(url) : null; }
+  async put(url, text, meta) { this.bodies.set(url, text); this.meta.set(url, meta); return true; }
+  async delete(url) { this.bodies.delete(url); this.meta.delete(url); return true; }
+  async entries() { return [...this.meta]; }
+  close() {}
+}
+
+/** Private browsing, a revoked quota, a corrupted database: every method rejects, including close. */
+export class ThrowingBackend {
+  async get() { throw new Error("chunk cache backend unavailable"); }
+  async put() { throw new Error("chunk cache backend unavailable"); }
+  async delete() { throw new Error("chunk cache backend unavailable"); }
+  async entries() { throw new Error("chunk cache backend unavailable"); }
+  close() { throw new Error("chunk cache backend unavailable"); }
+}
+
+export function chunkCacheMaxBytes() {
+  const megabytes = Number(getSetting("large-cache-max-mb"));
+  return (Number.isFinite(megabytes) && megabytes > 0 ? megabytes : DEFAULT_LARGE_CACHE_MB) * 1024 * 1024;
+}
+
+/**
+ * Every upload mints a fresh url, so a chunk url addresses exactly one immutable body: an entry is
+ * never stale, only superseded, and nothing here ever needs invalidating. That leaves one failure
+ * mode — the backend not working — and the answer to it is to switch the whole cache off. With
+ * `available` false every method is a no-op returning what "no cached copy" returns, which is
+ * byte-for-byte how the store behaved before this class existed. No method can throw or reject.
+ */
+export class ChunkCache {
+  constructor(backend = null, maxBytes = 0) {
+    this.backend = backend || null;
+    this.available = Boolean(backend);
+    this.maxBytes = maxBytes;
+    this.index = new Map();
+    this.bytes = 0;
+    this.clock = 0;
+  }
+
+  static disabled() { return new ChunkCache(null, 0); }
+
+  /** `undefined` builds the real IndexedDB backend; an explicit `null` yields a disabled cache. */
+  static async open(backend = undefined, maxBytes = chunkCacheMaxBytes()) {
+    let resolved = backend;
+    if (resolved === undefined) resolved = getSetting("large-cache-enabled") ? await IndexedDbBackend.open().catch(() => null) : null;
+    const cache = new ChunkCache(resolved, maxBytes);
+    await cache.hydrate();
+    return cache;
+  }
+
+  disable() {
+    const backend = this.backend;
+    this.available = false; this.backend = null; this.index.clear(); this.bytes = 0;
+    try { backend?.close?.(); } catch { /* a backend that cannot be closed is already gone */ }
+  }
+
+  /** The single place a backend rejection becomes "this cache no longer exists". */
+  async attempt(operation, fallback = null) {
+    if (!this.available) return fallback;
+    try { return await operation(this.backend); } catch { this.disable(); return fallback; }
+  }
+
+  async hydrate() {
+    for (const [url, meta] of (await this.attempt((backend) => backend.entries(), [])) || []) {
+      const bytes = Number(meta?.bytes);
+      if (typeof url !== "string" || !Number.isFinite(bytes) || bytes < 0) continue;
+      const at = Number.isFinite(Number(meta?.at)) ? Number(meta.at) : 0;
+      this.index.set(url, { bytes, at });
+      this.bytes += bytes;
+      this.clock = Math.max(this.clock, at);
+    }
+    await this.enforceBudget();
+    return this;
+  }
+
+  async get(url) {
+    const text = await this.attempt((backend) => backend.get(url));
+    if (typeof text !== "string") return null;
+    const entry = this.index.get(url);
+    if (entry) entry.at = ++this.clock;
+    return text;
+  }
+
+  async put(url, text) {
+    if (!this.available || typeof url !== "string" || typeof text !== "string") return false;
+    // Sizes are counted in characters, a stable proxy for the stored body that costs no encoding.
+    // A body larger than the whole budget would evict everything and still not fit, so it is simply
+    // not cached — the download path is unaffected either way.
+    const bytes = text.length;
+    if (bytes > this.maxBytes) return false;
+    const at = ++this.clock;
+    if (!await this.attempt(async (backend) => { await backend.put(url, text, { bytes, at }); return true; }, false)) return false;
+    this.bytes += bytes - (this.index.get(url)?.bytes || 0);
+    this.index.set(url, { bytes, at });
+    await this.enforceBudget();
+    return true;
+  }
+
+  async delete(url) {
+    const entry = this.index.get(url);
+    if (!await this.attempt(async (backend) => { await backend.delete(url); return true; }, false)) return false;
+    this.index.delete(url);
+    this.bytes -= entry?.bytes || 0;
+    return true;
+  }
+
+  /** Least-recently-used first. A backend that starts failing mid-eviction stops the loop, not the caller. */
+  async enforceBudget() {
+    if (!this.available || this.bytes <= this.maxBytes) return 0;
+    let evicted = 0;
+    for (const [url] of [...this.index].sort((left, right) => left[1].at - right[1].at)) {
+      if (this.bytes <= this.maxBytes) break;
+      if (!await this.delete(url)) break;
+      evicted += 1;
+    }
+    return evicted;
+  }
+
+  close() { this.disable(); }
+}
+
+let chunkCachePromise = null;
+
+/** One connection per page, shared by every open large grid and torn down with the extension. */
+export function sharedChunkCache() {
+  chunkCachePromise ||= ChunkCache.open();
+  return chunkCachePromise;
+}
+
+/** Swaps the shared cache, closing whatever it replaces. Tests inject; `onunload` passes nothing. */
+export function resetChunkCache(replacement = null) {
+  const previous = chunkCachePromise;
+  chunkCachePromise = replacement;
+  void Promise.resolve(previous).then((cache) => cache?.close?.()).catch(() => { /* a cache that cannot close is already gone */ });
+}
+
 function rawRows(model) {
   return model.rows.map((row) => row.map((cell) => cell.raw));
 }
@@ -3765,6 +3988,8 @@ export class LargeGridStore {
     this.manifestUrl = null;
     this.manifest = null;
     this.cache = new Map();
+    this.residentLimit = LARGE_RESIDENT_MIN_CHUNKS;
+    this.chunkCache = ChunkCache.disabled();
     this.rowIds = new Map();
     this.rowIndexById = new Map();
     this.dirty = new Set();
@@ -3779,6 +4004,9 @@ export class LargeGridStore {
   dispose() { this.disposed = true; }
 
   async initialize(model = null) {
+    // The device cache is shared across grids and outlives any one of them, so `dispose` does not
+    // close it; `onunload` does.
+    this.chunkCache = await sharedChunkCache();
     const tree = getTree(this.anchorUid);
     const pointer = tree?.children.find((child) => child.string.startsWith(MANIFEST_PREFIX));
     if (pointer) {
@@ -3840,9 +4068,12 @@ export class LargeGridStore {
     if (!chunk) return [];
     const ids = synthesizeChunkRowIds(chunk, rowIdRevisionFor(this.manifest), chunk.rows.length);
     chunk.rowIds = ids;
+    // Retire exactly the ids this chunk registered last time. Sweeping the whole index for rows in
+    // this chunk's range was equivalent, but eviction makes re-loads routine and that sweep costs
+    // one pass over every known row each time.
+    for (const id of this.rowIds.get(index) || []) this.rowIndexById.delete(id);
     this.rowIds.set(index, ids);
     const chunkRows = chunkRowsFor(this.manifest);
-    for (const [id, row] of this.rowIndexById) if (Math.floor(row / chunkRows) === index) this.rowIndexById.delete(id);
     ids.forEach((id, local) => this.rowIndexById.set(id, index * chunkRows + local));
     this.metricsVersion += 1;
     return ids;
@@ -3883,21 +4114,75 @@ export class LargeGridStore {
    */
   async downloadChunk(index, descriptor) {
     const expected = getSetting("large-verify-checksums") ? chunkDigestOf(descriptor) : null;
+    // The device cache is consulted before the retry budget rather than inside it, so a rotted entry
+    // still leaves all `CHUNK_DIGEST_RETRIES + 1` network attempts available.
+    const cached = await this.chunkCache.get(descriptor.url);
+    if (cached !== null) {
+      const parsed = await parseVerifiedChunk(cached, expected);
+      if (parsed) return parsed;
+      await this.chunkCache.delete(descriptor.url);
+    }
     let failure = null;
     for (let attempt = 0; attempt <= CHUNK_DIGEST_RETRIES; attempt += 1) {
       if (attempt) await sleep(this.retryDelay(attempt - 1));
       const text = await downloadFileText(descriptor.url);
-      if (!expected) return JSON.parse(text);
+      if (!expected) { await this.chunkCache.put(descriptor.url, text); return JSON.parse(text); }
       const actual = await sha256Hex(text);
-      if (actual === null || actual === expected) return JSON.parse(text);
+      if (actual === null || actual === expected) { await this.chunkCache.put(descriptor.url, text); return JSON.parse(text); }
       failure = new GridError("CHUNK_DIGEST", `Large-grid chunk ${index} failed its checksum and may be truncated`, { index, url: descriptor.url, expected, actual });
     }
     this.unreadableChunks.set(index, failure);
     throw failure;
   }
 
+  /**
+   * A read is also a use: the chunk moves to the young end of the `Map`'s insertion order, which is
+   * the entire LRU. `cache` stays a plain `Map` on purpose — `commit` and the tests read it
+   * directly, and an opaque wrapper would hide the pinning invariant rather than expose it.
+   */
+  residentChunk(index) {
+    if (!this.cache.has(index)) return undefined;
+    const chunk = this.cache.get(index);
+    this.cache.delete(index);
+    this.cache.set(index, chunk);
+    return chunk;
+  }
+
+  /**
+   * Sized from the band the caller is about to read, never from a constant: everything in the band
+   * has to be resident at once or `peekRaw` would read an evicted chunk back as empty. Four bands of
+   * headroom keeps ordinary scrolling inside the cache, and the ceiling is what stops a 100k-row
+   * grid scrolled end to end from pinning all 200 chunks for the rest of the Roam session.
+   */
+  boundResidentChunks(span) {
+    this.residentLimit = Math.max(span, clamp(span * 4, LARGE_RESIDENT_MIN_CHUNKS, LARGE_RESIDENT_MAX_CHUNKS));
+  }
+
+  /**
+   * A dirty chunk holds the only copy of an edit until `commit()` uploads it, so it is pinned and
+   * the resident set is allowed to sit over its limit rather than lose one. Row ids survive
+   * eviction: they are a fraction of a chunk's size, and dropping them would hand an evicted row's
+   * height and alignment to whichever row is derived into its id next.
+   */
+  evictResidentChunks() {
+    let evicted = 0;
+    if (this.cache.size <= this.residentLimit) return evicted;
+    // The youngest entry is the chunk whose load triggered this, and the caller is holding it —
+    // `setCell` is about to write into it and only then mark it dirty. It is never a candidate.
+    const candidates = [...this.cache.keys()];
+    candidates.pop();
+    for (const index of candidates) {
+      if (this.cache.size <= this.residentLimit) break;
+      if (this.dirty.has(index)) continue;
+      this.cache.delete(index);
+      evicted += 1;
+    }
+    return evicted;
+  }
+
   async loadChunk(index) {
-    if (this.cache.has(index)) return this.cache.get(index);
+    const resident = this.residentChunk(index);
+    if (resident !== undefined) return resident;
     // Sticky until something explicitly asks for a retry, so a failing chunk costs one round of
     // downloads rather than a fresh round on every frame, edit and formula read.
     const unreadable = this.unreadableChunks.get(index);
@@ -3907,13 +4192,16 @@ export class LargeGridStore {
       const empty = { schema: "roam-grid/chunk", version: 1, index, startRow: index * chunkRowsFor(this.manifest), rows: [] };
       this.cache.set(index, empty);
       this.syncRowIds(index, empty);
+      this.evictResidentChunks();
       return empty;
     }
     const chunk = await this.downloadChunk(index, descriptor);
     if (chunk.schema !== "roam-grid/chunk" || chunk.version !== 1 || chunk.index !== index || !Array.isArray(chunk.rows)) throw new GridError("CHUNK_CORRUPT", `Large-grid chunk ${index} is malformed`);
     if (this.disposed) return chunk;
     this.cache.set(index, chunk);
+    // A chunk served from the device cache took the same path here, so it is given its row ids too.
     this.syncRowIds(index, chunk);
+    this.evictResidentChunks();
     return chunk;
   }
 
@@ -3924,6 +4212,10 @@ export class LargeGridStore {
     if (limit <= start) return;
     const first = this.chunkIndexForRow(Math.max(0, start));
     const last = this.chunkIndexForRow(limit - 1);
+    // The caller asked for this whole band and is about to read it, so the bound is raised to cover
+    // it instead of evicting chunks out from under the read. It is not lowered here — the next
+    // render pass re-sizes it from the viewport, which is what gives the memory back.
+    this.residentLimit = Math.max(this.residentLimit, last - first + 1);
     await Promise.all(Array.from({ length: last - first + 1 }, (_, offset) => this.loadChunk(first + offset)));
   }
 
@@ -3937,6 +4229,9 @@ export class LargeGridStore {
     if (limit <= start) return failed;
     const first = this.chunkIndexForRow(Math.max(0, start));
     const last = this.chunkIndexForRow(limit - 1);
+    // The render path is the one caller whose band IS the viewport, so it is where the resident
+    // bound is set rather than merely raised, and where a shrinking viewport releases chunks.
+    this.boundResidentChunks(last - first + 1);
     await Promise.all(Array.from({ length: last - first + 1 }, async (_, offset) => {
       const index = first + offset;
       try { await this.loadChunk(index); } catch (error) {
@@ -3944,6 +4239,7 @@ export class LargeGridStore {
         failed.add(index);
       }
     }));
+    this.evictResidentChunks();
     return failed;
   }
 
@@ -3954,10 +4250,27 @@ export class LargeGridStore {
     return chunk?.rows[row - chunk.startRow]?.[col] ?? "";
   }
 
+  /**
+   * Reads through the chunk object it just resolved rather than through `peekRaw`, so a band wider
+   * than the resident bound cannot have its earlier chunks evicted out from under it and silently
+   * read back as empty rows. `ensureRows` still runs first — it is what makes the loads concurrent.
+   */
   async getRows(start, end) {
     await this.ensureRows(start, end);
     const rows = [];
-    for (let row = start; row < Math.min(end, this.manifest.rowCount); row += 1) rows.push(Array.from({ length: this.manifest.colCount }, (_, col) => this.peekRaw(row, col)));
+    const chunkRows = chunkRowsFor(this.manifest);
+    const limit = Math.min(end, this.manifest.rowCount);
+    const blank = () => Array.from({ length: this.manifest.colCount }, () => "");
+    for (let row = start; row < limit;) {
+      if (row < 0) { rows.push(blank()); row += 1; continue; }
+      const index = this.chunkIndexForRow(row);
+      const chunk = await this.loadChunk(index);
+      const stop = Math.min(limit, (index + 1) * chunkRows);
+      for (; row < stop; row += 1) {
+        const source = chunk.rows[row - chunk.startRow];
+        rows.push(source ? Array.from({ length: this.manifest.colCount }, (_, col) => source[col] ?? "") : blank());
+      }
+    }
     return rows;
   }
 
@@ -8366,6 +8679,7 @@ async function onunload() {
   runtime.observer?.disconnect(); runtime.observer = null; disposePortalObservers(); runtime.pendingScanRoots.clear(); runtime.rangeSpecs.clear(); runtime.scanQueued = false;
   for (const uid of [...runtime.sessions.keys()]) disposeNativeSession(uid, true);
   for (const mount of runtime.largeMounts.values()) mount.dispose(); runtime.largeMounts.clear(); mounting.clear();
+  resetChunkCache();
   clearUndoHistories();
   settingsCache.clear();
   runtime.guardStyle?.remove(); runtime.guardStyle = null;
