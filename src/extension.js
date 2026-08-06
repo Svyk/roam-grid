@@ -41,6 +41,8 @@ const DEFAULT_RANGE_RENDERED_CELLS = 2000;
 const DEFAULT_LARGE_CACHE_MB = 256;
 const LARGE_RESIDENT_MIN_CHUNKS = 8;
 const LARGE_RESIDENT_MAX_CHUNKS = 32;
+const LARGE_UPLOAD_CONCURRENCY = 4;
+const LARGE_PREFETCH_CONCURRENCY = 6;
 const CHUNK_CACHE_DB = "roam-grid-chunks";
 const CHUNK_CACHE_DB_VERSION = 1;
 const CHUNK_CACHE_BODIES = "bodies";
@@ -3600,6 +3602,21 @@ async function downloadFileText(url) {
 
 async function downloadJson(url) { return JSON.parse(await downloadFileText(url)); }
 
+/**
+ * The whole of the concurrency story: a fixed number of runners pulling from one shared cursor, so
+ * the peak number of `worker` calls actually in flight is the limit and not the item count. Results
+ * land at their input index rather than in completion order — that is what keeps a chunk's digest
+ * attached to the chunk it was computed from when four uploads are running at once.
+ */
+export async function mapWithConcurrency(items, limit, worker) {
+  const values = [...items];
+  const results = new Array(values.length);
+  let cursor = 0;
+  const runner = async () => { while (cursor < values.length) { const index = cursor; cursor += 1; results[index] = await worker(values[index], index); } };
+  await Promise.all(Array.from({ length: Math.max(1, Math.min(limit, values.length)) }, runner));
+  return results;
+}
+
 const CHUNK_DIGEST_RETRIES = 3;
 
 /** Bounded exponential backoff; instance-overridable on the store so tests do not sleep. */
@@ -3880,6 +3897,38 @@ function applyManifestAlignments(model, alignments = {}) {
 }
 
 /**
+ * A streamed copy's answer to `rowHeightsForManifest`. It re-keys the source's overrides straight
+ * into the destination revision's id namespace, which costs one pass over the overrides instead of
+ * one pass over every row — the rows of a grid this path exists for are deliberately never all in
+ * memory at once. Clamping matches `GridModel.getRowHeight`, which is what produced these values in
+ * the accumulating version.
+ */
+function copiedRowHeights(source, chunkRows, revision, rowCount) {
+  const heights = {};
+  for (const [key, height] of Object.entries(source.rowHeightIndexMap())) {
+    const row = Number(key);
+    const value = Number(height);
+    if (!Number.isInteger(row) || row < 0 || row >= rowCount || !Number.isFinite(value)) continue;
+    heights[deriveRowId(revision, Math.floor(row / chunkRows), row % chunkRows)] = clamp(Math.round(value), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height"));
+  }
+  return heights;
+}
+
+/** The same trade for alignments, resolving each onto its merge anchor exactly as a model would. */
+function copiedAlignments(source, columnIds, chunkRows, revision, rowCount) {
+  const alignments = {};
+  for (const [key, alignment] of Object.entries(source.alignmentIndexMap())) {
+    const [row, col] = String(key).split(":").map(Number);
+    if (!Number.isInteger(row) || row < 0 || row >= rowCount || !Number.isInteger(col) || col < 0 || !["left", "center", "right"].includes(alignment)) continue;
+    const merge = source.mergeAt(row, col);
+    const anchorRow = merge?.row ?? row;
+    const columnId = columnIds[merge?.col ?? col];
+    if (columnId) alignments[alignmentKey(deriveRowId(revision, Math.floor(anchorRow / chunkRows), anchorRow % chunkRows), columnId)] = alignment;
+  }
+  return alignments;
+}
+
+/**
  * Chunk size is a property of the manifest, never a live global: `chunkIndexForRow` and `loadChunk`
  * derive addresses from it, so changing it under an existing manifest misaddresses every chunk.
  * Manifests written before it was recorded are always 500 — the setting only seeds new grids.
@@ -4003,7 +4052,7 @@ export class LargeGridStore {
 
   dispose() { this.disposed = true; }
 
-  async initialize(model = null) {
+  async initialize(model = null, source = null) {
     // The device cache is shared across grids and outlives any one of them, so `dispose` does not
     // close it; `onunload` does.
     this.chunkCache = await sharedChunkCache();
@@ -4016,13 +4065,13 @@ export class LargeGridStore {
       this.metricsVersion += 1;
       return this;
     }
-    if (!model) {
+    if (!model && !source) {
       const newRows = Math.max(1, Math.round(Number(getSetting("new-grid-rows")) || DEFAULT_NEW_GRID_ROWS));
       const newCols = Math.max(1, Math.round(Number(getSetting("new-grid-cols")) || DEFAULT_NEW_GRID_COLS));
       model = applyDisplayDefaults(new GridModel({ rows: Array.from({ length: newRows }, (_, row) => Array.from({ length: newCols }, (_, col) => row === 0 ? columnLabel(col) : "")), frozenRows: 1 }));
     }
     this.pointerUid = await createBlock(this.anchorUid, `${MANIFEST_PREFIX} pending`);
-    await this.seed(model);
+    await (source ? this.seedFrom(source) : this.seed(model));
     return this;
   }
 
@@ -4047,6 +4096,46 @@ export class LargeGridStore {
       rowCount: model.rowCount, colCount: model.colCount, chunkRows: chunkSize, columnIds: model.columnIds, widths: model.widths,
       rowHeights: rowHeightsForManifest(model, chunkSize, revision), rowHeightsByIndex: {}, alignments: alignmentsForManifest(model, chunkSize, revision), alignmentsByIndex: {},
       frozenRows: model.frozenRows, frozenCols: model.frozenCols, merges: model.merges, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, colorFormulaCells: model.colorFormulaCells !== false, chunks, retained: [],
+    };
+    const url = await uploadJson(manifest, `roam-grid-${this.anchorUid}-manifest.json`);
+    const verified = normalizeManifest(await downloadJson(url));
+    await updateBlock(this.pointerUid, `${MANIFEST_PREFIX} ${url}`);
+    this.manifestUrl = url;
+    this.manifest = verified;
+    this.metricsVersion += 1;
+  }
+
+  /**
+   * `seed` for a copy of a live grid, streamed: one destination chunk of rows is read, uploaded and
+   * dropped before the next is read, so copying a 100k-row grid costs one chunk of memory instead of
+   * the whole grid. Reads go through the source's own `getRows`, which is what keeps the walk inside
+   * the source's resident bound — a band is one destination chunk wide, never the grid — and what
+   * leaves its dirty chunks pinned, so copying can never evict an edit that has not been saved yet.
+   * Row heights and alignments are re-keyed from the source manifest rather than replayed through a
+   * `GridModel`, because building that model is exactly the whole-grid allocation being removed.
+   */
+  async seedFrom(source) {
+    const chunkSize = this.manifest ? chunkRowsFor(this.manifest) : chunkRowsFor({ chunkRows: getSetting("large-chunk-rows") });
+    const rowCount = source.manifest.rowCount;
+    const colCount = Math.max(1, source.manifest.colCount, (source.manifest.columnIds || []).length);
+    const columnIds = Array.from({ length: colCount }, (_, col) => source.manifest.columnIds?.[col] || makeLocalUid());
+    const chunks = [];
+    for (let start = 0, index = 0; start < rowCount; start += chunkSize, index += 1) {
+      const band = await source.getRows(start, Math.min(rowCount, start + chunkSize));
+      const chunkRows = band.map((row) => (row.length === colCount ? row : Array.from({ length: colCount }, (_, col) => row[col] ?? "")));
+      const text = JSON.stringify({ schema: "roam-grid/chunk", version: 1, index, startRow: start, rows: chunkRows });
+      const digest = await sha256Hex(text);
+      const url = await uploadText(text, `roam-grid-${this.anchorUid}-${index}.json`);
+      chunks.push({ index, startRow: start, rowCount: chunkRows.length, url, digest });
+    }
+    const revision = cryptoId();
+    const manifest = {
+      schema: "roam-grid/manifest", version: 2, revision, rowIdRevision: revision, previous: null, createdAt: new Date().toISOString(),
+      rowCount, colCount, chunkRows: chunkSize, columnIds, widths: { ...source.manifest.widths },
+      rowHeights: copiedRowHeights(source, chunkSize, revision, rowCount), rowHeightsByIndex: {}, alignments: copiedAlignments(source, columnIds, chunkSize, revision, rowCount), alignmentsByIndex: {},
+      frozenRows: clamp(Number(source.manifest.frozenRows) || 0, 0, rowCount), frozenCols: clamp(Number(source.manifest.frozenCols) || 0, 0, colCount),
+      merges: deepClone(source.manifest.merges || []), charts: deepClone(source.manifest.charts || []),
+      showHeaders: source.manifest.showHeaders !== false, fitToWidth: source.manifest.fitToWidth !== false, colorFormulaCells: source.manifest.colorFormulaCells !== false, chunks, retained: [],
     };
     const url = await uploadJson(manifest, `roam-grid-${this.anchorUid}-manifest.json`);
     const verified = normalizeManifest(await downloadJson(url));
@@ -4216,7 +4305,9 @@ export class LargeGridStore {
     // it instead of evicting chunks out from under the read. It is not lowered here — the next
     // render pass re-sizes it from the viewport, which is what gives the memory back.
     this.residentLimit = Math.max(this.residentLimit, last - first + 1);
-    await Promise.all(Array.from({ length: last - first + 1 }, (_, offset) => this.loadChunk(first + offset)));
+    // Bounded: a band a hundred chunks wide used to open a hundred simultaneous file reads, which is
+    // slower than six and starves every other request the page has in flight.
+    await mapWithConcurrency(Array.from({ length: last - first + 1 }, (_, offset) => first + offset), LARGE_PREFETCH_CONCURRENCY, (index) => this.loadChunk(index));
   }
 
   /**
@@ -4232,13 +4323,12 @@ export class LargeGridStore {
     // The render path is the one caller whose band IS the viewport, so it is where the resident
     // bound is set rather than merely raised, and where a shrinking viewport releases chunks.
     this.boundResidentChunks(last - first + 1);
-    await Promise.all(Array.from({ length: last - first + 1 }, async (_, offset) => {
-      const index = first + offset;
+    await mapWithConcurrency(Array.from({ length: last - first + 1 }, (_, offset) => first + offset), LARGE_PREFETCH_CONCURRENCY, async (index) => {
       try { await this.loadChunk(index); } catch (error) {
         if (error?.code !== "CHUNK_DIGEST") throw error;
         failed.add(index);
       }
-    }));
+    });
     this.evictResidentChunks();
     return failed;
   }
@@ -4442,14 +4532,21 @@ export class LargeGridStore {
       if (liveUrl !== this.manifestUrl) throw new GridError("CONFLICT", "Large grid changed elsewhere. Reload or save as a copy.", { liveUrl, baseUrl: this.manifestUrl });
       const chunks = this.manifest.chunks.map((chunk) => ({ ...chunk }));
       const replaced = [];
-      for (const index of [...this.dirty].sort((a, b) => a - b)) {
+      // Serializing a hundred dirty chunks behind one another made saving a large paste as slow as
+      // the round-trip count. Each upload carries its own text, digest and index through a single
+      // worker and the results come back in input order, so four in-flight uploads cannot cross a
+      // digest onto a neighbouring chunk and `chunks`/`replaced` end up identical to the serial form.
+      const uploaded = await mapWithConcurrency([...this.dirty].sort((a, b) => a - b), LARGE_UPLOAD_CONCURRENCY, async (index) => {
         const chunk = this.cache.get(index);
         const text = JSON.stringify(chunk);
         const digest = await sha256Hex(text);
         const url = await uploadText(text, `roam-grid-${this.anchorUid}-${index}-${cryptoId()}.json`);
-        const existing = chunks.find((item) => item.index === index);
-        if (existing) { replaced.push(existing.url); existing.url = url; existing.digest = digest; existing.rowCount = chunk.rows.length; }
-        else chunks.push({ index, startRow: chunk.startRow, rowCount: chunk.rows.length, url, digest });
+        return { index, url, digest, startRow: chunk.startRow, rowCount: chunk.rows.length };
+      });
+      for (const entry of uploaded) {
+        const existing = chunks.find((item) => item.index === entry.index);
+        if (existing) { replaced.push(existing.url); existing.url = entry.url; existing.digest = entry.digest; existing.rowCount = entry.rowCount; }
+        else chunks.push({ index: entry.index, startRow: entry.startRow, rowCount: entry.rowCount, url: entry.url, digest: entry.digest });
       }
       const next = { ...deepClone(this.manifest), revision: cryptoId(), previous: this.manifestUrl, updatedAt: new Date().toISOString(), chunks, retained: [this.manifestUrl, ...(this.manifest.retained || []).slice(0, 1), ...replaced] };
       const url = await uploadJson(next, `roam-grid-${this.anchorUid}-manifest-${next.revision}.json`);
@@ -4465,12 +4562,8 @@ export class LargeGridStore {
     });
   }
 
-  async saveAsCopy(newAnchorUid) {
-    const rows = []; const chunkSize = chunkRowsFor(this.manifest);
-    for (let start = 0; start < this.manifest.rowCount; start += chunkSize) rows.push(...await this.getRows(start, Math.min(this.manifest.rowCount, start + chunkSize)));
-    const model = applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false, colorFormulaCells: this.manifest.colorFormulaCells !== false }), this.rowHeightIndexMap()), this.alignmentIndexMap());
-    return new LargeGridStore(newAnchorUid).initialize(model);
-  }
+  /** Streamed through `seedFrom`: the copy never holds more than one destination chunk of rows. */
+  async saveAsCopy(newAnchorUid) { return new LargeGridStore(newAnchorUid).initialize(null, this); }
 
   async toModel(limit = getSetting("writes-native-budget")) {
     if (this.manifest.rowCount * this.manifest.colCount > limit) throw new GridError("MUTATION_BUDGET", "Large grid exceeds the safe native-table conversion budget");
