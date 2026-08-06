@@ -207,6 +207,39 @@ test("onExternalContent marks stale uids and drops that setRaw when the entry is
   assert.equal(control.getRaw(0, 0), "0:0", "the unmarked entry did overwrite the external value");
 });
 
+test("a checkpoint entry keeps an externally edited cell instead of clobbering it", () => {
+  const model = grid(2, 2);
+  model.transact("hard edit", () => { model.setRaw(0, 0, "local"); model.setRaw(1, 1, "also-local"); }, { hard: true });
+  const entry = model.history.entries.at(-1);
+  assert.ok(entry.checkpoint, "the hard transaction carries a checkpoint");
+  assert.ok(entry.forwardCheckpoint, "and a forward checkpoint");
+
+  assert.equal(model.history.onExternalContent([{ uid: "c00", raw: "remote" }]).marked, 1);
+  model.rows[0][0].raw = "remote";
+
+  const applied = model.history.applyInverse(model, entry);
+  assert.deepEqual(applied.dropped, ["c00"], "the checkpoint path reports the kept uid like the op path does");
+  assert.equal(model.getRaw(0, 0), "remote", "the external value survives the checkpoint restore");
+  assert.equal(model.getRaw(1, 1), "1:1", "every other cell still reverts through the checkpoint");
+
+  const redone = model.history.applyForward(model, entry);
+  assert.deepEqual(redone.dropped, ["c00"], "the forward checkpoint honours stale identically");
+  assert.equal(model.getRaw(0, 0), "remote", "redo never overwrites the external value either");
+  assert.equal(model.getRaw(1, 1), "also-local");
+
+  // Positive control: with the stale mark removed the checkpoint clobbers the external value.
+  const control = grid(2, 2);
+  control.transact("hard edit", () => { control.setRaw(0, 0, "local"); control.setRaw(1, 1, "also-local"); }, { hard: true });
+  const controlEntry = control.history.entries.at(-1);
+  control.rows[0][0].raw = "remote";
+  assert.throws(() => {
+    const clobbered = control.history.applyInverse(control, controlEntry);
+    assert.deepEqual(clobbered.dropped, ["c00"]);
+    assert.equal(control.getRaw(0, 0), "remote");
+  }, "the checkpoint stale assertion catches an entry whose stale set was not marked");
+  assert.equal(control.getRaw(0, 0), "0:0", "the unmarked checkpoint did overwrite the external value");
+});
+
 test("onExternalContent only invalidates redo when it touches a redo entry", () => {
   const model = grid(2, 2);
   model.transact("edit", () => model.setRaw(0, 0, "local"));

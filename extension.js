@@ -1039,6 +1039,25 @@ export function applyUndoOp(model, op) {
   }
 }
 
+export function restoreCheckpointKeepingStale(model, snapshot, stale = null) {
+  const external = [...(stale || [])].map((uid) => {
+    const at = cellCoordinateForUid(model, uid);
+    return at ? { uid, raw: model.rows[at.row][at.col].raw } : null;
+  }).filter(Boolean);
+  model.restore(snapshot);
+  const dropped = [];
+  for (const { uid, raw } of external) {
+    const at = cellCoordinateForUid(model, uid);
+    if (!at) continue;
+    const cell = model.rows[at.row][at.col];
+    dropped.push(uid);
+    if (cell.raw === raw) continue;
+    cell.raw = raw;
+    model.collectingChangedCells?.add(`${at.row}:${at.col}`);
+  }
+  return { dropped };
+}
+
 export function applyUndoOps(model, ops, entry = null) {
   const dropped = [];
   for (const op of ops) {
@@ -1144,12 +1163,12 @@ export class UndoHistory {
   }
 
   applyInverse(model, entry) {
-    if (entry.checkpoint) { model.restore(entry.checkpoint); return { dropped: [] }; }
+    if (entry.checkpoint) return restoreCheckpointKeepingStale(model, entry.checkpoint, entry.stale);
     return applyUndoOps(model, entry.inverse, entry);
   }
 
   applyForward(model, entry) {
-    if (entry.forwardCheckpoint) { model.restore(entry.forwardCheckpoint); return { dropped: [] }; }
+    if (entry.forwardCheckpoint) return restoreCheckpointKeepingStale(model, entry.forwardCheckpoint, entry.stale);
     return applyUndoOps(model, entry.forward, entry);
   }
 
