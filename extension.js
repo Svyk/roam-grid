@@ -5162,10 +5162,18 @@ export class LargeGridStore {
   }
 }
 
-function uidFromFocusTarget(target) {
-  const input = target?.closest?.(".rm-block-input,[id^='block-input-']");
-  const idMatch = input?.id?.match(/^block-input-(.+)$/);
-  return idMatch?.[1] || input?.dataset?.uid || input?.closest?.("[data-uid]")?.dataset?.uid || null;
+function roamBlockInputFor(target) { return target?.closest?.(".rm-block-input,[id^='block-input-']") || null; }
+
+/**
+ * A block-input id carries a window path before the uid — `block-input-sidebar-block-<window>-<uid>`
+ * and `block-input-<user>-body-outline-<page>-<uid>` are both real — so anchoring on the prefix and
+ * taking `(.+)` returns the whole tail, not a uid. The DOM-provided uid is unambiguous and wins;
+ * the id is parsed the way `rangeBlockUid` parses it, as the trailing 9-character Roam uid.
+ */
+export function uidFromFocusTarget(target) {
+  const input = roamBlockInputFor(target);
+  if (!input) return null;
+  return input.dataset?.uid || input.closest?.("[data-uid]")?.dataset?.uid || /-([\w-]{9})$/.exec(String(input.id || ""))?.[1] || null;
 }
 
 function rememberFocusedUid(event) {
@@ -5228,7 +5236,8 @@ function ownerViewForUid(uid) {
   return runtime.largeMounts.get(uid) || null;
 }
 
-function isRoamBlockInput(target) { return Boolean(uidFromFocusTarget(target)); }
+/** Asks whether Roam owns this input, which is true whether or not its uid can be recovered. */
+export function isRoamBlockInput(target) { return Boolean(roamBlockInputFor(target)); }
 
 function isGridEditorInput(target) { return Boolean(target?.closest?.(".rg-editor,.rg-floating-editor-input,.rg-dialog-input")); }
 

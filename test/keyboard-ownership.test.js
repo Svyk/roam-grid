@@ -9,9 +9,11 @@ import {
   claimKeyboard,
   clearUndoHistories,
   installKeyboardOwnership,
+  isRoamBlockInput,
   keyboardOwner,
   portalOwnerUid,
   releaseKeyboard,
+  uidFromFocusTarget,
 } from "../src/extension.js";
 
 class ClassList {
@@ -253,6 +255,43 @@ test("a Roam block input takes the keyboard back and Cmd+Z is left to Roam", () 
     assert.equal(guarded.defaultPrevented, false, "a stale claim must not swallow undo while a Roam block has focus");
     assert.equal(view.undoCalls, 0);
   } finally { uninstall(); session.dispose(); }
+});
+
+// Both ids below were probed off a live graph. The window path sits BETWEEN the `block-input-`
+// prefix and the uid, so anchoring on the prefix and taking the whole tail never yields a uid.
+test("a focused Roam block resolves the trailing uid out of either real block-input id format", () => {
+  const sidebar = new Node("textarea"); sidebar.className = "rm-block-input"; sidebar.id = "block-input-sidebar-block-P3aejgJsY-No5SoKCZd";
+  assert.equal(uidFromFocusTarget(sidebar), "No5SoKCZd", "the sidebar window path is not part of the uid");
+
+  const outline = new Node("textarea"); outline.className = "rm-block-input"; outline.id = "block-input-uSeR12345-body-outline-08-05-2026-puDe_iHnp";
+  assert.equal(uidFromFocusTarget(outline), "puDe_iHnp", "a daily-page outline id ends with the block uid, not the page uid");
+
+  const inner = new Node("span"); outline.appendChild(inner);
+  assert.equal(uidFromFocusTarget(inner), "puDe_iHnp", "a target inside the input resolves through it");
+});
+
+test("a focused Roam block prefers a DOM-provided uid over its id", () => {
+  const own = new Node("textarea"); own.className = "rm-block-input"; own.id = "block-input-sidebar-block-P3aejgJsY-No5SoKCZd"; own.dataset.uid = "datasetUid";
+  assert.equal(uidFromFocusTarget(own), "datasetUid", "data-uid on the input itself is unambiguous and wins");
+
+  const container = new Node("div"); container.dataset.uid = "ancestorUid";
+  const nested = new Node("textarea"); nested.className = "rm-block-input"; nested.id = "block-input-sidebar-block-P3aejgJsY-No5SoKCZd"; container.appendChild(nested);
+  assert.equal(uidFromFocusTarget(nested), "ancestorUid");
+
+  assert.equal(uidFromFocusTarget(new Node("div")), null, "a target outside any block input has no uid");
+  assert.equal(uidFromFocusTarget(null), null);
+});
+
+test("Roam still owns a block input whose id carries no parseable uid", () => {
+  const sidebar = new Node("textarea"); sidebar.id = "block-input-sidebar-block-P3aejgJsY-No5SoKCZd";
+  const outline = new Node("textarea"); outline.id = "block-input-uSeR12345-body-outline-08-05-2026-puDe_iHnp";
+  assert.equal(isRoamBlockInput(sidebar), true);
+  assert.equal(isRoamBlockInput(outline), true);
+
+  const unparseable = new Node("textarea"); unparseable.className = "rm-block-input"; unparseable.id = "block-input-roam-block";
+  assert.equal(isRoamBlockInput(unparseable), true, "ownership is a question about the element, not about the uid");
+  assert.equal(uidFromFocusTarget(unparseable), null, "and no uid is invented for it");
+  assert.equal(isRoamBlockInput(new Node("div")), false);
 });
 
 test("Cmd+Z inside the grid's own editor is left to the textarea", () => {
