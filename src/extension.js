@@ -7802,7 +7802,7 @@ export class GridView {
 
   copy(cut) {
     const matrix = selectionMatrix(this.model, this.selection); const text = matrix.map((row) => row.map((value) => quoteDelimited(value, "\t")).join("\t")).join("\n");
-    navigator.clipboard?.writeText(text).catch(() => {});
+    globalThis.navigator?.clipboard?.writeText(text).catch(() => {});
     if (cut) this.clearSelection();
   }
 
@@ -8094,7 +8094,7 @@ export class GridView {
   copyRoamReference(table = false) {
     const uid = table ? this.model.tableUid : this.model.alignmentKey(this.selection.startRow, this.selection.startCol);
     if (!uid) return toast("This cell does not have a Roam block UID yet", "warning");
-    const copied = navigator.clipboard?.writeText(`((${uid}))`);
+    const copied = globalThis.navigator?.clipboard?.writeText(`((${uid}))`);
     if (!copied) return toast("Clipboard access is unavailable", "warning");
     copied.then(() => toast(`${table ? "Table" : "Cell"} block reference copied`, "success", 1600)).catch((error) => toast(`Copy failed: ${error.message}`, "danger"));
   }
@@ -8103,7 +8103,7 @@ export class GridView {
     let text;
     try { text = formatRangeComponent(this.model, this.selection); }
     catch (error) { return toast(error.message, "warning"); }
-    const copied = navigator.clipboard?.writeText(text);
+    const copied = globalThis.navigator?.clipboard?.writeText(text);
     if (!copied) return toast("Clipboard access is unavailable", "warning");
     const range = normalizeRange(this.selection);
     const rows = range.endRow - range.startRow + 1; const cols = range.endCol - range.startCol + 1;
@@ -8114,7 +8114,7 @@ export class GridView {
     let text;
     try { text = selectionBlockReferenceText(this.model, this.selection); }
     catch (error) { return toast(error.message, "warning"); }
-    const copied = navigator.clipboard?.writeText(text);
+    const copied = globalThis.navigator?.clipboard?.writeText(text);
     if (!copied) return toast("Clipboard access is unavailable", "warning");
     const range = normalizeRange(this.selection);
     const rows = range.endRow - range.startRow + 1; const cols = range.endCol - range.startCol + 1;
@@ -8780,7 +8780,7 @@ export class LargeGridView {
     if (event.key.length === 1 && !command && !event.altKey) { event.preventDefault(); const cell = this.cells.get(`${this.selection.startRow}:${this.selection.startCol}`); if (cell) this.beginEdit(this.selection.startRow, this.selection.startCol, cell, event.key); }
   }
   ensureVisible(row, col) { const top = this.rowTop(row); const height = this.rowSpanHeight(row); const left = this.colLeft(col); const width = this.columnWidth(col); if (top < this.viewport.scrollTop + this.headerHeight()) this.viewport.scrollTop = top - this.headerHeight(); else if (top + height > this.viewport.scrollTop + this.viewport.clientHeight) this.viewport.scrollTop = top - this.viewport.clientHeight + height; if (left < this.viewport.scrollLeft + this.headerWidth()) this.viewport.scrollLeft = left - this.headerWidth(); else if (left + width > this.viewport.scrollLeft + this.viewport.clientWidth) this.viewport.scrollLeft = left - this.viewport.clientWidth + width; }
-  async copy() { const range = normalizeRange(this.selection); const rows = await this.store.getRows(range.startRow, range.endRow + 1); const text = rows.map((row) => row.slice(range.startCol, range.endCol + 1).map((value) => quoteDelimited(value, "\t")).join("\t")).join("\n"); navigator.clipboard?.writeText(text); }
+  async copy() { const range = normalizeRange(this.selection); const rows = await this.store.getRows(range.startRow, range.endRow + 1); const text = rows.map((row) => row.slice(range.startCol, range.endCol + 1).map((value) => quoteDelimited(value, "\t")).join("\t")).join("\n"); globalThis.navigator?.clipboard?.writeText(text); }
   async onPaste(event) {
     const images = [...(event.clipboardData?.files || [])].filter((file) => file.type.startsWith("image/"));
     if (images.length) {
