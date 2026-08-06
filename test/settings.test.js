@@ -675,7 +675,7 @@ test("the display-defaults button rewrites open grids and repaints them", (t) =>
   const marked = [];
   gridSessions.set("t1", { model, views: [view], markChanged: (layout) => marked.push(layout) });
   const manifest = { showHeaders: true, fitToWidth: true, colorFormulaCells: true };
-  const large = { store: { manifest, metadataDirty: false }, rowMetricsKey: "stale", scheduleSave: (immediate) => renders.push(`save:${immediate}`), scheduleRender: () => renders.push("large") };
+  const large = { store: { manifest, metadataDirty: false, setDisplayFlag(key, value) { this.manifest[key] = value; this.metadataDirty = true; } }, rowMetricsKey: "stale", scheduleSave: (immediate) => renders.push(`save:${immediate}`), scheduleRender: () => renders.push("large") };
   largeGridMounts.set("l1", large);
 
   assert.equal(applyDisplayDefaultsToOpenGrids(), 2);

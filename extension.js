@@ -47,6 +47,10 @@ const LARGE_PREFETCH_CONCURRENCY = 6;
 const LARGE_LINEAGE_LIMIT = 16;
 const LARGE_COMMIT_ATTEMPTS = 3;
 const LARGE_GARBAGE_LIMIT = 256;
+// A commit swaps the manifest object, so every metadata write is journaled for replay onto the
+// verified copy. The cap bounds a grid that never saves successfully: the values themselves live
+// in `this.manifest` regardless, so a dropped entry only costs replay protection across a swap.
+export const LARGE_METADATA_JOURNAL_LIMIT = 256;
 const LARGE_GARBAGE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 const LARGE_GC_QUIET_MS = 60 * 60 * 1000;
 const CHUNK_CACHE_DB = "roam-grid-chunks";
@@ -4300,6 +4304,14 @@ export class LargeGridStore {
     this.dirtyEpoch = new Map();
     this.editSequence = 0;
     this.metadataDirty = false;
+    // The metadata twin of `dirtyEpoch`/`editSequence`. Cell edits survive a commit's manifest swap
+    // because their values live in chunk objects; metadata edits mutate `this.manifest` in place,
+    // and the swap replaces that object wholesale — so the journal captures the VALUE of every
+    // write, stamped with the epoch a commit compares against.
+    this.metadataEpoch = 0;
+    this.metadataJournal = [];
+    this.metadataJournalDropped = 0;
+    this.metadataReplaySkipped = 0;
     this.metricsVersion = 0;
     this.disposed = false;
     this.unreadableChunks = new Map();
@@ -4419,6 +4431,18 @@ export class LargeGridStore {
     this.dirty.add(index);
     this.dirtyEpoch.set(index, this.editSequence);
     return this.editSequence;
+  }
+
+  /** Every write to manifest metadata goes through here, so no path can dirty it without a replayable record. */
+  recordMetadataMutation(op, args) {
+    this.metadataEpoch += 1;
+    this.metadataJournal.push({ epoch: this.metadataEpoch, op, args });
+    if (this.metadataJournal.length > LARGE_METADATA_JOURNAL_LIMIT) {
+      const excess = this.metadataJournal.length - LARGE_METADATA_JOURNAL_LIMIT;
+      this.metadataJournal.splice(0, excess);
+      this.metadataJournalDropped += excess;
+    }
+    this.metadataDirty = true;
   }
 
   /**
@@ -4671,13 +4695,15 @@ export class LargeGridStore {
     // The legacy entry has to go with the write, or clearing a height would let the index-keyed
     // fallback resurrect the value the user just removed.
     delete this.manifest.rowHeightsByIndex[row];
+    let applied = null;
     if (height == null || height === "") delete this.manifest.rowHeights[id];
     else {
       const value = Number(height);
       if (!Number.isFinite(value)) throw new GridError("ROW_HEIGHT", "Row height must be a number");
-      this.manifest.rowHeights[id] = clamp(Math.round(value), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height"));
+      applied = clamp(Math.round(value), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height"));
+      this.manifest.rowHeights[id] = applied;
     }
-    this.metadataDirty = true;
+    this.recordMetadataMutation("rowHeight", { rowId: id, row, value: applied });
     this.metricsVersion += 1;
   }
 
@@ -4716,13 +4742,15 @@ export class LargeGridStore {
     const id = this.manifest.columnIds[col];
     if (!id) throw new GridError("OUT_OF_BOUNDS", `Column ${columnLabel(col)} is outside the grid`);
     this.manifest.widths ||= {};
+    let applied = null;
     if (width == null || width === "") delete this.manifest.widths[id];
     else {
       const value = Number(width);
       if (!Number.isFinite(value)) throw new GridError("COLUMN_WIDTH", "Column width must be a number");
-      this.manifest.widths[id] = clamp(Math.round(value), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width"));
+      applied = clamp(Math.round(value), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width"));
+      this.manifest.widths[id] = applied;
     }
-    this.metadataDirty = true;
+    this.recordMetadataMutation("columnWidth", { columnId: id, value: applied });
   }
 
   getAlignment(row, col) {
@@ -4736,18 +4764,21 @@ export class LargeGridStore {
     if (row < 0 || col < 0 || row >= this.manifest.rowCount || col >= this.manifest.colCount) throw new GridError("OUT_OF_BOUNDS", `Cell ${cellLabel(row, col)} is outside the grid`);
     const merge = this.mergeAt(row, col); const anchorRow = merge?.row ?? row; const anchorCol = merge?.col ?? col; const indexKey = `${anchorRow}:${anchorCol}`;
     const columnId = this.manifest.columnIds[anchorCol];
-    const key = columnId ? alignmentKey(this.rowIdAt(anchorRow), columnId) : null;
+    const rowId = this.rowIdAt(anchorRow);
+    const key = columnId ? alignmentKey(rowId, columnId) : null;
     this.manifest.alignments ||= {};
     this.manifest.alignmentsByIndex ||= {};
+    let recorded = null;
     if (alignment == null || alignment === "auto") { if (key) delete this.manifest.alignments[key]; delete this.manifest.alignmentsByIndex[indexKey]; }
     else if (["left", "center", "right"].includes(alignment)) {
+      recorded = alignment;
       // A manifest whose `columnIds` is short of `colCount` has no stable key to write, so the
       // legacy index map stays the store of record for that column rather than losing the value.
       if (key) { this.manifest.alignments[key] = alignment; delete this.manifest.alignmentsByIndex[indexKey]; }
       else this.manifest.alignmentsByIndex[indexKey] = alignment;
     }
     else throw new GridError("ALIGNMENT", `Unsupported alignment: ${alignment}`);
-    this.metadataDirty = true;
+    this.recordMetadataMutation("alignment", { rowId, columnId: columnId || null, anchorRow, anchorCol, indexKey, alignment: recorded });
   }
 
   /**
@@ -4798,16 +4829,24 @@ export class LargeGridStore {
     }
     if (blocking.length) throw new GridError("MERGE_NONEMPTY", `Merge blocked by non-empty cells: ${blocking.join(", ")}`, { cells: blocking });
     this.manifest.merges ||= [];
-    this.manifest.merges.push({ id: makeLocalUid(), row: value.startRow, col: value.startCol, rowSpan: value.endRow - value.startRow + 1, colSpan: value.endCol - value.startCol + 1 });
-    this.metadataDirty = true;
+    const region = { id: makeLocalUid(), row: value.startRow, col: value.startCol, rowSpan: value.endRow - value.startRow + 1, colSpan: value.endCol - value.startCol + 1 };
+    this.manifest.merges.push(region);
+    this.recordMetadataMutation("merge", { merge: deepClone(region) });
   }
 
   unmerge(row, col) {
     const merge = this.mergeAt(row, col);
     if (!merge) return false;
     this.manifest.merges = this.manifest.merges.filter((item) => item.id !== merge.id);
-    this.metadataDirty = true;
+    this.recordMetadataMutation("unmerge", { id: merge.id });
     return true;
+  }
+
+  /** The three display flags are plain manifest keys; routing their writes here keeps them journaled. */
+  setDisplayFlag(key, value) {
+    if (!["showHeaders", "fitToWidth", "colorFormulaCells"].includes(key)) throw new GridError("METADATA", `Unknown display flag: ${key}`);
+    this.manifest[key] = value;
+    this.recordMetadataMutation("flag", { key, value });
   }
 
   livePointerUrl() {
@@ -4847,6 +4886,84 @@ export class LargeGridStore {
   }
 
   /**
+   * Re-applies one journaled metadata write onto the manifest a commit just swapped in. Every op is
+   * idempotent, so replaying a write the uploaded manifest already captured is a no-op. An op whose
+   * row, column or range no longer exists in the merged result is refused (returns false) rather
+   * than resurrected — the same rule the merge applies to a chunk the other writer rewrote.
+   */
+  applyMetadataOp({ op, args }) {
+    const manifest = this.manifest;
+    if (op === "rowHeight") {
+      if (this.rowIndexForRowId(args.rowId) == null) return false;
+      manifest.rowHeights ||= {};
+      if (args.value == null) delete manifest.rowHeights[args.rowId];
+      else manifest.rowHeights[args.rowId] = args.value;
+      // The legacy index entry is cleared only when the index still addresses this exact row —
+      // after a merge the slot may belong to a different row, whose entry is not ours to delete.
+      if (this.unmovedRowId(args.row) === args.rowId) delete manifest.rowHeightsByIndex?.[args.row];
+      return true;
+    }
+    if (op === "columnWidth") {
+      if (!manifest.columnIds?.includes(args.columnId)) return false;
+      manifest.widths ||= {};
+      if (args.value == null) delete manifest.widths[args.columnId];
+      else manifest.widths[args.columnId] = args.value;
+      return true;
+    }
+    if (op === "alignment") {
+      if (this.rowIndexForRowId(args.rowId) == null) return false;
+      if (args.columnId) {
+        if (!manifest.columnIds?.includes(args.columnId)) return false;
+        manifest.alignments ||= {};
+        const key = alignmentKey(args.rowId, args.columnId);
+        if (args.alignment == null) delete manifest.alignments[key];
+        else manifest.alignments[key] = args.alignment;
+        if (this.unmovedRowId(args.anchorRow) === args.rowId) delete manifest.alignmentsByIndex?.[args.indexKey];
+      } else {
+        if (!(args.anchorRow < manifest.rowCount && args.anchorCol < manifest.colCount)) return false;
+        manifest.alignmentsByIndex ||= {};
+        if (args.alignment == null) delete manifest.alignmentsByIndex[args.indexKey];
+        else manifest.alignmentsByIndex[args.indexKey] = args.alignment;
+      }
+      return true;
+    }
+    if (op === "merge") {
+      const region = args.merge;
+      if (region.row + region.rowSpan > manifest.rowCount || region.col + region.colSpan > manifest.colCount) return false;
+      manifest.merges ||= [];
+      if (manifest.merges.some((item) => item.id === region.id)) return true;
+      const overlap = manifest.merges.find((item) => rangesOverlap({ startRow: region.row, endRow: region.row + region.rowSpan - 1, startCol: region.col, endCol: region.col + region.colSpan - 1 }, { startRow: item.row, endRow: item.row + item.rowSpan - 1, startCol: item.col, endCol: item.col + item.colSpan - 1 }));
+      if (overlap) return false;
+      manifest.merges.push(deepClone(region));
+      return true;
+    }
+    if (op === "unmerge") { manifest.merges = (manifest.merges || []).filter((item) => item.id !== args.id); return true; }
+    if (op === "flag") { manifest[args.key] = args.value; return true; }
+    return false;
+  }
+
+  /**
+   * The metadata half of the commit tail. Entries at or below the snapshot epoch went up with the
+   * manifest bytes (or rode the merge plan), so they are simply subtracted — the same
+   * "subtract what you committed, don't clear wholesale" shape as the chunk dirty set. Entries
+   * after it landed in the manifest object the swap just discarded, so they are replayed onto the
+   * verified manifest; the replay is what commits them, because the next save clones the object
+   * they now live in. Replayed entries are then dropped too: their value is in `this.manifest`,
+   * which is the only thing a later swap can discard.
+   */
+  replayMetadataJournal(snapshotEpoch) {
+    const pending = this.metadataJournal.filter((entry) => entry.epoch > snapshotEpoch);
+    this.metadataJournal = [];
+    let applied = 0; let skipped = 0;
+    for (const entry of pending) {
+      if (this.applyMetadataOp(entry)) applied += 1;
+      else skipped += 1;
+    }
+    this.metadataReplaySkipped += skipped;
+    return { applied, skipped };
+  }
+
+  /**
    * A hard refuse on every concurrent write was throwing away the common case: content-addressed
    * immutable chunks make two writers who touched different row blocks trivially reconcilable. So
    * the pointer is now a compare-and-swap target — plan a merge against whatever it names, write the
@@ -4861,6 +4978,11 @@ export class LargeGridStore {
       // uploaded once and reused across attempts rather than re-uploaded into fresh garbage.
       let uploaded = null;
       for (let attempt = 1; attempt <= LARGE_COMMIT_ATTEMPTS; attempt += 1) {
+        // Read at the top of the attempt rather than beside the manifest snapshot: on a merge the
+        // plan is computed from `this.manifest` several awaits before the clone, and only an epoch
+        // taken before both guarantees every missed write lands after it and gets replayed. Ops are
+        // idempotent, so the writes this does capture are replayed as no-ops.
+        const metadataSnapshot = this.metadataEpoch;
         const liveUrl = this.livePointerUrl();
         const plan = liveUrl === this.manifestUrl ? null : await this.planLiveMerge(liveUrl, dirtyChunks);
         const source = plan ? plan.manifest : this.manifest;
@@ -4913,7 +5035,8 @@ export class LargeGridStore {
           this.dirty.delete(entry.index);
           this.dirtyEpoch.delete(entry.index);
         }
-        this.metadataDirty = false;
+        const replayed = this.replayMetadataJournal(metadataSnapshot);
+        this.metadataDirty = replayed.applied > 0;
         this.metricsVersion += 1;
         return verified;
       }
@@ -8584,8 +8707,8 @@ export class LargeGridView {
   async merge() { try { await this.store.merge(this.selection); this.scheduleSave(true); this.scheduleRender(); } catch (error) { toast(error.message, "danger"); } }
   unmerge() { if (!this.store.unmerge(this.selection.startRow, this.selection.startCol)) return toast("The active cell is not merged", "warning"); this.scheduleSave(true); this.scheduleRender(); }
   alignSelection(alignment) { const range = normalizeRange(this.selection); for (let row = range.startRow; row <= range.endRow; row += 1) for (let col = range.startCol; col <= range.endCol; col += 1) this.store.setAlignment(row, col, alignment); this.scheduleSave(true); this.scheduleRender(); }
-  toggleFormulaColors() { this.store.manifest.colorFormulaCells = this.store.manifest.colorFormulaCells === false; this.store.metadataDirty = true; this.scheduleSave(true); this.scheduleRender(); }
-  toggleHeaders() { this.store.manifest.showHeaders = this.store.manifest.showHeaders === false; this.store.metadataDirty = true; this.scheduleSave(true); this.scheduleRender(); }
+  toggleFormulaColors() { this.store.setDisplayFlag("colorFormulaCells", this.store.manifest.colorFormulaCells === false); this.scheduleSave(true); this.scheduleRender(); }
+  toggleHeaders() { this.store.setDisplayFlag("showHeaders", this.store.manifest.showHeaders === false); this.scheduleSave(true); this.scheduleRender(); }
   scheduleSave(immediate = false) { clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flush(), immediate ? 0 : getSetting("writes-large-debounce-ms")); }
   async flush() { clearTimeout(this.saveTimer); this.root.classList.add("rg-root--saving"); try { await this.store.commit(); toast("Large grid saved", "success", 1800); } catch (error) { toast(error.message, "danger", 8000); } finally { this.root.classList.remove("rg-root--saving"); } }
   async exportSelection() { const range = normalizeRange(this.selection); const rows = await this.store.getRows(range.startRow, range.endRow + 1); downloadText(rows.map((row) => row.slice(range.startCol, range.endCol + 1).map((value) => quoteDelimited(value, ",")).join(",")).join("\n"), "roam-grid-selection.csv", "text/csv"); }
@@ -9112,8 +9235,10 @@ export function applyDisplayDefaultsToOpenGrids() {
   }
   for (const mount of runtime.largeMounts.values()) {
     if (!mount?.store?.manifest) continue;
-    applyDisplayDefaults(mount.store.manifest); grids += 1;
-    mount.store.metadataDirty = true; mount.rowMetricsKey = null;
+    const defaults = displayDefaults();
+    mount.store.setDisplayFlag("showHeaders", defaults.showHeaders);
+    mount.store.setDisplayFlag("fitToWidth", defaults.fitToWidth);
+    grids += 1; mount.rowMetricsKey = null;
     try { mount.scheduleSave(true); mount.scheduleRender(); } catch (error) { console.warn("[roam-grid] Could not repaint a large grid", error); }
   }
   toast(grids ? `Applied display defaults to ${grids} open grid${grids === 1 ? "" : "s"}.` : "No grids are open right now.", grids ? "success" : "warning");
