@@ -685,6 +685,41 @@ test("the raw range component's pre-paint rule is the only CSS selector without 
   assert.match(docs, /rm-xparser-default-roam-grid-range/);
 });
 
+/**
+ * The menu matches Roam's metrics through our own classes rather than Roam's. `.rm-autocomplete__*`
+ * would carry every installed theme's overrides of those names — including `position` and `z-index`
+ * rules written for a menu Roam mounts itself, which is not where ours lives — and a subject with no
+ * `.rg-` class would break the one-exception sweep above as well.
+ */
+test("the autocomplete parity rules key on our classes, never on Roam's", async () => {
+  const css = (await readFile(new URL("../extension.css", import.meta.url), "utf8")).replace(/\/\*[\s\S]*?\*\//g, "");
+  const selectors = [];
+  for (const rule of css.matchAll(/([^{}]+)\{/g)) {
+    for (const part of rule[1].split(",")) { const value = part.trim(); if (value && !value.startsWith("@")) selectors.push(value); }
+  }
+  assert.ok(selectors.some((selector) => /^\.rg-portal\s+\.rg-autocomplete-row$/.test(selector)), "the row rule exists and is scoped to the portal");
+  assert.deepEqual(selectors.filter((selector) => /rm-autocomplete/.test(selector)), [], "Roam's own menu classes are never a subject here");
+});
+
+// node:test has no layout engine, so this cannot see a 28px row. It is a CSS-level guard for the two
+// declarations the live measurement turned on. Measured in the running app against a 360px popover:
+// without the ellipsis a long block suggestion wrapped to three lines and a 102px row, and with the
+// flexible track left on the detail instead of the primary, the detail was squeezed to zero width and
+// vanished from every long row.
+test("the suggestion primary is the flexible track and clips to one line", async () => {
+  const css = (await readFile(new URL("../extension.css", import.meta.url), "utf8")).replace(/\/\*[\s\S]*?\*\//g, "");
+
+  const row = css.match(/\.rg-portal \.rg-autocomplete-row \{([^}]*)\}/);
+  assert.ok(row, "the sweep must actually find the row rule");
+  assert.match(row[1], /grid-template-columns:\s*minmax\(\d+px, 1fr\)/, "the primary track takes the free space, not the detail");
+
+  const primary = css.match(/\.rg-portal \.rg-autocomplete-primary \{([^}]*)\}/);
+  assert.ok(primary, "the sweep must actually find the primary rule");
+  assert.match(primary[1], /overflow:\s*hidden;/);
+  assert.match(primary[1], /text-overflow:\s*ellipsis;/);
+  assert.match(primary[1], /white-space:\s*nowrap;/);
+});
+
 // node:test has no layout engine, so this cannot observe wrapping behavior. It is a CSS-level
 // regression guard only: `overflow-wrap: anywhere` breaks a word at any character (shredding
 // "Protein / 100g" into "Protei" / "n /" / "100g"), while `break-word` only breaks a word that

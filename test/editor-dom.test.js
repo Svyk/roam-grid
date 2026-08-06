@@ -1294,6 +1294,37 @@ test("within a result set only the block rows that actually carry markup are ren
   controller.dispose();
 });
 
+/**
+ * The parity rules are keyed on classes the runtime has to emit, and node:test has no layout engine to
+ * notice when it stops emitting one. So the stylesheet and the painted menu are checked against each
+ * other: every `.rg-autocomplete-*` class the stylesheet styles must land on a real element of a real
+ * rendered list. It fails in both directions — a rule for a class nobody paints is dead CSS, and a
+ * dropped class silently un-styles the menu.
+ */
+test("every .rg-autocomplete class the stylesheet styles lands on the painted menu", async (t) => {
+  t.after(() => { resetSuggestionRendering(); settingsCache.clear(); });
+  const css = await readFile(new URL("../extension.css", import.meta.url), "utf8");
+  const styled = [...new Set([...css.matchAll(/\.(rg-autocomplete[\w-]*)\b/g)].map((match) => match[1]))];
+  assert.ok(styled.length >= 3, "the sweep must actually see the parity rules");
+
+  const { controller, cells, flush } = makeController({
+    referenceSearchDelay: 0,
+    searchReferences: async () => [{ kind: "roam-block", name: "a block about **emphasis**", description: "Block · blkparity1", uid: "blkparity1" }],
+  });
+  settingsCache.set("editing-autocomplete-render-rows", false);
+  await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "((q", floating: false });
+  flush(); await waitForSearch();
+
+  const painted = (node, found = new Set()) => {
+    for (const name of node.classList?.values || []) found.add(name);
+    for (const child of node.children) painted(child, found);
+    return found;
+  };
+  const names = painted(controller.suggestionList);
+  for (const name of styled) assert.equal(names.has(name), true, `${name} is styled but never painted`);
+  controller.dispose();
+});
+
 test("the render cap is six rows, every row is non-empty from its first frame, and arrows re-render nothing", async (t) => {
   t.after(() => { resetSuggestionRendering(); settingsCache.clear(); });
   const rows = Array.from({ length: 8 }, (whole, index) => richBlock(index));

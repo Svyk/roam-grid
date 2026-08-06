@@ -6650,7 +6650,7 @@ export class GridEditorController {
     this.mirror.className = "rg-formula-expression rg-formula-mirror";
     this.mirror.setAttribute("aria-hidden", "true");
     this.suggestionList = document.createElement("div");
-    this.suggestionList.className = "rg-formula-suggestions";
+    this.suggestionList.className = "rg-formula-suggestions rg-autocomplete-list";
     this.suggestionList.id = `rg-editor-list-${cryptoId()}`;
     this.suggestionList.setAttribute("role", "listbox");
     this.suggestionList.setAttribute("aria-label", "Cell editing suggestions");
@@ -7151,10 +7151,10 @@ export class GridEditorController {
     const rendering = suggestionRenderingEnabled() && typeof globalThis.window?.roamAlphaAPI?.ui?.components?.renderString === "function";
     const jobs = []; let rendered = 0;
     this.suggestions.forEach((suggestion, index) => {
-      const option = document.createElement("button"); option.type = "button"; option.className = "rg-formula-suggestion";
+      const option = document.createElement("button"); option.type = "button"; option.className = "rg-formula-suggestion rg-autocomplete-row";
       option.id = `${this.suggestionList.id}-option-${index}`;
       option.setAttribute("role", "option");
-      const name = document.createElement("strong");
+      const name = document.createElement("strong"); name.className = "rg-autocomplete-primary";
       // Block content genuinely IS Roam markdown, so it normalizes. A page title, a tag, a
       // create-page name and a function name are names: their literal characters are part of what
       // the row inserts, and a label that disagrees with the insertion is a defect, not a tidy-up.

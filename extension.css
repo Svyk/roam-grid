@@ -991,6 +991,53 @@ body.roam-body.dark .rg-portal {
   opacity: 0.86;
 }
 
+/* Roam's own menu, measured live in the running app: `.rm-autocomplete__results-scroll` pads the list
+   by 4px and a `.bp3-menu-item` row is `line-height: 20px` inside `padding: 5px 7px`. These rules
+   restate those metrics on our own classes, inside the `.rg-portal` scope that already carries the
+   bridged palette, so the colours stay the ones the rules above resolve. Keying on Roam's classes
+   instead would inherit every installed theme's overrides of them — including the `position` and
+   `z-index` rules written for a menu Roam mounts itself, which is not where ours lives. */
+.rg-portal .rg-autocomplete-list {
+  padding: 4px;
+}
+
+/* 18px of line inside 5px of padding is the 28px row. `center` rather than `baseline` because the
+   tracks run at three sizes and baseline alignment resolves each against its own line box: measured
+   live, that alone grew the row to 28.9px, which a stack of eight rows makes visible. */
+.rg-portal .rg-autocomplete-row {
+  grid-template-columns: minmax(72px, 1fr) auto;
+  grid-auto-flow: column;
+  grid-auto-columns: auto;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 18px;
+}
+
+/* The primary is the one track holding user data, so it takes the free space and the fixed secondaries
+   hug their content. Measured live against a real 360px popover: without the ellipsis a long block
+   suggestion wrapped to three lines and a 102px row, and with the flexible track left on the detail
+   instead, the detail was squeezed to zero width and disappeared. */
+.rg-portal .rg-autocomplete-primary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rg-portal .rg-autocomplete-row > .rg-suggestion-detail,
+.rg-portal .rg-autocomplete-row > .rg-suggestion-breadcrumb {
+  font-size: 11px;
+}
+
+/* The detail is a fixed vocabulary of our own strings, the longest being `Create page · alias target`.
+   A formula description is not: measured live, `Multiplies matching ranges and adds the products` took
+   240px and clipped `SUMPRODUCT` down to the 72px track minimum. The cap sits just above the longest
+   reference detail, the same idea as the breadcrumb's own 14ch. */
+.rg-portal .rg-autocomplete-row > .rg-suggestion-detail {
+  max-width: 26ch;
+}
+
 .rg-formula-signature {
   color: var(--rg-portal-muted, #5f6b7c);
   font: 500 11px/1.4 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
