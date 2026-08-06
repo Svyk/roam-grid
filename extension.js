@@ -12,6 +12,8 @@ const TEMPLATE_PREFIX = "roam-grid/template::";
 const COMMENTS_PAGE = "roam/comments";
 const COMMENTS_CONTAINER_STRING = `[[${COMMENTS_PAGE}]]`;
 const MANIFEST_PREFIX = "roam-grid/manifest::";
+const REFS_PREFIX = "roam-grid/refs::";
+const REFS_VERSION = "v1";
 const MAX_NATIVE_MUTATIONS = 1200;
 const CHUNK_ROWS = 500;
 const DEFAULT_ROW_HEIGHT = 32;
@@ -77,6 +79,8 @@ const LARGE_GARBAGE_LIMIT = 256;
 export const LARGE_METADATA_JOURNAL_LIMIT = 256;
 const LARGE_GARBAGE_GRACE_MS = 7 * 24 * 60 * 60 * 1000;
 const LARGE_GC_QUIET_MS = 60 * 60 * 1000;
+const LARGE_REFS_PER_SHARD = 100;
+const DEFAULT_LARGE_REFS_MAX = 2000;
 const CHUNK_CACHE_DB = "roam-grid-chunks";
 const CHUNK_CACHE_DB_VERSION = 1;
 const CHUNK_CACHE_BODIES = "bodies";
@@ -144,6 +148,8 @@ const SETTING_DESCRIPTORS = [
   { key: "large-cache-max-mb", group: "Large grids", name: "Chunk cache size (MB)", description: "How much device storage the large-grid chunk cache may use.", control: "input", type: "int", default: DEFAULT_LARGE_CACHE_MB, min: 8, max: 4096, scope: "device", apply: "next-op", stage: "live" },
   { key: "large-verify-checksums", group: "Large grids", name: "Verify chunk checksums", description: "Re-hash each downloaded chunk before trusting it.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
   { key: "large-gc-orphans", group: "Large grids", name: "Permanently delete superseded large-grid files (irreversible)", description: "Delete chunk and manifest files that no revision references any more. Runs once per session, only on grids nothing has saved for an hour, and only after a file has been superseded for seven days. This cannot be undone.", control: "switch", type: "bool", default: false, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "large-refs-sync", group: "Large grids", name: "Mirror large-grid references into Roam", description: "A large-grid cell lives in a chunk file, so a [[page]], #tag or ((block)) typed into one is a link Roam has never indexed — it looks live in the cell and the page it names shows nothing. Turning this on collects the distinct references a grid contains and writes them into collapsed blocks under the grid, which is what makes Roam create the real reference. Off by default: it puts a write on Roam's transactor on every save, which is the cost the chunk format exists to avoid. Click-through lands on the grid, not the cell.", control: "switch", type: "bool", default: false, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "large-refs-max", group: "Large grids", name: "Maximum mirrored references", description: "How many distinct references one grid may mirror. Past this the list is cut in sort order — the same cut on every device, so two devices still agree — and the marker block says it was truncated.", control: "input", type: "int", default: DEFAULT_LARGE_REFS_MAX, min: 1, max: 20000, scope: "graph", apply: "next-op", stage: "live" },
 ];
 
 /**
@@ -2637,10 +2643,12 @@ async function createPage(title) {
   return uid;
 }
 
-async function createBlock(parentUid, string, order = "last", uid = null) {
+async function createBlock(parentUid, string, order = "last", uid = null, open = null) {
   const blockUid = uid || roam().util.generateUID();
   const create = roam().data?.block?.create || roam().createBlock;
-  await create.call(roam().data?.block || roam(), { location: { "parent-uid": parentUid, order }, block: { uid: blockUid, string: String(string ?? "") } });
+  const block = { uid: blockUid, string: String(string ?? "") };
+  if (typeof open === "boolean") block.open = open;
+  await create.call(roam().data?.block || roam(), { location: { "parent-uid": parentUid, order }, block });
   return blockUid;
 }
 
@@ -4268,7 +4276,99 @@ export function normalizeManifest(manifest) {
   normalized.lineage = manifestLineage(normalized);
   normalized.retained = manifestRetained(normalized);
   normalized.garbage = manifestGarbage(normalized);
+  // A manifest written before references existed carries no `refs` at all, and one written with the
+  // mirror off carries an empty one. Both read as "this chunk contributes nothing to the union",
+  // which is exactly right: the entry fills in the next time that chunk is actually saved.
+  normalized.chunks = normalized.chunks.map((chunk) => ({ ...chunk, refs: chunkReferences(chunk) }));
   return normalized;
+}
+
+const PAGE_REFERENCE_RE = /#?\[\[([^[\]\n]+)\]\]/g;
+const TAG_REFERENCE_RE = /(?:^|\s)#([\p{L}\p{N}_/-]+)/gu;
+const BLOCK_REFERENCE_RE = /\(\(([^()\n]+)\)\)/g;
+
+/**
+ * Code-unit order, never `localeCompare`: shard content has to be a pure function of manifest
+ * content or two devices computing from the same merged manifest write different strings and never
+ * converge, and collation is a property of the device's locale rather than of the manifest.
+ */
+export function sortReferences(refs) { return [...refs].sort(); }
+
+/**
+ * A large-grid cell is JSON inside a chunk file, so Roam never parses it and never indexes what it
+ * names — the cell paints a link that looks live while the page it points at shows nothing. This is
+ * the regex that recovers those references from the text the user actually typed. Nothing is
+ * inferred and nothing is synthesized, because a token invented here becomes a real page the moment
+ * a shard carrying it is committed. `#tag` and `#[[Tag]]` both canonicalize to `[[Tag]]`: they name
+ * the same page, so a set union counts them once, and the bare form is the only one that carries no
+ * component, attribute or tag-styling behaviour into the block the shard writes it to.
+ *
+ * A `((…))` run is kept only when its contents are uid-shaped, because `=SUM((A1+B1))` is a formula
+ * and not a reference. That errs toward dropping a block reference written against a custom uid
+ * longer than nine characters, which costs one missing entry in a mirror the design already fills in
+ * lazily — where the other direction fills the shard with inert junk and spends the budget on it.
+ */
+export function deriveChunkReferences(rows) {
+  const found = new Set();
+  for (const row of rows || []) {
+    for (const cell of row || []) {
+      const value = typeof cell === "string" ? cell : "";
+      if (!value) continue;
+      for (const match of value.matchAll(PAGE_REFERENCE_RE)) { const name = match[1].trim(); if (name) found.add(`[[${name}]]`); }
+      for (const match of value.matchAll(TAG_REFERENCE_RE)) { const name = match[1].trim(); if (name) found.add(`[[${name}]]`); }
+      for (const match of value.matchAll(BLOCK_REFERENCE_RE)) { const uid = match[1].trim(); if (ROAM_UID_SHAPE.test(uid)) found.add(`((${uid}))`); }
+    }
+  }
+  return sortReferences([...found]);
+}
+
+export function chunkReferences(chunk) {
+  return (Array.isArray(chunk?.refs) ? chunk.refs : []).filter((ref) => typeof ref === "string" && ref);
+}
+
+/**
+ * References are a set union, not positional data. That is the whole reason this design needs no
+ * structural-op handling: a reference that moves from row 50 to row 51, or across a chunk boundary,
+ * leaves the union identical and every shard byte-for-byte unchanged.
+ */
+export function manifestReferenceUnion(manifest) {
+  const found = new Set();
+  for (const chunk of manifest?.chunks || []) for (const ref of chunkReferences(chunk)) found.add(ref);
+  return sortReferences([...found]);
+}
+
+/**
+ * Sort first, then cut: truncation has to be deterministic for the same reason the sort does. A cut
+ * taken in encounter order would keep a different two thousand on each device, and two devices that
+ * disagree about the set never stop rewriting each other's shards.
+ */
+export function referenceShardPlan(refs, { max = getSetting("large-refs-max"), perShard = LARGE_REFS_PER_SHARD } = {}) {
+  const sorted = sortReferences([...new Set((refs || []).filter((ref) => typeof ref === "string" && ref))]);
+  const limit = Math.max(1, Math.round(Number(max) || DEFAULT_LARGE_REFS_MAX));
+  const truncated = sorted.length > limit;
+  const kept = truncated ? sorted.slice(0, limit) : sorted;
+  const shards = [];
+  for (let start = 0; start < kept.length; start += Math.max(1, perShard)) shards.push(kept.slice(start, start + Math.max(1, perShard)).join(" "));
+  return { marker: `${REFS_PREFIX} ${REFS_VERSION}${truncated ? ` (truncated at ${limit})` : ""}`, shards, truncated, total: sorted.length };
+}
+
+/**
+ * The diff is the whole point. Shard content is a pure function of manifest content, so the common
+ * save — one cell edited, no reference added or removed — produces the identical strings and must
+ * cost zero transactor writes; without this comparison every save would rewrite every shard.
+ */
+export function planReferenceShardWrites(plan, existing = null) {
+  const current = existing?.children || [];
+  if (!plan.shards.length) return { marker: null, creates: [], updates: [], deletes: existing ? [existing.uid] : [] };
+  const marker = existing ? (existing.string === plan.marker ? null : { uid: existing.uid, string: plan.marker }) : { uid: null, string: plan.marker };
+  const creates = []; const updates = []; const deletes = [];
+  for (let index = 0; index < plan.shards.length; index += 1) {
+    const block = current[index];
+    if (!block) creates.push(plan.shards[index]);
+    else if (block.string !== plan.shards[index]) updates.push({ uid: block.uid, string: plan.shards[index] });
+  }
+  for (let index = plan.shards.length; index < current.length; index += 1) deletes.push(current[index].uid);
+  return { marker, creates, updates, deletes };
 }
 
 /**
@@ -4492,6 +4592,7 @@ export class LargeGridStore {
       // promise is kept rather than dropped so the work is nameable — an unobservable background
       // deletion is not something a test can pin down, and this one deletes files.
       this.orphanSweep = this.collectOrphans().catch(() => ({ skipped: "error", deleted: [], failed: [] }));
+      this.scheduleReferenceSync();
       return this;
     }
     if (!model && !source) {
@@ -4501,12 +4602,14 @@ export class LargeGridStore {
     }
     this.pointerUid = await createBlock(this.anchorUid, `${MANIFEST_PREFIX} pending`);
     await (source ? this.seedFrom(source) : this.seed(model));
+    this.scheduleReferenceSync();
     return this;
   }
 
   async seed(model) {
     const rows = rawRows(model);
     const chunkSize = this.manifest ? chunkRowsFor(this.manifest) : chunkRowsFor({ chunkRows: getSetting("large-chunk-rows") });
+    const mirrorReferences = getSetting("large-refs-sync");
     const chunks = [];
     for (let start = 0, index = 0; start < rows.length; start += chunkSize, index += 1) {
       const chunkRows = rows.slice(start, start + chunkSize);
@@ -4515,7 +4618,7 @@ export class LargeGridStore {
       const text = JSON.stringify({ schema: "roam-grid/chunk", version: 1, index, startRow: start, rows: chunkRows });
       const digest = await sha256Hex(text);
       const url = await uploadText(text, `roam-grid-${this.anchorUid}-${index}.json`);
-      chunks.push({ index, startRow: start, rowCount: chunkRows.length, url, digest });
+      chunks.push({ index, startRow: start, rowCount: chunkRows.length, url, digest, refs: mirrorReferences ? deriveChunkReferences(chunkRows) : [] });
     }
     // A fresh grid is born in the id namespace of its own first revision, and the chunks carry no
     // ids: every reader derives the same ones from position until a row actually moves.
@@ -4546,6 +4649,7 @@ export class LargeGridStore {
    */
   async seedFrom(source) {
     const chunkSize = this.manifest ? chunkRowsFor(this.manifest) : chunkRowsFor({ chunkRows: getSetting("large-chunk-rows") });
+    const mirrorReferences = getSetting("large-refs-sync");
     const rowCount = source.manifest.rowCount;
     const colCount = Math.max(1, source.manifest.colCount, (source.manifest.columnIds || []).length);
     const columnIds = Array.from({ length: colCount }, (_, col) => source.manifest.columnIds?.[col] || makeLocalUid());
@@ -4556,7 +4660,7 @@ export class LargeGridStore {
       const text = JSON.stringify({ schema: "roam-grid/chunk", version: 1, index, startRow: start, rows: chunkRows });
       const digest = await sha256Hex(text);
       const url = await uploadText(text, `roam-grid-${this.anchorUid}-${index}.json`);
-      chunks.push({ index, startRow: start, rowCount: chunkRows.length, url, digest });
+      chunks.push({ index, startRow: start, rowCount: chunkRows.length, url, digest, refs: mirrorReferences ? deriveChunkReferences(chunkRows) : [] });
     }
     const revision = cryptoId();
     const manifest = {
@@ -5116,6 +5220,50 @@ export class LargeGridStore {
     return { applied, skipped };
   }
 
+  /** The marker block and its shards as they stand in the graph right now, or null if none exists. */
+  readReferenceShards() {
+    const marker = getTree(this.anchorUid)?.children.find((child) => child.string.startsWith(REFS_PREFIX));
+    return marker ? { uid: marker.uid, string: marker.string, children: (marker.children || []).map((child) => ({ uid: child.uid, string: child.string })) } : null;
+  }
+
+  /**
+   * Materializes the manifest's reference union into collapsed blocks under the anchor, so Roam's own
+   * indexer creates the `:block/refs` datoms — real by construction rather than emulated. Block count
+   * is bounded by DISTINCT references, not cells: a hundred thousand cells all naming `[[Foo]]` are
+   * one reference and one shard.
+   *
+   * Not queued here. `commit` calls it inside its own queue turn, and `scheduleReferenceSync` wraps
+   * it in one; taking the queue in both places would deadlock the commit path.
+   */
+  async syncReferenceShards() {
+    if (!getSetting("large-refs-sync")) return { skipped: "disabled", writes: 0 };
+    if (this.disposed || !this.manifest) return { skipped: "disposed", writes: 0 };
+    const plan = referenceShardPlan(manifestReferenceUnion(this.manifest));
+    const existing = this.readReferenceShards();
+    const ops = planReferenceShardWrites(plan, existing);
+    let writes = 0;
+    for (const uid of ops.deletes) { await deleteBlock(uid); writes += 1; }
+    // `open` is passed only on creation: a user who expands the marker to look inside should not
+    // find it collapsed again by the next save.
+    let markerUid = existing?.uid ?? null;
+    if (ops.marker?.uid) { await updateBlock(ops.marker.uid, ops.marker.string); writes += 1; }
+    else if (ops.marker) { markerUid = await createBlock(this.anchorUid, ops.marker.string, "last", null, false); writes += 1; }
+    for (const update of ops.updates) { await updateBlock(update.uid, update.string); writes += 1; }
+    for (const string of ops.creates) { await createBlock(markerUid, string); writes += 1; }
+    return { skipped: null, writes, shards: plan.shards.length, truncated: plan.truncated, total: plan.total };
+  }
+
+  /**
+   * Deliberately not awaited, for the same reason as the orphan sweep: opening a grid must not wait
+   * on the reference mirror, and a mirror that fails to write leaves references stale rather than
+   * wrong. This is also the reconciliation the design leans on — a shard write lost after a commit
+   * is recomputed from the manifest the next time the grid is opened.
+   */
+  scheduleReferenceSync() {
+    this.refsSync = this.queue.run(() => this.syncReferenceShards()).catch(() => ({ skipped: "error", writes: 0 }));
+    return this.refsSync;
+  }
+
   /**
    * A hard refuse on every concurrent write was throwing away the common case: content-addressed
    * immutable chunks make two writers who touched different row blocks trivially reconcilable. So
@@ -5127,6 +5275,9 @@ export class LargeGridStore {
     return this.queue.run(async () => {
       if (!this.dirty.size && !this.metadataDirty) return this.manifest;
       const dirtyChunks = [...this.dirty].sort((a, b) => a - b);
+      // Read once, outside the attempt loop: a setting that flipped mid-save would otherwise put
+      // half a union in the manifest this commit writes.
+      const mirrorReferences = getSetting("large-refs-sync");
       // Chunk bytes are content-addressed and say nothing about which manifest wins, so they are
       // uploaded once and reused across attempts rather than re-uploaded into fresh garbage.
       let uploaded = null;
@@ -5152,14 +5303,18 @@ export class LargeGridStore {
           // is what lets the clear below tell an uploaded chunk from one a keystroke has moved on.
           const epoch = this.dirtyEpoch.get(index);
           const text = JSON.stringify(chunk);
+          // Derived in the same synchronous step as the bytes, so the entry's `refs` describe the
+          // exact rows its `digest` covers. A chunk this commit does not touch keeps whatever it
+          // already carried, which is what makes the union incremental instead of a whole-grid read.
+          const refs = mirrorReferences ? deriveChunkReferences(chunk.rows) : null;
           const digest = await sha256Hex(text);
           const url = await uploadText(text, `roam-grid-${this.anchorUid}-${index}-${cryptoId()}.json`);
-          return { index, url, digest, epoch, startRow: chunk.startRow, rowCount: chunk.rows.length };
+          return { index, url, digest, epoch, refs, startRow: chunk.startRow, rowCount: chunk.rows.length };
         });
         for (const entry of uploaded) {
           const existing = chunks.find((item) => item.index === entry.index);
-          if (existing) { replaced.push(existing.url); existing.url = entry.url; existing.digest = entry.digest; existing.rowCount = entry.rowCount; }
-          else chunks.push({ index: entry.index, startRow: entry.startRow, rowCount: entry.rowCount, url: entry.url, digest: entry.digest });
+          if (existing) { replaced.push(existing.url); existing.url = entry.url; existing.digest = entry.digest; existing.rowCount = entry.rowCount; if (entry.refs) existing.refs = entry.refs; }
+          else chunks.push({ index: entry.index, startRow: entry.startRow, rowCount: entry.rowCount, url: entry.url, digest: entry.digest, refs: entry.refs || [] });
         }
         const retained = [liveUrl, ...manifestRetained(source).slice(0, 1), ...replaced];
         // A url that falls out of `retained` is unreachable from every revision a reader can still
@@ -5191,6 +5346,11 @@ export class LargeGridStore {
         const replayed = this.replayMetadataJournal(metadataSnapshot);
         this.metadataDirty = replayed.applied > 0;
         this.metricsVersion += 1;
+        // After the pointer swap and inside this same queue turn — never per attempt. An attempt
+        // that retried has written no shard, so there is nothing to roll back, and a shard write
+        // that fails here leaves the mirror stale rather than wrong: the manifest is already
+        // committed, and the next open recomputes the shards from it.
+        try { await this.syncReferenceShards(); } catch { /* stale references are the designed failure mode */ }
         return verified;
       }
       throw new GridError("CONFLICT", "Large grid kept changing while this save was in flight. Reload or save as a copy.", { reason: "cas", attempts: LARGE_COMMIT_ATTEMPTS, baseUrl: this.manifestUrl });

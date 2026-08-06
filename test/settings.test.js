@@ -97,6 +97,8 @@ const TODAYS_CONSTANTS = {
   "large-cache-max-mb": 256,
   "large-verify-checksums": true,
   "large-gc-orphans": false,
+  "large-refs-sync": false,
+  "large-refs-max": 2000,
 };
 
 /**
