@@ -10580,7 +10580,9 @@ export class RangeGridView {
     this.cells.clear(); this.cellCoordinatesByUid.clear();
     this.session?.removeView(this);
     this.host?.classList?.remove?.("rg-range-host");
-    if (releaseNative) this.nativeElement?.classList.add("rg-range-restored");
+    // Only a real component button has a raw Roam render to restore; on a text host the class
+    // would be stray — the pre-paint rule never matches a plain block div.
+    if (releaseNative && this.nativeElement?.matches?.(RANGE_BUTTON_SELECTOR)) this.nativeElement.classList.add("rg-range-restored");
   }
 }
 
@@ -11384,7 +11386,9 @@ export function rangeBlockUid(element) {
 
 /**
  * Parses the range spec behind a rendered component button.  Specs are cached per block uid and
- * invalidated when Roam replaces the button node, so a re-render costs one identity comparison.
+ * invalidated when Roam replaces the button node, and the source string is stored with the entry:
+ * every lookup re-reads the string and re-parses when it changed, so an edited range string never
+ * serves a stale spec and a cached negative recovers.
  */
 export function rangeInstanceInfo(button, entries = runtime.rangeSpecs, readString = blockString, trace = traceRange) {
   if (!button) return null;
@@ -11395,16 +11399,16 @@ export function rangeInstanceInfo(button, entries = runtime.rangeSpecs, readStri
   const blockUid = uidFromFocusTarget(button) || rangeBlockUid(roamBlockInputFor(button));
   if (!blockUid) { trace("no-uid"); return null; }
   const cached = entries?.get?.(blockUid);
-  if (cached && cached.button === button) return cached.info;
   let text = "";
   try { text = readString(blockUid) || ""; } catch { text = ""; }
   // An empty read is transient (the block is still mounting) — caching it would kill this button
   // for the session, so only a definitive non-empty non-spec may cache a null.
   if (!text) { trace("empty-read", blockUid); return null; }
+  if (cached && cached.button === button && cached.text === text) return cached.info;
   const spec = parseRangeComponent(text);
-  if (!spec) { trace("no-spec", blockUid); entries?.set?.(blockUid, { button, info: null }); return null; }
+  if (!spec) { trace("no-spec", blockUid); entries?.set?.(blockUid, { button, text, info: null }); return null; }
   const info = { ...spec, blockUid };
-  entries?.set?.(blockUid, { button, info });
+  entries?.set?.(blockUid, { button, text, info });
   return info;
 }
 
@@ -11429,7 +11433,17 @@ export function rangeTextHostsWithin(root) {
   const candidates = [];
   if (root.matches?.(ROAM_BLOCK_INPUT_SELECTOR)) candidates.push(root);
   for (const node of root.querySelectorAll?.(ROAM_BLOCK_INPUT_SELECTOR) || []) if (!candidates.includes(node)) candidates.push(node);
-  return candidates.filter((host) => String(host.textContent || "").includes("roam-grid-range"));
+  return candidates.filter((host) => {
+    // The block-input id prefix also matches Roam's LIVE editing <textarea> (probe-confirmed id
+    // shape), whose textContent is the raw block string — claiming it would mount a grid inside a
+    // form control and tag the live editor. Edit mode = hands off.
+    const tag = String(host.tagName || "").toUpperCase();
+    if (tag === "TEXTAREA" || tag === "INPUT") return false;
+    const active = globalThis.document?.activeElement;
+    const activeTag = String(active?.tagName || "").toUpperCase();
+    if (active && active !== host && (activeTag === "TEXTAREA" || activeTag === "INPUT") && host.contains?.(active)) return false;
+    return String(host.textContent || "").includes("roam-grid-range");
+  });
 }
 
 function mountRangeTextHost(host, info, surface = instanceSurface(host)) {
@@ -11479,6 +11493,15 @@ export function claimRangeMounts(root, {
       if (entry.value?.mode === "large") { trace("large-source", info.tableUid); button.classList.add("rg-range-restored"); continue; }
     } catch (error) { noteRangeLoopError(error, trace, button); continue; }
     try {
+      // A host text-claimed before Roam rendered the component button must yield to it — one
+      // excerpt per block. Dispose the text view before the button view mounts.
+      const textHost = roamBlockInputFor(button);
+      const priorTextView = textHost ? viewsByNative.get(textHost) : null;
+      if (priorTextView) {
+        viewsByNative.delete(textHost);
+        runtime.views.delete(priorTextView);
+        priorTextView.dispose?.({ releaseNative: false });
+      }
       mount(button, info);
       trace("mounted", info.tableUid);
     } catch (error) {
@@ -11502,6 +11525,13 @@ export function claimRangeMounts(root, {
       let text = "";
       try { text = readString(blockUid) || ""; } catch { text = ""; }
       if (!text) { trace("empty-read", blockUid); continue; }
+      // The host-hide erases the host's other children, so a block with prose around the marker
+      // keeps Roam's native render: text-claim only when the trimmed Datascript string IS the
+      // marker alone (an anchored full match; RANGE_MARKER itself keeps its search semantics —
+      // the button path may still claim the button inside a mixed block).
+      const trimmed = text.trim();
+      const only = RANGE_MARKER.exec(trimmed);
+      if (!only || only.index !== 0 || only[0].length !== trimmed.length) { trace("no-spec", blockUid); continue; }
       const spec = parseRangeComponent(text);
       if (!spec) { trace("no-spec", blockUid); continue; }
       const entry = metadataEntries.get(spec.tableUid);

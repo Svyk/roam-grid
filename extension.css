@@ -81,7 +81,9 @@ body.roam-body.dark .rg-root {
   --rg-portal-danger: #b42318;
 }
 
-/* Narrow safety net for dark modes that are global rather than app-scoped. */
+/* Narrow safety net for dark modes that are global rather than app-scoped. Portal chrome resolves
+   from the host's own dark markers ONLY — a bare `prefers-color-scheme: dark` OS hint paints dark
+   chrome on a light Roam, and portals with an owning .rg-root already inherit the sampled vars. */
 :root.bp3-dark .rg-portal,
 body.bp3-dark .rg-portal,
 body.bt-theme-dark .rg-portal,
@@ -95,18 +97,6 @@ body.roam-body.dark .rg-portal {
   --rg-portal-muted: #abb3bf;
   --rg-portal-active: #48aff0;
   --rg-portal-status: #abb3bf;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root:not(.bp3-light) .rg-portal {
-    --rg-portal-bg: #293742;
-    --rg-portal-color: #f5f8fa;
-    --rg-portal-border: #5f6b7c;
-    --rg-portal-header: #30404d;
-    --rg-portal-muted: #abb3bf;
-    --rg-portal-active: #48aff0;
-    --rg-portal-status: #abb3bf;
-  }
 }
 
 .rg-root:focus-within {

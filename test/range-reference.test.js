@@ -644,7 +644,7 @@ function rangeButtonIn(host) {
 }
 
 for (const variant of RANGE_HOST_VARIANTS) {
-  test(`a range spec is read once per block and re-read when Roam replaces the button node (${variant} host)`, () => {
+  test(`a range spec is cached per block and re-validated against a fresh read on every lookup (${variant} host)`, () => {
     installMiniDom();
     const reads = [];
     const readString = (uid) => { reads.push(uid); return "{{roam-grid-range: ((tbl00001)) B2:D5}}"; };
@@ -654,12 +654,12 @@ for (const variant of RANGE_HOST_VARIANTS) {
 
     const first = rangeInstanceInfo(button, entries, readString);
     assert.deepEqual(first, { tableUid: "tbl00001", range: { startRow: 1, endRow: 4, startCol: 1, endCol: 3 }, label: "B2:D5", blockUid: "blk123456" });
-    assert.equal(rangeInstanceInfo(button, entries, readString), first, "a cached spec is returned by identity");
-    assert.deepEqual(reads, ["blk123456"], "the cache spares the second read");
+    assert.equal(rangeInstanceInfo(button, entries, readString), first, "an unchanged string returns the cached spec by identity");
+    assert.deepEqual(reads, ["blk123456", "blk123456"], "the string is re-read on every lookup so an edit is seen — the cache spares the re-parse, not the read");
 
     const replacement = rangeButtonIn(input);
     rangeInstanceInfo(replacement, entries, readString);
-    assert.deepEqual(reads, ["blk123456", "blk123456"], "a replaced button node invalidates the cache");
+    assert.deepEqual(reads, ["blk123456", "blk123456", "blk123456"], "a replaced button node re-parses even for an identical string");
 
     const orphan = new MiniNode("button"); orphan.className = "rm-xparser-default-roam-grid-range";
     assert.equal(rangeInstanceInfo(orphan, entries, readString), null, "a button with no block input resolves to nothing");
@@ -690,9 +690,9 @@ test("an empty read is never cached, but a definitive non-spec caches its null",
   const garbageReads = [];
   const readGarbage = (uid) => { garbageReads.push(uid); return "just some text"; };
   assert.equal(rangeInstanceInfo(garbageButton, garbageEntries, readGarbage), null);
-  assert.deepEqual(garbageEntries.get("blk777777"), { button: garbageButton, info: null }, "a non-empty non-spec is definitive and caches the null");
+  assert.deepEqual(garbageEntries.get("blk777777"), { button: garbageButton, text: "just some text", info: null }, "a non-empty non-spec is definitive and caches the null with its source string");
   assert.equal(rangeInstanceInfo(garbageButton, garbageEntries, readGarbage), null);
-  assert.deepEqual(garbageReads, ["blk777777"], "the cached null spares the re-read");
+  assert.deepEqual(garbageReads, ["blk777777", "blk777777"], "the cached null is re-validated against a fresh read, so an edit into a real spec recovers");
 });
 
 test("with live range references off no spec is parsed, read, or cached", (t) => {
@@ -962,4 +962,139 @@ test("cell and inline-reference text wraps at word boundaries, not mid-word", as
   const formulaExpressionRule = css.match(/\.rg-formula-expression\s*\{([^}]*)\}/);
   assert.ok(formulaExpressionRule, "the sweep must actually find the .rg-formula-expression rule");
   assert.match(formulaExpressionRule[1], /overflow-wrap:\s*anywhere;/, "formula source is a single unbroken run, unlike prose — it keeps the aggressive break");
+});
+
+// ---------------------------------------------------------------------------
+// GOAL-FIX-B — editing-surface safety + claim hygiene
+// ---------------------------------------------------------------------------
+
+test("a live editing form control is never a text-claim candidate, even with the marker in it", () => {
+  installMiniDom();
+  // Probe-confirmed: Roam's editing <textarea> carries the same block-input-<window>-<uid> id
+  // shape as the block host div, and its textContent is the raw block string — the marker included.
+  const textarea = new MiniNode("textarea"); textarea.id = "block-input-main-window-blk123456";
+  textarea.textContent = "{{roam-grid-range: ((tbl00001)) B2:D5}}";
+  const input = new MiniNode("input"); input.id = "block-input-main-window-blk999999";
+  input.textContent = "{{roam-grid-range: ((tbl00001)) B2:D5}}";
+  const root = new MiniNode("div"); root.append(textarea, input);
+
+  assert.deepEqual(rangeTextHostsWithin(root), [], "form controls are Roam's live editor — hands off");
+  assert.deepEqual(rangeTextHostsWithin(textarea), [], "even passed as the scan root itself");
+});
+
+test("a host whose block is being edited is never text-claimed", () => {
+  installMiniDom();
+  const host = rangeHostVariant("bem");
+  const editor = new MiniNode("textarea");
+  editor.textContent = "{{roam-grid-range: ((tbl00001)) B2:D5}}";
+  host.appendChild(editor);
+  globalThis.document.activeElement = editor;
+  try {
+    assert.deepEqual(rangeTextHostsWithin(host), [], "a focused Roam input inside the host means edit mode — hands off");
+  } finally { globalThis.document.activeElement = null; }
+  assert.deepEqual(rangeTextHostsWithin(host), [host], "once the editor blurs, the host is a candidate again");
+});
+
+test("a marker wrapped in prose keeps Roam's native render — no text claim", () => {
+  installMiniDom();
+  const host = rangeHostVariant("bem");
+  const prose = "Q3 summary {{roam-grid-range: ((tbl00001)) B2:D5}} — see C2";
+  host.textContent = prose;
+  const root = new MiniNode("div"); root.appendChild(host);
+  const mounted = []; const traced = [];
+  claimRangeMounts(root, claimDeps({
+    strings: new Map([["blk123456", prose]]),
+    mount: (element, info) => mounted.push({ element, info }),
+    traced,
+  }));
+
+  assert.equal(mounted.length, 0, "mixed-content blocks keep Roam's native render");
+  assert.equal(host.classList.contains("rg-range-host"), false, "the host-hide would erase the sibling prose");
+  assert.deepEqual(traced.map((entry) => entry.stage), ["no-spec"]);
+
+  // Positive control: the marker alone (surrounding whitespace tolerated) still claims.
+  const clean = "  {{roam-grid-range: ((tbl00001)) B2:D5}}  ";
+  host.textContent = clean;
+  claimRangeMounts(root, claimDeps({
+    strings: new Map([["blk123456", clean]]),
+    mount: (element, info) => mounted.push({ element, info }),
+    traced: [],
+  }));
+  assert.equal(mounted.length, 1);
+  assert.equal(host.classList.contains("rg-range-host"), true);
+});
+
+test("a button rendered after a text claim replaces the text view — one excerpt per block", () => {
+  installMiniDom();
+  const marker = "{{roam-grid-range: ((tbl00001)) B2:D5}}";
+  const host = rangeHostVariant("bem");
+  host.textContent = marker;
+  const root = new MiniNode("div"); root.appendChild(host);
+  const mounted = [];
+  const deps = claimDeps({
+    strings: new Map([["blk123456", marker]]),
+    mount: (element, info) => mounted.push({ element, info }),
+  });
+  const textView = { root: new MiniNode("section"), disposed: 0, dispose() { this.disposed += 1; host.classList.remove("rg-range-host"); } };
+  deps.mount = (element, info) => { mounted.push({ element, info }); deps.viewsByNative.set(element, element === host ? textView : { root: new MiniNode("section"), dispose() {} }); };
+
+  claimRangeMounts(root, deps);
+  assert.equal(mounted.length, 1);
+  assert.equal(mounted[0].element, host, "scan one text-claims the buttonless host");
+  assert.equal(host.classList.contains("rg-range-host"), true);
+
+  // Roam then renders the component button inside the same block.
+  const button = rangeButtonIn(host);
+  claimRangeMounts(root, deps);
+
+  assert.equal(mounted.length, 2, "the button mounts");
+  assert.equal(mounted[1].element, button);
+  assert.equal(textView.disposed, 1, "the text view is disposed exactly once");
+  assert.equal(deps.viewsByNative.get(host), undefined, "the text claim's registry entry is gone");
+  assert.equal(host.classList.contains("rg-range-host"), false, "the host-hide lifts with the text view");
+});
+
+test("a cached range spec re-parses when the block string changes under the same button node", () => {
+  installMiniDom();
+  const entries = new Map();
+  const button = rangeButtonIn(rangeHostVariant("bem"));
+  let value = "{{roam-grid-range: ((tbl00001)) B2:D5}}";
+  const readString = () => value;
+
+  const first = rangeInstanceInfo(button, entries, readString);
+  assert.equal(first.label, "B2:D5");
+  assert.equal(rangeInstanceInfo(button, entries, readString), first, "an unchanged string returns the cached spec by identity");
+
+  value = "{{roam-grid-range: ((tbl00001)) A1:A2}}";
+  const next = rangeInstanceInfo(button, entries, readString);
+  assert.notEqual(next, first);
+  assert.equal(next.label, "A1:A2", "an edited range string must not serve the stale spec");
+  assert.equal(entries.get("blk123456").info, next);
+
+  value = "no marker any more";
+  assert.equal(rangeInstanceInfo(button, entries, readString), null, "editing the marker away drops the spec");
+  assert.equal(entries.get("blk123456").info, null, "the negative caches with its source string");
+  assert.equal(entries.get("blk123456").text, "no marker any more");
+
+  value = "{{roam-grid-range: ((tbl00001)) C3:C4}}";
+  assert.equal(rangeInstanceInfo(button, entries, readString)?.label, "C3:C4", "a cached negative recovers when the string becomes a spec again");
+});
+
+test("dispose adds rg-range-restored to a real component button only, never to a text host", () => {
+  installMiniDom();
+  const model = persistedModel();
+  const session = sessionFor(model);
+  const host = rangeHostVariant("bem");
+  // mountRangeTextHost passes the plain block div as nativeElement — that is the case under test.
+  const view = new RangeGridView({ host, session, range: { startRow: 0, endRow: 1, startCol: 0, endCol: 1 }, nativeElement: host });
+  host.classList.add("rg-range-host");
+
+  view.dispose({ releaseNative: true });
+  assert.equal(host.classList.contains("rg-range-host"), false, "the hide lifts on every dispose path");
+  assert.equal(host.classList.contains("rg-range-restored"), false, "a plain block div has no raw component to restore — the class would be stray");
+});
+
+test("portal dark-mode never resolves from the OS hint alone", async () => {
+  const css = (await readFile(new URL("../extension.css", import.meta.url), "utf8")).replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.equal(/prefers-color-scheme:\s*dark/.test(css), false, "the host's own dark markers decide portal chrome — a dark OS over a light Roam must not paint dark portals");
 });

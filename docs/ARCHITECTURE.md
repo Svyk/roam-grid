@@ -128,8 +128,10 @@ source grid — so the session's badge fan-out simply skips it.
 Cell content, the theme bridge, and the `grid-template-*` track math are the
 shared helpers, so a repeat render writes nothing. Mounting mirrors the native
 trio (`rangeButtonsWithin` / `rangeInstanceInfo` / `mountRangeInstance`) inside
-the same added-node-scoped, synchronous scan; specs are cached per block uid and
-invalidated when Roam replaces the button node. An empty Datascript read is
+the same added-node-scoped, synchronous scan; specs are cached per block uid,
+invalidated when Roam replaces the button node, and re-validated against a fresh
+string read on every lookup — an edited range string re-parses and a cached
+negative recovers. An empty Datascript read is
 transient — the block is still mounting — so it is never cached and the next
 scan retries; only a definitive non-empty non-spec caches a null. The block host
 is located by `roamBlockInputFor`, which accepts the current BEM
@@ -148,8 +150,15 @@ renders no component button at all are found by `rangeTextHostsWithin` — a
 textContent prefilter only, always verified by the Datascript read — and mount
 with the host given `rg-range-host`, whose CSS hides the host's other children
 until `:focus-within` lifts the hide for editing; view disposal removes the
-class. A host containing any range button is owned by the button path and never
-text-claimed.
+class. The text claim is deliberately narrow: the block-input id prefix also
+matches Roam's live editing `<textarea>`, so form controls and any host
+containing a focused Roam input are excluded (edit mode = hands off), and the
+trimmed Datascript string must be the marker alone — a block with prose around
+the marker keeps Roam's native render, since the host-hide would erase it (the
+button path may still claim the rendered button inside a mixed block). A host
+containing any range button is owned by the button path and never text-claimed;
+a button that arrives after a text claim disposes the text view before
+mounting, so a block never paints two excerpts.
 
 The pre-paint rule
 `.rm-xparser-default-roam-grid-range:not(.rg-range-restored)` is the single
