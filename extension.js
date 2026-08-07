@@ -7650,9 +7650,41 @@ export class NativeCellEditorOverlay {
     this.pendingSeed = null;
     this.claimedUid = null;
     this.mountTriggerContext = null;
+    // FORENSIC (no behavior change): per-edit clock base for `traceOverlay` offsets. Captured in
+    // `start()`, never cleared by teardown so late reconcile/backstop traces keep a stable base.
+    this.editStartClock = null;
   }
 
   get active() { return Boolean(this.state); }
+
+  /**
+   * FORENSIC INSTRUMENTATION — pure observation, ZERO behavior change. Ring-buffered (cap 64)
+   * trace of the escape → cancel/commit → settle → teardown → reconcile → focus-floor path,
+   * always-on and dependency-free, so the live sequence can be reconstructed from
+   * `window.__rgDiag.overlayTrace` after reproducing the wedge on real Roam. `t` is a ms offset
+   * from the per-edit clock captured in `start()`. Nothing here mutates graph state, timing, or
+   * control flow — a trace call is a small object push, and the pull below is read-only.
+   */
+  traceOverlay(stage, detail = null) {
+    const target = globalThis.window;
+    if (!target) return;
+    const clock = globalThis.performance?.now?.() ?? Date.now();
+    const base = this.editStartClock;
+    const entry = { t: Math.round((clock - (base ?? clock)) * 100) / 100, stage, detail };
+    const diag = (target.__rgDiag ||= {});
+    const trace = (diag.overlayTrace ||= []);
+    trace.push(entry);
+    if (trace.length > 64) trace.splice(0, trace.length - 64);
+    diag.overlayLast = entry;
+  }
+
+  /** Read the live block string for a trace detail WITHOUT ever throwing (read-only). Lets each
+   *  trace show WHEN Roam's blur flush lands on `:block/string` relative to the step. */
+  pullRawForTrace(uid) {
+    if (!uid) return null;
+    try { return pullNativeCell(uid)?.raw ?? null; }
+    catch { return null; }
+  }
 
   nextFrame() {
     return new Promise((resolve) => {
@@ -7713,6 +7745,8 @@ export class NativeCellEditorOverlay {
     // keystroke must JOIN the in-flight mount — returning null here would stack the grid editor
     // on top of the overlay that is about to finish mounting.
     if (this.starting) return this.starting;
+    this.editStartClock = globalThis.performance?.now?.() ?? Date.now();
+    this.traceOverlay("start", { uid: args.uid, initial: args.initial != null, pulled: this.pullRawForTrace(args.uid) });
     const pending = this.startOnce(args);
     this.starting = pending;
     const clear = () => { if (this.starting === pending) this.starting = null; };
@@ -7917,6 +7951,13 @@ export class NativeCellEditorOverlay {
    * menu. `input` opens a new episode; everything else after the loan is the overlay's cancel.
    */
   handleEscapeKey(event, { scoped = false } = {}) {
+    // FORENSIC entry snapshot. `nativeAutocompleteOpen()` is called here exactly as the FIX-E logic
+    // below calls it; its only side effect (the `runtime.nativeEditorSawPopup` latch) is set solely
+    // when a real `.rm-autocomplete__results` portal exists, and in every state where the real path
+    // below short-circuits before its own probe that latch is already set — so this extra read is
+    // idempotent and behaviour-preserving. In the auto-paired `[[]]` wedge there is no real portal
+    // at all, so it is fully side-effect-free.
+    this.traceOverlay("escape:entry", { scoped, escapeDeferred: this.escapeDeferred, popupJustClosed: this.popupJustClosed, menuOpen: this.nativeAutocompleteOpen(), handled: Boolean(event?.__rgOverlayEscapeHandled), finishing: Boolean(this.state?.finishing), uid: this.state?.uid ?? null, pulled: this.pullRawForTrace(this.state?.uid) });
     const state = this.state;
     if (!state || state.finishing) return false;
     if (state.composing || event?.isComposing) return false;
@@ -7925,12 +7966,14 @@ export class NativeCellEditorOverlay {
     if (!scoped && !this.escapeBelongsToOverlay(event)) return false;
     if (event) event.__rgOverlayEscapeHandled = true;
     if (!this.escapeDeferred && !this.popupJustClosed && this.nativeAutocompleteOpen()) {
+      this.traceOverlay("escape:lent", { uid: state.uid, pulled: this.pullRawForTrace(state.uid) });
       this.escapeDeferred = true;
       this.markPopupJustClosed();
       return false;
     }
     event?.preventDefault?.(); event?.stopPropagation?.();
     this.escapeDeferred = false;
+    this.traceOverlay("escape:cancel", { uid: state.uid, pulled: this.pullRawForTrace(state.uid) });
     void this.cancel();
     return true;
   }
@@ -7948,6 +7991,7 @@ export class NativeCellEditorOverlay {
     if (String(event?.key ?? "") !== "Escape") return;
     if (!this.state || this.state.finishing) return;
     this.escapeKeydownSeen = true;
+    this.traceOverlay("doc:keydown", { uid: this.state?.uid ?? null, escapeDeferred: this.escapeDeferred, pulled: this.pullRawForTrace(this.state?.uid) });
     this.handleEscapeKey(event);
   }
 
@@ -7957,6 +8001,7 @@ export class NativeCellEditorOverlay {
     if (String(event?.key ?? "") !== "Escape") return;
     if (this.escapeKeydownSeen) { this.escapeKeydownSeen = false; return; }
     if (!this.state || this.state.finishing) return;
+    this.traceOverlay("doc:keyup", { uid: this.state?.uid ?? null, escapeDeferred: this.escapeDeferred, pulled: this.pullRawForTrace(this.state?.uid) });
     this.handleEscapeKey(event);
   }
 
@@ -8014,6 +8059,7 @@ export class NativeCellEditorOverlay {
    */
   finishIfFocusLeft() {
     const state = this.state;
+    this.traceOverlay("focusLeft:entry", { uid: state?.uid ?? null, finishing: Boolean(state?.finishing), repairScheduled: this.repairScheduled, repairRunning: this.repairRunning, pulled: this.pullRawForTrace(state?.uid) });
     if (!state || state.finishing) return false;
     if (this.repairScheduled || this.repairRunning) return false;
     const active = globalThis.document?.activeElement || null;
@@ -8021,6 +8067,7 @@ export class NativeCellEditorOverlay {
     if (active?.closest?.(".rm-autocomplete__results")) return false;
     if (this.nativeAutocompletePortal()) return false;
     if (active && this.view?.root?.contains?.(active)) return false;
+    this.traceOverlay("focusLeft:commit", { uid: state.uid, pulled: this.pullRawForTrace(state.uid) });
     void this.commit(null);
     return true;
   }
@@ -8117,12 +8164,16 @@ export class NativeCellEditorOverlay {
   settleTextareaValue(value) {
     const textarea = this.textarea;
     if (!textarea) return;
+    this.traceOverlay("settle:enter", { uid: this.state?.uid ?? null, before: String(textarea.value ?? ""), to: String(value ?? "") });
     setNativeTextareaValue(textarea, String(value ?? ""));
     const Constructor = globalThis.InputEvent || globalThis.Event;
     if (typeof Constructor === "function") textarea.dispatchEvent?.(new Constructor("input", { bubbles: true }));
+    this.traceOverlay("settle:exit", { uid: this.state?.uid ?? null, after: String(textarea.value ?? ""), pulled: this.pullRawForTrace(this.state?.uid) });
   }
 
   teardown() {
+    const teardownUid = this.state?.uid ?? this.claimedUid ?? null;
+    this.traceOverlay("teardown:entry", { uid: teardownUid, hasTextarea: Boolean(this.textarea), value: this.textarea ? String(this.textarea.value ?? "") : null, pulled: this.pullRawForTrace(teardownUid) });
     for (const dispose of this.mountDisposers.splice(0).reverse()) {
       try { dispose(); } catch (error) { noteNativeEditorError(error); }
     }
@@ -8140,6 +8191,7 @@ export class NativeCellEditorOverlay {
     this.state?.cell?.classList?.remove("rg-cell--editing", "rg-cell--native-editing");
     this.overlay?.remove?.();
     this.overlay = null; this.textarea = null; this.state = null;
+    this.traceOverlay("teardown:done", { uid: teardownUid, pulled: this.pullRawForTrace(teardownUid) });
   }
 
   /**
@@ -8153,6 +8205,7 @@ export class NativeCellEditorOverlay {
     const { row, col, cell, uid } = state;
     const beforeRaw = this.beforeRaw;
     const live = this.textarea ? String(this.textarea.value ?? "") : null;
+    this.traceOverlay("commit:entry", { uid, beforeRaw, live, movement: movement ?? null, pulled: this.pullRawForTrace(uid) });
     // Commit flushes the same value Roam does (both persist the typed text), so the two writes
     // agree — except an empty cell, which we persist as " " to stop Roam collapsing the block while
     // Roam's own flush would write "". Settle the textarea to the persisted form so both match.
@@ -8196,6 +8249,7 @@ export class NativeCellEditorOverlay {
     const { row, col, cell, uid } = state;
     const beforeRaw = this.beforeRaw;
     const flushed = nativeStoredRaw(this.textarea ? String(this.textarea.value ?? "") : state.lastValue);
+    this.traceOverlay("cancel:entry", { uid, beforeRaw, flushed, live: this.textarea ? String(this.textarea.value ?? "") : null, reconcileDelayMs: this.reconcileDelayMs, pulled: this.pullRawForTrace(uid) });
     // Cooperate with Roam's blur-flush: put `beforeRaw` in the textarea BEFORE teardown so the flush
     // teardown triggers persists the cancelled-to value, not the typed one. Read `flushed` first.
     if (flushed !== beforeRaw) this.settleTextareaValue(beforeRaw);
@@ -8227,6 +8281,7 @@ export class NativeCellEditorOverlay {
    * absorbs the echo, and stop only once the value has stayed `beforeRaw` across two reads.
    */
   async reconcileCancelWrite(uid, beforeRaw, { attempts = 12, delayMs = 130 } = {}) {
+    this.traceOverlay("reconcile:entry", { uid, beforeRaw, attempts, delayMs, pulled: this.pullRawForTrace(uid) });
     // Poll the WHOLE budget rather than stopping at the first stable read: Roam's flush timing is
     // not known, and a poll that quit early could return just before a late flush landed. Every
     // divergence in the window is re-applied, so the graph ends at `beforeRaw` regardless of when
@@ -8237,15 +8292,16 @@ export class NativeCellEditorOverlay {
       let current = null;
       try { current = pullNativeCell(uid); }
       catch (error) { noteNativeEditorError(error); return corrected; }
-      if (!current) continue;
+      if (!current) { this.traceOverlay("reconcile:poll", { i: attempt, raw: null, reapplied: false }); continue; }
       const raw = nativeStoredRaw(current.raw);
-      if (raw === beforeRaw) continue;
+      if (raw === beforeRaw) { this.traceOverlay("reconcile:poll", { i: attempt, raw, reapplied: false }); continue; }
       try {
         this.view.adapter?.recordSelfWrite?.(uid, raw, beforeRaw);
         try { await updateBlock(uid, nativePersistedRaw(beforeRaw)); }
         catch (error) { this.view.adapter?.consumeSelfWrite?.(uid, raw, beforeRaw); throw error; }
         this.view.adapter?.patchBaseContent?.([{ uid, raw: beforeRaw }]);
         corrected = true;
+        this.traceOverlay("reconcile:poll", { i: attempt, raw, reapplied: true });
       } catch (error) { noteNativeEditorError(error); return corrected; }
     }
     return corrected;
@@ -8255,6 +8311,7 @@ export class NativeCellEditorOverlay {
     if (this.disposed) return;
     this.disposed = true;
     const uid = this.state?.uid || null;
+    this.traceOverlay("dispose", { uid, pulled: this.pullRawForTrace(uid) });
     this.teardown();
     if (uid) this.view?.session?.endNativeOverlayEdit?.(uid, { commit: false });
   }
