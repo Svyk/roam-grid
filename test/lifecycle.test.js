@@ -7,7 +7,10 @@ import extension, {
   enhancedUidGuardCss,
   initializeSettings,
   mounting,
+  nativeEditorEnabled,
   pendingTimers,
+  roamRecentsCache,
+  runtime,
   settingsCache,
   toast,
 } from "../src/extension.js";
@@ -283,6 +286,86 @@ test("toast paints while loaded and is inert once the runtime is torn down", asy
     for (const id of pendingTimers) clearTimeout(id);
     pendingTimers.clear();
     mock.dispose();
+    if (previousObserver === undefined) delete globalThis.MutationObserver; else globalThis.MutationObserver = previousObserver;
+    if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
+    if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
+  }
+});
+
+test("onunload unregisters every palette and slash command", async () => {
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  const previousObserver = globalThis.MutationObserver;
+  const mock = installMetadataRoamMock();
+  const dom = installFakeDom();
+  globalThis.document = dom.document;
+  globalThis.MutationObserver = class { observe() {} disconnect() {} };
+  const added = [];
+  const removed = [];
+  const extensionAPI = {
+    settings: { canSet: false, get: () => null, set: async () => {}, panel: { create: async () => {} } },
+    ui: {
+      commandPalette: { addCommand: (command) => added.push(["palette", command.label]), removeCommand: (label) => removed.push(["palette", label]) },
+      slashCommand: { addCommand: (command) => added.push(["slash", command.label]), removeCommand: (label) => removed.push(["slash", label]) },
+    },
+  };
+  try {
+    await extension.onload({ extensionAPI });
+    await Promise.resolve();
+    const paletteAdded = added.filter(([reg]) => reg === "palette").length;
+    const slashAdded = added.filter(([reg]) => reg === "slash").length;
+    assert.equal(paletteAdded, slashAdded, "palette and slash receive the same command set");
+    assert.ok(paletteAdded >= 14, "the full command set registers");
+    await extension.onunload();
+    assert.deepEqual([...removed].sort(), [...added].sort(), "every registration is removed on unload — a disable cycle cannot stack duplicates");
+  } finally {
+    mock.dispose();
+    for (const id of pendingTimers) clearTimeout(id);
+    pendingTimers.clear();
+    if (previousObserver === undefined) delete globalThis.MutationObserver; else globalThis.MutationObserver = previousObserver;
+    if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
+    if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
+  }
+});
+
+test("onunload resets the session health flags so a reload starts clean", async () => {
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  const previousObserver = globalThis.MutationObserver;
+  const mock = installMetadataRoamMock();
+  const dom = installFakeDom();
+  globalThis.document = dom.document;
+  globalThis.MutationObserver = class { observe() {} disconnect() {} };
+  const extensionAPI = {
+    settings: { canSet: false, get: () => null, set: async () => {}, panel: { create: async () => {} } },
+    ui: { commandPalette: { addCommand() {} }, slashCommand: { addCommand() {} } },
+  };
+  try {
+    await extension.onload({ extensionAPI });
+    await Promise.resolve();
+    runtime.nativeEditorDisabled = true;
+    runtime.nativeEditorFailures = 7;
+    runtime.nativeEditorSawPopup = true;
+    runtime.recentsDisabled = true;
+    runtime.recentsOverruns = 3;
+    runtime.suggestionRenderDisabled = true;
+    roamRecentsCache.set("svy:page", { at: Date.now(), rows: [["x"]] });
+    assert.equal(nativeEditorEnabled(), false, "the health flags are live before unload");
+
+    await extension.onunload();
+    assert.equal(runtime.nativeEditorDisabled, false);
+    assert.equal(runtime.nativeEditorFailures, 0);
+    assert.equal(runtime.nativeEditorSawPopup, false);
+    assert.equal(runtime.recentsDisabled, false);
+    assert.equal(runtime.recentsOverruns, 0);
+    assert.equal(runtime.suggestionRenderDisabled, false);
+    assert.equal(runtime.slowSuggestionBatches, 0);
+    assert.equal(roamRecentsCache.size, 0, "the recents cache does not survive the unload boundary");
+  } finally {
+    roamRecentsCache.clear();
+    mock.dispose();
+    for (const id of pendingTimers) clearTimeout(id);
+    pendingTimers.clear();
     if (previousObserver === undefined) delete globalThis.MutationObserver; else globalThis.MutationObserver = previousObserver;
     if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
     if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;

@@ -6,8 +6,10 @@ import {
   MetadataStore,
   RegistrySet,
   migrateLegacyTemplates,
+  pendingTimers,
   resolveTemplateModel,
   runtime,
+  savedTemplateNameList,
   serializeTemplateModel,
   settingsCache,
 } from "../src/extension.js";
@@ -20,7 +22,7 @@ const METADATA_PAGE = "roam/grid/metadata";
  * page/block create, update, and delete recorded in `ops` so ordering pins (metadata LAST,
  * backup BEFORE rewrite, dispose→remove→delete) are asserted against the actual write stream.
  */
-function installTemplateRoamMock({ dropStrings = new Set() } = {}) {
+function installTemplateRoamMock({ dropStrings = new Set(), throwStrings = new Set() } = {}) {
   let uidCounter = 0;
   const pages = new Map();
   const blocks = new Map();
@@ -35,6 +37,7 @@ function installTemplateRoamMock({ dropStrings = new Set() } = {}) {
   globalThis.window = { roamAlphaAPI: {
     util: { generateUID: () => `uid${String(++uidCounter).padStart(6, "0")}` },
     q: (_query, uid) => (uid && blocks.has(uid) ? [[clone(blocks.get(uid))]] : []),
+    ui: { getFocusedBlock: () => null },
     data: {
       pull: (_pattern, [, title]) => (pages.has(title) ? { ":block/uid": pages.get(title) } : null),
       page: { create: async ({ page }) => { pages.set(page.title, page.uid); blocks.set(page.uid, { uid: page.uid, string: page.title, order: 0, children: [] }); ops.push(["page", page.title]); } },
@@ -43,6 +46,7 @@ function installTemplateRoamMock({ dropStrings = new Set() } = {}) {
           ops.push(["create", block.uid, block.string, location["parent-uid"], location.order]);
           const node = { uid: block.uid, string: block.string, order: 0, children: [] };
           blocks.set(block.uid, node);
+          if (throwStrings.has(block.string)) throw new Error(`simulated write failure for ${block.string}`);
           if (dropStrings.has(block.string)) return; // recorded but never attached — simulates a lost write
           const siblings = blocks.get(location["parent-uid"])?.children;
           if (!siblings) throw new Error(`missing parent ${location["parent-uid"]}`);
@@ -78,6 +82,41 @@ function installDocumentStub() {
   const previous = globalThis.document;
   globalThis.document = { querySelector: () => null, querySelectorAll: () => [], addEventListener() {}, removeEventListener() {} };
   return () => { if (previous === undefined) delete globalThis.document; else globalThis.document = previous; };
+}
+
+/** Document stub that can host a `showChoice` dialog (overwrite confirm) and capture toasts. */
+function installDialogDocumentStub() {
+  const previous = globalThis.document;
+  const nodes = [];
+  const makeElement = (tag) => {
+    const listeners = {};
+    const element = {
+      tagName: String(tag || "div").toUpperCase(), className: "", textContent: "", title: "", value: "", isConnected: false,
+      children: [], style: { setProperty() {}, removeProperty() {} }, dataset: {},
+      classList: { add() {}, remove() {}, contains: () => false },
+      setAttribute() {}, appendChild(child) { element.children.push(child); child.isConnected = true; return child; },
+      append(...children) { for (const child of children) if (child) element.appendChild(child); },
+      remove() { element.isConnected = false; }, addEventListener(type, handler) { (listeners[type] ||= []).push(handler); },
+      dispatch(type, ...args) { for (const handler of listeners[type] || []) handler(...args); },
+      querySelector: () => null, querySelectorAll: () => [],
+    };
+    nodes.push(element);
+    return element;
+  };
+  const body = makeElement();
+  globalThis.document = {
+    body,
+    createElement: makeElement,
+    querySelector: (selector) => (selector === ".rg-toasts" ? nodes.find((node) => node.className === "rg-toasts") || null : null),
+    querySelectorAll: () => [],
+    addEventListener() {}, removeEventListener() {},
+  };
+  return {
+    nodes,
+    buttons: (label) => nodes.filter((node) => node.tagName === "BUTTON" && node.textContent === label),
+    toastItems: () => nodes.filter((node) => node.className === "rg-toast rg-toast--danger" || node.className === "rg-toast rg-toast--success"),
+    restore: () => { if (previous === undefined) delete globalThis.document; else globalThis.document = previous; },
+  };
 }
 
 function legacyTemplateString(model, name) {
@@ -157,30 +196,53 @@ test("save creates the name block, materializes cells row-major, and writes meta
   assert.equal(mock.pages.has(METADATA_PAGE), true);
 });
 
-test("overwrite disposes, drops metadata, then deletes the old table before reusing the name block", async (t) => {
+test("overwrite materializes the new table first, then drops the old table and its metadata", async (t) => {
   const mock = installTemplateRoamMock();
   const seeded = seedRuntime(t, mock);
   await seeded.metadata.initialize();
   await seeded.templates.initialize();
-  await seeded.templates.save("Calc", new GridModel({ rows: [["A"]] }));
+  await seeded.templates.save("Calc", new GridModel({ rows: [["A"]] }), { confirmOverwrite: false });
   const first = seeded.templates.entries.get("CALC");
   const oldMetaBlock = seeded.metadata.entries.get(first.tableUid).blockUid;
   mock.ops.length = 0;
 
-  await seeded.templates.save("Calc", new GridModel({ rows: [["B", "C"]] }));
+  await seeded.templates.save("Calc", new GridModel({ rows: [["B", "C"]] }), { confirmOverwrite: false });
   const kinds = mock.ops.map(([op, uid]) => [op, uid]);
   const deleteMeta = kinds.findIndex(([op, uid]) => op === "delete" && uid === oldMetaBlock);
   const deleteTable = kinds.findIndex(([op, uid]) => op === "delete" && uid === first.tableUid);
   const updateName = kinds.findIndex(([op, uid]) => op === "update" && uid === first.nameBlockUid);
+  const tableCreateOp = mock.ops.findIndex(([op, , string]) => op === "create" && string === "{{[[table]]}}");
+  assert.ok(tableCreateOp >= 0, "the new table is created");
+  assert.ok(tableCreateOp < deleteTable, "the new table is materialized BEFORE the old one is deleted");
   assert.ok(deleteMeta >= 0, "old metadata record is removed");
   assert.ok(deleteMeta < deleteTable, "metadata remove lands before the table subtree delete");
-  assert.ok(deleteTable < updateName, "the old table is gone before the name block is reused");
   assert.equal(mock.ops.filter(([op, uid]) => op === "create" && uid === first.nameBlockUid).length, 0, "the name block is reused, not recreated");
   assert.equal(mock.ops.filter(([op]) => op === "create").at(-1)[2].startsWith("roam-grid/table:: "), true, "metadata is still the last write");
   const next = seeded.templates.entries.get("CALC");
   assert.equal(next.nameBlockUid, first.nameBlockUid);
   assert.notEqual(next.tableUid, first.tableUid);
   assert.equal(seeded.metadata.has(first.tableUid), false, "no orphaned layout record survives");
+  assert.ok(updateName >= 0, "the reused name block is restamped with the canonical name");
+});
+
+test("overwrite asks before replacing an existing template and aborts when declined", async (t) => {
+  const mock = installTemplateRoamMock();
+  const seeded = seedRuntime(t, mock);
+  const dialog = installDialogDocumentStub();
+  await seeded.metadata.initialize();
+  await seeded.templates.initialize();
+  await seeded.templates.save("Calc", new GridModel({ rows: [["A"]] }), { confirmOverwrite: false });
+  mock.ops.length = 0;
+
+  const pending = seeded.templates.save("Calc", new GridModel({ rows: [["B"]] }));
+  const cancel = dialog.buttons("Cancel")[0];
+  assert.ok(cancel, "the confirm dialog offers a cancel");
+  cancel.dispatch("click");
+  const result = await pending;
+  assert.equal(result, null, "declining the overwrite aborts the save");
+  assert.deepEqual(mock.ops, [], "a declined overwrite writes nothing");
+  const entry = seeded.templates.entries.get("CALC");
+  assert.equal(mock.blocks.get(entry.tableUid).string, "{{[[table]]}}", "the old table is untouched");
 });
 
 test("save rewrites a legacy JSON block into the v2 name block in place", async (t) => {
@@ -191,7 +253,7 @@ test("save rewrites a legacy JSON block into the v2 name block in place", async 
   mock.addBlock("legacy001", legacyTemplateString(new GridModel({ rows: [["Old"]] }), "Old Grid"), "tplpage01");
   await seeded.templates.initialize();
 
-  await seeded.templates.save("Old Grid", new GridModel({ rows: [["New"]] }));
+  await seeded.templates.save("Old Grid", new GridModel({ rows: [["New"]] }), { confirmOverwrite: false });
   const entry = seeded.templates.entries.get("OLD GRID");
   assert.equal(entry.nameBlockUid, "legacy001", "the legacy block becomes the name block — uid preserved");
   assert.equal(entry.legacyValue, null);
@@ -253,7 +315,7 @@ test("migration backs up BEFORE rewriting, then materializes a verified table", 
   assert.deepEqual(mock.ops, [], "re-detection makes the idle run a zero-write no-op");
 });
 
-test("migration restores the original JSON and stops when verification fails", async (t) => {
+test("migration restores a failed entry's JSON and continues to the entries after it", async (t) => {
   const mock = installTemplateRoamMock({ dropStrings: new Set(["lost-cell"]) });
   const seeded = seedRuntime(t, mock);
   await seeded.metadata.initialize();
@@ -264,7 +326,8 @@ test("migration restores the original JSON and stops when verification fails", a
   await seeded.templates.initialize();
 
   const result = await migrateLegacyTemplates();
-  assert.equal(result.migrated, 0);
+  assert.equal(result.migrated, 1, "the entry after the failed one is still migrated — no run abort");
+  assert.equal(result.legacy, 2);
   const updates = mock.ops.filter(([op, uid]) => op === "update" && uid === "legacy001");
   assert.equal(updates.length, 2, "rewrite then restore");
   assert.deepEqual(updates[1][2], original, "the original JSON string is restored byte-for-byte");
@@ -277,7 +340,8 @@ test("migration restores the original JSON and stops when verification fails", a
   assert.ok(tableDelete < restore, "the delete lands before the JSON restore so no broken table survives a retry");
   assert.equal(mock.blocks.get("legacy001").children.length, 0, "the name block has no leftover table child");
   assert.ok(globalThis.window.__RG_U2_LAST_ERROR.includes("Broken"), "the failure lands on the forensic surface");
-  assert.equal(mock.blocks.get("legacy002").string.startsWith("roam-grid/template:: {"), true, "the run stops — later entries wait for the maintenance action");
+  assert.equal(mock.blocks.get("legacy002").string, "roam-grid/template:: Next", "the run continues — the next entry is rewritten to v2");
+  assert.equal(mock.blocks.get("legacy002").children[0].string, "{{[[table]]}}");
   delete globalThis.window.__RG_U2_LAST_ERROR;
 });
 
@@ -318,4 +382,130 @@ test("resolveTemplateModel keeps registry → v2 → legacy precedence", async (
   const fromLegacy = await resolveTemplateModel("Old");
   assert.equal(fromLegacy.getRaw(0, 0), "legacy-cell");
   await assert.rejects(() => resolveTemplateModel("Missing"), (error) => error.code === "TEMPLATE_NOT_FOUND");
+});
+
+test("a failed overwrite deletes the partial new table and leaves the old template intact", async (t) => {
+  const mock = installTemplateRoamMock({ throwStrings: new Set(["bomb"]) });
+  const seeded = seedRuntime(t, mock);
+  await seeded.metadata.initialize();
+  await seeded.templates.initialize();
+  await seeded.templates.save("Calc", new GridModel({ rows: [["A"]] }), { confirmOverwrite: false });
+  const first = seeded.templates.entries.get("CALC");
+  const nameBlockUid = first.nameBlockUid;
+  mock.ops.length = 0;
+
+  await assert.rejects(
+    () => seeded.templates.save("Calc", new GridModel({ rows: [["bomb"]] }), { confirmOverwrite: false }),
+    (error) => /simulated write failure/.test(error.message),
+  );
+  assert.equal(seeded.metadata.has(first.tableUid), true, "the old metadata survives the failed overwrite");
+  assert.ok(mock.blocks.get(first.tableUid), "the old table block survives");
+  assert.equal(mock.blocks.get(nameBlockUid).children.length, 1, "only the old table remains under the name block");
+  const entry = seeded.templates.entries.get("CALC");
+  assert.equal(entry.tableUid, first.tableUid, "the store entry still resolves to the old table");
+  const tableCreates = mock.ops.filter(([op, , string]) => op === "create" && string === "{{[[table]]}}");
+  assert.equal(tableCreates.length, 1, "one partial table was created");
+  assert.equal(mock.blocks.has(tableCreates[0][1]), false, "the partial new table is deleted");
+  assert.ok(globalThis.window.__RG_U2_LAST_ERROR, "the failure lands on the forensic surface");
+  delete globalThis.window.__RG_U2_LAST_ERROR;
+});
+
+test("migration restores JSON on a throw and continues to the entries after it", async (t) => {
+  const mock = installTemplateRoamMock({ throwStrings: new Set(["boom-cell"]) });
+  const seeded = seedRuntime(t, mock);
+  await seeded.metadata.initialize();
+  mock.addPage(TEMPLATE_PAGE, "tplpage01");
+  const original = legacyTemplateString(new GridModel({ rows: [["boom-cell"]] }), "Doomed");
+  mock.addBlock("legacy001", original, "tplpage01");
+  mock.addBlock("legacy002", legacyTemplateString(new GridModel({ rows: [["next"]] }), "Next"), "tplpage01");
+  await seeded.templates.initialize();
+
+  const result = await migrateLegacyTemplates();
+  assert.equal(result.legacy, 2);
+  assert.equal(result.migrated, 1, "the throw does not abort the run — the next entry still migrates");
+  assert.equal(mock.blocks.get("legacy001").string, original, "the thrown entry's JSON is restored byte-for-byte");
+  assert.equal(mock.blocks.get("legacy001").children.length, 0, "no partial table survives under the thrown entry");
+  assert.equal(mock.blocks.get("legacy002").string, "roam-grid/template:: Next");
+  assert.ok(globalThis.window.__RG_U2_LAST_ERROR.includes("simulated write failure"), "the throw lands on the forensic surface");
+  delete globalThis.window.__RG_U2_LAST_ERROR;
+});
+
+test("migration skips a second backup when an identical one already exists", async (t) => {
+  const mock = installTemplateRoamMock();
+  const seeded = seedRuntime(t, mock);
+  await seeded.metadata.initialize();
+  mock.addPage(METADATA_PAGE, "metapage01");
+  await seeded.metadata.initialize();
+  mock.addPage(TEMPLATE_PAGE, "tplpage01");
+  const legacyModel = new GridModel({ rows: [["a", "b"]] });
+  const original = legacyTemplateString(legacyModel, "Dup");
+  mock.addBlock("legacy001", original, "tplpage01");
+  const payload = original.slice("roam-grid/template::".length).trim();
+  mock.addBlock("backup001", `roam-grid/template-backup:: ${payload}`, "metapage01");
+  await seeded.templates.initialize();
+
+  const result = await migrateLegacyTemplates();
+  assert.equal(result.migrated, 1);
+  const backupCreates = mock.ops.filter(([op, , string]) => op === "create" && string.startsWith("roam-grid/template-backup:: "));
+  assert.equal(backupCreates.length, 0, "an identical pre-existing backup means no second backup block");
+});
+
+test("migration is guarded against re-entrancy", async (t) => {
+  const mock = installTemplateRoamMock();
+  const seeded = seedRuntime(t, mock);
+  await seeded.metadata.initialize();
+  mock.addPage(TEMPLATE_PAGE, "tplpage01");
+  mock.addBlock("legacy001", legacyTemplateString(new GridModel({ rows: [["a"]] }), "Solo"), "tplpage01");
+  await seeded.templates.initialize();
+
+  const first = migrateLegacyTemplates();
+  const second = await migrateLegacyTemplates();
+  assert.equal(second.reentered, true, "a concurrent call short-circuits on the in-flight flag");
+  assert.deepEqual(second.migrated, 0);
+  const result = await first;
+  assert.equal(result.migrated, 1, "the in-flight run completes normally");
+  const after = await migrateLegacyTemplates();
+  assert.deepEqual(after, { legacy: 0, migrated: 0, skipped: 0 }, "the flag is released once the run settles — a later call runs normally");
+});
+
+test("a zero-progress migration run toasts danger, never success", async (t) => {
+  const mock = installTemplateRoamMock({ throwStrings: new Set(["boom-cell"]) });
+  const seeded = seedRuntime(t, mock);
+  const dialog = installDialogDocumentStub();
+  seeded.extensionAPI = {};
+  t.after(() => { runtime.extensionAPI = null; for (const id of pendingTimers) clearTimeout(id); pendingTimers.clear(); });
+  await seeded.metadata.initialize();
+  mock.addPage(TEMPLATE_PAGE, "tplpage01");
+  mock.addBlock("legacy001", legacyTemplateString(new GridModel({ rows: [["boom-cell"]] }), "Doomed"), "tplpage01");
+  await seeded.templates.initialize();
+
+  const result = await migrateLegacyTemplates();
+  assert.equal(result.legacy, 1);
+  assert.equal(result.migrated, 0);
+  const dangers = dialog.toastItems().filter((node) => node.className === "rg-toast rg-toast--danger");
+  assert.equal(dangers.length, 1, "a zero-progress run must not claim success");
+  assert.match(dangers[0].textContent, /no progress/, "the danger toast says nothing moved");
+  assert.match(dangers[0].textContent, /__RG_U2_LAST_ERROR/, "the danger toast points at the forensic surface");
+  delete globalThis.window.__RG_U2_LAST_ERROR;
+});
+
+test("savedTemplateNameList dedupes case-insensitively and lets the registry display name win", async (t) => {
+  const mock = installTemplateRoamMock();
+  const seeded = seedRuntime(t, mock);
+  await seeded.metadata.initialize();
+  await seeded.templates.initialize();
+  await seeded.templates.save("Calc", new GridModel({ rows: [["A"]] }), { confirmOverwrite: false });
+  const registry = new RegistrySet();
+  registry.registerTemplate("calc", { rows: [["registry-cell"]] });
+  assert.deepEqual(savedTemplateNameList(registry, seeded.templates), ["calc"], "the registry's display casing wins, and the saved template is not duplicated");
+  registry.templates.delete("CALC");
+  registry.templateDisplayNames.delete("CALC");
+  assert.deepEqual(savedTemplateNameList(registry, seeded.templates), ["Calc"], "without the registry, the saved template shows its own casing");
+  registry.registerTemplate("Zebra", { rows: [["z"]] });
+  assert.deepEqual(savedTemplateNameList(registry, seeded.templates), ["Calc", "Zebra"], "distinct names still sort together");
+
+  registry.registerTemplate("calc", { rows: [["registry-cell"]] });
+  seeded.registries = registry;
+  const fromRegistry = await resolveTemplateModel("calc");
+  assert.equal(fromRegistry.getRaw(0, 0), "registry-cell", "resolution precedence is unchanged — the registry wins by normalized key");
 });

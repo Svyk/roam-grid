@@ -172,7 +172,7 @@ const SETTING_DESCRIPTORS = [
  */
 const MAINTENANCE_ACTIONS = Object.freeze([
   { key: "maintenance-apply-display", group: "Maintenance", name: "Apply display defaults to open grids", description: "Rewrite headers and fit-to-width on every grid currently on screen to match the Appearance defaults above. Existing grids keep their own settings until you press this. Use it when a grid you hid the labels on should follow the default again — the “Show row and column headers” switch hides labels everywhere while it is off, but on its own it never overrides a table you deliberately opted out.", control: "button", type: "string", default: "", scope: "graph", apply: "immediate", stage: "live" },
-  { key: "maintenance-forget-device", group: "Maintenance", name: "Forget this device's overrides", description: "Drop the device-only values (toolbar, theme, maximum width, overscan) and fall back to the graph-synced ones.", control: "button", type: "string", default: "", scope: "device", apply: "immediate", stage: "live" },
+  { key: "maintenance-forget-device", group: "Maintenance", name: "Forget this device's overrides", description: "Drop the device-only values (toolbar, theme, notifications, maximum width, overscan, chunk cache, comment compose mode) and fall back to the graph-synced ones.", control: "button", type: "string", default: "", scope: "device", apply: "immediate", stage: "live" },
   { key: "maintenance-clear-caches", group: "Maintenance", name: "Clear local caches", description: "Forget the cached enhanced-table list and the theme palette. Nothing in your graph changes.", control: "button", type: "string", default: "", scope: "device", apply: "immediate", stage: "live" },
   { key: "maintenance-migrate-templates", group: "Maintenance", name: "Migrate legacy grid templates", description: "Rewrite any legacy JSON template records on [[roam/grid/templates]] into real, editable tables — a backup of each original record lands on [[roam/grid/metadata]] before anything is rewritten. This runs once automatically after Roam Grid loads; press it to convert templates that were skipped for exceeding the native-table write budget.", control: "button", type: "string", default: "", scope: "graph", apply: "immediate", stage: "live" },
   { key: "maintenance-reset", group: "Maintenance", name: "Reset all Roam Grid settings", description: "Restore every setting on this page to its default.", control: "button", type: "string", default: "", scope: "graph", apply: "immediate", stage: "live" },
@@ -370,7 +370,7 @@ function readGraphSettings(extensionAPI) {
   if (typeof api?.getAll === "function") { try { return api.getAll() || {}; } catch { return {}; } }
   if (typeof api?.get !== "function") return {};
   const values = {};
-  for (const key of [...Object.keys(SETTINGS), SETTINGS_VERSION_KEY, LEGACY_BUDGET_KEY]) {
+  for (const key of [...Object.keys(SETTINGS), SETTINGS_VERSION_KEY, LEGACY_BUDGET_KEY, LEGACY_SIDEBAR_COMMENTS_KEY]) {
     const value = api.get(key);
     if (value != null) values[key] = value;
   }
@@ -2620,6 +2620,9 @@ export class RegistrySet {
     this.exporters = new Map();
     this.dataSources = new Map();
     this.templates = new Map();
+    // Registry keys are uppercased, but a template's display label must keep the author's casing —
+    // `templateNames()` dedupes case-insensitively with this map winning the label.
+    this.templateDisplayNames = new Map();
   }
 
   register(map, key, value) {
@@ -2627,6 +2630,12 @@ export class RegistrySet {
     if (map.has(normalized)) throw new GridError("REGISTRY_DUPLICATE", `${key} is already registered`);
     map.set(normalized, value);
     return () => map.delete(normalized);
+  }
+
+  registerTemplate(name, template) {
+    const normalized = String(name).toUpperCase();
+    this.templateDisplayNames.set(normalized, String(name));
+    return this.register(this.templates, name, template);
   }
 
   registerFormulaFunction(name, fn, options = {}) {
@@ -2955,6 +2964,20 @@ export class MetadataStore {
   }
 }
 
+/** The last `{{[[table]]}}` child of a name block — the one a failed materialize just appended.
+ *  A partial materialize throws before its uid is returned, so the unwind locates it structurally. */
+function lastTableChildUid(blockUid) {
+  return [...(getTree(blockUid)?.children || [])].filter((child) => NATIVE_MARKER.test(child.string || "")).at(-1)?.uid || null;
+}
+
+/** Overwrite guard for `GridTemplateStore.save` — the "existing confirm dialog" of the codebase. */
+function confirmTemplateOverwrite(name) {
+  return showChoice(`A grid template named “${name}” already exists. Overwrite it?`, [
+    { label: "Overwrite", value: true, primary: true },
+    { label: "Cancel", value: false },
+  ]);
+}
+
 /**
  * Templates live as real, editable native tables on `[[roam/grid/templates]]`: a top-level
  * `roam-grid/template:: <name>` block whose first `{{[[table]]}}` child IS the template. Its layout
@@ -3030,14 +3053,34 @@ export class GridTemplateStore {
     return templateModelFromValue(serializeTemplateModel(live, entry.name));
   }
 
-  async save(name, model) {
+  async save(name, model, { confirmOverwrite = true } = {}) {
     this.reload();
     const cleanName = String(name || "").trim();
     if (!cleanName) throw new GridError("TEMPLATE_NAME", "Give this grid template a name");
     if (model.rowCount * model.colCount > getSetting("writes-native-budget")) throw new GridError("TEMPLATE_SIZE", "Saved templates must fit within the native-table write budget");
     const key = cleanName.toUpperCase();
     const existing = this.entries.get(key);
+    if (existing && confirmOverwrite) {
+      const proceed = await confirmTemplateOverwrite(cleanName);
+      if (!proceed) return null;
+    }
     const pageUid = await this.ensurePage();
+    const nameBlockUid = existing ? existing.nameBlockUid : await createBlock(pageUid, `${TEMPLATE_PREFIX} ${cleanName}`);
+    const originalString = existing?.legacyValue ? `${TEMPLATE_PREFIX} ${JSON.stringify(existing.legacyValue)}` : null;
+    if (existing) await updateBlock(nameBlockUid, `${TEMPLATE_PREFIX} ${cleanName}`);
+    const clean = templateModelFromValue(serializeTemplateModel(model, cleanName));
+    // The NEW table is materialized first; the old table is deleted only once its replacement
+    // exists, so a mid-save failure can never destroy the template it was replacing.
+    let tableUid = null;
+    try {
+      tableUid = await createNativeTableFromModel(clean, null, { parentUid: nameBlockUid });
+    } catch (error) {
+      const partialUid = tableUid || lastTableChildUid(nameBlockUid);
+      if (partialUid) await deleteBlock(partialUid).catch(() => {});
+      if (originalString != null) await updateBlock(nameBlockUid, originalString).catch(() => {});
+      if (globalThis.window) globalThis.window.__RG_U2_LAST_ERROR = String(error?.stack || error);
+      throw error;
+    }
     if (existing?.tableUid) {
       // The old table's session dies before its blocks, or its pull watch would echo our own
       // delete back as an external change. Metadata goes before the subtree so a crash between
@@ -3046,16 +3089,6 @@ export class GridTemplateStore {
       await runtime.metadata.remove(existing.tableUid);
       await deleteBlock(existing.tableUid);
     }
-    let nameBlockUid;
-    if (existing) {
-      // A legacy block becomes the v2 name block in place — uid and position are preserved.
-      nameBlockUid = existing.nameBlockUid;
-      await updateBlock(nameBlockUid, `${TEMPLATE_PREFIX} ${cleanName}`);
-    } else {
-      nameBlockUid = await createBlock(pageUid, `${TEMPLATE_PREFIX} ${cleanName}`);
-    }
-    const clean = templateModelFromValue(serializeTemplateModel(model, cleanName));
-    const tableUid = await createNativeTableFromModel(clean, null, { parentUid: nameBlockUid });
     this.entries.set(key, { key, name: cleanName, nameBlockUid, tableUid, legacyValue: null });
     return cleanName;
   }
@@ -3065,40 +3098,68 @@ export class GridTemplateStore {
  * One-time, idempotent rewrite of legacy v1 JSON template blocks into the v2 name-block + real
  * table shape. Re-detection is the idempotency: a run that finds no legacy entries performs zero
  * writes. Each entry is backed up to `[[roam/grid/metadata]]` BEFORE its block is rewritten, and
- * the materialized table is verified by a fresh tree read — a failed verify restores the original
- * JSON and stops the run, leaving the rest for the maintenance action.
+ * the materialized table is verified by a fresh tree read — a failed verify (or a throw) restores
+ * the original JSON, deletes the partial table, and moves on to the next entry rather than
+ * aborting the run.
  */
+let templateMigrationInFlight = false;
+
 export async function migrateLegacyTemplates() {
   const store = runtime.templates;
   if (!store || !runtime.metadata) return { legacy: 0, migrated: 0, skipped: 0 };
-  store.reload();
-  const legacy = [...store.entries.values()].filter((entry) => entry.legacyValue);
-  if (!legacy.length) return { legacy: 0, migrated: 0, skipped: 0 };
-  let migrated = 0;
-  let skipped = 0;
-  for (const entry of legacy) {
-    const model = templateModelFromValue(deepClone(entry.legacyValue));
-    if (model.rowCount * model.colCount + 3 > getSetting("writes-native-budget")) { skipped += 1; continue; }
-    const original = getTree(entry.nameBlockUid)?.string || `${TEMPLATE_PREFIX} ${JSON.stringify(entry.legacyValue)}`;
-    await createBlock(await runtime.metadata.ensurePage(), `${TEMPLATE_BACKUP_PREFIX} ${original.slice(TEMPLATE_PREFIX.length).trim()}`);
-    await updateBlock(entry.nameBlockUid, `${TEMPLATE_PREFIX} ${entry.name}`);
-    const tableUid = await createNativeTableFromModel(model, null, { parentUid: entry.nameBlockUid });
-    const tree = getTree(tableUid);
-    const cells = tableCells(tree).reduce((total, row) => total + row.length, 0);
-    if (!tree || cells !== model.rowCount * model.colCount) {
-      if (globalThis.window) globalThis.window.__RG_U2_LAST_ERROR = `Template migration verify failed for "${entry.name}": ${cells} cells, expected ${model.rowCount * model.colCount}`;
-      console.warn("[roam-grid] Template migration verify failed; restored the original JSON", entry.nameBlockUid);
-      // The block re-parses as legacy on the next run, so the partial table must not survive —
-      // otherwise every failed retry stacks another broken table under the same name block.
-      if (tableUid) await deleteBlock(tableUid).catch(() => {});
-      await updateBlock(entry.nameBlockUid, original);
-      break;
+  if (templateMigrationInFlight) return { legacy: 0, migrated: 0, skipped: 0, reentered: true };
+  templateMigrationInFlight = true;
+  try {
+    store.reload();
+    const legacy = [...store.entries.values()].filter((entry) => entry.legacyValue);
+    if (!legacy.length) return { legacy: 0, migrated: 0, skipped: 0 };
+    let migrated = 0;
+    let skipped = 0;
+    for (const entry of legacy) {
+      const model = templateModelFromValue(deepClone(entry.legacyValue));
+      if (model.rowCount * model.colCount + 3 > getSetting("writes-native-budget")) { skipped += 1; continue; }
+      const original = getTree(entry.nameBlockUid)?.string || `${TEMPLATE_PREFIX} ${JSON.stringify(entry.legacyValue)}`;
+      let tableUid = null;
+      try {
+        await createTemplateBackup(original);
+        await updateBlock(entry.nameBlockUid, `${TEMPLATE_PREFIX} ${entry.name}`);
+        tableUid = await createNativeTableFromModel(model, null, { parentUid: entry.nameBlockUid });
+        const tree = getTree(tableUid);
+        const cells = tableCells(tree).reduce((total, row) => total + row.length, 0);
+        if (!tree || cells !== model.rowCount * model.colCount) throw new Error(`Template migration verify failed for "${entry.name}": ${cells} cells, expected ${model.rowCount * model.colCount}`);
+      } catch (error) {
+        if (globalThis.window) globalThis.window.__RG_U2_LAST_ERROR = String(error?.stack || error);
+        console.warn("[roam-grid] Template migration failed; restored the original JSON", entry.nameBlockUid, error);
+        // A THROW (vs verify failure) strips the JSON with nothing restored unless the same
+        // delete-partial + restore-original unwind runs here — and one entry's failure must not
+        // abort the run for the entries after it. The block re-parses as legacy on the next run,
+        // so the partial table must not survive, or every retry stacks another broken table.
+        const partialUid = tableUid || lastTableChildUid(entry.nameBlockUid);
+        if (partialUid) await deleteBlock(partialUid).catch(() => {});
+        await updateBlock(entry.nameBlockUid, original).catch(() => {});
+        continue;
+      }
+      store.entries.set(entry.key, { key: entry.key, name: entry.name, nameBlockUid: entry.nameBlockUid, tableUid, legacyValue: null });
+      migrated += 1;
     }
-    store.entries.set(entry.key, { key: entry.key, name: entry.name, nameBlockUid: entry.nameBlockUid, tableUid, legacyValue: null });
-    migrated += 1;
+    if (migrated === 0 && legacy.length > skipped) {
+      toast("Template migration made no progress. See window.__RG_U2_LAST_ERROR for the failure.", "danger", 8000);
+    } else {
+      toast(`Migrated ${migrated} grid template(s) to editable tables on [[${TEMPLATE_PAGE}]]${skipped ? ` — ${skipped} skipped (over write budget)` : ""}`, "success", 8000);
+    }
+    return { legacy: legacy.length, migrated, skipped };
+  } finally {
+    templateMigrationInFlight = false;
   }
-  toast(`Migrated ${migrated} grid template(s) to editable tables on [[${TEMPLATE_PAGE}]]${skipped ? ` — ${skipped} skipped (over write budget)` : ""}`, "success", 8000);
-  return { legacy: legacy.length, migrated, skipped };
+}
+
+/** Backup with dedupe: a re-run against an already-backed-up record skips a second identical backup. */
+async function createTemplateBackup(original) {
+  const pageUid = await runtime.metadata.ensurePage();
+  const backupString = `${TEMPLATE_BACKUP_PREFIX} ${original.slice(TEMPLATE_PREFIX.length).trim()}`;
+  const tree = getTree(pageUid);
+  const exists = (tree?.children || []).some((block) => block.string === backupString);
+  if (!exists) await createBlock(pageUid, backupString);
 }
 
 class MutationQueue {
@@ -5903,9 +5964,23 @@ function patchChangesLayout(patch) {
   return (Array.isArray(patch) ? patch : [patch]).some((item) => item.op !== "set");
 }
 
+/** Case-insensitively deduped template list: registry display name wins the label over a saved
+ *  template that differs only by case, and resolution precedence is unchanged (registry first). */
+export function savedTemplateNameList(registry = runtime.registries, store = runtime.templates) {
+  const byKey = new Map();
+  for (const key of registry?.templates?.keys?.() || []) {
+    const display = registry.templateDisplayNames?.get(key) || key;
+    if (!byKey.has(key)) byKey.set(key, display);
+  }
+  for (const name of store?.list?.() || []) {
+    const key = String(name).toUpperCase();
+    if (!byKey.has(key)) byKey.set(key, name);
+  }
+  return [...byKey.values()].sort((a, b) => a.localeCompare(b));
+}
+
 function createPublicApi() {
   const registries = runtime.registries;
-  const templateNames = () => [...new Set([...registries.templates.keys(), ...(runtime.templates?.list() || [])])].sort((a, b) => a.localeCompare(b));
   return {
     version: VERSION,
     registerFormulaFunction: (name, fn, options) => registries.registerFormulaFunction(name, fn, options),
@@ -5914,12 +5989,12 @@ function createPublicApi() {
     registerImporter: (name, importer) => registries.register(registries.importers, name, importer),
     registerExporter: (name, exporter) => registries.register(registries.exporters, name, exporter),
     registerDataSource: (name, source) => registries.register(registries.dataSources, name, source),
-    registerTemplate: (name, template) => registries.register(registries.templates, name, template),
-    listTemplates: templateNames,
+    registerTemplate: (name, template) => registries.registerTemplate(name, template),
+    listTemplates: () => savedTemplateNameList(registries, runtime.templates),
     saveTemplate: async (name, tableUid = activeGridUid()) => {
       const model = tableUid ? runtime.sessions.get(tableUid)?.model || (runtime.metadata.has(tableUid) ? new NativeTableAdapter(tableUid).load() : null) : null;
       if (!model) throw new GridError("TEMPLATE_SOURCE", "Focus an enhanced native grid before saving a template");
-      return runtime.templates.save(name, model);
+      return runtime.templates.save(name, model, { confirmOverwrite: false });
     },
     createFromTemplate: async (name) => createNativeTableFromModel(await resolveTemplateModel(name)),
     getTableModel: (tableUid) => {
@@ -11112,7 +11187,8 @@ async function saveModelAsTemplate(model) {
   try {
     const name = await showPrompt("Save grid template as", model.getRaw(0, 0).replace(/[*_[\]]/g, "").slice(0, 80) || "My grid");
     if (!name) return;
-    await runtime.templates.save(name, model);
+    const saved = await runtime.templates.save(name, model);
+    if (saved == null) return; // the overwrite confirm was declined
     toast(`Saved “${name}” to [[${TEMPLATE_PAGE}]]`, "success", 5000);
   } catch (error) { toast(error.message, "danger", 8000); }
 }
@@ -11125,7 +11201,7 @@ async function saveFocusedTemplate() {
 
 async function newFromSavedTemplate() {
   try {
-    const names = [...new Set([...runtime.registries.templates.keys(), ...runtime.templates.list()])].sort((a, b) => a.localeCompare(b));
+    const names = savedTemplateNameList(runtime.registries, runtime.templates);
     if (!names.length) throw new GridError("TEMPLATE_EMPTY", "No grid templates are saved yet. Focus a grid and run “Save current grid as template” first.");
     const name = await showChoice("Insert grid template", names.map((value, index) => ({ label: value, value, primary: index === 0 })));
     if (!name) return;
@@ -11577,7 +11653,10 @@ function handleDomMutations(records) {
     for (const node of record.removedNodes || []) referencesChanged ||= containsRenderedBlockReference(node);
   }
   if (referencesChanged) for (const session of runtime.sessions.values()) session.scheduleReferenceCountRefresh();
-  if (!(records || []).some((record) => record.addedNodes?.length)) scheduleScan(document);
+  // Removal-only batches never trigger a full-document scan: `scheduleScan(document)` walks every
+  // block's textContent synchronously on every popover close / block delete / virtual scroll.
+  // Removals need no claiming — `cleanupDisconnectedViews` (run at the end of every real scan)
+  // disposes views whose hosts are gone — and a subsequent add in the next batch scans normally.
 }
 
 /** Portal subtrees are scanned added-node-first only — they must never fall back to a document scan. */
@@ -11655,7 +11734,12 @@ async function scanMounts() {
     try {
       const block = findBlockElement(uid); if (!block) continue;
       const marker = block.querySelector(".rm-block__input") || block.firstElementChild;
-      const store = await new LargeGridStore(uid).initialize(); const view = new LargeGridView({ host: block, store, markerElement: marker });
+      const store = await new LargeGridStore(uid).initialize();
+      // An unload can land during the initialize await; mounting a live view (+listeners +timers)
+      // into a torn-down runtime would leak it. The metadata re-check is the liveness probe.
+      if (!runtime.metadata || !runtime.extensionAPI) continue;
+      const view = new LargeGridView({ host: block, store, markerElement: marker });
+      if (!runtime.metadata) { try { view.dispose(); } catch { /* mid-unload */ } continue; }
       view.root.dataset.roamGridUid = uid; view.root.__rgView = view; runtime.largeMounts.set(uid, view);
     } catch (error) { console.error("[roam-grid] Large-grid mount failed", uid, error); toast(`Roam Grid could not mount ${uid}: ${error.message}`, "danger", 10000); }
     finally { mounting.delete(uid); }
@@ -11680,10 +11764,21 @@ function registerCommands(extensionAPI) {
     ["Roam Grid: Merge", () => commandOnActive("mergeSelection", "merge")],
     ["Roam Grid: Unmerge", () => commandOnActive("unmergeSelection", "unmerge")],
   ];
+  const labels = [];
   for (const [label, callback] of commands) {
     extensionAPI.ui.commandPalette.addCommand({ label, callback });
     extensionAPI.ui.slashCommand.addCommand({ label, callback });
+    labels.push(label);
   }
+  // Roam does NOT unregister commands on disable/reload — without this disposer every
+  // enable→disable cycle duplicates every palette/slash entry, and invoking a stale one while
+  // disabled throws into a gated-inert toast. `onunload` runs this via runtime.disposers.
+  runtime.disposers.push(() => {
+    for (const label of labels) {
+      try { extensionAPI.ui.commandPalette.removeCommand(label); } catch { /* registry already gone */ }
+      try { extensionAPI.ui.slashCommand.removeCommand(label); } catch { /* registry already gone */ }
+    }
+  });
 }
 
 /** Rewrites the display flags of every grid already on screen, from `displayRestampValues` rather than
@@ -11735,7 +11830,8 @@ export async function runMaintenanceAction(key, { extensionAPI = runtime.extensi
   if (key === "maintenance-migrate-templates") {
     try {
       const result = await migrateLegacyTemplates();
-      if (!result.legacy) toast("No legacy grid templates to migrate.", "warning");
+      if (result.reentered) toast("Template migration is already running.", "warning");
+      else if (!result.legacy) toast("No legacy grid templates to migrate.", "warning");
     } catch (error) {
       if (globalThis.window) globalThis.window.__RG_U2_LAST_ERROR = String(error?.stack || error);
       toast(`Template migration failed: ${error.message}`, "danger", 8000);
@@ -11762,18 +11858,24 @@ export async function runMaintenanceAction(key, { extensionAPI = runtime.extensi
 export async function initializeSettings(extensionAPI, { storage = globalThis.localStorage } = {}) {
   const stored = { ...readGraphSettings(extensionAPI) };
   const plan = planSettingsMigration(stored[SETTINGS_VERSION_KEY], stored);
+  // The legacy sidebar switch was device-scoped, so its value lives in the localStorage shadow:
+  // migrate the shadow BEFORE the seeding loop. Seeding first would stamp the graph with the
+  // compose-mode default, then the migrated device value would shadow it only until a "Forget
+  // this device's overrides" emptied the shadow and silently reverted the migration.
+  const deviceMigration = planDeviceSettingsMigration(readDeviceSettings(storage));
+  if (deviceMigration.changed) writeDeviceSettings(deviceMigration.values, storage);
   if (extensionAPI.settings.canSet !== false) {
     for (const [key, value] of plan.writes) { await extensionAPI.settings.set(key, value); stored[key] = value; }
     for (const descriptor of Object.values(SETTINGS)) {
       if (descriptor.stage === "pending" || stored[descriptor.key] != null) continue;
-      await extensionAPI.settings.set(descriptor.key, descriptor.default);
-      stored[descriptor.key] = descriptor.default;
+      // Seed the graph from the migrated device value when the graph has none, so both layers
+      // agree after a device migration — otherwise a later forget-device would revert it.
+      const migratedDevice = descriptor.scope === "device" ? deviceMigration.values[descriptor.key] : undefined;
+      const seed = migratedDevice != null ? coerceSetting(descriptor, migratedDevice) : descriptor.default;
+      await extensionAPI.settings.set(descriptor.key, seed);
+      stored[descriptor.key] = seed;
     }
   }
-  // The legacy sidebar switch was device-scoped, so its value lives in the localStorage shadow:
-  // migrate the shadow before the cache reads it. Storage-only — works when the graph forbids writes.
-  const deviceMigration = planDeviceSettingsMigration(readDeviceSettings(storage));
-  if (deviceMigration.changed) writeDeviceSettings(deviceMigration.values, storage);
   refreshSettingsCache(extensionAPI, storage);
   // Roam renders each row's value once, so anything that rewrites values behind the panel's back
   // has to hand it a fresh config rather than mutating the live rows.
@@ -11829,6 +11931,11 @@ async function onunload() {
   runtime.guardStyle?.remove(); runtime.guardStyle = null;
   for (const dispose of runtime.disposers.splice(0)) try { dispose(); } catch { /* no-op */ }
   cancelRecentsWarm();
+  // Session health is per load, never persisted: a reload must start from a clean slate instead of
+  // carrying a graph's mount-failure or budget flags across the unload boundary.
+  resetNativeEditorHealth();
+  resetRoamRecents();
+  resetSuggestionRendering();
   clearTrackedTimers();
   document.querySelectorAll(".rg-toasts,.rg-dialog-overlay,.rg-context-menu").forEach((element) => {
     if (element.__rgDismiss) element.__rgDismiss(); else element.remove();

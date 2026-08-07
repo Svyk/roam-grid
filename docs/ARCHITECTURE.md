@@ -706,6 +706,6 @@ rendered panel separately.
 The Depot `onload` installs the pre-paint guard, registers commands, settings,
 the public API, shared sessions, pull watches, the `.roam-app` added-node
 observer, and the `<body>` portal observer. `onunload` removes views, sessions,
-listeners, observers, portal observers, dialogs, guards, and the public API. The
-native table becomes visible immediately because suppression exists only while
-the enhanced UID remains actively claimed.
+commands, listeners, observers, portal observers, dialogs, guards, and the public
+API. The native table becomes visible immediately because suppression exists only
+while the enhanced UID remains actively claimed.

@@ -221,13 +221,15 @@ mouse-out is not a safe place to edit.
 
 **Settings → Roam Depot → Roam Grid.** Forty-eight controls in eight groups —
 Writes, Editing, Appearance, Sizing, New grids, Large grids, Comments, Ranges —
-plus four maintenance actions: apply display defaults to open grids, forget this
-device's overrides, clear local caches, and reset every setting.
+plus five maintenance actions: apply display defaults to open grids, forget this
+device's overrides, clear local caches, migrate legacy grid templates, and reset
+every setting.
 
 Most settings sync with your graph. Presentation choices that are properly
-per-device — toolbar density, theme, maximum grid width, large-grid overscan,
-chunk cache size, and how comment threads are composed and opened — are
-stored on the device instead.
+per-device — toolbar density, theme, notification level, maximum grid width,
+large-grid overscan, whether chunks are cached on this device, chunk cache size,
+and how comment threads are composed and opened — are stored on the device
+instead.
 
 Two settings deserve a note. **Capture grid undo history** (on) is what makes
 `Cmd/Ctrl-Z` reverse grid edits. **Permanently delete superseded large-grid

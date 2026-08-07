@@ -355,6 +355,21 @@ test("initializeSettings migrates the device shadow even when the graph forbids 
   assert.equal(fake.counters.set, 0, "canSet:false still means zero graph writes");
 });
 
+test("device migration runs before seeding, so graph and shadow agree and forget-device cannot revert it", async (t) => {
+  t.after(() => { clearRegistries(); settingsCache.clear(); });
+  clearRegistries();
+  const fake = makeApi({ values: { settingsVersion: 2 } });
+  const storage = makeStorage({ [deviceSettingsKey()]: '{"comments-open-in-sidebar":true}' });
+  await initializeSettings(fake.api, { storage });
+  const written = new Map(fake.writes);
+  assert.equal(written.get("comments-compose-mode"), "Right sidebar", "the migrated device value seeds the graph, not the default");
+  assert.equal(getSetting("comments-compose-mode"), "Right sidebar", "graph and shadow agree right after seeding");
+
+  await runMaintenanceAction("maintenance-forget-device", { extensionAPI: fake.api, storage });
+  assert.deepEqual(readDeviceSettings(storage), {}, "the device shadow is emptied");
+  assert.equal(getSetting("comments-compose-mode"), "Right sidebar", "forgetting the device falls back to the migrated graph seed, not the default");
+});
+
 test("the compose-mode panel row is a select with exactly the three modes", () => {
   const rows = buildSettingsPanelConfig().settings;
   const row = rows.find((candidate) => candidate.id === "comments-compose-mode");
