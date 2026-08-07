@@ -95,6 +95,8 @@ const TODAYS_CONSTANTS = {
   "comments-compose-mode": "In place",
   "ranges-live-references": true,
   "ranges-max-rendered-cells": 2000,
+  "images-cell-media": true,
+  "images-max-height": 180,
   "large-cache-enabled": true,
   "large-cache-max-mb": 256,
   "large-verify-checksums": true,
@@ -113,6 +115,8 @@ const PENDING_KEYS = [];
 const COMMENT_KEYS = ["comments-enabled", "comments-affordance-trigger", "comments-badges", "comments-compose-mode"];
 
 const RANGE_KEYS = ["ranges-live-references", "ranges-max-rendered-cells"];
+
+const IMAGE_KEYS = ["images-cell-media", "images-max-height"];
 
 const LARGE_STORAGE_KEYS = ["large-cache-enabled", "large-cache-max-mb", "large-verify-checksums", "large-gc-orphans"];
 
@@ -543,6 +547,10 @@ test("the panel omits pending rows but the schema still resolves them", async ()
     assert.equal(SETTINGS[key].stage, "live");
   }
   assert.equal(SETTINGS["ranges-read-only"], undefined, "a setting whose true branch cannot exist must not be declared");
+  for (const key of IMAGE_KEYS) {
+    assert.ok(ids.includes(key), `${key} backs a shipped feature and must be rendered`);
+    assert.equal(SETTINGS[key].stage, "live");
+  }
   for (const key of COMMENT_KEYS) {
     assert.ok(ids.includes(key), `${key} ships with the comments feature and must be rendered`);
     assert.equal(SETTINGS[key].stage, "live");
@@ -839,6 +847,46 @@ test("row and column labels are the AND of the global setting and the grid's own
   refreshSettingsCache(makeApi().api, makeStorage());
   assert.equal(headersVisible(undefined), true, "an absent per-grid flag is explicitly true everywhere else");
   assert.equal(headersVisible(null), true);
+});
+
+test("the Images rows are live graph settings that repaint decor, not re-render grids", () => {
+  const media = SETTINGS["images-cell-media"];
+  assert.ok(media, "the descriptor exists in the schema");
+  assert.equal(media.group, "Images");
+  assert.equal(media.control, "switch");
+  assert.equal(media.type, "bool");
+  assert.equal(media.default, true);
+  assert.equal(media.scope, "graph");
+  assert.equal(media.apply, "immediate");
+  assert.equal(media.stage, "live");
+  const calls = [];
+  media.onView({ refreshMediaDecor: () => calls.push("decor"), render: () => calls.push("render") });
+  assert.deepEqual(calls, ["decor"], "the view walk goes through refreshMediaDecor so an excerpt can repaint in place");
+  media.onLarge({ scheduleRender: () => calls.push("large") });
+  assert.deepEqual(calls, ["decor", "large"]);
+
+  const height = SETTINGS["images-max-height"];
+  assert.equal(height.group, "Images");
+  assert.equal(height.control, "input");
+  assert.equal(height.type, "int");
+  assert.equal(height.default, 180);
+  assert.equal(height.min, 48);
+  assert.equal(height.max, 480);
+  assert.equal(height.scope, "graph");
+  assert.equal(height.apply, "immediate");
+  assert.equal(coerceSetting(height, 10), 48, "below min clamps to min");
+  assert.equal(coerceSetting(height, 999), 480, "above max clamps to max");
+  assert.equal(coerceSetting(height, "garbage"), 180);
+  const heightCalls = [];
+  height.onView({ refreshMediaDecor: () => heightCalls.push("decor") });
+  height.onLarge({ scheduleRender: () => heightCalls.push("large") });
+  assert.deepEqual(heightCalls, ["decor", "large"], "a new cap must reach mounted cells without a rebuild");
+
+  const row = buildSettingsPanelConfig().settings.find((candidate) => candidate.id === "images-cell-media");
+  assert.ok(row, "the row is rendered in the panel");
+  assert.equal(row.name, "Images — Render images in cells");
+  assert.equal(row.className, "rg-settings-images");
+  assert.equal(row.action.type, "switch");
 });
 
 test("the header setting reaches live views through refreshHeaders, and a range excerpt absorbs it", () => {

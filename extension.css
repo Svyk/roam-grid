@@ -645,11 +645,87 @@ body.roam-body.dark .rg-portal {
 .rg-cell img {
   display: block;
   max-width: 100%;
-  max-height: 180px;
+  max-height: var(--rg-img-max-h, 180px);
   margin: 2px auto;
   border-radius: 4px;
   object-fit: contain;
-  cursor: zoom-in;
+}
+
+/* LP-1: Roam persists the resize width as an INLINE width on these wrapper divs, and a sized
+   wrapper defeats max-width on the img inside it — the cap has to land on the wrapper. The
+   .rm-*/.react-* selectors are allowed here only as descendants of the .rg-cell--media scope. */
+.rg-cell--media .rm-inline-img__resize,
+.rg-cell--media .react-resizable {
+  width: auto !important;
+  max-width: 100% !important;
+}
+
+/* Roam's hover edit button, resize handle, and extraction icon all write block markdown, which is
+   meaningless from a grid cell — hidden inside media cells only. */
+.rg-cell--media .rm-inline-img__resize--hover,
+.rg-cell--media .react-resizable-handle,
+.rg-cell--media .image-extraction-icon-container {
+  display: none !important;
+}
+
+/* A media cell's content wraps block-level image divs; display:block kills the inline baseline gap. */
+.rg-cell--media > .rg-cell-content {
+  display: block;
+}
+
+.rg-cell--img-fit-contain img.rm-inline-img {
+  max-width: 100%;
+  max-height: var(--rg-img-max-h, 180px);
+  object-fit: contain;
+}
+
+.rg-cell--img-fit-cover img.rm-inline-img {
+  width: 100%;
+  height: var(--rg-img-max-h, 180px);
+  max-height: none;
+  object-fit: cover;
+}
+
+.rg-cell--img-fit-original img.rm-inline-img {
+  max-width: none;
+  max-height: none;
+  object-fit: initial;
+}
+
+.rg-cell--img-strip .rm-inline-img__resize {
+  display: block;
+}
+
+.rg-img-fallback {
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  max-width: 100%;
+  margin: 2px 4px 2px 0;
+  padding: 1px 6px;
+  overflow: hidden;
+  color: var(--rg-muted);
+  background: var(--rg-header);
+  border: 1px dashed var(--rg-border);
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rg-img-clip-chip {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  z-index: 5;
+  padding: 0 6px;
+  color: var(--rg-muted);
+  background: var(--rg-bg);
+  border: 1px solid var(--rg-border);
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 16px;
 }
 
 .rg-cell a,

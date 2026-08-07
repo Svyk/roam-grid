@@ -75,6 +75,7 @@ const DEFAULT_NEW_GRID_ROWS = 100;
 const DEFAULT_NEW_GRID_COLS = 26;
 const DEFAULT_LARGE_OVERSCAN_ROWS = 8;
 const DEFAULT_RANGE_RENDERED_CELLS = 2000;
+const DEFAULT_IMAGE_MAX_HEIGHT = 180;
 const DEFAULT_LARGE_CACHE_MB = 256;
 const COMMENT_TRIGGER_HOVER = "Hover";
 const COMMENT_TRIGGER_MODIFIER = "Cmd/Ctrl + hover";
@@ -165,6 +166,8 @@ const SETTING_DESCRIPTORS = [
   { key: COMMENT_COMPOSE_MODE_KEY, group: "Comments", name: "Composing and opening threads", description: "Where a new comment is written and where a cell's thread opens. “In place” opens the inline Comments panel with the cursor in an empty comment, ready to type. “Comment box” asks in a dialog first — the pre-0.12 behaviour. “Right sidebar” sends the thread to the right sidebar and starts the comment there, the way Roam's own comment button works.", control: "select", type: "enum", default: COMMENT_COMPOSE_IN_PLACE, items: [COMMENT_COMPOSE_IN_PLACE, COMMENT_COMPOSE_BOX, COMMENT_COMPOSE_SIDEBAR], scope: "device", apply: "immediate", stage: "live" },
   { key: "ranges-live-references", group: "Ranges", name: "Render live range references", description: "Render {{roam-grid-range: …}} components as a live view of the source cells. With this off the component stays as its raw text; views already on screen keep rendering until Roam next redraws their block.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
   { key: "ranges-max-rendered-cells", group: "Ranges", name: "Maximum cells in a rendered range", description: "How many cells a rendered range may paint. A larger range renders whole rows up to this many cells and says so in its caption.", control: "input", type: "int", default: DEFAULT_RANGE_RENDERED_CELLS, min: 1, max: 50000, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "images-cell-media", group: "Images", name: "Render images in cells", description: "Render ![image](url) embeds inside cells, capped to the cell instead of overflowing it, with a fallback chip naming the image when it cannot load. Off restores the exact pre-image rendering.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshMediaDecor?.(), onLarge: (mount) => mount.scheduleRender?.() },
+  { key: "images-max-height", group: "Images", name: "Maximum image height in cells (px)", description: "Tallest an image may render inside a cell. Larger images scale down to fit; a small image is never enlarged.", control: "input", type: "int", default: DEFAULT_IMAGE_MAX_HEIGHT, min: 48, max: 480, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshMediaDecor?.(), onLarge: (mount) => mount.scheduleRender?.() },
   { key: "large-cache-enabled", group: "Large grids", name: "Cache large-grid chunks on this device", description: "Keep downloaded chunks in IndexedDB so reopening a large grid is instant. Takes effect the next time Roam Grid loads.", control: "switch", type: "bool", default: true, scope: "device", apply: "next-op", stage: "live" },
   { key: "large-cache-max-mb", group: "Large grids", name: "Chunk cache size (MB)", description: "How much device storage the large-grid chunk cache may use.", control: "input", type: "int", default: DEFAULT_LARGE_CACHE_MB, min: 8, max: 4096, scope: "device", apply: "next-op", stage: "live" },
   { key: "large-verify-checksums", group: "Large grids", name: "Verify chunk checksums", description: "Re-hash each downloaded chunk before trusting it.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
@@ -488,6 +491,21 @@ export function repaintFormulaTint(cells, gridFlag) {
     cell?.classList?.toggle("rg-cell--formula", enabled && raw.startsWith("=") && !raw.startsWith("=="));
   }
   return enabled;
+}
+
+/**
+ * Media-decor equivalent of the tint repaint: re-resolves every mounted cell's image classes,
+ * height cap, and chips from the live settings — no re-render, no formula evaluation, no model
+ * write. Cell keys are the `row:col` form both grid classes already use.
+ */
+export function repaintMediaDecor(cells, model) {
+  let visited = 0;
+  for (const [key, cell] of cells?.entries?.() || []) {
+    const [row, col] = String(key).split(":").map(Number);
+    applyCellImageLayout(cell, model, row, col);
+    visited += 1;
+  }
+  return visited;
 }
 
 /**
@@ -6833,6 +6851,7 @@ function activateRichHost(content, host, token) {
   for (const child of [...(content.childNodes || content.children || [])]) if (child !== host) child.remove();
   host.hidden = false;
   host.dataset.rgRichActive = "true";
+  wireRichHostImages(content, host);
 }
 
 /** `fallbackText` defaults to the raw string, which is what a cell wants. A suggestion row passes its
@@ -7162,6 +7181,172 @@ export function roamSuggestionPlainText(raw) {
     .replace(/\s+/gu, " ")
     .trim();
 }
+
+/**
+ * Every `![alt](url)` embed in a cell's raw markdown, with `start`/`end` delimiting the whole
+ * `![…](…)` span so a caller can splice it back out. The pattern matches `roamSuggestionPlainText`'s
+ * image stripper exactly: no newlines inside either bracket pair, and a `(` ends the URL.
+ */
+export function cellImageMarkdown(raw) {
+  const images = [];
+  const pattern = /!\[([^\]\n]*)\]\(([^)\n]*)\)/gu;
+  for (const match of String(raw ?? "").matchAll(pattern)) {
+    images.push({ alt: match[1], url: match[2], start: match.index, end: match.index + match[0].length });
+  }
+  return images;
+}
+
+/**
+ * Cell image layout resolution. IMG-1 reads the two global settings only and always resolves the
+ * default fit/layout; IMG-3 layers the per-table `model.imageLayout` (cell → column → default)
+ * UNDER this seam, so the signature and return shape are what both generations code against.
+ */
+export function resolveImageLayout(model, row, col) {
+  return {
+    enabled: getSetting("images-cell-media") !== false,
+    maxHeight: clamp(Math.floor(Number(getSetting("images-max-height"))) || DEFAULT_IMAGE_MAX_HEIGHT, 48, 480),
+    fit: "contain",
+    layout: "inline",
+  };
+}
+
+/** Natural sizes measured from Roam's own rendered `<img>` (LP-4: decryption is transparent because
+ *  renderString owns the element). Session-scoped, never persisted; cleared on unload. */
+export const imageDimensionCache = new Map();
+
+const IMAGE_FIT_CLASSES = ["rg-cell--img-fit-contain", "rg-cell--img-fit-cover", "rg-cell--img-fit-original"];
+const IMAGE_LAYOUT_CLASSES = ["rg-cell--img-inline", "rg-cell--img-strip"];
+
+function clearCellImageChips(cell) {
+  for (const chip of cell?.querySelectorAll?.(".rg-img-fallback,.rg-img-clip-chip") || []) chip.remove();
+}
+
+/** The `<img>` nodes Roam rendered inside this content's live rich hosts. */
+function cellRichImages(content) {
+  const images = [];
+  for (const host of content?.__rgRichHosts || []) {
+    if (host.__rgDisposed) continue;
+    for (const img of host.querySelectorAll?.("img") || []) images.push(img);
+  }
+  return images;
+}
+
+/** LP-5: a dead URL settles as `complete === true` with zero natural size, and the error event can
+ *  fire before the listener exists — both shapes must read as broken. */
+function richImageBroken(img) {
+  if (img.__rgBroken) return true;
+  return img.complete === true && !(Number(img.naturalWidth) > 0);
+}
+
+/**
+ * Rebuilds the cell-level chips from live image state: one `.rg-img-fallback` per broken image
+ * (alt or "image", url in the title), and a `.rg-img-clip-chip` ("+n hidden") when a height-fixed
+ * cell's content overflows and whole images sit below the fold. Chips are appended to the CELL so
+ * Roam's reconciliation of the rich host never sees them. Idempotent: clears, then re-derives.
+ */
+function syncCellImageChips(cell, content) {
+  clearCellImageChips(cell);
+  if (!cell?.classList?.contains?.("rg-cell--media")) return;
+  const images = cellRichImages(content);
+  for (const img of images) {
+    if (!richImageBroken(img)) continue;
+    const label = String(img.alt || "").trim() || "image";
+    const chip = document.createElement("span");
+    chip.className = "rg-img-fallback";
+    chip.textContent = `⚠ ${label}`;
+    chip.setAttribute("role", "img");
+    chip.setAttribute("aria-label", `Image failed to load: ${label}`);
+    chip.title = String(img.currentSrc || img.src || "");
+    cell.appendChild(chip);
+  }
+  const cellHeight = Number(cell.clientHeight) || 0;
+  const contentHeight = Number(content?.scrollHeight) || 0;
+  if (!cellHeight || !images.length || contentHeight <= cellHeight + 1) return;
+  const hiddenCount = images.filter((img) => Number(img.offsetTop || 0) >= cellHeight).length;
+  if (!hiddenCount) return;
+  const chip = document.createElement("span");
+  chip.className = "rg-img-clip-chip";
+  chip.textContent = `+${hiddenCount} hidden`;
+  chip.title = `${hiddenCount} image${hiddenCount === 1 ? "" : "s"} clipped by the fixed row height`;
+  cell.appendChild(chip);
+}
+
+/**
+ * The decoration half of the media feature: toggles `rg-cell--media` plus the fit/layout classes
+ * and the `--rg-img-max-h` custom property from `resolveImageLayout`, then re-derives chips. Reads
+ * raw from the model when one is passed, else from `dataset.rgRaw` (the large-grid path, where the
+ * render already peeked the value). Off, plain, and formula cells get stripped decor — which is a
+ * DOM no-op when nothing was ever applied, so the kill switch restores exact pre-feature rendering.
+ */
+export function applyCellImageLayout(cell, model, row, col) {
+  if (!cell?.classList) return false;
+  const layout = resolveImageLayout(model, row, col);
+  const raw = String(model?.getRaw?.(row, col) ?? cell.dataset?.rgRaw ?? "");
+  const formula = raw.startsWith("=") && !raw.startsWith("==");
+  const active = layout.enabled && !formula && cellImageMarkdown(raw).length > 0;
+  cell.classList.toggle("rg-cell--media", Boolean(active));
+  cell.classList.remove(...IMAGE_FIT_CLASSES, ...IMAGE_LAYOUT_CLASSES);
+  if (!active) {
+    cell.style?.removeProperty?.("--rg-img-max-h");
+    clearCellImageChips(cell);
+    return false;
+  }
+  cell.style?.setProperty?.("--rg-img-max-h", `${layout.maxHeight}px`);
+  cell.classList.add(`rg-cell--img-fit-${layout.fit}`, `rg-cell--img-${layout.layout}`);
+  const content = cell.querySelector?.(".rg-cell-content");
+  if (content) syncCellImageChips(cell, content);
+  return true;
+}
+
+/** Hint attributes only — the React-owned host subtree is never restructured. */
+function noteRichImage(img) {
+  try {
+    img.loading = "lazy";
+    img.decoding = "async";
+    if (!img.title) img.title = String(img.alt || "");
+    if (img.complete && Number(img.naturalWidth) > 0) {
+      const url = String(img.currentSrc || img.src || "");
+      if (url) imageDimensionCache.set(url, { w: img.naturalWidth, h: img.naturalHeight });
+    }
+  } catch (error) {
+    if (globalThis.window) globalThis.window.__RG_IMG_LAST_ERROR = String(error?.stack || error);
+  }
+}
+
+/**
+ * LP-1/LP-5 wiring for Roam-rendered cell images. Installs ONE idempotent capture-phase
+ * load+error pair on the content div (neither event bubbles, both capture), records natural sizes,
+ * and drives the cell chips. Called from `activateRichHost` ONLY for hosts inside a `.rg-cell` —
+ * a suggestion-row host parked in the render cache is never wired. The listener lives on the
+ * cell-owned content node, so it dies with the cell; there is nothing else to dispose.
+ */
+export function wireRichHostImages(content, host, cell = content?.closest?.(".rg-cell")) {
+  if (!content || !cell) return false;
+  if (!content.__rgImgWired) {
+    content.__rgImgWired = true;
+    const onMediaEvent = (event) => {
+      const img = event.target;
+      if (!img || String(img.tagName || "").toUpperCase() !== "IMG") return;
+      try {
+        if (event.type === "error") img.__rgBroken = true;
+        else noteRichImage(img);
+        if (richImageBroken(img)) img.__rgBroken = true;
+        syncCellImageChips(content.closest?.(".rg-cell") || cell, content);
+      } catch (error) {
+        if (globalThis.window) globalThis.window.__RG_IMG_LAST_ERROR = String(error?.stack || error);
+      }
+    };
+    content.addEventListener("load", onMediaEvent, true);
+    content.addEventListener("error", onMediaEvent, true);
+  }
+  for (const img of host?.querySelectorAll?.("img") || []) {
+    noteRichImage(img);
+    if (richImageBroken(img)) img.__rgBroken = true;
+  }
+  syncCellImageChips(cell, content);
+  return true;
+}
+
 
 /** Roam's own uid shape: nine characters of `[A-Za-z0-9_-]`. Custom uids exist and are longer, which
  *  is why this only ever ADDS a row rather than deciding what the query means. */
@@ -9717,6 +9902,7 @@ export class GridView {
       } catch (error) { console.warn("[roam-grid] Cell renderer failed", error); }
     }
     renderStableCellContent(content, { raw, value, formula, renderRich: paintRichCellContent });
+    applyCellImageLayout(cell, this.model, row, col);
     this.updateCellReferenceCount(cell, this.model.getCell(row, col)?.uid);
   }
 
@@ -10671,6 +10857,12 @@ export class GridView {
     return repaintFormulaTint(this.cells, this.model?.colorFormulaCells);
   }
 
+  /** Re-derives media classes, the height cap, and chips on mounted cells from the live settings —
+   *  the same in-place repaint contract as the tint mask, so a settings flip costs no re-render. */
+  refreshMediaDecor() {
+    return repaintMediaDecor(this.cells, this.model);
+  }
+
   /** The single source of effective header visibility for every layout read site in this class. */
   headersOn() {
     return headersVisible(this.model?.showHeaders);
@@ -10835,7 +11027,9 @@ export class RangeGridView {
     cell.dataset.rgRaw = raw;
     cell.classList.toggle("rg-cell--formula", formula && formulaTintEnabled(this.model.colorFormulaCells));
     cell.classList.toggle("rg-cell--error", formula && String(value).startsWith("#"));
-    return renderStableCellContent(content, { raw, value, formula, renderRich: paintRichCellContent });
+    const changed = renderStableCellContent(content, { raw, value, formula, renderRich: paintRichCellContent });
+    applyCellImageLayout(cell, this.model, row, col);
+    return changed;
   }
 
   render() {
@@ -10892,6 +11086,12 @@ export class RangeGridView {
 
   refreshFormulaTint() {
     return repaintFormulaTint(this.cells, this.model?.colorFormulaCells);
+  }
+
+  /** Same in-place media repaint as the full grid; a range excerpt holds the same `row:col` cell
+   *  map, so the shared walk just works. */
+  refreshMediaDecor() {
+    return repaintMediaDecor(this.cells, this.model);
   }
 
   /** A range excerpt is always `rg-grid--clean` and paints no axis gutters, so the header mask has
@@ -11225,6 +11425,7 @@ export class LargeGridView {
     const key = `${row}:${col}`; const token = (this.cellValueTokens.get(cell) || 0) + 1; this.cellValueTokens.set(cell, token);
     const formula = raw.startsWith("=") && !raw.startsWith("=="); const content = ensureCellContent(cell);
     cell.dataset.rgRaw = raw; cell.classList.toggle("rg-cell--formula", formula && formulaTintEnabled(this.store.manifest.colorFormulaCells));
+    applyCellImageLayout(cell, null, row, col);
     if (formula) {
       const value = await engine.evaluateCell(row, col);
       if (this.cellValueTokens.get(cell) !== token || this.cells.get(key) !== cell) return;
@@ -12201,6 +12402,7 @@ async function onunload() {
   resetOrphanCollection();
   clearUndoHistories();
   settingsCache.clear();
+  imageDimensionCache.clear();
   runtime.guardStyle?.remove(); runtime.guardStyle = null;
   for (const dispose of runtime.disposers.splice(0)) try { dispose(); } catch { /* no-op */ }
   cancelRecentsWarm();
