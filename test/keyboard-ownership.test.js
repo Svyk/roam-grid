@@ -806,6 +806,39 @@ test("focusing the block Roam mounts over a cell releases the grid, and committi
   } finally { clearTimeout(session.saveTimer); uninstall(); session.dispose(); }
 });
 
+test("commit refocuses the grid and reclaims the keyboard before the block write lands", async (t) => {
+  const dom = installDom();
+  installOverlayFrames(t);
+  releaseKeyboard();
+  const uninstall = installKeyboardOwnership();
+  const { view, cell, session } = makeGrid(dom);
+  const record = installOverlayRoam({ a1: "1" });
+  // The controller's finish closure deliberately does NOT re-claim here: the assertion is that
+  // commit() itself restores focus and ownership before the write round-trip, so the
+  // type→Enter→type loop loses no keystrokes to <body>.
+  view.editorController = { onFinish: async () => {} };
+  const overlay = new NativeCellEditorOverlay(view, { onFinish: (result) => view.editorController?.onFinish?.(result) });
+  view.nativeOverlay = overlay;
+  const order = [];
+  const update = globalThis.window.roamAlphaAPI.data.block.update;
+  globalThis.window.roamAlphaAPI.data.block.update = async (args) => { order.push("write"); return update(args); };
+  try {
+    const started = await overlay.start({ row: 0, col: 0, cell, uid: "a1", raw: "1" });
+    assert.ok(started);
+    dom.fireFocusIn(overlay.textarea);
+    assert.equal(keyboardOwner(), null, "Roam owns the keyboard while its editor is focused");
+    const focuses = view.root.focusCount || 0;
+    const rootFocus = view.root.focus.bind(view.root);
+    view.root.focus = (...args) => { order.push("focus"); rootFocus(...args); };
+    overlay.textarea.value = "typed";
+    await overlay.commit([1, 0]);
+    assert.deepEqual(order.slice(0, 2), ["focus", "write"], "focus returns to the grid immediately after teardown, before the write resolves");
+    assert.equal((view.root.focusCount || 0) > focuses, true);
+    assert.equal(keyboardOwner()?.view, view, "the grid owns the keyboard again even before onFinish runs");
+    assert.deepEqual(record.updates, [{ uid: "a1", string: "typed" }]);
+  } finally { clearTimeout(session.saveTimer); uninstall(); session.dispose(); }
+});
+
 test("beginEdit on another view finishes a live native overlay before mounting a second one", async () => {
   const dom = installDom();
   releaseKeyboard();

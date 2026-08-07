@@ -173,16 +173,19 @@ test("the split-remainder repair plan recognises exactly the damage pinned fact 
   const split = rawTree();
   split.children[1].string = "A";
   split.children[1].children.push({ uid: "strayblok", string: "lpha", order: 1, children: [] });
-  assert.deepEqual(nativeOverlayStrayRepair(base, split, "row000002"), { cellUid: "row000002", strayUid: "strayblok", text: "lpha" });
+  assert.deepEqual(nativeOverlayStrayRepair(base, split, "row000002"), { cellUid: "row000002", strays: [{ uid: "strayblok", text: "lpha" }] });
 
   const empty = rawTree();
   empty.children[1].children.push({ uid: "strayblok", string: "", order: 1, children: [] });
-  assert.deepEqual(nativeOverlayStrayRepair(base, empty, "row000002"), { cellUid: "row000002", strayUid: "strayblok", text: "" });
+  assert.deepEqual(nativeOverlayStrayRepair(base, empty, "row000002"), { cellUid: "row000002", strays: [{ uid: "strayblok", text: "" }] });
 
   const twoStrays = rawTree();
   twoStrays.children[1].children.push({ uid: "strayblok", string: "lpha", order: 1, children: [] });
   twoStrays.children[1].children.push({ uid: "strayblo2", string: "more", order: 2, children: [] });
-  assert.equal(nativeOverlayStrayRepair(base, twoStrays, "row000002"), null, "two strays is a structural reload, not a repair");
+  assert.deepEqual(nativeOverlayStrayRepair(base, twoStrays, "row000002"), {
+    cellUid: "row000002",
+    strays: [{ uid: "strayblok", text: "lpha" }, { uid: "strayblo2", text: "more" }],
+  }, "every childless stray merges back in document order — the signature watch sees none of them");
 
   const wrongCell = rawTree();
   wrongCell.children[0].children.push({ uid: "strayblok", string: "lpha", order: 1, children: [] });

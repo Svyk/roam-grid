@@ -2177,7 +2177,7 @@ test("the keydown table intercepts what would damage the row and passes what bel
   fired = keydownOn(node, { key: "z", metaKey: true, target: textarea });
   assert.equal(fired.event.defaultPrevented, false, "⌘Z mid-edit is the browser's native undo on Roam's textarea");
   fired = keydownOn(node, { key: "Enter", metaKey: true, target: textarea });
-  assert.equal(fired.event.defaultPrevented, true, "⌘Enter opens the block in the sidebar — a second editor over the same block");
+  assert.equal(fired.event.defaultPrevented, false, "⌘Enter is Roam's TODO toggle — content-only, not structural, so it passes through");
   fired = keydownOn(node, { key: "ArrowUp", metaKey: true, shiftKey: true, target: textarea });
   assert.equal(fired.event.defaultPrevented, true, "a block-move chord would take the cell out of its row chain");
 
@@ -2386,16 +2386,19 @@ test("repairStructure merges Roam's split remainder back into the cell and delet
       ] },
     ],
   };
-  assert.deepEqual(nativeOverlayStrayRepair(base, damaged, "cell00001"), { cellUid: "cell00001", strayUid: "strayblok", text: "pha" });
+  assert.deepEqual(nativeOverlayStrayRepair(base, damaged, "cell00001"), { cellUid: "cell00001", strays: [{ uid: "strayblok", text: "pha" }] });
   assert.equal(nativeOverlayStrayRepair(base, base, "cell00001"), null, "an undamaged tree needs no repair");
 
   const twoStrays = structuredClone(damaged);
   twoStrays.children[0].children.push({ uid: "strayblo2", string: "more", order: 2, children: [] });
-  assert.equal(nativeOverlayStrayRepair(base, twoStrays, "cell00001"), null, "two strays is not the pinned damage shape — the structural-reload lane owns it");
+  assert.deepEqual(nativeOverlayStrayRepair(base, twoStrays, "cell00001"), {
+    cellUid: "cell00001",
+    strays: [{ uid: "strayblok", text: "pha" }, { uid: "strayblo2", text: "more" }],
+  }, "every childless stray under the edited cell merges back in document order — the signature-based watch cannot see any of them");
 
   const nested = structuredClone(damaged);
   nested.children[0].children[1].children = [{ uid: "strayblo3", string: "deep", order: 0, children: [] }];
-  assert.equal(nativeOverlayStrayRepair(base, nested, "cell00001"), null, "a stray with children is not the pinned damage shape");
+  assert.deepEqual(nativeOverlayStrayRepair(base, nested, "cell00001"), { cellUid: "cell00001", forceReload: true, strays: [] }, "a stray with children is more than a split remainder — the structural-reload lane must be forced");
 
   const elsewhere = structuredClone(base);
   elsewhere.children[0].children[0].children = [{ uid: "strayblo4", string: "x", order: 0, children: [] }];
@@ -2406,7 +2409,7 @@ test("repairStructure merges Roam's split remainder back into the cell and delet
   await startOverlay(harness, { raw: "Alpha" });
   harness.overlay.textarea.value = "Al";
   const plan = await harness.overlay.repairStructure();
-  assert.deepEqual(plan, { cellUid: "cell00001", strayUid: "strayblok", text: "pha" });
+  assert.deepEqual(plan, { cellUid: "cell00001", strays: [{ uid: "strayblok", text: "pha" }] });
   assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "Alpha" }]);
   assert.deepEqual(harness.roamRecord.deletes, ["strayblok"]);
   assert.deepEqual(harness.adapter.selfWrites, [{ uid: "cell00001", from: "Al", to: "Alpha" }]);
@@ -2464,4 +2467,221 @@ test("GridView.render wires exactly one native overlay and hands it the editor c
 
   view.dispose();
   assert.equal(view.nativeOverlay, null);
+});
+
+/* --------------------------------------------------------------------------------------------
+ * GOAL-FIX-C2 — native overlay lifecycle: mid-edit renders, reentrancy, failed-start cleanup,
+ * popup-probe gating, multi-stray repair, cancelled frames and the double-accept seam.
+ * ------------------------------------------------------------------------------------------ */
+
+test("a mid-edit re-render commits the live overlay instead of throwing the typed text away", async (t) => {
+  t.after(() => { settingsCache.clear(); resetNativeEditorHealth(); runtime.registries = null; releaseKeyboard(); });
+  installOverlayDom();
+  resetNativeEditorHealth();
+  runtime.registries = new RegistrySet();
+  const roamRecord = installOverlayRoam({ strings: { cell00001: "Alpha", cell00002: "Beta" } });
+  const model = new GridModel({ tableUid: "table0001", rows: [[{ uid: "cell00001", raw: "Alpha" }, { uid: "cell00002", raw: "Beta" }]] });
+  const root = new OverlayNode("section"); root.className = "rg-root"; globalThis.document.body.appendChild(root);
+  const session = { ...overlaySession(), editorFinished() {}, scheduleReferenceCountRefresh() {}, removeView() {} };
+  const view = Object.assign(Object.create(GridView.prototype), {
+    model, root, cells: new Map(), cellCoordinatesByUid: new Map(), selection: { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+    anchor: { row: 0, col: 0 }, selectedCellElements: new Set(), activeCellElement: null, selectionControls: new Set(),
+    context: "source", surface: "main", disposed: false, editorController: null, nativeOverlay: null, viewport: null,
+    referenceCounts: new Map(), commentThreads: new Map(), inlineReferenceDisposers: new Set(),
+    session,
+    commitMutation: (label, mutation) => { mutation(); return Promise.resolve(model); },
+    moveSelection() {}, renderCellValue() {}, updateReferenceCountBadges() {}, syncCommentAffordance() {},
+  });
+  view.render();
+  const overlay = view.nativeOverlay;
+  const cell = view.cells.get("0:0");
+  assert.ok(cell);
+  assert.ok(await overlay.start({ row: 0, col: 0, cell, uid: "cell00001", raw: "Alpha" }));
+  overlay.textarea.value = "Typed mid-edit";
+
+  view.render();
+  assert.equal(overlay.active, false, "the render finishes the edit rather than leaking a dead overlay");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  // PINNED FACT 7: Roam had not flushed, so the text existed only in the textarea. A dispose would
+  // have written nothing; a commit captures it synchronously before the DOM is swapped.
+  assert.deepEqual(roamRecord.updates, [{ uid: "cell00001", string: "Typed mid-edit" }], "the typed text reaches the graph");
+  assert.equal(model.getRaw(0, 0), "Typed mid-edit");
+  assert.ok(view.nativeOverlay);
+  assert.notEqual(view.nativeOverlay, overlay, "the re-render wires a fresh overlay");
+  assert.equal(view.nativeOverlay.active, false);
+
+  view.dispose();
+});
+
+test("a row-deletion patch refuses to run under a live native overlay", async (t) => {
+  t.after(() => { settingsCache.clear(); resetNativeEditorHealth(); releaseKeyboard(); });
+  installOverlayDom();
+  resetNativeEditorHealth();
+  const viewport = new OverlayNode("div"); const grid = new OverlayNode("div");
+  const view = Object.assign(Object.create(GridView.prototype), {
+    viewport, gridElement: grid,
+    editorController: { state: null }, nativeOverlay: { active: true },
+    resizeCleanup: null, rowResizePreview: null, columnResizePreview: null, dragSelecting: false, fillStart: null,
+    hasCustomCellRenderers: () => { throw new Error("reached past the overlay guard"); },
+  });
+  // The incremental path swaps cell DOM under the overlay's live textarea; it must fall through to
+  // render(), which commits the edit first.
+  assert.equal(view.patchRowDeletion({ viewport, gridElement: grid }), false);
+});
+
+test("a re-entrant start shares the in-flight mount instead of stacking a second editor", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  const args = { row: 0, col: 0, cell: harness.cell, uid: "cell00001", raw: "Alpha", initial: "x" };
+  // OS key auto-repeat fires beginEdit again while the first start is still awaiting Roam.
+  const first = harness.overlay.start(args);
+  const second = harness.overlay.start(args);
+  const [one, two] = await Promise.all([first, second]);
+  assert.ok(one);
+  assert.equal(two, one, "the repeated keystroke joins the mount already in flight — falling back to the grid editor would stack two editors");
+  assert.equal(harness.roamRecord.mounts.length, 1, "one overlay, one Roam mount");
+  assert.equal(harness.roamRecord.updates.filter((update) => update.string === "x").length, 1, "one seed write");
+  assert.equal(harness.cell.querySelectorAll(".rg-native-cell-editor").length, 1);
+  harness.overlay.dispose();
+});
+
+test("a failed start releases the session claim and restores the cell it seeded", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  // Failure AFTER the claim: Roam mounted the block but never yielded a textarea.
+  const harness = makeOverlayHarness({ mode: "no-textarea" });
+  harness.overlay.nextFrame = async () => {};
+  const result = await harness.overlay.start({ row: 0, col: 0, cell: harness.cell, uid: "cell00001", raw: "Alpha", initial: "x" });
+  assert.equal(result, null);
+  assert.deepEqual(harness.session.calls.begin, ["cell00001"]);
+  assert.deepEqual(harness.session.calls.end, [{ uid: "cell00001", commit: false }], "a leaked claim makes every later external edit to this cell invisible to undo");
+  assert.deepEqual(harness.roamRecord.updates, [
+    { uid: "cell00001", string: "x" },
+    { uid: "cell00001", string: "Alpha" },
+  ], "the seed character is reverted — the fallback editor must open on the pre-seed value");
+  assert.deepEqual(harness.adapter.patches.at(-1), { uid: "cell00001", raw: "Alpha" });
+  assert.equal(harness.roamRecord.strings.cell00001, "Alpha");
+
+  // Failure BEFORE the claim: renderBlock itself is missing. The seed is still reverted.
+  const early = makeOverlayHarness({ mode: "no-render-block" });
+  assert.equal(await early.overlay.start({ row: 0, col: 0, cell: early.cell, uid: "cell00001", raw: "Alpha", initial: "y" }), null);
+  assert.deepEqual(early.session.calls.begin, []);
+  assert.deepEqual(early.session.calls.end, [], "no claim was taken, so nothing is released");
+  assert.deepEqual(early.roamRecord.updates, [
+    { uid: "cell00001", string: "y" },
+    { uid: "cell00001", string: "Alpha" },
+  ]);
+});
+
+test("the popup fallback ignores a trigger context that was already open when the edit mounted", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  // The portal selector has never matched all session, so the trigger-context fallback is live. A
+  // cell that simply READS `… #done` must not look like an open menu — that wedges Enter into a
+  // block split and leaves repair focusing a detached textarea.
+  const harness = makeOverlayHarness({ strings: { cell00001: "see #done", cell00002: "Beta" } });
+  await startOverlay(harness, { raw: "see #done" });
+  assert.equal(harness.overlay.textarea.value, "see #done");
+  assert.equal(harness.overlay.nativeAutocompleteOpen(), false, "a pre-existing #tag context is text, not a menu");
+  harness.overlay.textarea.value = "see #done [[Ne"; harness.overlay.textarea.setSelectionRange(13, 13);
+  assert.equal(harness.overlay.nativeAutocompleteOpen(), true, "a context opened DURING this edit still stands in for the popup");
+  harness.overlay.dispose();
+});
+
+test("a multi-stray split merges every childless stray back in document order", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const base = {
+    uid: "table0001", string: "{{[[table]]}}", order: 0, children: [
+      { uid: "cell00001", string: "Alpha", order: 0, children: [{ uid: "cell00002", string: "Beta", order: 0, children: [] }] },
+    ],
+  };
+  const damaged = {
+    uid: "table0001", string: "{{[[table]]}}", order: 0, children: [
+      { uid: "cell00001", string: "Al", order: 0, children: [
+        { uid: "cell00002", string: "Beta", order: 0, children: [] },
+        { uid: "stray0001", string: "pha", order: 1, children: [] },
+        { uid: "stray0002", string: "-more", order: 2, children: [] },
+      ] },
+    ],
+  };
+  const harness = makeOverlayHarness({ strings: { cell00001: "Al", cell00002: "Beta", stray0001: "pha", stray0002: "-more" }, tree: damaged });
+  harness.adapter.baseTree = base;
+  await startOverlay(harness, { raw: "Alpha" });
+  harness.overlay.textarea.value = "Al";
+  const plan = await harness.overlay.repairStructure();
+  assert.deepEqual(plan, { cellUid: "cell00001", strays: [{ uid: "stray0001", text: "pha" }, { uid: "stray0002", text: "-more" }] });
+  assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "Alpha-more" }], "both remainders merge into the cell in document order");
+  assert.deepEqual(harness.roamRecord.deletes, ["stray0001", "stray0002"]);
+  assert.equal(harness.adapter.transitions.length, 1, "the repair is declared so the echo is absorbed");
+  assert.equal(harness.overlay.textarea.value, "Alpha-more");
+  harness.overlay.dispose();
+});
+
+test("a stray with children of its own forces the structural reload lane explicitly", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const base = {
+    uid: "table0001", string: "{{[[table]]}}", order: 0, children: [
+      { uid: "cell00001", string: "Alpha", order: 0, children: [{ uid: "cell00002", string: "Beta", order: 0, children: [] }] },
+    ],
+  };
+  const damaged = {
+    uid: "table0001", string: "{{[[table]]}}", order: 0, children: [
+      { uid: "cell00001", string: "Al", order: 0, children: [
+        { uid: "cell00002", string: "Beta", order: 0, children: [] },
+        { uid: "stray0001", string: "pha", order: 1, children: [{ uid: "stray0002", string: "deep", order: 0, children: [] }] },
+      ] },
+    ],
+  };
+  const harness = makeOverlayHarness({ strings: { cell00001: "Al", cell00002: "Beta", stray0001: "pha", stray0002: "deep" }, tree: damaged });
+  harness.adapter.baseTree = base;
+  const reloads = [];
+  harness.session.handleExternalChange = (externalModel, event) => reloads.push({ externalModel, event });
+  await startOverlay(harness, { raw: "Alpha" });
+  harness.overlay.textarea.value = "Al";
+  const plan = await harness.overlay.repairStructure();
+  assert.deepEqual(plan, { cellUid: "cell00001", forceReload: true, strays: [] });
+  assert.equal(reloads.length, 1, "the signature-based watch computes structural === false for this shape — the reload must be forced");
+  assert.equal(reloads[0].event.structural, true);
+  assert.ok(reloads[0].externalModel, "the reload receives the live tree as a model");
+  assert.deepEqual(harness.roamRecord.deletes, [], "a nested stray is the reload lane's, not the merge lane's");
+  harness.overlay.dispose();
+});
+
+test("a frame cancelled by teardown still resolves the promise start() is awaiting", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness({ mode: "no-textarea" });
+  let armed = false;
+  globalThis.requestAnimationFrame = () => { armed = true; return 42; }; // never calls back
+  globalThis.cancelAnimationFrame = () => {};
+  let settled = null;
+  const pending = harness.overlay.start({ row: 0, col: 0, cell: harness.cell, uid: "cell00001", raw: "Alpha" })
+    .then((value) => { settled = value === null ? "null" : "state"; return settled; });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(armed, true, "the textarea poll is parked on a frame that will never fire");
+  harness.overlay.dispose();
+  const raced = await Promise.race([pending, new Promise((resolve) => setTimeout(() => resolve("pending"), 50))]);
+  assert.equal(raced, "null", "a cancelled frame must still resolve — otherwise beginEditLocal is retained forever");
+  assert.equal(settled, "null");
+});
+
+test("accepting a function suggestion twice does not rewrite the committed text", async () => {
+  const { controller, cells, flush } = makeController();
+  const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "=su", floating: true });
+  flush();
+  assert.equal(controller.suggestionList.hidden, false);
+  controller.acceptSuggestion(0);
+  const committed = editor.value;
+  assert.equal(committed, "=SUM(", "sanity: the first accept inserts the function");
+  assert.equal(controller.suggestionList.hidden, true, "the menu hides on the accept frame, not a frame later");
+  assert.equal(controller.suggestions.length, 0);
+  assert.equal(controller.autocompleteContext, null);
+  assert.equal(editor.getAttribute("aria-expanded"), "false");
+  controller.acceptSuggestion(0);
+  flush();
+  assert.equal(editor.value, committed, "a stale menu frame must not rewrite what the first accept committed (=SUM(M()");
+  controller.dispose();
 });
