@@ -2951,6 +2951,130 @@ test("the focus-floor still commits the live value when no Escape is pending", a
   assert.equal(harness.roamRecord.strings.cell00001, "test edited");
 });
 
+// FIX-E4 — the live trace AFTER FIX-E3 shipped proved WHY it still failed on real Roam: Roam fires an
+// `input` event on the mounted textarea while closing its `[[` menu, and the overlay's `input`
+// listener clears `escapeDeferred` ~65ms BEFORE the blur-driven focus-floor reads it — so the floor
+// saw a false flag and committed `test [[]]`. FIX-E3's headless test never fired that `input` event,
+// which is exactly why it passed while the bug shipped (a test that could not fail). THIS test fires
+// it: the `input`-event step is the thing that makes the test able to fail. The floor must still
+// cancel, now keyed on `lastEscapeLentAt` (which the `input` listener does NOT clear).
+test("the focus-floor cancels after Roam's menu-close `input` clears escapeDeferred, within the recency window", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = autoPairHarness();
+  await startOverlay(harness, { raw: "test" });
+  const node = harness.cell.querySelector(".rg-native-cell-editor");
+  // The user opened `[[`, Roam auto-paired to `test [[]]` and parked the caret between the brackets.
+  harness.overlay.textarea.value = "test [[]]";
+  harness.overlay.textarea.setSelectionRange(7, 7);
+  harness.dom.state.popupOpen = true;
+
+  // First Escape is lent to Roam to close its menu; the loan latches `escapeDeferred` AND stamps the
+  // recency timestamp the `input` listener must leave untouched.
+  const fired = keydownOn(node, { key: "Escape", target: harness.overlay.textarea });
+  assert.equal(fired.event.defaultPrevented, false, "the first Escape is lent to Roam so its menu closes");
+  assert.equal(harness.overlay.escapeDeferred, true, "the lent Escape is pending");
+  assert.ok(harness.overlay.lastEscapeLentAt > 0, "the loan is timestamped");
+  assert.equal(harness.overlay.active, true);
+
+  // THE STEP FIX-E3 OMITTED: Roam fires `input` on the textarea while closing its menu, and the
+  // overlay's `input` listener clears `escapeDeferred`. This is the exact live state FIX-E3 missed —
+  // without a temporal signal the floor now has nothing to tell this blur from a genuine click-away.
+  node.dispatch("input", { target: harness.overlay.textarea });
+  assert.equal(harness.overlay.escapeDeferred, false, "Roam's menu-close input cleared the loan flag — the exact live state FIX-E3 missed");
+  assert.ok(harness.overlay.lastEscapeLentAt > 0, "but the recency timestamp survives the input event");
+  await settle(); // drain the structure-repair the input listener scheduled, so the floor is not gated
+
+  // Roam blurs the textarea to <body> as it dismisses the menu — the menu-close blur, tens of ms
+  // after the lent Escape, well inside ESCAPE_BLUR_WINDOW_MS.
+  harness.dom.state.popupOpen = false;
+  const away = new OverlayNode("div"); harness.dom.body.appendChild(away);
+  globalThis.document.activeElement = away;
+  node.dispatch("focusout", { target: harness.overlay.textarea });
+  await settle();
+
+  // The floor must back the edit out, NOT persist the auto-paired brackets — this assertion COMMITS
+  // `test [[]]` on the pre-fix source (b4a2588) and passes only after the timestamp discriminator.
+  assert.equal(harness.overlay.active, false, "the overlay tears down — no wedge");
+  assert.equal(harness.cell.querySelector(".rg-native-cell-editor"), null);
+  assert.equal(harness.cell.classList.contains("rg-cell--native-editing"), false);
+  assert.equal(harness.finishes.at(-1)?.commit, false, "a menu-close blur within the window is a cancel, not a commit");
+  assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "test" }], "beforeRaw restored, NOT the auto-paired `test [[]]`");
+  assert.deepEqual(harness.adapter.selfWrites, [
+    { uid: "cell00001", from: null, to: "test [[]]" },
+    { uid: "cell00001", from: "test [[]]", to: "test" },
+  ], "Roam's flush and the restore are both absorbed");
+  assert.equal(harness.roamRecord.strings.cell00001, "test", "the graph ends holding `test`, not the committed auto-pair");
+});
+
+// FIX-E4 bookkeeping: the recency stamp must be cleared the moment the loan resolves to a real cancel
+// and again when a NEW edit starts — otherwise a stale stamp would wrongly cancel a later, unrelated
+// focus-leave. (Survival-past-`input` is pinned by the test above.)
+test("lastEscapeLentAt clears on a resolved cancel and on a fresh edit", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = autoPairHarness();
+  await startOverlay(harness, { raw: "test" });
+  assert.equal(harness.overlay.lastEscapeLentAt, 0, "a fresh edit carries no outstanding loan");
+  const node = harness.cell.querySelector(".rg-native-cell-editor");
+  harness.overlay.textarea.value = "test [[]]";
+  harness.overlay.textarea.setSelectionRange(7, 7);
+  harness.dom.state.popupOpen = true;
+
+  keydownOn(node, { key: "Escape", target: harness.overlay.textarea });
+  assert.ok(harness.overlay.lastEscapeLentAt > 0, "the lent Escape stamps the timestamp");
+  await settle(); // the one-frame popupJustClosed marker expires; escapeDeferred stays true (no input)
+
+  // The loan is spent — a second Escape resolves to a real cancel (escape:cancel branch), clearing it.
+  keydownOn(node, { key: "Escape", target: harness.overlay.textarea });
+  assert.equal(harness.overlay.active, false, "the spent-loan Escape cancels the edit");
+  assert.equal(harness.overlay.lastEscapeLentAt, 0, "resolving the loan clears the timestamp");
+  await settle();
+
+  // Reusing the overlay instance for a NEW edit clears any residual stamp (start() resets it).
+  harness.overlay.lastEscapeLentAt = 999;
+  await harness.overlay.start({ row: 0, col: 0, cell: harness.cell, uid: "cell00001", raw: "test", initial: null });
+  assert.equal(harness.overlay.lastEscapeLentAt, 0, "start() resets the stamp for the new edit episode");
+  harness.overlay.dispose();
+});
+
+// FIX-E4 — the discriminator is temporal, so it must NOT over-cancel. A lent Escape that resolved
+// long ago (older than ESCAPE_BLUR_WINDOW_MS = 400ms), followed by genuine typing and a click-away,
+// is a COMMIT. The `now()` seam places the lent Escape past the window without a wall-clock wait.
+test("the focus-floor still commits when the lent Escape is older than the recency window", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = autoPairHarness();
+  await startOverlay(harness, { raw: "test" });
+  const node = harness.cell.querySelector(".rg-native-cell-editor");
+  const clock = { value: 1000 };
+  harness.overlay.now = () => clock.value; // deterministic monotonic seam for record + check
+  harness.overlay.textarea.value = "test [[]]";
+  harness.overlay.textarea.setSelectionRange(7, 7);
+  harness.dom.state.popupOpen = true;
+
+  keydownOn(node, { key: "Escape", target: harness.overlay.textarea });
+  assert.equal(harness.overlay.lastEscapeLentAt, 1000, "the loan is stamped on the seam clock");
+
+  // Roam's menu-close input clears the flag; the user then keeps typing well past the 400ms window.
+  node.dispatch("input", { target: harness.overlay.textarea });
+  await settle();
+  assert.equal(harness.overlay.escapeDeferred, false);
+  harness.overlay.textarea.value = "test edited";
+  harness.overlay.textarea.setSelectionRange(11, 11);
+  clock.value = 1500; // 500ms since the lent Escape — outside ESCAPE_BLUR_WINDOW_MS (400)
+
+  harness.dom.state.popupOpen = false;
+  globalThis.document.activeElement = null;
+  node.dispatch("focusout", { target: harness.overlay.textarea });
+  await settle();
+
+  assert.equal(harness.overlay.active, false, "the edit finishes");
+  assert.equal(harness.finishes.at(-1)?.commit, true, "outside the window a focus-leave commits the live value");
+  assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "test edited" }], "the genuinely-typed value is persisted, not cancelled");
+  assert.equal(harness.roamRecord.strings.cell00001, "test edited");
+});
+
 test("accepting a function suggestion twice does not rewrite the committed text", async () => {
   const { controller, cells, flush } = makeController();
   const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "=su", floating: true });

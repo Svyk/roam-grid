@@ -35,6 +35,12 @@ const DEFAULT_CONTENT_SAVE_MS = 220;
 const DEFAULT_LARGE_SAVE_MS = 500;
 const DEFAULT_AUTOCOMPLETE_MS = 90;
 const DEFAULT_AUTOCOMPLETE_LIMIT = 8;
+// FIX-E4: Roam fires an `input` event on the mounted textarea while closing its `[[` menu, which
+// clears the overlay's one-Escape loan (`escapeDeferred`) ~65ms before the blur-driven focus-floor
+// reads it. A lent Escape within this window of a focus-leave IS that menu-close blur, so the floor
+// cancels the auto-paired value rather than committing it. A genuine click-to-commit is
+// human-reaction-delayed (hundreds of ms) and not temporally bound to an Escape, so it stays a commit.
+const ESCAPE_BLUR_WINDOW_MS = 400;
 const RECENTS_TTL_MS = 60000;
 // The page query returns every page in the graph and has not been measured on a large one. Over
 // budget the result is still used — it is already paid for — but the empty-opener path disarms
@@ -7642,6 +7648,11 @@ export class NativeCellEditorOverlay {
     // FIX-E: exactly ONE Escape per typing episode is lent to Roam's menu; every Escape after that
     // is the overlay's cancel, whatever the popup probe reads.
     this.escapeDeferred = false;
+    // FIX-E4: monotonic timestamp of the last Escape lent to Roam's menu. The `input` listener that
+    // clears `escapeDeferred` (Roam fires `input` while closing its `[[` menu) deliberately does NOT
+    // clear this, so the focus-floor can still recognise a menu-close blur as the lent Escape's
+    // consequence within ESCAPE_BLUR_WINDOW_MS. 0 means no Escape is outstanding.
+    this.lastEscapeLentAt = 0;
     this.escapeKeydownSeen = false;
     this.focusCheckScheduled = false;
     this.disposed = false;
@@ -7655,6 +7666,10 @@ export class NativeCellEditorOverlay {
   }
 
   get active() { return Boolean(this.state); }
+
+  /** FIX-E4: monotonic clock seam — the same source `traceOverlay` reads. A test overrides it to
+   *  place a lent Escape inside or outside ESCAPE_BLUR_WINDOW_MS without a wall-clock wait. */
+  now() { return globalThis.performance?.now?.() ?? Date.now(); }
 
   /**
    * FORENSIC INSTRUMENTATION — pure observation, ZERO behavior change. Ring-buffered (cap 64)
@@ -7763,6 +7778,8 @@ export class NativeCellEditorOverlay {
     }
     if (this.disposed) return null;
     this.beforeRaw = String(raw ?? "");
+    // FIX-E4: a new edit episode starts with no Escape outstanding.
+    this.lastEscapeLentAt = 0;
     if (initial != null) {
       const seed = String(initial);
       try {
@@ -7967,11 +7984,16 @@ export class NativeCellEditorOverlay {
     if (!this.escapeDeferred && !this.popupJustClosed && this.nativeAutocompleteOpen()) {
       this.traceOverlay("escape:lent", { uid: state.uid, pulled: this.pullRawForTrace(state.uid) });
       this.escapeDeferred = true;
+      // FIX-E4: stamp the loan so the focus-floor can recognise Roam's menu-close blur even after the
+      // menu-close `input` event clears `escapeDeferred` before the floor runs.
+      this.lastEscapeLentAt = this.now();
       this.markPopupJustClosed();
       return false;
     }
     event?.preventDefault?.(); event?.stopPropagation?.();
+    // FIX-E4: the loan resolved to a real cancel, so no Escape is outstanding any more.
     this.escapeDeferred = false;
+    this.lastEscapeLentAt = 0;
     this.traceOverlay("escape:cancel", { uid: state.uid, pulled: this.pullRawForTrace(state.uid) });
     void this.cancel();
     return true;
@@ -8066,13 +8088,17 @@ export class NativeCellEditorOverlay {
     if (active?.closest?.(".rm-autocomplete__results")) return false;
     if (this.nativeAutocompletePortal()) return false;
     if (active && this.view?.root?.contains?.(active)) return false;
-    // FIX-E3: an Escape was lent to Roam and has not resolved (`escapeDeferred`), so this focus-leave
-    // is Roam blurring its textarea to close the menu it just closed for that Escape — the user is
-    // backing out, not committing. Committing here persists the auto-paired text (e.g. `test [[]]`)
-    // before the pending second Escape can cancel. Cancel instead: restore `beforeRaw`, still tear
-    // down (never re-wedge). Only the deferred window flips to cancel; a genuine focus-leave commits.
-    if (this.escapeDeferred) {
-      this.traceOverlay("focusLeft:cancel", { uid: state.uid, pulled: this.pullRawForTrace(state.uid) });
+    // FIX-E4: an Escape was lent to Roam to close its `[[` menu, so this focus-leave is Roam blurring
+    // its textarea as it dismisses that menu — the user is backing out, not committing. Committing
+    // here persists the auto-paired text (e.g. `test [[]]`) before the pending second Escape can
+    // cancel. `escapeDeferred` alone (FIX-E3) is not enough: Roam fires an `input` event while closing
+    // the menu and the overlay's `input` listener clears `escapeDeferred` ~65ms before this floor runs
+    // (proven by live trace). `lastEscapeLentAt` is NOT cleared by that `input` event, so a lent Escape
+    // within ESCAPE_BLUR_WINDOW_MS of this blur still identifies the menu-close blur and flips to
+    // cancel. Outside the window, and with no deferred loan, a genuine click-away still commits.
+    const sinceEscapeLent = this.lastEscapeLentAt > 0 ? this.now() - this.lastEscapeLentAt : Infinity;
+    if (this.escapeDeferred || sinceEscapeLent <= ESCAPE_BLUR_WINDOW_MS) {
+      this.traceOverlay("focusLeft:cancel", { uid: state.uid, escapeDeferred: this.escapeDeferred, sinceEscapeLent: Number.isFinite(sinceEscapeLent) ? Math.round(sinceEscapeLent) : null, pulled: this.pullRawForTrace(state.uid) });
       void this.cancel();
       return true;
     }
@@ -8196,6 +8222,7 @@ export class NativeCellEditorOverlay {
     this.frames.clear();
     this.repairScheduled = false; this.repairCommitWhenClean = false; this.popupJustClosed = false;
     this.escapeDeferred = false; this.escapeKeydownSeen = false; this.focusCheckScheduled = false;
+    this.lastEscapeLentAt = 0; // FIX-E4: commit/cancel/dispose all end any outstanding Escape loan.
     this.claimedUid = null; this.mountTriggerContext = null;
     this.state?.cell?.classList?.remove("rg-cell--editing", "rg-cell--native-editing");
     this.overlay?.remove?.();
