@@ -7635,6 +7635,9 @@ export class NativeCellEditorOverlay {
     this.repairScheduled = false;
     this.repairCommitWhenClean = false;
     this.repairRunning = false;
+    // FIX-E backstop cadence: Roam's blur flush lands hundreds of ms out, so the reconcile poll
+    // waits this long between reads. An instance field so a test can drop it to run fast.
+    this.reconcileDelayMs = 130;
     this.popupJustClosed = false;
     // FIX-E: exactly ONE Escape per typing episode is lent to Roam's menu; every Escape after that
     // is the overlay's cancel, whatever the popup probe reads.
@@ -8103,6 +8106,21 @@ export class NativeCellEditorOverlay {
   }
 
   /** Unmounts and unregisters everything. Writes nothing, ever. */
+  /**
+   * FIX-E write-behind, the cooperate half. Roam persists the mounted textarea's CONTENT on the
+   * blur that `teardown()` triggers, and that flush lands after our own restore write — so racing it
+   * loses. Instead we set the textarea to the value we want persisted BEFORE teardown, and Roam's
+   * own flush then writes it for us. `input` is dispatched so Roam's React model updates, not just
+   * the DOM node. The explicit `updateBlock` and `reconcileCancelWrite` remain as backstops.
+   */
+  settleTextareaValue(value) {
+    const textarea = this.textarea;
+    if (!textarea) return;
+    setNativeTextareaValue(textarea, String(value ?? ""));
+    const Constructor = globalThis.InputEvent || globalThis.Event;
+    if (typeof Constructor === "function") textarea.dispatchEvent?.(new Constructor("input", { bubbles: true }));
+  }
+
   teardown() {
     for (const dispose of this.mountDisposers.splice(0).reverse()) {
       try { dispose(); } catch (error) { noteNativeEditorError(error); }
@@ -8134,6 +8152,10 @@ export class NativeCellEditorOverlay {
     const { row, col, cell, uid } = state;
     const beforeRaw = this.beforeRaw;
     const live = this.textarea ? String(this.textarea.value ?? "") : null;
+    // Commit flushes the same value Roam does (both persist the typed text), so the two writes
+    // agree — except an empty cell, which we persist as " " to stop Roam collapsing the block while
+    // Roam's own flush would write "". Settle the textarea to the persisted form so both match.
+    if (live != null) this.settleTextareaValue(nativePersistedRaw(nativeStoredRaw(live)));
     this.teardown();
     // The write below is a round-trip; onFinish only refocuses after it. Without focus the moment
     // the textarea unmounts, a type→Enter→type loop drops the next characters onto <body>.
@@ -8173,6 +8195,9 @@ export class NativeCellEditorOverlay {
     const { row, col, cell, uid } = state;
     const beforeRaw = this.beforeRaw;
     const flushed = nativeStoredRaw(this.textarea ? String(this.textarea.value ?? "") : state.lastValue);
+    // Cooperate with Roam's blur-flush: put `beforeRaw` in the textarea BEFORE teardown so the flush
+    // teardown triggers persists the cancelled-to value, not the typed one. Read `flushed` first.
+    if (flushed !== beforeRaw) this.settleTextareaValue(beforeRaw);
     this.teardown();
     try {
       if (flushed !== beforeRaw) {
@@ -8188,23 +8213,29 @@ export class NativeCellEditorOverlay {
     catch (error) { noteNativeEditorError(error); }
     this.view.session?.endNativeOverlayEdit?.(uid, { beforeRaw, afterRaw: beforeRaw, commit: false });
     // Only a cancel that had something to undo can lose the write-behind race (PINNED FACT 7).
-    if (flushed !== beforeRaw) await this.reconcileCancelWrite(uid, beforeRaw);
+    if (flushed !== beforeRaw) await this.reconcileCancelWrite(uid, beforeRaw, { delayMs: this.reconcileDelayMs });
     return { uid, value: beforeRaw };
   }
 
   /**
-   * FIX-E write-behind. PINNED FACT 7 says Roam flushes its textarea to `:block/string` at blur —
-   * which is the blur `teardown()` just caused, and it can land AFTER the restore write above. The
-   * graph would then hold the exact value the user cancelled, with nothing left mounted to notice.
-   * Re-read for a few frames and re-apply `beforeRaw`, recording the self-write so the adapter
-   * absorbs the echo instead of reloading the grid.
+   * FIX-E write-behind BACKSTOP. `settleTextareaValue` already makes Roam's blur flush persist
+   * `beforeRaw`, so this rarely fires — but if a flush still lands on `:block/string` AFTER the
+   * restore write (its timing is hundreds of ms, not a few frames), the graph would hold the exact
+   * value the user cancelled with nothing mounted to notice. Poll on a real cadence for up to
+   * ~1.5s, re-applying `beforeRaw` on every divergence and recording the self-write so the adapter
+   * absorbs the echo, and stop only once the value has stayed `beforeRaw` across two reads.
    */
-  async reconcileCancelWrite(uid, beforeRaw, { attempts = 3 } = {}) {
+  async reconcileCancelWrite(uid, beforeRaw, { attempts = 12, delayMs = 130 } = {}) {
+    // Poll the WHOLE budget rather than stopping at the first stable read: Roam's flush timing is
+    // not known, and a poll that quit early could return just before a late flush landed. Every
+    // divergence in the window is re-applied, so the graph ends at `beforeRaw` regardless of when
+    // the flush arrives inside it.
+    let corrected = false;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      await this.nextFrame();
+      await new Promise((resolve) => trackedTimeout(resolve, delayMs));
       let current = null;
       try { current = pullNativeCell(uid); }
-      catch (error) { noteNativeEditorError(error); return false; }
+      catch (error) { noteNativeEditorError(error); return corrected; }
       if (!current) continue;
       const raw = nativeStoredRaw(current.raw);
       if (raw === beforeRaw) continue;
@@ -8213,10 +8244,10 @@ export class NativeCellEditorOverlay {
         try { await updateBlock(uid, nativePersistedRaw(beforeRaw)); }
         catch (error) { this.view.adapter?.consumeSelfWrite?.(uid, raw, beforeRaw); throw error; }
         this.view.adapter?.patchBaseContent?.([{ uid, raw: beforeRaw }]);
-      } catch (error) { noteNativeEditorError(error); return false; }
-      return true;
+        corrected = true;
+      } catch (error) { noteNativeEditorError(error); return corrected; }
     }
-    return false;
+    return corrected;
   }
 
   dispose() {

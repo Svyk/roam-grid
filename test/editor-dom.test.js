@@ -1907,7 +1907,9 @@ function installOverlayRoam({ strings = {}, tree = null, mode = "ok" } = {}) {
           globalThis.document.activeElement = textarea;
         });
       }
-      return () => { record.unmounts.push(uid); };
+      // Roam persists the textarea's CONTENT on the blur that unmount triggers — capture it so a
+      // test can assert what the graph would receive (it must be the cancelled-to value).
+      return () => { record.unmounts.push(uid); record.flushedAtBlur = el.querySelector("textarea")?.value ?? null; };
     },
   };
   if (mode === "no-render-block") delete components.renderBlock;
@@ -2302,6 +2304,7 @@ test("cancel restores the exact bytes the cell held, absorbing whatever Roam flu
   await startOverlay(harness, { initial: "z" });
   harness.roamRecord.updates.length = 0; harness.adapter.selfWrites.length = 0; harness.adapter.patches.length = 0;
   harness.overlay.textarea.value = "zebra";
+  harness.overlay.reconcileDelayMs = 3; // poll fast in the test
   const result = await harness.overlay.cancel();
   assert.deepEqual(result, { uid: "cell00001", value: "Alpha" });
   assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "Alpha" }], "byte-identical restore, unconditionally");
@@ -2808,22 +2811,18 @@ test("cancel re-applies the restored bytes when Roam's blur flush lands after th
   const harness = autoPairHarness();
   await startOverlay(harness, { raw: "test" });
   harness.overlay.textarea.value = "test [[]]";
-  const frames = harness.overlay.nextFrame.bind(harness.overlay);
-  let ticks = 0;
-  harness.overlay.nextFrame = () => {
-    ticks += 1;
-    // PINNED FACT 7: the flush happens at blur, which teardown just caused — after our write.
-    if (ticks === 1) harness.roamRecord.strings.cell00001 = "test [[]]";
-    return frames();
-  };
+  harness.overlay.reconcileDelayMs = 3; // poll fast in the test
+  // Roam's blur flush is a MACROTASK that lands after the old 3-frame (microtask) reconcile window
+  // had already closed, but inside the timed backstop's budget. This is what the old window missed.
+  setTimeout(() => { harness.roamRecord.strings.cell00001 = "test [[]]"; }, 7);
 
   const result = await harness.overlay.cancel();
   assert.deepEqual(result, { uid: "cell00001", value: "test" });
+  assert.equal(harness.roamRecord.strings.cell00001, "test", "the graph does not keep the value the user cancelled");
   assert.deepEqual(harness.roamRecord.updates, [
     { uid: "cell00001", string: "test" },
     { uid: "cell00001", string: "test" },
-  ], "the write-behind is detected and undone");
-  assert.equal(harness.roamRecord.strings.cell00001, "test", "the graph does not keep the value the user cancelled");
+  ], "the late write-behind is detected and undone");
   assert.deepEqual(harness.adapter.selfWrites.at(-1), { uid: "cell00001", from: "test [[]]", to: "test" }, "the reconcile write is recorded so its echo is absorbed");
   assert.deepEqual(harness.adapter.patches.at(-1), { uid: "cell00001", raw: "test" });
 
@@ -2831,8 +2830,22 @@ test("cancel re-applies the restored bytes when Roam's blur flush lands after th
   const quiet = autoPairHarness();
   await startOverlay(quiet, { raw: "test" });
   quiet.overlay.textarea.value = "test [[]]";
+  quiet.overlay.reconcileDelayMs = 3;
   await quiet.overlay.cancel();
   assert.deepEqual(quiet.roamRecord.updates, [{ uid: "cell00001", string: "test" }], "nothing diverged, so nothing is rewritten");
+});
+
+test("cancel settles the textarea to beforeRaw before teardown, so Roam's blur flush persists the cancelled value", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = autoPairHarness();
+  await startOverlay(harness, { raw: "test" });
+  harness.overlay.textarea.value = "test [[]]"; // Roam auto-paired the brackets the user opened
+  harness.overlay.reconcileDelayMs = 2;
+  await harness.overlay.cancel();
+  // The blur that unmount causes reads the textarea; cooperating means it already holds beforeRaw,
+  // so Roam persists "test" for us rather than the "[[]]" we would then have to race to undo.
+  assert.equal(harness.roamRecord.flushedAtBlur, "test", "the textarea is settled to beforeRaw before the blur, not left holding the typed value");
 });
 
 test("focus leaving the overlay for <body> finishes the edit instead of wedging it", async (t) => {
