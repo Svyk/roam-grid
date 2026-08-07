@@ -114,7 +114,7 @@ const RANGE_KEYS = ["ranges-live-references", "ranges-max-rendered-cells"];
 
 const LARGE_STORAGE_KEYS = ["large-cache-enabled", "large-cache-max-mb", "large-verify-checksums", "large-gc-orphans"];
 
-const MAINTENANCE_KEYS = ["maintenance-apply-display", "maintenance-forget-device", "maintenance-clear-caches", "maintenance-reset"];
+const MAINTENANCE_KEYS = ["maintenance-apply-display", "maintenance-forget-device", "maintenance-clear-caches", "maintenance-migrate-templates", "maintenance-reset"];
 
 function makeApi({ values = {}, canSet = true, useGetAll = true } = {}) {
   const store = { ...values };

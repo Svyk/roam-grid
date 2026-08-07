@@ -36,7 +36,8 @@ is nothing else.
 | --- | --- | --- |
 | Cell contents | The original Roam blocks, unchanged in structure | Whenever you edit a cell |
 | Table layout (column widths, row heights, merges, alignment, header visibility, chart specs) | Blocks on the `[[roam/grid/metadata]]` page, one per table | The page is created **on the first table you enhance**, never on install |
-| Saved templates | Blocks on the `[[roam/grid/templates]]` page | Only when you run **Save current grid as template** |
+| Saved templates | A name block per template on the `[[roam/grid/templates]]` page, with the template itself as a real `{{[[table]]}}` table under it | Only when you run **Save current grid as template** |
+| Legacy template backups | `roam-grid/template-backup::` blocks on the `[[roam/grid/metadata]]` page | Only if a one-time migration rewrites a pre-0.12 JSON template into an editable table |
 | Comment threads | A collapsed `[[roam/comments]]` block on the **commented cell's own page**, exactly the structure Roam's own comments use | Only when you add a comment to a cell |
 | Large-grid data | JSON files in Roam's file storage, pointed at by a manifest block under the `{{[[roam/grid]]}}` block | Only for large grids you explicitly create |
 | Large-grid reference mirror | Collapsed blocks under that same `{{[[roam/grid]]}}` block, listing the distinct `[[page]]`, `#tag` and `((block))` references that grid's cells contain | Only while **Mirror large-grid references into Roam** is on, which is **off** by default |
@@ -44,6 +45,14 @@ is nothing else.
 
 Cell contents never leave the blocks they already live in. Layout is kept
 separately so that turning Roam Grid off leaves a normal Roam table.
+
+Saved templates are ordinary enhanced tables on their page: open
+`[[roam/grid/templates]]` and edit one like any other grid, then **Save current
+grid as template** on any grid to overwrite or add one. Templates saved by
+older versions as JSON blocks are converted in place once, automatically, a few
+seconds after Roam Grid loads — the original JSON is backed up first — and the
+**Migrate legacy grid templates** maintenance button retries anything that was
+skipped.
 
 Locally, on your device only: two `localStorage` keys per graph —
 `roam-grid:enhanced-uids:<graph>` (which tables you enhanced, so they render

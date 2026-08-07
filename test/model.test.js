@@ -345,7 +345,7 @@ test("saved templates remap UID-backed layout by position", () => {
   const grid = model([
     [{ uid: "source-r1", raw: "Title" }, { uid: "source-r1c2", raw: "" }],
     [{ uid: "source-r2", raw: "2" }, { uid: "source-r2c2", raw: "=A2*3" }],
-  ], { columnIds: ["source-c1", "source-c2"], showHeaders: false, fitToWidth: true, colorFormulaCells: false });
+  ], { columnIds: ["source-c1", "source-c2"], frozenCols: 1, charts: [{ id: "chart", type: "line" }], showHeaders: false, fitToWidth: true, colorFormulaCells: false });
   grid.merge({ startRow: 0, endRow: 0, startCol: 0, endCol: 1 });
   grid.widths[grid.columnIds[0]] = 240;
   grid.setRowHeight(1, 48);
@@ -360,6 +360,8 @@ test("saved templates remap UID-backed layout by position", () => {
   assert.equal(restored.getRowHeight(1), 48);
   assert.equal(restored.getAlignment(1, 1), "right");
   assert.equal(restored.isHeaderRow(1), true);
+  assert.equal(restored.frozenCols, 1);
+  assert.deepEqual(restored.charts, [{ id: "chart", type: "line" }]);
   assert.equal(restored.colorFormulaCells, false);
   assert.equal(new FormulaEngine(restored).evaluateCell(1, 1), 6);
 });

@@ -160,6 +160,43 @@ button the scan does not claim — an unresolvable spec, a target that is not an
 enhanced native grid, or a failed mount — is given `rg-range-restored` so the
 raw Roam component stays visible rather than leaving blank space.
 
+## Templates
+
+Saved templates live on `[[roam/grid/templates]]` as real, editable tables, not
+serialized JSON. Each template is a top-level `roam-grid/template:: <name>` block
+whose first `{{[[table]]}}` child IS the template — an ordinary enhanced native
+table whose widths, merges, alignments, charts, frozen, and header flags sit in
+the normal MetadataStore keyed by that table's uid. Opening the page mounts each
+template as a regular GridView, so editing the template is editing a grid; no
+template-specific rendering exists.
+
+`GridTemplateStore.reload()` is synchronous (one `getTree` of one page) and runs
+at the top of `list`, `get`, and `save`, so the store can never act on a
+load-once snapshot. A top-level block whose remainder parses as a v1
+`roam-grid-template` JSON record is a legacy entry and reads through the old
+`templateModelFromValue` path; anything else with the prefix is a v2 name block.
+`get(name)` loads the live table through a watch-free `NativeTableAdapter` and
+returns the positional uid-remap round-trip
+(`templateModelFromValue(serializeTemplateModel(live, name))`) so no real cell
+uid ever leaks into an inserted copy; a missing metadata entry degrades to raw
+rows rather than throwing. `save` disposes any existing table's session first,
+drops its metadata record, then deletes the subtree — in that order, so a crash
+mid-overwrite leaves a restorable table instead of an orphaned layout record —
+reuses the name block (a legacy JSON block becomes the name block in place,
+keeping its uid and position), materializes the replacement table as the name
+block's last child, and writes metadata last.
+
+Legacy JSON records are rewritten once, idly: four seconds after load, and only
+when the load-time reload actually found legacy entries, so steady state pays no
+timer and no writes. `migrateLegacyTemplates` backs each record up to
+`[[roam/grid/metadata]]` as `roam-grid/template-backup:: <original JSON>` BEFORE
+touching the block, rewrites the block into the v2 name block, materializes the
+table, and verifies by re-reading the tree (cell count must match rows × cols).
+A failed verify restores the original JSON string and stops the run; over-budget
+records are skipped untouched. Idempotency is re-detection — a run that finds
+nothing legacy performs zero writes. The settings-panel maintenance action
+**Migrate legacy grid templates** is the manual retry.
+
 ## Cell autocomplete
 
 `roamEditorTriggerContext(raw, caret, { formula })` is the single scanner. It
