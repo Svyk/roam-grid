@@ -3061,6 +3061,9 @@ export async function migrateLegacyTemplates() {
     if (!tree || cells !== model.rowCount * model.colCount) {
       if (globalThis.window) globalThis.window.__RG_U2_LAST_ERROR = `Template migration verify failed for "${entry.name}": ${cells} cells, expected ${model.rowCount * model.colCount}`;
       console.warn("[roam-grid] Template migration verify failed; restored the original JSON", entry.nameBlockUid);
+      // The block re-parses as legacy on the next run, so the partial table must not survive —
+      // otherwise every failed retry stacks another broken table under the same name block.
+      if (tableUid) await deleteBlock(tableUid).catch(() => {});
       await updateBlock(entry.nameBlockUid, original);
       break;
     }

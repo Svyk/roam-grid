@@ -269,6 +269,13 @@ test("migration restores the original JSON and stops when verification fails", a
   assert.equal(updates.length, 2, "rewrite then restore");
   assert.deepEqual(updates[1][2], original, "the original JSON string is restored byte-for-byte");
   assert.equal(mock.blocks.get("legacy001").string, original);
+  const tableCreate = mock.ops.findIndex(([op, , string]) => op === "create" && string === "{{[[table]]}}");
+  const tableUid = mock.ops[tableCreate][1];
+  const tableDelete = mock.ops.findIndex(([op, uid]) => op === "delete" && uid === tableUid);
+  const restore = mock.ops.findIndex(([op, uid, string]) => op === "update" && uid === "legacy001" && string === original);
+  assert.ok(tableDelete > tableCreate, "the failed table subtree is deleted");
+  assert.ok(tableDelete < restore, "the delete lands before the JSON restore so no broken table survives a retry");
+  assert.equal(mock.blocks.get("legacy001").children.length, 0, "the name block has no leftover table child");
   assert.ok(globalThis.window.__RG_U2_LAST_ERROR.includes("Broken"), "the failure lands on the forensic surface");
   assert.equal(mock.blocks.get("legacy002").string.startsWith("roam-grid/template:: {"), true, "the run stops — later entries wait for the maintenance action");
   delete globalThis.window.__RG_U2_LAST_ERROR;
