@@ -2884,6 +2884,73 @@ test("focus leaving the overlay for <body> finishes the edit instead of wedging 
   grid.overlay.dispose();
 });
 
+// FIX-E3 — the live trace proved the misfire: after a lent Escape closes Roam's menu, Roam blurs the
+// textarea and the focus-floor COMMITS `test [[]]` while `escapeDeferred` is still true, before the
+// user's second Escape can cancel. The floor must cancel in that window, not commit.
+test("the focus-floor cancels, not commits, when an Escape is still pending after Roam closes its menu", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = autoPairHarness();
+  await startOverlay(harness, { raw: "test" });
+  const node = harness.cell.querySelector(".rg-native-cell-editor");
+  // The user opened `[[`, Roam auto-paired to `test [[]]` and parked the caret between the brackets.
+  harness.overlay.textarea.value = "test [[]]";
+  harness.overlay.textarea.setSelectionRange(7, 7);
+  harness.dom.state.popupOpen = true;
+
+  // First Escape is lent to Roam to close its menu; the loan latches `escapeDeferred`.
+  const fired = keydownOn(node, { key: "Escape", target: harness.overlay.textarea });
+  assert.equal(fired.event.defaultPrevented, false, "the first Escape is lent to Roam so its menu closes");
+  assert.equal(harness.overlay.escapeDeferred, true, "the lent Escape is pending until it resolves");
+  assert.equal(harness.overlay.active, true);
+
+  // Roam closes its menu and blurs the textarea to <body> — WITHOUT an `input` event, so the loan
+  // is still outstanding. This is the exact live focusLeft frame, ~270ms before the second Escape.
+  await settle();
+  assert.equal(harness.overlay.escapeDeferred, true, "nothing cleared the loan: no input, no second Escape");
+  harness.dom.state.popupOpen = false;
+  const away = new OverlayNode("div"); harness.dom.body.appendChild(away);
+  globalThis.document.activeElement = away;
+  node.dispatch("focusout", { target: harness.overlay.textarea });
+  await settle();
+
+  // The floor must back the edit out, not persist the auto-paired brackets.
+  assert.equal(harness.overlay.active, false, "the focus-floor still tears the overlay down — no wedge");
+  assert.equal(harness.cell.querySelector(".rg-native-cell-editor"), null);
+  assert.equal(harness.cell.classList.contains("rg-cell--native-editing"), false);
+  assert.equal(harness.finishes.at(-1)?.commit, false, "a lent-Escape focus-leave is a cancel, not a commit");
+  assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "test" }], "beforeRaw is restored, NOT the auto-paired `test [[]]`");
+  assert.deepEqual(harness.adapter.selfWrites, [
+    { uid: "cell00001", from: null, to: "test [[]]" },
+    { uid: "cell00001", from: "test [[]]", to: "test" },
+  ], "Roam's flush and the restore are both absorbed");
+  assert.equal(harness.roamRecord.strings.cell00001, "test", "the graph ends holding `test`, not the committed auto-pair");
+});
+
+// Regression guard: the fix is scoped to the deferred window. With no Escape pending, a genuine
+// focus-leave must still COMMIT the live value. This passes both before and after the fix.
+test("the focus-floor still commits the live value when no Escape is pending", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness({ strings: { cell00001: "test", cell00002: "Beta" } });
+  await startOverlay(harness, { raw: "test" });
+  const node = harness.cell.querySelector(".rg-native-cell-editor");
+  // The user typed but never pressed Escape — nothing is deferred.
+  harness.overlay.textarea.value = "test edited";
+  harness.overlay.textarea.setSelectionRange(11, 11);
+  assert.equal(harness.overlay.escapeDeferred, false, "no lent Escape — this is an ordinary focus-away");
+
+  globalThis.document.activeElement = null;
+  harness.dom.state.popupOpen = false;
+  node.dispatch("focusout", { target: harness.overlay.textarea });
+  await settle();
+
+  assert.equal(harness.overlay.active, false, "the edit finishes");
+  assert.equal(harness.finishes.at(-1)?.commit, true, "a plain focus-away commits, exactly as before");
+  assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "test edited" }], "the live value is persisted");
+  assert.equal(harness.roamRecord.strings.cell00001, "test edited");
+});
+
 test("accepting a function suggestion twice does not rewrite the committed text", async () => {
   const { controller, cells, flush } = makeController();
   const editor = await controller.start({ row: 0, col: 0, cell: cells.get("0:0"), raw: "=su", floating: true });

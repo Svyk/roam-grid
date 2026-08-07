@@ -8067,6 +8067,16 @@ export class NativeCellEditorOverlay {
     if (active?.closest?.(".rm-autocomplete__results")) return false;
     if (this.nativeAutocompletePortal()) return false;
     if (active && this.view?.root?.contains?.(active)) return false;
+    // FIX-E3: an Escape was lent to Roam and has not resolved (`escapeDeferred`), so this focus-leave
+    // is Roam blurring its textarea to close the menu it just closed for that Escape — the user is
+    // backing out, not committing. Committing here persists the auto-paired text (e.g. `test [[]]`)
+    // before the pending second Escape can cancel. Cancel instead: restore `beforeRaw`, still tear
+    // down (never re-wedge). Only the deferred window flips to cancel; a genuine focus-leave commits.
+    if (this.escapeDeferred) {
+      this.traceOverlay("focusLeft:cancel", { uid: state.uid, pulled: this.pullRawForTrace(state.uid) });
+      void this.cancel();
+      return true;
+    }
     this.traceOverlay("focusLeft:commit", { uid: state.uid, pulled: this.pullRawForTrace(state.uid) });
     void this.commit(null);
     return true;
