@@ -197,6 +197,88 @@ records are skipped untouched. Idempotency is re-detection — a run that finds
 nothing legacy performs zero writes. The settings-panel maintenance action
 **Migrate legacy grid templates** is the manual retry.
 
+## Cell editing
+
+A cell edit takes one of three editors, decided in `GridView.beginEditLocal`:
+
+1. a **registered custom editor**, if one matches — it wins outright;
+2. **Roam's own block editor**, mounted over the cell by
+   `NativeCellEditorOverlay` — the default for a plain cell;
+3. the **grid's own editor**, `GridEditorController` — the fallback, and the
+   only editor for a formula, an F2 floating edit, a large grid, a preview or
+   reference surface, and anything the overlay could not start.
+
+### The native overlay
+
+`renderBlock({uid, el})` mounts the real Roam block editor inside a
+`.rg-native-cell-editor` node in the cell, so `[[`, `((`, `#`, `{{` and `/` open
+**Roam's own menus**, not the extension's approximations of them. The setting
+`editing-native-editor` (Editing, graph-scoped, default on) plus
+`nativeEditorEnabled()` gate it; two CONSECUTIVE mount or focus failures set
+`runtime.nativeEditorDisabled` for the rest of the session and say so once. Every
+failure falls through to the grid editor — the overlay never fails toward an
+empty cell.
+
+Five measured facts about Roam shape the whole class:
+
+- **Focus comes from a synthetic click.** `setBlockFocusAndSelection` does not
+  reach a `renderBlock` window. A `mousedown` + `mouseup` + `click` on the
+  `.rm-block__input` does, and a focused `<textarea>` appears in-host.
+- **The textarea is the only truth.** While typing, Roam has not written
+  `:block/string`; Datascript still holds the old value seconds later. Every
+  commit reads `textarea.value` first and only falls back to
+  `pullNativeCell(uid).raw` when focus is already gone.
+- **The chained cells render.** A native table stores the next column as the
+  block's CHILD, so the mount paints the rest of the row inside the cell unless
+  `.rm-block-children` is hidden — and a caret can still walk into one, which the
+  overlay's `focusin` guard commits on.
+- **Enter splits the block.** With the menu closed and the caret mid-value, Enter
+  truncates the cell and turns the remainder into a new child block. That is why
+  Enter is intercepted; `repairStructure` is the safety net for the passed-through
+  case, and it detects the damage by novel uid — NOT by
+  `nativeStructureSignature`, which walks row roots and first-child chains and so
+  reports a split table as healthy.
+- **The menu portal is a body child.** `nativeAutocompleteOpen()` reads
+  `.rm-autocomplete__results`. Only on a session where that selector has never
+  matched anything does it fall back to treating an open
+  `roamEditorTriggerContext` as a plausibly-open menu.
+
+`interceptKeydown` is a capture-phase listener on the overlay root, so a swallow
+stops the event before Roam's own handlers see it:
+
+| Key | Menu open | Menu closed |
+|---|---|---|
+| Enter | pass (select a row) + schedule the split check | commit, `enterMovement()` |
+| Tab / Shift+Tab | pass + schedule the split check | commit, `tabMovement()` |
+| Escape | pass (Roam closes the menu), menu treated closed for one frame | cancel |
+| Backspace at caret 0 | swallow — would merge the cell into the previous chain block |
+| Delete at the end | swallow — would forward-merge the hidden next-column cell |
+| ArrowUp/Down past the line | pass (menu nav) | swallow (caret clamp) |
+| ⌘Enter, block-move chords | swallow | swallow |
+
+Shift+Enter (soft break) and ⌘Z / ⌘⇧Z pass through, and a `composing` flag from
+`compositionstart`/`compositionend` yields the whole table to an IME. A
+multi-line paste is flattened to one line, because a grid cell is one block.
+
+`commit()` writes the live value, patches the adapter base, syncs the model cell
+and finishes through the editor controller's own `onFinish` closure — the same
+one the grid editor uses, so the cell renders, the selection moves and the grid
+re-claims the keyboard exactly as before. `cancel()` restores `beforeRaw`
+byte-for-byte, recording both the blur flush and the restore as self-writes so
+neither surfaces as somebody else's edit. `dispose()` unmounts and NEVER writes:
+a mid-edit disposal must not clobber what Roam last saved.
+
+Keyboard ownership needs no new code. The mounted input matches the hardened
+`ROAM_BLOCK_INPUT_SELECTOR`, so focusing it already runs `onGlobalFocusIn` →
+`releaseKeyboard()`, and the commit path re-claims through `onFinish`.
+
+On the session, `nativeOverlayUids` marks the block Roam is typing into. Its
+flushes arrive as external content changes, so they are skipped when collecting
+novel undo entries; `endNativeOverlayEdit` then pushes exactly one entry for the
+whole edit, by rewinding the cell to `beforeRaw` and re-applying the committed
+value through `commitMutation`. Because the base was already patched, that
+transaction leaves the dirty-cell diff empty and issues no second write.
+
 ## Cell autocomplete
 
 `roamEditorTriggerContext(raw, caret, { formula })` is the single scanner. It

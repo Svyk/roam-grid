@@ -10,6 +10,7 @@ import {
   clearUndoHistories,
   installKeyboardOwnership,
   isRoamBlockInput,
+  NativeCellEditorOverlay,
   keyboardOwner,
   portalOwnerUid,
   releaseKeyboard,
@@ -95,6 +96,8 @@ class Node {
     for (const listener of [...(this.listeners.get(type) || [])]) listener(event);
     return event;
   }
+  /** Real-`Event` entry point, for code that constructs a MouseEvent/InputEvent and dispatches it. */
+  dispatchEvent(event) { this.dispatch(event?.type ?? String(event)); return true; }
   focus() { globalThis.document.activeElement = this; this.focusCount = (this.focusCount || 0) + 1; }
   getBoundingClientRect() { return { left: 10, right: 110, top: 20, bottom: 54, width: 100, height: 34 }; }
   scrollIntoView() {}
@@ -699,5 +702,131 @@ test("a focused range excerpt routes commands to the source grid, not to the exc
 
     document.activeElement = preview.cell;
     assert.equal(activeMount(), main.view, "a hover preview resolves the same way");
+  } finally { session.dispose(); }
+});
+
+/* --------------------------------------------------------------------------------------------
+ * GOAL-U1 — keyboard ownership across a native cell overlay.
+ *
+ * The overlay adds NOTHING to the global keyboard layer: focusing the block input Roam mounts is
+ * already a Roam block input, so `onGlobalFocusIn` releases the grid, and the commit path re-claims
+ * through the editor controller's finish closure. These tests pin exactly that, end to end.
+ * ------------------------------------------------------------------------------------------ */
+
+function installOverlayFrames(t) {
+  const previous = globalThis.requestAnimationFrame;
+  const previousCancel = globalThis.cancelAnimationFrame;
+  globalThis.requestAnimationFrame = (callback) => { queueMicrotask(callback); return 1; };
+  globalThis.cancelAnimationFrame = () => {};
+  t.after(() => {
+    if (previous === undefined) delete globalThis.requestAnimationFrame; else globalThis.requestAnimationFrame = previous;
+    if (previousCancel === undefined) delete globalThis.cancelAnimationFrame; else globalThis.cancelAnimationFrame = previousCancel;
+  });
+}
+
+function installOverlayRoam(strings) {
+  const record = { updates: [], strings: { ...strings }, mounts: [] };
+  globalThis.window.roamAlphaAPI = {
+    q: () => [],
+    data: {
+      pull: (_pattern, reference) => {
+        const uid = Array.isArray(reference) ? reference[1] : reference;
+        return Object.hasOwn(record.strings, uid) ? { uid, string: record.strings[uid] } : null;
+      },
+      block: { update: async ({ block }) => { record.updates.push({ ...block }); record.strings[block.uid] = block.string; } },
+    },
+    ui: { components: {
+      unmountNode: () => {},
+      renderBlock: ({ uid, el }) => {
+        record.mounts.push(uid);
+        const host = new Node("div");
+        host.className = "rm-block__input";
+        host.id = `block-input-render-block-path-tbl-uuid55-${uid}`;
+        el.appendChild(host);
+        host.addEventListener("click", () => {
+          if (host.querySelector("textarea")) return;
+          const textarea = new Node("textarea");
+          textarea.id = host.id;
+          textarea.value = String(record.strings[uid] ?? "");
+          textarea.selectionStart = textarea.value.length; textarea.selectionEnd = textarea.value.length;
+          textarea.setSelectionRange = (start, end) => { textarea.selectionStart = start; textarea.selectionEnd = end; };
+          host.appendChild(textarea);
+          textarea.focus();
+        });
+        return () => {};
+      },
+    } },
+  };
+  return record;
+}
+
+test("focusing the block Roam mounts over a cell releases the grid, and committing takes it back", async (t) => {
+  const dom = installDom();
+  installOverlayFrames(t);
+  releaseKeyboard();
+  const uninstall = installKeyboardOwnership();
+  const { view, cell, session, model } = makeGrid(dom);
+  const record = installOverlayRoam({ a1: "1" });
+  const finishes = [];
+  view.editorController = {
+    // The shape `GridView.render` installs: the overlay finishes through the controller's own
+    // closure, whose keyboard half is `claimKeyboard(this)`. The full closure is exercised in
+    // test/editor-dom.test.js; here the assertion is the ownership handover.
+    onFinish: async (result) => { finishes.push(result); claimKeyboard(view); },
+  };
+  const overlay = new NativeCellEditorOverlay(view, { onFinish: (result) => view.editorController?.onFinish?.(result) });
+  view.nativeOverlay = overlay;
+  try {
+    dom.firePointerDown(cell);
+    assert.equal(keyboardOwner()?.view, view);
+
+    const started = await overlay.start({ row: 0, col: 0, cell, uid: "a1", raw: "1" });
+    assert.ok(started, "the mount reached a focused textarea");
+    assert.equal(record.mounts.at(-1), "a1");
+
+    dom.fireFocusIn(overlay.textarea);
+    assert.equal(isRoamBlockInput(overlay.textarea), true, "the hardened block-input selector matches Roam's mounted input");
+    assert.equal(keyboardOwner(), null, "Roam owns the keyboard while its own editor is focused");
+    assert.equal(view.root.classList.contains("rg-root--interaction-active"), false);
+
+    const keys = [];
+    view.onKeydown = (event) => keys.push(event.key);
+    dom.fireKeydown(overlay.textarea, { key: "ArrowDown" });
+    dom.fireKeydown(overlay.textarea, { key: "Delete" });
+    assert.deepEqual(keys, [], "with no owner the grid's keydown handler never runs against Roam's editor");
+
+    overlay.textarea.value = "typed in Roam";
+    await overlay.commit([1, 0]);
+    assert.equal(finishes.length, 1);
+    assert.equal(finishes[0].commit, true);
+    assert.equal(finishes[0].value, "typed in Roam");
+    assert.equal(keyboardOwner()?.view, view, "the committed edit hands the keyboard back to the grid");
+    assert.equal(model.getRaw(0, 0), "typed in Roam");
+    assert.deepEqual(record.updates, [{ uid: "a1", string: "typed in Roam" }]);
+  } finally { clearTimeout(session.saveTimer); uninstall(); session.dispose(); }
+});
+
+test("beginEdit on another view finishes a live native overlay before mounting a second one", async () => {
+  const dom = installDom();
+  releaseKeyboard();
+  const { view, session } = makeGrid(dom);
+  const commits = []; const finishes = [];
+  const previous = {
+    nativeOverlay: { active: true, commit: async (movement) => { commits.push(movement); } },
+    editorController: { state: { row: 0 }, finish: async (commit) => { finishes.push(commit); } },
+  };
+  session.activeEditorView = previous;
+  try {
+    const result = await session.beginEdit(view, () => "started");
+    assert.equal(result, "started");
+    assert.deepEqual(commits, [null], "Roam's editor is mounted on one block at a time — the live overlay commits first");
+    assert.deepEqual(finishes, [true]);
+    assert.equal(session.activeEditorView, view);
+
+    commits.length = 0;
+    session.activeEditorView = view;
+    view.nativeOverlay = { active: true, commit: async (movement) => { commits.push(movement); } };
+    await session.beginEdit(view, () => "again");
+    assert.deepEqual(commits, [], "re-entering the same view does not tear down its own overlay");
   } finally { session.dispose(); }
 });

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { FormulaEngine, GridEditorController, GridModel, GridView, NativeGridSession, formulaCanPointReference, moveFormulaReferenceCoordinate, paintRichCellContent, queryBlockReferenceSources, recentsCacheReady, recentsDisabled, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, resetRoamRecents, resetSuggestionRendering, roamSuggestionPlainText, searchRoamRecentSuggestions, settingsCache, syncPortalThemeFromRoot, wrapSelectionOnPair } from "../src/extension.js";
+import { FormulaEngine, GridEditorController, GridModel, GridView, NativeCellEditorOverlay, NativeGridSession, RegistrySet, claimKeyboard, formulaCanPointReference, keyboardOwner, moveFormulaReferenceCoordinate, nativeEditorEnabled, nativeOverlayStrayRepair, paintRichCellContent, queryBlockReferenceSources, recentsCacheReady, recentsDisabled, releaseKeyboard, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, resetNativeEditorHealth, resetRoamRecents, resetSuggestionRendering, roamSuggestionPlainText, runtime, sanitizeNativePasteText, searchRoamRecentSuggestions, settingsCache, syncPortalThemeFromRoot, wrapSelectionOnPair } from "../src/extension.js";
 
 class MiniClassList {
   constructor() { this.values = new Set(); }
@@ -1814,4 +1814,654 @@ test("native and large views route Enter inline and F2 floating without legacy e
   assert.doesNotMatch(source, /this\.formulaEdit|this\.formulaPopover/);
   assert.equal((source.match(/navigateReference:/g) || []).length, 2);
   assert.equal((source.match(/revealReference:/g) || []).length, 2);
+});
+
+/* --------------------------------------------------------------------------------------------
+ * GOAL-U1 — native cell editing through Roam's real block editor.
+ *
+ * The harness below mounts a stand-in for `renderBlock`: a `.rm-block__input` host that grows a
+ * focused `<textarea>` when it is clicked, which is the mechanism pinned fact 4 identified as the
+ * only way into edit mode on a renderBlock mount. `document` gains real listener plumbing so the
+ * overlay's document-level click-away listener can be exercised, and `requestAnimationFrame` runs
+ * on the microtask queue so the poll loops resolve inside a single `await`.
+ * ------------------------------------------------------------------------------------------ */
+
+class OverlayNode extends MiniNode {
+  matches(selector) {
+    return String(selector).split(",").some((part) => {
+      const value = part.trim();
+      if (!value) return false;
+      if (value.startsWith(".")) return value.slice(1).split(".").every((name) => this.classList.contains(name));
+      const prefix = /^\[([\w-]+)\^=['"]?([^'"\]]+)['"]?\]$/.exec(value);
+      if (prefix) return String(this.getAttribute(prefix[1]) ?? "").startsWith(prefix[2]);
+      return this.tagName === value.toUpperCase();
+    });
+  }
+  closest(selector) { for (let current = this; current; current = current.parentNode) if (current.matches?.(selector)) return current; return null; }
+  getBoundingClientRect() { return { left: 40, top: 60, right: 160, bottom: 88, width: 120, height: 28 }; }
+  dispatchEvent(event) {
+    const type = event?.type ?? String(event);
+    const payload = { type, target: this, currentTarget: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, stopPropagation() {} };
+    for (const listener of [...(this.listeners.get(type) || [])]) listener(payload);
+    return true;
+  }
+}
+
+function installOverlayDom() {
+  const body = new OverlayNode("body");
+  const listeners = new Map();
+  const popup = new OverlayNode("div"); popup.className = "rm-autocomplete__results";
+  const state = { popupOpen: false };
+  globalThis.document = {
+    body,
+    documentElement: { clientWidth: 1024 },
+    activeElement: null,
+    createElement: (name) => new OverlayNode(name),
+    createTextNode: (text) => new OverlayNode("#text", text),
+    querySelector: (selector) => (selector === ".rm-autocomplete__results" ? (state.popupOpen ? popup : null) : body.querySelector(selector)),
+    addEventListener(type, listener) { if (!listeners.has(type)) listeners.set(type, []); listeners.get(type).push(listener); },
+    removeEventListener(type, listener) { listeners.set(type, (listeners.get(type) || []).filter((value) => value !== listener)); },
+  };
+  globalThis.window = { addEventListener() {}, removeEventListener() {}, dispatchEvent() {} };
+  globalThis.requestAnimationFrame = (callback) => { queueMicrotask(callback); return 1; };
+  globalThis.cancelAnimationFrame = () => {};
+  delete globalThis.getComputedStyle; delete globalThis.MutationObserver; delete globalThis.matchMedia;
+  return {
+    body, state, popup,
+    documentListenerCount: (type) => (listeners.get(type) || []).length,
+    firePointerDown(target) {
+      const event = { type: "pointerdown", target, preventDefault() {}, stopPropagation() {} };
+      for (const listener of [...(listeners.get("pointerdown") || [])]) listener(event);
+      return event;
+    },
+  };
+}
+
+/** `renderBlock` stand-in. `mode` picks the failure being characterised. */
+function installOverlayRoam({ strings = {}, tree = null, mode = "ok" } = {}) {
+  const record = { updates: [], deletes: [], mounts: [], unmounts: [], strings: { ...strings } };
+  const components = {
+    unmountNode: ({ el }) => record.unmounts.push(el),
+    renderBlock: ({ uid, el }) => {
+      record.mounts.push(uid);
+      const host = new OverlayNode("div");
+      host.className = "rm-block__input";
+      host.id = `block-input-render-block-path-tbl-uuid7788-${uid}`;
+      el.appendChild(host);
+      if (mode !== "no-textarea") {
+        host.addEventListener("click", () => {
+          if (host.querySelector("textarea")) return;
+          const textarea = new OverlayNode("textarea");
+          textarea.id = host.id;
+          const stored = String(record.strings[uid] ?? "");
+          textarea.value = stored;
+          textarea.setSelectionRange(stored.length, stored.length);
+          host.appendChild(textarea);
+          globalThis.document.activeElement = textarea;
+        });
+      }
+      return () => { record.unmounts.push(uid); };
+    },
+  };
+  if (mode === "no-render-block") delete components.renderBlock;
+  globalThis.window.roamAlphaAPI = {
+    q: () => (tree ? [[tree]] : []),
+    data: {
+      pull: (_pattern, reference) => {
+        const uid = Array.isArray(reference) ? reference[1] : reference;
+        return Object.hasOwn(record.strings, uid) ? { uid, string: record.strings[uid] } : null;
+      },
+      block: {
+        update: async ({ block }) => { record.updates.push({ ...block }); record.strings[block.uid] = block.string; },
+        delete: async ({ block }) => { record.deletes.push(block.uid); },
+      },
+    },
+    ui: { components },
+  };
+  return record;
+}
+
+function overlayModel() {
+  return new GridModel({ tableUid: "table0001", rows: [[{ uid: "cell00001", raw: "Alpha" }, { uid: "cell00002", raw: "Beta" }]] });
+}
+
+function overlayAdapter(model, baseTree = null) {
+  const selfWrites = []; const patches = []; const transitions = [];
+  return {
+    model, baseTree, selfWrites, patches, transitions,
+    baseCells: new Map(model.rows.flat().map((cell) => [cell.uid, { uid: cell.uid, raw: cell.raw }])),
+    recordSelfWrite: (uid, from, to) => selfWrites.push({ uid, from, to }),
+    patchBaseContent: (changes) => patches.push(...changes.map((change) => ({ ...change }))),
+    recordExpectedStructuralTransition: (before, after, verified) => transitions.push({ before, after, verified }),
+  };
+}
+
+function overlaySession() {
+  const calls = { begin: [], end: [], flushes: 0 };
+  return {
+    calls, structuralPending: false, dirtyCells: new Map(),
+    flushContentSave: async () => { calls.flushes += 1; },
+    beginNativeOverlayEdit: (uid) => calls.begin.push(uid),
+    endNativeOverlayEdit: (uid, detail) => calls.end.push({ uid, ...detail }),
+  };
+}
+
+function makeOverlayHarness({ strings = { cell00001: "Alpha", cell00002: "Beta" }, tree = null, mode = "ok" } = {}) {
+  const dom = installOverlayDom();
+  const roamRecord = installOverlayRoam({ strings, tree, mode });
+  const model = overlayModel();
+  const adapter = overlayAdapter(model, tree);
+  const session = overlaySession();
+  const root = new OverlayNode("section"); root.className = "rg-root"; dom.body.appendChild(root);
+  const cell = new OverlayNode("div"); cell.className = "rg-cell"; root.appendChild(cell);
+  const finishes = [];
+  const view = { model, adapter, session, root, surface: "main", context: "source" };
+  const overlay = new NativeCellEditorOverlay(view, { onFinish: async (result) => { finishes.push(result); } });
+  view.nativeOverlay = overlay;
+  return { dom, roamRecord, model, adapter, session, root, cell, view, overlay, finishes };
+}
+
+async function startOverlay(harness, { row = 0, col = 0, uid = "cell00001", raw = "Alpha", initial = null } = {}) {
+  const started = await harness.overlay.start({ row, col, cell: harness.cell, uid, raw, initial });
+  return started;
+}
+
+function keydownOn(overlayRoot, fields) {
+  const stops = [];
+  const event = overlayRoot.dispatch("keydown", { stopPropagation() { stops.push(true); }, ...fields });
+  return { event, stopped: stops.length > 0 };
+}
+
+test("a plain source cell edits through Roam's block editor and a formula, F2, preview or registry editor never does", async (t) => {
+  t.after(() => { settingsCache.clear(); resetNativeEditorHealth(); runtime.registries = null; delete globalThis.HTMLElement; });
+  installOverlayDom();
+  resetNativeEditorHealth();
+  runtime.registries = new RegistrySet();
+  globalThis.HTMLElement = OverlayNode;
+  const model = new GridModel({ tableUid: "table0001", rows: [[{ uid: "cell00001", raw: "Alpha" }, { uid: "cell00002", raw: "=SUM(A1)" }], [{ uid: "cell00003", raw: "==escaped" }, { uid: "cell00004", raw: "Delta" }]] });
+  const cells = new Map();
+  for (let row = 0; row < 2; row += 1) for (let col = 0; col < 2; col += 1) cells.set(`${row}:${col}`, new OverlayNode("div"));
+  const overlayStarts = []; const controllerStarts = [];
+  let overlayResult = { started: true };
+  const view = Object.assign(Object.create(GridView.prototype), {
+    model, cells, surface: "main", context: "source", session: { id: "session" },
+    nativeOverlay: { start: async (args) => { overlayStarts.push(args); return overlayResult; } },
+    editorController: { start: async (args) => { controllerStarts.push(args); return "custom"; } },
+  });
+
+  assert.equal(await view.beginEditLocal(0, 0), overlayResult, "a plain source cell takes the native overlay");
+  assert.deepEqual(overlayStarts.at(-1), { row: 0, col: 0, cell: cells.get("0:0"), uid: "cell00001", raw: "Alpha", initial: null });
+  assert.equal(controllerStarts.length, 0);
+
+  assert.equal(await view.beginEditLocal(0, 1), "custom", "a formula cell keeps the grid editor and its fx assistant");
+  assert.equal(overlayStarts.length, 1);
+
+  assert.ok(await view.beginEditLocal(1, 0), "the == escape is text, not a formula");
+  assert.equal(overlayStarts.length, 2);
+
+  await view.beginEditLocal(0, 0, null, true);
+  assert.equal(controllerStarts.at(-1).floating, true, "F2 floating editing is never native");
+  assert.equal(overlayStarts.length, 2);
+
+  settingsCache.set("editing-native-editor", false);
+  assert.equal(await view.beginEditLocal(0, 0), "custom", "the setting off routes to the grid editor");
+  assert.equal(overlayStarts.length, 2);
+  settingsCache.set("editing-native-editor", true);
+
+  view.surface = "preview";
+  assert.equal(await view.beginEditLocal(0, 0), "custom");
+  view.surface = "main"; view.context = "reference";
+  assert.equal(await view.beginEditLocal(0, 0), "custom", "a reference-context grid is not the source of truth for the block");
+  view.context = "source";
+
+  const registered = new OverlayNode("textarea");
+  runtime.registries.register(runtime.registries.cellEditors, "stars", { match: () => true, create: () => registered });
+  assert.equal(await view.beginEditLocal(0, 0), "custom");
+  assert.equal(controllerStarts.at(-1).customEditor, registered, "a registered cell editor wins outright");
+  assert.equal(overlayStarts.length, 2);
+  runtime.registries.cellEditors.clear();
+
+  overlayResult = null;
+  assert.equal(await view.beginEditLocal(0, 0), "custom", "an overlay that cannot start falls through to the grid editor");
+  assert.equal(overlayStarts.length, 3);
+  assert.equal(controllerStarts.at(-1).customEditor, null);
+});
+
+test("two consecutive mount failures retire the native editor for the session with one toast", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); runtime.extensionAPI = null; settingsCache.clear(); });
+  resetNativeEditorHealth();
+  runtime.extensionAPI = { settings: {} };
+  const harness = makeOverlayHarness({ mode: "no-render-block" });
+
+  assert.equal(await startOverlay(harness), null);
+  assert.equal(runtime.nativeEditorFailures, 1);
+  assert.equal(runtime.nativeEditorDisabled, false);
+  assert.equal(nativeEditorEnabled(), true, "one failure is a fallback, not a retirement");
+  assert.equal(harness.cell.classList.contains("rg-cell--native-editing"), false, "a failed mount leaves no overlay chrome behind");
+  assert.equal(harness.cell.children.length, 0);
+
+  assert.equal(await startOverlay(harness), null);
+  assert.equal(runtime.nativeEditorDisabled, true);
+  assert.equal(nativeEditorEnabled(), false);
+  assert.equal(globalThis.document.body.querySelectorAll(".rg-toast").length, 1);
+
+  assert.equal(await startOverlay(harness), null);
+  assert.equal(globalThis.document.body.querySelectorAll(".rg-toast").length, 1, "the retirement toast is said once");
+
+  resetNativeEditorHealth();
+  const focusFailure = makeOverlayHarness({ mode: "no-textarea" });
+  focusFailure.overlay.nextFrame = async () => {};
+  assert.equal(await startOverlay(focusFailure), null, "a mount with no reachable textarea is a focus failure");
+  assert.equal(runtime.nativeEditorFailures, 1);
+  assert.equal(focusFailure.roamRecord.unmounts.length > 0, true, "the failed mount is unmounted, not leaked");
+});
+
+test("a successful mount clicks into Roam's input, claims the overlay uid, and resets the failure streak", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  runtime.nativeEditorFailures = 1;
+  const harness = makeOverlayHarness();
+  const started = await startOverlay(harness);
+  assert.ok(started);
+  assert.equal(runtime.nativeEditorFailures, 0, "a success clears the streak — the two failures must be CONSECUTIVE");
+  assert.equal(harness.roamRecord.mounts.at(-1), "cell00001");
+  assert.equal(harness.cell.classList.contains("rg-cell--editing"), true);
+  assert.equal(harness.cell.classList.contains("rg-cell--native-editing"), true);
+  const overlayNode = harness.cell.querySelector(".rg-native-cell-editor");
+  assert.ok(overlayNode);
+  assert.equal(overlayNode.classList.contains("rg-native-cell-editor--ready"), true, "the overlay only paints once Roam's input exists");
+  assert.equal(harness.overlay.textarea.value, "Alpha");
+  assert.equal(harness.overlay.textarea.selectionStart, 5);
+  assert.deepEqual(harness.session.calls.begin, ["cell00001"]);
+  assert.equal(harness.dom.documentListenerCount("pointerdown"), 1);
+  harness.overlay.dispose();
+  assert.equal(harness.dom.documentListenerCount("pointerdown"), 0);
+});
+
+test("a typed character seeds the block before Roam's editor opens and parks the caret after it", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  await startOverlay(harness, { initial: "x" });
+  assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "x" }]);
+  assert.deepEqual(harness.adapter.selfWrites, [{ uid: "cell00001", from: "Alpha", to: "x" }], "the seed is recorded so its own echo is absorbed");
+  assert.deepEqual(harness.adapter.patches, [{ uid: "cell00001", raw: "x" }]);
+  assert.equal(harness.overlay.textarea.value, "x");
+  assert.equal(harness.overlay.textarea.selectionStart, 1);
+  assert.equal(harness.overlay.beforeRaw, "Alpha", "beforeRaw is the value the cell had before the seed");
+});
+
+test("the keydown table intercepts what would damage the row and passes what belongs to Roam", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  await startOverlay(harness);
+  const { overlay } = harness;
+  const node = harness.cell.querySelector(".rg-native-cell-editor");
+  const textarea = overlay.textarea;
+  let popupOpen = false;
+  overlay.nativeAutocompleteOpen = () => popupOpen;
+  const commits = []; const cancels = []; const repairs = [];
+  overlay.commit = async (movement) => { commits.push(movement); return null; };
+  overlay.cancel = async () => { cancels.push(true); return null; };
+  overlay.scheduleStructureRepair = () => { repairs.push(true); return null; };
+  const setCaret = (value, start, end = start) => { textarea.value = value; textarea.setSelectionRange(start, end); };
+
+  setCaret("Alpha", 3);
+  let fired = keydownOn(node, { key: "Enter", shiftKey: false, target: textarea });
+  assert.equal(fired.event.defaultPrevented, true);
+  assert.equal(fired.stopped, true);
+  assert.deepEqual(commits, [[1, 0]], "Enter with the menu closed commits and moves down");
+  assert.deepEqual(repairs, []);
+
+  popupOpen = true;
+  fired = keydownOn(node, { key: "Enter", shiftKey: false, target: textarea });
+  assert.equal(fired.event.defaultPrevented, false, "Enter selects the menu row — Roam owns it");
+  assert.equal(commits.length, 1);
+  assert.deepEqual(repairs, [true], "a passed-through Enter schedules the split check from pinned fact 6");
+
+  fired = keydownOn(node, { key: "Tab", shiftKey: false, target: textarea });
+  assert.equal(fired.event.defaultPrevented, false);
+  assert.equal(repairs.length, 2);
+  popupOpen = false;
+  fired = keydownOn(node, { key: "Tab", shiftKey: true, target: textarea });
+  assert.equal(fired.event.defaultPrevented, true);
+  assert.deepEqual(commits.at(-1), [0, -1], "Shift+Tab commits leftward");
+
+  popupOpen = true;
+  fired = keydownOn(node, { key: "Escape", target: textarea });
+  assert.equal(fired.event.defaultPrevented, false, "Escape closes Roam's menu first");
+  assert.deepEqual(cancels, []);
+  assert.equal(overlay.popupJustClosed, true);
+  fired = keydownOn(node, { key: "Escape", target: textarea });
+  assert.equal(fired.event.defaultPrevented, true, "the menu is gone one keystroke later, so Escape now cancels");
+  assert.deepEqual(cancels, [true]);
+  overlay.popupJustClosed = false;
+  popupOpen = false;
+
+  setCaret("Alpha", 0);
+  fired = keydownOn(node, { key: "Backspace", target: textarea });
+  assert.equal(fired.event.defaultPrevented, true, "Backspace at caret 0 would merge the cell into the previous chain block");
+  assert.equal(fired.stopped, true);
+  setCaret("Alpha", 0, 3);
+  fired = keydownOn(node, { key: "Backspace", target: textarea });
+  assert.equal(fired.event.defaultPrevented, false, "with a selection Backspace is an ordinary delete");
+  setCaret("Alpha", 1);
+  fired = keydownOn(node, { key: "Backspace", target: textarea });
+  assert.equal(fired.event.defaultPrevented, false);
+
+  setCaret("Alpha", 5);
+  fired = keydownOn(node, { key: "Delete", target: textarea });
+  assert.equal(fired.event.defaultPrevented, true, "Delete at the end would forward-merge the hidden next-column cell");
+  setCaret("Alpha", 2);
+  fired = keydownOn(node, { key: "Delete", target: textarea });
+  assert.equal(fired.event.defaultPrevented, false);
+
+  setCaret("one\ntwo", 1);
+  fired = keydownOn(node, { key: "ArrowUp", target: textarea });
+  assert.equal(fired.event.defaultPrevented, true, "the caret is clamped inside the cell");
+  fired = keydownOn(node, { key: "ArrowDown", target: textarea });
+  assert.equal(fired.event.defaultPrevented, false, "a second line below means ArrowDown stays in the cell");
+  setCaret("one\ntwo", 5);
+  fired = keydownOn(node, { key: "ArrowDown", target: textarea });
+  assert.equal(fired.event.defaultPrevented, true);
+  popupOpen = true;
+  setCaret("one\ntwo", 1);
+  fired = keydownOn(node, { key: "ArrowUp", target: textarea });
+  assert.equal(fired.event.defaultPrevented, false, "with the menu open the arrows navigate it");
+  popupOpen = false;
+
+  setCaret("Alpha", 2);
+  fired = keydownOn(node, { key: "Enter", shiftKey: true, target: textarea });
+  assert.equal(fired.event.defaultPrevented, false, "Shift+Enter is a legal soft break");
+  fired = keydownOn(node, { key: "z", metaKey: true, target: textarea });
+  assert.equal(fired.event.defaultPrevented, false, "⌘Z mid-edit is the browser's native undo on Roam's textarea");
+  fired = keydownOn(node, { key: "Enter", metaKey: true, target: textarea });
+  assert.equal(fired.event.defaultPrevented, true, "⌘Enter opens the block in the sidebar — a second editor over the same block");
+  fired = keydownOn(node, { key: "ArrowUp", metaKey: true, shiftKey: true, target: textarea });
+  assert.equal(fired.event.defaultPrevented, true, "a block-move chord would take the cell out of its row chain");
+
+  overlay.state.composing = true;
+  setCaret("Alpha", 3);
+  fired = keydownOn(node, { key: "Enter", shiftKey: false, target: textarea });
+  assert.equal(fired.event.defaultPrevented, false, "an IME composition owns Enter");
+  overlay.state.composing = false;
+  const commitCount = commits.length;
+  keydownOn(node, { key: "Enter", shiftKey: false, isComposing: true, target: textarea });
+  assert.equal(commits.length, commitCount);
+});
+
+test("the popup probe reads Roam's portal and only falls back where that selector has never matched", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  await startOverlay(harness);
+  const { overlay, dom } = harness;
+  assert.equal(overlay.nativeAutocompleteOpen(), false);
+  overlay.textarea.value = "[[Pro"; overlay.textarea.setSelectionRange(5, 5);
+  assert.equal(overlay.nativeAutocompleteOpen(), true, "with no portal ever seen an open trigger context stands in for it");
+  dom.state.popupOpen = true;
+  assert.equal(overlay.nativeAutocompleteOpen(), true);
+  dom.state.popupOpen = false;
+  assert.equal(overlay.nativeAutocompleteOpen(), false, "once the real portal has been seen, its absence is authoritative");
+  dom.state.popupOpen = true;
+  dom.popup.hidden = true;
+  assert.equal(overlay.nativeAutocompleteOpen(), false, "a hidden portal is a closed menu");
+  dom.popup.hidden = false;
+});
+
+test("a multi-line paste becomes one line instead of a block per line", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  assert.equal(sanitizeNativePasteText("one\r\n  two \n\nthree"), "one two three");
+  assert.equal(sanitizeNativePasteText("single"), "single");
+  const harness = makeOverlayHarness();
+  await startOverlay(harness);
+  const node = harness.cell.querySelector(".rg-native-cell-editor");
+  harness.overlay.textarea.value = ""; harness.overlay.textarea.setSelectionRange(0, 0);
+  const multi = node.dispatch("paste", { clipboardData: { getData: () => "one\ntwo" }, target: harness.overlay.textarea });
+  assert.equal(multi.defaultPrevented, true);
+  assert.equal(harness.overlay.textarea.value, "one two");
+  const single = node.dispatch("paste", { clipboardData: { getData: () => "plain" }, target: harness.overlay.textarea });
+  assert.equal(single.defaultPrevented, false, "a single-line paste is Roam's to handle");
+});
+
+test("commit reads the live textarea, writes it back, syncs the model and reports through onFinish", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  await startOverlay(harness);
+  // PINNED FACT 7: Roam has not written :block/string yet, so Datascript still says "Alpha".
+  harness.overlay.textarea.value = "Typed live";
+  const result = await harness.overlay.commit([1, 0]);
+  assert.deepEqual(result, { uid: "cell00001", value: "Typed live", movement: [1, 0] });
+  assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "Typed live" }]);
+  assert.deepEqual(harness.adapter.selfWrites, [{ uid: "cell00001", from: "Alpha", to: "Typed live" }]);
+  assert.deepEqual(harness.adapter.patches, [{ uid: "cell00001", raw: "Typed live" }]);
+  assert.equal(harness.model.getRaw(0, 0), "Typed live");
+  assert.deepEqual(harness.finishes, [{ row: 0, col: 0, cell: harness.cell, raw: "Alpha", value: "Typed live", commit: true, movement: [1, 0] }]);
+  assert.deepEqual(harness.session.calls.end, [{ uid: "cell00001", beforeRaw: "Alpha", afterRaw: "Typed live", commit: true }]);
+  assert.equal(harness.cell.querySelector(".rg-native-cell-editor"), null);
+  assert.equal(harness.cell.classList.contains("rg-cell--native-editing"), false);
+  assert.equal(await harness.overlay.commit([1, 0]), null, "a second commit on a finished overlay is a no-op");
+  assert.equal(harness.roamRecord.updates.length, 1);
+});
+
+test("commit falls back to the stored block string when focus has already left the overlay", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  await startOverlay(harness);
+  harness.roamRecord.strings.cell00001 = "Flushed by Roam";
+  harness.overlay.textarea = null;
+  await harness.overlay.commit(null);
+  assert.equal(harness.model.getRaw(0, 0), "Flushed by Roam");
+  assert.deepEqual(harness.roamRecord.updates, [], "the graph already holds that value; committing it again would be a redundant write");
+  assert.deepEqual(harness.adapter.patches, [{ uid: "cell00001", raw: "Flushed by Roam" }]);
+});
+
+test("an emptied cell commits as Roam's single space and a spaced cell commits back to text", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const emptied = makeOverlayHarness();
+  await startOverlay(emptied);
+  emptied.overlay.textarea.value = "";
+  await emptied.overlay.commit(null);
+  assert.deepEqual(emptied.roamRecord.updates, [{ uid: "cell00001", string: " " }], "an empty cell is stored as a single space so Roam keeps the block");
+  assert.deepEqual(emptied.adapter.patches, [{ uid: "cell00001", raw: "" }], "the base records the raw value, which is the empty string");
+  assert.equal(emptied.model.getRaw(0, 0), "");
+
+  const spaced = makeOverlayHarness({ strings: { cell00001: " ", cell00002: "Beta" } });
+  const started = await startOverlay(spaced, { raw: "" });
+  assert.ok(started);
+  assert.equal(spaced.overlay.textarea.value, " ");
+  spaced.overlay.textarea.value = "Filled";
+  await spaced.overlay.commit(null);
+  assert.deepEqual(spaced.roamRecord.updates, [{ uid: "cell00001", string: "Filled" }]);
+  assert.deepEqual(spaced.adapter.selfWrites, [{ uid: "cell00001", from: "", to: "Filled" }], "the block held raw \"\", not \" \"");
+  assert.deepEqual(spaced.session.calls.end.at(-1), { uid: "cell00001", beforeRaw: "", afterRaw: "Filled", commit: true });
+
+  const unchanged = makeOverlayHarness({ strings: { cell00001: " ", cell00002: "Beta" } });
+  await startOverlay(unchanged, { raw: "" });
+  await unchanged.overlay.commit(null);
+  assert.deepEqual(unchanged.roamRecord.updates, [{ uid: "cell00001", string: " " }], "an untouched empty cell is rewritten as \" \" rather than left to collapse");
+  assert.deepEqual(unchanged.adapter.selfWrites, [], "nothing changed, so there is no echo to absorb");
+});
+
+test("cancel restores the exact bytes the cell held, absorbing whatever Roam flushed on blur", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  await startOverlay(harness, { initial: "z" });
+  harness.roamRecord.updates.length = 0; harness.adapter.selfWrites.length = 0; harness.adapter.patches.length = 0;
+  harness.overlay.textarea.value = "zebra";
+  const result = await harness.overlay.cancel();
+  assert.deepEqual(result, { uid: "cell00001", value: "Alpha" });
+  assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "Alpha" }], "byte-identical restore, unconditionally");
+  assert.deepEqual(harness.adapter.selfWrites, [
+    { uid: "cell00001", from: null, to: "zebra" },
+    { uid: "cell00001", from: "zebra", to: "Alpha" },
+  ], "the blur flush and the restore are both absorbed, in order");
+  assert.deepEqual(harness.adapter.patches, [{ uid: "cell00001", raw: "Alpha" }]);
+  assert.equal(harness.model.getRaw(0, 0), "Alpha");
+  assert.deepEqual(harness.finishes, [{ row: 0, col: 0, cell: harness.cell, raw: "Alpha", value: "Alpha", commit: false, movement: null }]);
+  assert.deepEqual(harness.session.calls.end, [{ uid: "cell00001", beforeRaw: "Alpha", afterRaw: "Alpha", commit: false }]);
+});
+
+test("dispose is idempotent, unmounts, and never writes what Roam last saved", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  await startOverlay(harness);
+  harness.overlay.textarea.value = "half typed";
+  harness.overlay.dispose();
+  harness.overlay.dispose();
+  assert.deepEqual(harness.roamRecord.updates, [], "a mid-edit disposal must not clobber whatever Roam last saved");
+  assert.deepEqual(harness.adapter.selfWrites, []);
+  assert.deepEqual(harness.finishes, []);
+  assert.equal(harness.cell.querySelector(".rg-native-cell-editor"), null);
+  assert.equal(harness.cell.classList.contains("rg-cell--editing"), false);
+  assert.deepEqual(harness.session.calls.end, [{ uid: "cell00001", commit: false }], "the session's overlay claim is released without an undo entry");
+  assert.equal(harness.overlay.active, false);
+  assert.equal(await startOverlay(harness), null, "a disposed overlay refuses to start again");
+});
+
+test("a click outside the overlay commits, and a click inside Roam's own menu does not", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  await startOverlay(harness);
+  const commits = [];
+  harness.overlay.commit = async (movement) => { commits.push(movement); return null; };
+  harness.dom.firePointerDown(harness.overlay.textarea);
+  assert.deepEqual(commits, [], "a click inside the overlay is ordinary caret placement");
+  const menuRow = new OverlayNode("div");
+  harness.dom.popup.appendChild(menuRow);
+  harness.dom.body.appendChild(harness.dom.popup);
+  harness.dom.firePointerDown(menuRow);
+  assert.deepEqual(commits, [], "Roam's menu is mounted on the body, outside our node — accepting a row is not a click-away");
+  const elsewhere = new OverlayNode("div"); harness.dom.body.appendChild(elsewhere);
+  harness.dom.firePointerDown(elsewhere);
+  assert.deepEqual(commits, [null], "a click anywhere else commits the edit in place");
+});
+
+test("a caret that escapes into a hidden chained cell commits, and one that lands on a stray repairs", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  await startOverlay(harness);
+  const node = harness.cell.querySelector(".rg-native-cell-editor");
+  const commits = []; const repairs = [];
+  harness.overlay.commit = async (movement) => { commits.push(movement); return null; };
+  harness.overlay.scheduleStructureRepair = (options) => { repairs.push(options); return null; };
+
+  const chained = new OverlayNode("div"); chained.className = "rm-block__input"; chained.id = "block-input-x-cell00002"; node.appendChild(chained);
+  node.dispatch("focusin", { target: chained });
+  assert.deepEqual(commits, [null], "the chained next-column cell is hidden, not absent — typing into it must not be possible");
+
+  commits.length = 0;
+  const stray = new OverlayNode("div"); stray.className = "rm-block__input"; stray.id = "block-input-x-strayblok"; node.appendChild(stray);
+  node.dispatch("focusin", { target: stray });
+  assert.deepEqual(commits, [], "a uid the table has never seen is a split remainder, not an escape");
+  assert.deepEqual(repairs, [{ commitWhenClean: true }]);
+
+  const own = new OverlayNode("div"); own.className = "rm-block__input"; own.id = "block-input-x-cell00001"; node.appendChild(own);
+  node.dispatch("focusin", { target: own });
+  assert.deepEqual(commits, []);
+});
+
+test("repairStructure merges Roam's split remainder back into the cell and deletes the stray", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const base = {
+    uid: "table0001", string: "{{[[table]]}}", order: 0, children: [
+      { uid: "cell00001", string: "Alpha", order: 0, children: [{ uid: "cell00002", string: "Beta", order: 0, children: [] }] },
+    ],
+  };
+  const damaged = {
+    uid: "table0001", string: "{{[[table]]}}", order: 0, children: [
+      { uid: "cell00001", string: "Al", order: 0, children: [
+        { uid: "cell00002", string: "Beta", order: 0, children: [] },
+        { uid: "strayblok", string: "pha", order: 1, children: [] },
+      ] },
+    ],
+  };
+  assert.deepEqual(nativeOverlayStrayRepair(base, damaged, "cell00001"), { cellUid: "cell00001", strayUid: "strayblok", text: "pha" });
+  assert.equal(nativeOverlayStrayRepair(base, base, "cell00001"), null, "an undamaged tree needs no repair");
+
+  const twoStrays = structuredClone(damaged);
+  twoStrays.children[0].children.push({ uid: "strayblo2", string: "more", order: 2, children: [] });
+  assert.equal(nativeOverlayStrayRepair(base, twoStrays, "cell00001"), null, "two strays is not the pinned damage shape — the structural-reload lane owns it");
+
+  const nested = structuredClone(damaged);
+  nested.children[0].children[1].children = [{ uid: "strayblo3", string: "deep", order: 0, children: [] }];
+  assert.equal(nativeOverlayStrayRepair(base, nested, "cell00001"), null, "a stray with children is not the pinned damage shape");
+
+  const elsewhere = structuredClone(base);
+  elsewhere.children[0].children[0].children = [{ uid: "strayblo4", string: "x", order: 0, children: [] }];
+  assert.equal(nativeOverlayStrayRepair(base, elsewhere, "cell00001"), null, "a stray under a different cell is not this cell's split");
+
+  const harness = makeOverlayHarness({ strings: { cell00001: "Al", cell00002: "Beta", strayblok: "pha" }, tree: damaged });
+  harness.adapter.baseTree = base;
+  await startOverlay(harness, { raw: "Alpha" });
+  harness.overlay.textarea.value = "Al";
+  const plan = await harness.overlay.repairStructure();
+  assert.deepEqual(plan, { cellUid: "cell00001", strayUid: "strayblok", text: "pha" });
+  assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "Alpha" }]);
+  assert.deepEqual(harness.roamRecord.deletes, ["strayblok"]);
+  assert.deepEqual(harness.adapter.selfWrites, [{ uid: "cell00001", from: "Al", to: "Alpha" }]);
+  assert.equal(harness.adapter.transitions.length, 1, "the repair is declared so the pull-watch echo is absorbed rather than reloading the grid");
+  assert.equal(harness.overlay.textarea.value, "Alpha");
+  assert.equal(harness.overlay.textarea.selectionStart, 2, "the caret lands where the split happened");
+
+  const emptyStray = structuredClone(damaged);
+  emptyStray.children[0].children[1].string = "";
+  const second = makeOverlayHarness({ strings: { cell00001: "Al", cell00002: "Beta", strayblok: "" }, tree: emptyStray });
+  second.adapter.baseTree = base;
+  await startOverlay(second, { raw: "Alpha" });
+  second.overlay.textarea.value = "Al";
+  await second.overlay.repairStructure();
+  assert.deepEqual(second.roamRecord.updates, [], "an empty stray only needs deleting");
+  assert.deepEqual(second.roamRecord.deletes, ["strayblok"]);
+});
+
+test("GridView.render wires exactly one native overlay and hands it the editor controller's finish closure", async (t) => {
+  t.after(() => { settingsCache.clear(); resetNativeEditorHealth(); runtime.registries = null; releaseKeyboard(); });
+  installOverlayDom();
+  resetNativeEditorHealth();
+  runtime.registries = new RegistrySet();
+  globalThis.window.roamAlphaAPI = { ui: { components: {} } };
+  const model = new GridModel({ tableUid: "table0001", rows: [[{ uid: "cell00001", raw: "Alpha" }, { uid: "cell00002", raw: "Beta" }]] });
+  const commits = []; const moves = []; const finished = [];
+  const root = new OverlayNode("section"); root.className = "rg-root"; globalThis.document.body.appendChild(root);
+  const view = Object.assign(Object.create(GridView.prototype), {
+    model, root, cells: new Map(), cellCoordinatesByUid: new Map(), selection: { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+    anchor: { row: 0, col: 0 }, selectedCellElements: new Set(), activeCellElement: null, selectionControls: new Set(),
+    context: "source", surface: "main", disposed: false, editorController: null, nativeOverlay: null, viewport: null,
+    referenceCounts: new Map(), commentThreads: new Map(), inlineReferenceDisposers: new Set(),
+    session: { editorFinished: (value) => finished.push(value), scheduleReferenceCountRefresh() {}, removeView() {} },
+    commitMutation: (label, mutation) => { commits.push(label); mutation(); return Promise.resolve(model); },
+    moveSelection: (dr, dc) => moves.push([dr, dc]),
+    renderCellValue() {},
+    updateReferenceCountBadges() {},
+    syncCommentAffordance() {},
+  });
+
+  view.render();
+  const first = view.nativeOverlay;
+  assert.ok(first instanceof NativeCellEditorOverlay);
+  view.render();
+  assert.notEqual(view.nativeOverlay, first, "a re-render replaces the overlay alongside its controller");
+  assert.equal(first.disposed, true, "the previous overlay is disposed, not leaked");
+
+  claimKeyboard({ root: new OverlayNode("section"), surface: "main", onKeydown() {} });
+  await view.nativeOverlay.onFinish({ row: 0, col: 0, cell: new OverlayNode("div"), raw: "Alpha", value: "Committed", commit: true, movement: [1, 0] });
+  assert.deepEqual(commits, ["Edit cell"], "the overlay finishes through the controller's own closure");
+  assert.equal(model.getRaw(0, 0), "Committed");
+  assert.deepEqual(moves, [[1, 0]]);
+  assert.deepEqual(finished, [view]);
+  assert.equal(keyboardOwner()?.view, view, "committing a native edit hands the keyboard back to the grid");
+
+  view.dispose();
+  assert.equal(view.nativeOverlay, null);
 });

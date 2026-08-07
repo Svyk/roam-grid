@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { NativeTableAdapter, nativeTreeToModel } from "../src/extension.js";
+import { GridModel, NativeGridSession, NativeTableAdapter, UndoHistory, nativeOverlayStrayRepair, nativeTreeToModel } from "../src/extension.js";
 
 function rawTree() {
   return {
@@ -78,4 +78,115 @@ test("native save detects an external edit before writing", async (t) => {
   tree.children[1].string = "external";
   await assert.rejects(adapter.save(model), { code: "CONFLICT" });
   assert.equal(writes, 0);
+});
+
+/* --------------------------------------------------------------------------------------------
+ * GOAL-U1 — what the adapter and the session owe a cell being edited in Roam's own block editor.
+ * ------------------------------------------------------------------------------------------ */
+
+function overlaySessionHarness({ tableUid = "table0001" } = {}) {
+  const model = new GridModel({ tableUid, columnIds: ["col0", "col1"], rows: [[{ uid: "cell00001", raw: "Alpha" }, { uid: "cell00002", raw: "Beta" }]] });
+  const history = new UndoHistory();
+  model.history = history;
+  const base = new Map([["cell00001", "Alpha"], ["cell00002", "Beta"]]);
+  const session = Object.assign(Object.create(NativeGridSession.prototype), {
+    tableUid, model, history, views: new Set(), nativeOverlayUids: new Set(),
+    adapter: { model, getBaseRaw: (uid) => base.get(uid) ?? null, acceptExternalTree() {}, load: () => model, saveContent: async () => ({ saved: [], skipped: [] }) },
+    dirtyCells: new Map(), editRevisions: new Map(), metadataDirty: false, structuralPending: false,
+    contentSavePromise: null, disposed: false, changeVersion: 0, savedVersion: 0, saveTimer: null,
+    renderStructural() {}, refreshValues() {}, scheduleReferenceCountRefresh() {}, setSaving() {},
+  });
+  return { model, history, session, base };
+}
+
+test("the overlay's seed write comes back as an echo, not as an edit from somewhere else", (t) => {
+  const tree = rawTree(); let handler = null;
+  globalThis.window = { roamAlphaAPI: {
+    q: () => [[tree]],
+    data: { addPullWatch: (_pattern, _entity, fn) => { handler = fn; }, removePullWatch: () => {}, block: { update: async () => {} } },
+  } };
+  t.after(() => { delete globalThis.window; });
+  const adapter = new NativeTableAdapter("table0001", { get: () => null, set: async () => {} });
+  adapter.load();
+  const events = [];
+  adapter.watchExternal((_model, event) => events.push(event));
+
+  // A typed character seeds the block before Roam's editor opens: cell00002 goes from " " to "x".
+  adapter.recordSelfWrite("cell00002", "", "x");
+  const seeded = structuredClone(tree); seeded.children[1].children[0].string = "x";
+  handler(structuredClone(tree), seeded);
+  assert.deepEqual(events, [], "our own seed must not surface as an external change");
+
+  const remote = structuredClone(seeded); remote.children[1].children[0].string = "someone else";
+  handler(seeded, remote);
+  assert.equal(events.length, 1, "a write we did not record still reaches the session");
+  assert.deepEqual(events[0].changes, [{ uid: "cell00002", from: "x", raw: "someone else", row: 1, col: 1 }]);
+});
+
+test("keystrokes flushed from a cell held by a native overlay take the non-conflict lane and record no undo entry", () => {
+  const { model, history, session } = overlaySessionHarness();
+  session.beginNativeOverlayEdit("cell00001");
+
+  const typing = new GridModel({ columnIds: ["col0", "col1"], rows: [[{ uid: "cell00001", raw: "Alph" }, { uid: "cell00002", raw: "Beta" }]] });
+  session.handleExternalChange(typing, { type: "content", structural: false, tree: {}, changes: [{ uid: "cell00001", raw: "Alph" }] });
+  assert.equal(model.getRaw(0, 0), "Alph", "the model still follows what Roam wrote");
+  assert.equal(history.entries.length, 0, "per-keystroke flushes are not undo entries — endNativeOverlayEdit pushes the single one");
+
+  const elsewhere = new GridModel({ columnIds: ["col0", "col1"], rows: [[{ uid: "cell00001", raw: "Alph" }, { uid: "cell00002", raw: "remote" }]] });
+  session.handleExternalChange(elsewhere, { type: "content", structural: false, tree: {}, changes: [{ uid: "cell00002", raw: "remote" }] });
+  assert.equal(history.entries.length, 1, "a cell no overlay owns still records its external edit");
+  assert.equal(history.entries[0].touched.includes("cell00002"), true);
+});
+
+test("endNativeOverlayEdit pushes exactly one undo entry and issues no second write", (t) => {
+  const { model, history, session, base } = overlaySessionHarness();
+  globalThis.window = { dispatchEvent() {} };
+  t.after(() => { clearTimeout(session.saveTimer); delete globalThis.window; });
+  session.beginNativeOverlayEdit("cell00001");
+  // The overlay has already written the value and patched the adapter base before it ends the edit.
+  base.set("cell00001", "Committed");
+  model.getCell(0, 0).raw = "Committed";
+
+  session.endNativeOverlayEdit("cell00001", { beforeRaw: "Alpha", afterRaw: "Committed", commit: true });
+
+  assert.equal(session.nativeOverlayUids.has("cell00001"), false);
+  assert.equal(history.entries.length, 1);
+  assert.equal(history.entries[0].label, "Edit cell");
+  assert.equal(history.entries[0].lane, "content");
+  assert.deepEqual(history.entries[0].inverse, [{ op: "setRaw", uid: "cell00001", raw: "Alpha" }]);
+  assert.deepEqual(history.entries[0].forward, [{ op: "setRaw", uid: "cell00001", raw: "Committed" }]);
+  assert.equal(model.getRaw(0, 0), "Committed");
+  assert.equal(session.dirtyCells.size, 0, "the patched base makes the dirty-cell diff empty, so no duplicate write is queued");
+
+  session.beginNativeOverlayEdit("cell00002");
+  session.endNativeOverlayEdit("cell00002", { beforeRaw: "Beta", afterRaw: "Beta", commit: true });
+  assert.equal(history.entries.length, 1, "a commit that changed nothing is not an undo entry");
+  session.beginNativeOverlayEdit("cell00002");
+  session.endNativeOverlayEdit("cell00002", { beforeRaw: "Beta", afterRaw: "Escaped", commit: false });
+  assert.equal(history.entries.length, 1, "a cancelled edit is not an undo entry");
+  assert.equal(model.getRaw(0, 1), "Beta");
+  assert.equal(session.nativeOverlayUids.size, 0);
+});
+
+test("the split-remainder repair plan recognises exactly the damage pinned fact 6 describes", () => {
+  const base = rawTree();
+  const split = rawTree();
+  split.children[1].string = "A";
+  split.children[1].children.push({ uid: "strayblok", string: "lpha", order: 1, children: [] });
+  assert.deepEqual(nativeOverlayStrayRepair(base, split, "row000002"), { cellUid: "row000002", strayUid: "strayblok", text: "lpha" });
+
+  const empty = rawTree();
+  empty.children[1].children.push({ uid: "strayblok", string: "", order: 1, children: [] });
+  assert.deepEqual(nativeOverlayStrayRepair(base, empty, "row000002"), { cellUid: "row000002", strayUid: "strayblok", text: "" });
+
+  const twoStrays = rawTree();
+  twoStrays.children[1].children.push({ uid: "strayblok", string: "lpha", order: 1, children: [] });
+  twoStrays.children[1].children.push({ uid: "strayblo2", string: "more", order: 2, children: [] });
+  assert.equal(nativeOverlayStrayRepair(base, twoStrays, "row000002"), null, "two strays is a structural reload, not a repair");
+
+  const wrongCell = rawTree();
+  wrongCell.children[0].children.push({ uid: "strayblok", string: "lpha", order: 1, children: [] });
+  assert.equal(nativeOverlayStrayRepair(base, wrongCell, "row000002"), null);
+  assert.equal(nativeOverlayStrayRepair(base, rawTree(), "row000002"), null, "an intact table needs no repair");
+  assert.equal(nativeOverlayStrayRepair(null, split, "row000002"), null, "with no verified base there is nothing to diff against");
 });

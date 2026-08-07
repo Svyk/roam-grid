@@ -904,6 +904,70 @@ body.roam-body.dark .rg-portal {
   user-select: text;
 }
 
+/* Roam's real block editor, mounted over the cell through renderBlock so [[, ((, #, {{ and / open
+   Roam's OWN menus. The overlay paints nothing until Roam's block input exists, so a mount can never
+   flash an empty box over the value it is replacing. */
+.rg-native-cell-editor {
+  position: absolute;
+  inset: 1px;
+  z-index: 21;
+  overflow: auto;
+  padding: 3px 5px;
+  background: var(--rg-bg);
+  border: 2px solid var(--rg-active);
+  border-radius: 1px;
+  opacity: 0;
+  text-align: left;
+}
+
+.rg-native-cell-editor--ready {
+  opacity: 1;
+}
+
+.rg-cell--native-editing > .rg-cell-content {
+  visibility: hidden;
+}
+
+/* Everything below addresses Roam-owned nodes INSIDE the extension-owned overlay root. They carry no
+   .rg- class of their own, so a descendant selector is the only way to reach them, and the overlay
+   root scopes each rule to the one mount this extension created.
+
+   .rm-block-children: a native table chains the next-column cells as this block's CHILDREN (pinned
+   probe fact 3), so an un-hidden mount would paint the rest of the row inside one cell.
+   .rm-bullet / .controls: the block's outliner chrome, which a grid cell has no room for.
+   .rm-block__input / .roam-block / textarea: match the cell's typography so the value does not
+   reflow the moment the editor opens. */
+.rg-native-cell-editor .rm-block-children {
+  display: none !important;
+}
+
+.rg-native-cell-editor .rm-bullet,
+.rg-native-cell-editor .controls,
+.rg-native-cell-editor .rm-block-separator {
+  display: none !important;
+}
+
+.rg-native-cell-editor .rm-block-main,
+.rg-native-cell-editor .roam-block-container,
+.rg-native-cell-editor .rm-block__self {
+  margin: 0;
+  padding: 0;
+}
+
+.rg-native-cell-editor .rm-block__input,
+.rg-native-cell-editor .roam-block,
+.rg-native-cell-editor textarea {
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  outline: none;
+  font: inherit;
+  line-height: 1.45;
+}
+
 .rg-formula-popover {
   position: fixed;
   z-index: 10010;

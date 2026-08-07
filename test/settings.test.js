@@ -57,6 +57,7 @@ const TODAYS_CONSTANTS = {
   "writes-content-debounce-ms": 220,
   "writes-large-debounce-ms": 500,
   "session-idle-ms": 1500,
+  "editing-native-editor": true,
   "editing-autocomplete": true,
   "editing-autocomplete-debounce-ms": 90,
   "editing-autocomplete-limit": 8,
@@ -362,6 +363,32 @@ test("the compose-mode panel row is a select with exactly the three modes", () =
   assert.deepEqual(row.action.items, ["In place", "Comment box", "Right sidebar"]);
   assert.equal(SETTINGS["comments-compose-mode"].scope, "device", "compose preference stays per-device like the switch it replaces");
   assert.equal(SETTINGS["comments-open-in-sidebar"], undefined, "the legacy descriptor is gone from the schema");
+});
+
+/**
+ * GOAL-U1. The row is a graph-scoped switch because native cell editing is a property of how the
+ * graph's tables are edited, not of one browser, and it defaults ON: the whole point of the feature
+ * is that a cell gets Roam's own `[[` / `((` / `#` / `{{` / `/` menus without being asked twice.
+ */
+test("the native-editor row is a live graph switch that ships on", () => {
+  const descriptor = SETTINGS["editing-native-editor"];
+  assert.ok(descriptor, "the descriptor exists in the schema");
+  assert.equal(descriptor.group, "Editing");
+  assert.equal(descriptor.control, "switch");
+  assert.equal(descriptor.type, "bool");
+  assert.equal(descriptor.default, true);
+  assert.equal(descriptor.scope, "graph");
+  assert.equal(descriptor.apply, "immediate");
+  assert.equal(descriptor.stage, "live");
+  for (const hook of ["onView", "onLarge", "onSession"]) {
+    assert.equal(descriptor[hook], undefined, `${hook} must be absent — the value is read live at beginEditLocal`);
+  }
+  const row = buildSettingsPanelConfig().settings.find((candidate) => candidate.id === "editing-native-editor");
+  assert.ok(row, "the row is rendered in the panel");
+  assert.equal(row.action.type, "switch");
+  assert.match(descriptor.description, /Roam/, "the description says whose editor this is");
+  assert.equal(coerceSetting(descriptor, "false"), false);
+  assert.equal(coerceSetting(descriptor, "nonsense"), true, "garbage falls back to on");
 });
 
 test("resolveSettingValue reads device-scoped keys device-first and treats the graph value as a seed", () => {

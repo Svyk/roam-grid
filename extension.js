@@ -121,6 +121,7 @@ const SETTING_DESCRIPTORS = [
   { key: "writes-content-debounce-ms", group: "Writes", name: "Content save delay (ms)", description: "How long typing settles before edited cells are written back to Roam.", control: "input", type: "int", default: DEFAULT_CONTENT_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "writes-large-debounce-ms", group: "Writes", name: "Large-grid save delay (ms)", description: "How long a large grid settles before its chunks are uploaded.", control: "input", type: "int", default: DEFAULT_LARGE_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "session-idle-ms", group: "Writes", name: "Session idle timeout (ms)", description: "How long an unmounted grid session stays warm before it is released.", control: "input", type: "int", default: SESSION_IDLE_MS, min: 200, max: 60000, scope: "graph", apply: "immediate", stage: "live", onSession: (session) => session.rescheduleIdle() },
+  { key: "editing-native-editor", group: "Editing", name: "Edit cells with Roam's own block editor", description: "Open Roam's real block editor over the cell instead of the grid's text box, so [[, ((, #, {{ and / open Roam's OWN menus with everything they carry. Formula cells, the F2 floating editor, large grids and registered custom editors always use the grid editor. If the editor cannot be mounted twice in a row the grid editor takes over for the rest of the session.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-autocomplete", group: "Editing", name: "Suggest functions and pages while typing", description: "Offer formula-function and [[page]] / ((block)) suggestions inside the cell editor. With this off nothing pops up while you type and the two delay/results rows below do nothing.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-autocomplete-debounce-ms", group: "Editing", name: "Autocomplete delay (ms)", description: "How long a reference query settles before Roam is searched.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_MS, min: 0, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "editing-autocomplete-limit", group: "Editing", name: "Autocomplete results", description: "How many suggestions the formula and reference pickers offer.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_LIMIT, min: 1, max: 25, scope: "graph", apply: "next-op", stage: "live" },
@@ -220,6 +221,11 @@ export const runtime = {
   lastFocusedUid: null,
   keyboardOwner: null,
   commentArmed: false,
+  // Native-overlay health is per session, never persisted: a graph that cannot mount Roam's editor
+  // today may be able to after a reload, and a disabled flag on disk would outlive the cause.
+  nativeEditorDisabled: false,
+  nativeEditorFailures: 0,
+  nativeEditorSawPopup: false,
   recentsDisabled: false,
   recentsOverruns: 0,
   recentsRearmedAt: null,
@@ -3550,6 +3556,10 @@ export class NativeGridSession {
     this.referenceCountFrame = null;
     this.referenceCountTimer = null;
     this.discardedEdits = null;
+    // Cell uids whose block is currently mounted in a `NativeCellEditorOverlay`. Roam writes a
+    // native block through its own lane, so every keystroke can arrive as an external content
+    // change; collecting those as novel undo entries would fill the history with per-keystroke noise.
+    this.nativeOverlayUids = new Set();
     this.disposed = false;
     this.stopWatch = this.adapter.watchExternal?.((nextModel, event) => this.handleExternalChange(nextModel, event));
   }
@@ -3584,12 +3594,38 @@ export class NativeGridSession {
 
   async beginEdit(view, start) {
     const previous = this.activeEditorView;
-    if (previous && previous !== view && previous.editorController?.state) await previous.editorController.finish(true);
+    if (previous && previous !== view) {
+      // A live native overlay owns Roam's real block editor, so it has to be finished before another
+      // view mounts one: two mounts of the same block fight over focus and the write-behind flush.
+      if (previous.nativeOverlay?.active) await previous.nativeOverlay.commit(null);
+      if (previous.editorController?.state) await previous.editorController.finish(true);
+    }
     this.activeEditorView = view;
     return start();
   }
 
   editorFinished(view) { if (this.activeEditorView === view) this.activeEditorView = null; }
+
+  /** Marks `uid` as owned by a native overlay for as long as Roam's editor is mounted over it. */
+  beginNativeOverlayEdit(uid) { if (uid) this.nativeOverlayUids.add(uid); return this.nativeOverlayUids; }
+
+  /**
+   * Releases the overlay claim and, on a committing edit that actually changed the value, produces
+   * the single undo entry for it. The overlay has already written the value to Roam and patched the
+   * adapter base, so the cell is rewound to `beforeRaw` first: that is what makes `transact` record
+   * a `setRaw` pair, and the patched base is what makes `queueChangedCells` drop the cell again
+   * without issuing a second write.
+   */
+  endNativeOverlayEdit(uid, { beforeRaw = null, afterRaw = null, commit = false } = {}) {
+    this.nativeOverlayUids.delete(uid);
+    if (!commit || this.disposed) return null;
+    const before = String(beforeRaw ?? ""); const after = String(afterRaw ?? "");
+    if (before === after) return null;
+    const coordinate = this.coordinateForUid(uid); if (!coordinate) return null;
+    const cell = this.model.getCell(coordinate.row, coordinate.col); if (!cell) return null;
+    cell.raw = before;
+    return this.commitMutation(null, "Edit cell", (model) => model.setRaw(coordinate.row, coordinate.col, after), false);
+  }
 
   setSaving(value) { for (const view of this.views) view.root?.classList?.toggle("rg-root--saving", value); }
 
@@ -3878,7 +3914,10 @@ export class NativeGridSession {
       const coordinate = this.coordinateForUid(change.uid); if (!coordinate) continue;
       const cell = this.model.getCell(coordinate.row, coordinate.col); if (!cell || cell.raw === change.raw) continue;
       effective.push(change);
-      if (!rebasable.has(cell.uid)) novel.push({ uid: cell.uid, from: cell.raw, to: change.raw });
+      // A block mounted in a native overlay is being typed into through Roam's own editor, so each
+      // flush arrives here as an external change. Those are the user's in-flight keystrokes, not a
+      // novel edit from elsewhere: the single undo entry is pushed by `endNativeOverlayEdit`.
+      if (!rebasable.has(cell.uid) && !this.nativeOverlayUids?.has?.(cell.uid)) novel.push({ uid: cell.uid, from: cell.raw, to: change.raw });
       cell.raw = change.raw; changed.push([coordinate.row, coordinate.col]);
     }
     // Only changes that actually moved a cell reach the history: an echo that
@@ -7271,6 +7310,505 @@ function applySuggestionEnrichment(option, suggestion) {
   badge.setAttribute("aria-label", `${count} linked reference${count === 1 ? "" : "s"}`);
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * Native cell editing — Roam's own block editor, mounted over the cell.
+ *
+ * The grid's editor is a plain textarea with the extension's approximation of Roam's menus behind
+ * it. Mounting `renderBlock({uid, el})` over the cell instead gives the cell Roam's REAL editor, so
+ * `[[`, `((`, `#`, `{{` and `/` open Roam's own menus with everything they carry. Everything below
+ * exists because that editor belongs to a document outliner, not to a grid: it wants to split the
+ * block on Enter, merge it into its neighbour on Backspace, and walk the caret into the chained
+ * next-column cell on the arrows. Each of those is intercepted; what is left is Roam's.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Records the U1 forensic surface before a catch swallows an error. */
+function noteNativeEditorError(error) {
+  const target = globalThis.window;
+  if (target) target.__RG_U1_LAST_ERROR = String(error?.stack || error);
+  return error;
+}
+
+/** `getSetting !== false` rather than `=== true`, so a graph that has never seen the key opts in. */
+export function nativeEditorEnabled() {
+  return getSetting("editing-native-editor") !== false && !runtime.nativeEditorDisabled;
+}
+
+/** Two CONSECUTIVE mount/focus failures retire the overlay for the session, with one toast. */
+export function noteNativeEditorFailure() {
+  runtime.nativeEditorFailures = (Number(runtime.nativeEditorFailures) || 0) + 1;
+  if (runtime.nativeEditorFailures < 2 || runtime.nativeEditorDisabled) return runtime.nativeEditorFailures;
+  runtime.nativeEditorDisabled = true;
+  toast("Roam Grid: native editor unavailable — using the grid editor", "warning");
+  return runtime.nativeEditorFailures;
+}
+
+export function noteNativeEditorSuccess() { runtime.nativeEditorFailures = 0; return runtime.nativeEditorFailures; }
+
+export function resetNativeEditorHealth() {
+  runtime.nativeEditorFailures = 0; runtime.nativeEditorDisabled = false; runtime.nativeEditorSawPopup = false;
+  return runtime;
+}
+
+/**
+ * Roam's textarea is a React controlled input, so assigning `.value` directly is reverted on the
+ * next render. The prototype setter plus a dispatched `input` is the standard escape hatch.
+ */
+export function setNativeTextareaValue(textarea, value) {
+  const next = String(value ?? "");
+  const setter = Object.getOwnPropertyDescriptor(globalThis.HTMLTextAreaElement?.prototype || {}, "value")?.set;
+  if (typeof setter === "function") setter.call(textarea, next); else textarea.value = next;
+  return next;
+}
+
+export function insertIntoNativeTextarea(textarea, text) {
+  const value = String(textarea?.value ?? "");
+  const start = Number.isFinite(Number(textarea?.selectionStart)) ? Number(textarea.selectionStart) : value.length;
+  const end = Number.isFinite(Number(textarea?.selectionEnd)) ? Number(textarea.selectionEnd) : start;
+  const next = setNativeTextareaValue(textarea, `${value.slice(0, start)}${text}${value.slice(end)}`);
+  const caret = start + String(text).length;
+  textarea.setSelectionRange?.(caret, caret);
+  const Constructor = globalThis.InputEvent || globalThis.Event;
+  if (typeof Constructor === "function") textarea.dispatchEvent?.(new Constructor("input", { bubbles: true }));
+  return next;
+}
+
+/** Multi-line clipboard text becomes one line: a grid cell is one block, and Roam's own paste would
+ *  otherwise create a block per line underneath it, which is the structural damage U1 exists to avoid. */
+export function sanitizeNativePasteText(text) {
+  return String(text ?? "").replace(/\r\n?/g, "\n").split("\n").map((line) => line.trim()).filter(Boolean).join(" ");
+}
+
+/**
+ * PINNED FACT 4: `setBlockFocusAndSelection` does not reach a `renderBlock` mount — a synthetic
+ * mousedown/mouseup/click on the rendered block input does. This is the only mechanism that works.
+ */
+export function synthesizeBlockClick(host) {
+  if (!host?.dispatchEvent) return false;
+  const rect = host.getBoundingClientRect?.() || { left: 0, top: 0, height: 0 };
+  const init = {
+    bubbles: true, cancelable: true, composed: true, button: 0, buttons: 1, detail: 1,
+    clientX: (Number(rect.left) || 0) + 2, clientY: (Number(rect.top) || 0) + ((Number(rect.height) || 0) / 2),
+  };
+  for (const type of ["mousedown", "mouseup", "click"]) {
+    const Constructor = globalThis.MouseEvent || globalThis.Event;
+    const event = typeof Constructor === "function" ? new Constructor(type, init) : { type, ...init };
+    host.dispatchEvent(event);
+  }
+  return true;
+}
+
+function nativeOverlayNodeVisible(node) {
+  if (!node) return false;
+  if (node.hidden) return false;
+  const rect = node.getBoundingClientRect?.();
+  if (rect && Number.isFinite(Number(rect.height)) && Number.isFinite(Number(rect.width))) return Number(rect.height) > 0 || Number(rect.width) > 0;
+  return true;
+}
+
+function nativeTreeUids(tree, found = new Set()) {
+  if (!tree?.uid) return found;
+  found.add(tree.uid);
+  for (const child of tree.children || []) nativeTreeUids(child, found);
+  return found;
+}
+
+function nativeTreeNode(tree, uid) {
+  if (!tree) return null;
+  if (tree.uid === uid) return tree;
+  for (const child of tree.children || []) { const found = nativeTreeNode(child, uid); if (found) return found; }
+  return null;
+}
+
+/**
+ * PINNED FACT 6: an Enter that reaches Roam with the caret mid-value SPLITS the cell block — the
+ * value truncates at the caret and the remainder becomes a NEW child of the cell, sitting next to
+ * the chained next-column cell. That is the one damage shape this repairs, and it is recognised
+ * structurally: exactly one uid in the live tree that the verified base tree has never seen, and it
+ * is a childless direct child of the edited cell. Two strays, a stray with children, or a stray
+ * somewhere else is left alone — the session's structural-reload lane owns anything more complex.
+ */
+export function nativeOverlayStrayRepair(baseTree, currentTree, uid) {
+  if (!baseTree || !currentTree || !uid) return null;
+  const known = nativeTreeUids(baseTree);
+  const novel = [...nativeTreeUids(currentTree)].filter((value) => !known.has(value));
+  if (novel.length !== 1) return null;
+  const cell = nativeTreeNode(currentTree, uid);
+  const stray = (cell?.children || []).find((child) => child.uid === novel[0]);
+  if (!stray) return null;
+  if ((stray.children || []).length) return null;
+  return { cellUid: uid, strayUid: stray.uid, text: nativeStoredRaw(stray.string) };
+}
+
+/**
+ * One instance per `GridView`. Owns at most one mounted Roam block editor at a time and every
+ * listener, frame and node it creates; `dispose()` unmounts and NEVER writes, because a mid-edit
+ * disposal must not clobber whatever Roam last saved.
+ */
+export class NativeCellEditorOverlay {
+  constructor(view, { onFinish = null } = {}) {
+    this.view = view;
+    this.onFinish = onFinish;
+    this.state = null;
+    this.overlay = null;
+    this.textarea = null;
+    this.beforeRaw = "";
+    this.mountDisposers = [];
+    this.listenerDisposers = [];
+    this.frames = new Set();
+    this.repairScheduled = false;
+    this.repairCommitWhenClean = false;
+    this.popupJustClosed = false;
+    this.disposed = false;
+  }
+
+  get active() { return Boolean(this.state); }
+
+  nextFrame() {
+    return new Promise((resolve) => {
+      if (typeof globalThis.requestAnimationFrame !== "function") { trackedTimeout(resolve, 16); return; }
+      const id = globalThis.requestAnimationFrame(() => { this.frames.delete(id); resolve(); });
+      this.frames.add(id);
+    });
+  }
+
+  /** Polls `probe` now and then once per frame, at most `limit` extra frames. No timers. */
+  async pollFrames(probe, limit) {
+    for (let attempt = 0; attempt <= limit; attempt += 1) {
+      let value = null;
+      try { value = probe(); } catch (error) { noteNativeEditorError(error); value = null; }
+      if (value) return value;
+      if (attempt === limit || this.disposed) break;
+      await this.nextFrame();
+    }
+    return null;
+  }
+
+  blockInput() { return this.overlay?.querySelector?.(ROAM_BLOCK_INPUT_SELECTOR) || null; }
+
+  hostTextarea() {
+    const active = globalThis.document?.activeElement;
+    if (active && this.overlay?.contains?.(active) && String(active.tagName || "").toUpperCase() === "TEXTAREA") return active;
+    return this.overlay?.querySelector?.("textarea") || null;
+  }
+
+  mountBlock(uid, el) {
+    const components = roam().ui?.components;
+    if (typeof components?.renderBlock !== "function") return false;
+    if (typeof components.unmountNode === "function") this.mountDisposers.push(() => components.unmountNode({ el }));
+    const result = components.renderBlock({ uid, el });
+    if (typeof result === "function") this.mountDisposers.push(result);
+    else if (typeof result?.dispose === "function") this.mountDisposers.push(() => result.dispose());
+    else if (result && typeof result.then === "function") {
+      result.then((resolved) => {
+        if (typeof resolved !== "function") return;
+        if (this.state) this.mountDisposers.push(resolved); else resolved();
+      }, (error) => { noteNativeEditorError(error); });
+    }
+    return true;
+  }
+
+  listen(target, type, handler, capture = false) {
+    if (!target?.addEventListener) return;
+    target.addEventListener(type, handler, capture);
+    this.listenerDisposers.push(() => target.removeEventListener?.(type, handler, capture));
+  }
+
+  /** Truthy on success; `null` means the caller falls back to the grid's own editor. */
+  async start({ row, col, cell, uid, raw, initial = null }) {
+    if (this.disposed || !cell || !uid) return null;
+    if (this.state) await this.commit(null);
+    const session = this.view?.session || null;
+    if (session && (session.structuralPending || session.dirtyCells?.has?.(uid))) {
+      try { await session.flushContentSave(); } catch (error) { noteNativeEditorError(error); return null; }
+      if (session.structuralPending || session.dirtyCells?.has?.(uid)) return null;
+    }
+    if (this.disposed) return null;
+    this.beforeRaw = String(raw ?? "");
+    if (initial != null) {
+      const seed = String(initial);
+      try {
+        this.view.adapter?.recordSelfWrite?.(uid, this.beforeRaw, seed);
+        await updateBlock(uid, nativePersistedRaw(seed));
+        this.view.adapter?.patchBaseContent?.([{ uid, raw: seed }]);
+      } catch (error) { noteNativeEditorError(error); return null; }
+    }
+    const overlay = document.createElement("div");
+    overlay.className = "rg-native-cell-editor";
+    overlay.setAttribute("role", "presentation");
+    this.overlay = overlay;
+    cell.classList.add("rg-cell--editing", "rg-cell--native-editing");
+    cell.appendChild(overlay);
+    this.state = { row, col, cell, uid, composing: false, finishing: false, lastValue: this.beforeRaw };
+    let mounted = false;
+    try { mounted = this.mountBlock(uid, overlay); } catch (error) { noteNativeEditorError(error); mounted = false; }
+    if (!mounted) return this.failStart();
+    const host = await this.pollFrames(() => this.blockInput(), 5);
+    if (!host || !this.state) return this.failStart();
+    overlay.classList.add("rg-native-cell-editor--ready");
+    session?.beginNativeOverlayEdit?.(uid);
+    try { synthesizeBlockClick(host); } catch (error) { noteNativeEditorError(error); }
+    const textarea = await this.pollFrames(() => this.hostTextarea(), 3);
+    if (!textarea || !this.state) return this.failStart();
+    this.textarea = textarea;
+    const value = String(textarea.value ?? "");
+    const caret = initial == null ? value.length : Math.min(value.length, String(initial).length);
+    try { textarea.setSelectionRange?.(caret, caret); } catch (error) { noteNativeEditorError(error); }
+    this.state.lastValue = value;
+    this.listen(overlay, "keydown", (event) => this.interceptKeydown(event), true);
+    this.listen(overlay, "paste", (event) => this.interceptPaste(event), true);
+    this.listen(overlay, "input", () => { this.state && (this.state.lastValue = String(this.textarea?.value ?? this.state.lastValue)); this.scheduleStructureRepair(); }, true);
+    this.listen(overlay, "compositionstart", () => { if (this.state) this.state.composing = true; }, true);
+    this.listen(overlay, "compositionend", () => { if (this.state) this.state.composing = false; }, true);
+    this.listen(overlay, "focusin", (event) => this.onOverlayFocusIn(event), true);
+    this.listen(globalThis.document, "pointerdown", (event) => this.onDocumentPointerDown(event), true);
+    noteNativeEditorSuccess();
+    return this.state;
+  }
+
+  /** A mount or focus failure: fail toward the grid editor, never toward an empty cell. */
+  failStart() {
+    this.teardown();
+    noteNativeEditorFailure();
+    return null;
+  }
+
+  /** PINNED FACT 5: Roam's menu portal is a direct child of `<body>`. The trigger-context fallback
+   *  only applies on a session where that selector has never matched anything at all. */
+  nativeAutocompleteOpen() {
+    let node = null;
+    try { node = globalThis.document?.querySelector?.(".rm-autocomplete__results") || null; }
+    catch (error) { noteNativeEditorError(error); node = null; }
+    if (node) { runtime.nativeEditorSawPopup = true; return nativeOverlayNodeVisible(node); }
+    if (runtime.nativeEditorSawPopup) return false;
+    const textarea = this.textarea; if (!textarea) return false;
+    const value = String(textarea.value ?? "");
+    const caret = Number.isFinite(Number(textarea.selectionStart)) ? Number(textarea.selectionStart) : value.length;
+    return Boolean(roamEditorTriggerContext(value, caret, { formula: false }));
+  }
+
+  swallow(event) { event.preventDefault?.(); event.stopPropagation?.(); return true; }
+
+  markPopupJustClosed() {
+    this.popupJustClosed = true;
+    void this.nextFrame().then(() => { this.popupJustClosed = false; });
+  }
+
+  interceptKeydown(event) {
+    const state = this.state;
+    if (!state || state.finishing) return;
+    if (state.composing || event.isComposing) return;
+    const key = String(event.key ?? "");
+    const command = event.metaKey || event.ctrlKey;
+    // Roam has no JS undo handler; ⌘Z / ⌘⇧Z mid-edit belong to the browser's native undo on its
+    // textarea, which is exactly what the user expects while typing.
+    if (command && key.toLowerCase() === "z") return;
+    // Block-level chords: open in sidebar, move block up/down. Every one of them either moves this
+    // cell out of its row chain or opens a second editor over the same block.
+    if (command && (key === "Enter" || key === "ArrowUp" || key === "ArrowDown")) return void this.swallow(event);
+    const popup = !this.popupJustClosed && this.nativeAutocompleteOpen();
+    if (key === "Enter" && !event.shiftKey) {
+      if (popup) return void this.scheduleStructureRepair();
+      this.swallow(event);
+      void this.commit(enterMovement());
+      return;
+    }
+    if (key === "Tab") {
+      if (popup) return void this.scheduleStructureRepair();
+      this.swallow(event);
+      void this.commit(tabMovement(undefined, event.shiftKey));
+      return;
+    }
+    if (key === "Escape") {
+      if (popup) { this.markPopupJustClosed(); return; }
+      event.preventDefault?.(); event.stopPropagation?.();
+      void this.cancel();
+      return;
+    }
+    const textarea = this.textarea;
+    const value = String(textarea?.value ?? "");
+    const start = Number.isFinite(Number(textarea?.selectionStart)) ? Number(textarea.selectionStart) : 0;
+    const end = Number.isFinite(Number(textarea?.selectionEnd)) ? Number(textarea.selectionEnd) : start;
+    const collapsed = start === end;
+    // Backspace at 0 merges this cell into the previous block of the chain; Delete at the end
+    // forward-merges the hidden next-column cell into it. Both destroy the row.
+    if (key === "Backspace" && collapsed && start === 0) return void this.swallow(event);
+    if (key === "Delete" && collapsed && end === value.length) return void this.swallow(event);
+    if (key === "ArrowUp" && !value.slice(0, start).includes("\n")) { if (popup) return; return void this.swallow(event); }
+    if (key === "ArrowDown" && !value.slice(end).includes("\n")) { if (popup) return; return void this.swallow(event); }
+  }
+
+  interceptPaste(event) {
+    const textarea = this.textarea; if (!textarea || !this.state) return;
+    let text = "";
+    try { text = event.clipboardData?.getData?.("text/plain") ?? event.clipboardData?.getData?.("text") ?? ""; }
+    catch (error) { noteNativeEditorError(error); text = ""; }
+    if (!/[\r\n]/.test(String(text))) return;
+    this.swallow(event);
+    insertIntoNativeTextarea(textarea, sanitizeNativePasteText(text));
+    this.state.lastValue = String(textarea.value ?? "");
+  }
+
+  onDocumentPointerDown(event) {
+    if (!this.state || this.state.finishing) return;
+    const target = event?.target;
+    if (this.overlay?.contains?.(target)) return;
+    if (target?.closest?.(".rm-autocomplete__results")) return;
+    void this.commit(null);
+  }
+
+  /**
+   * The caret can leave the cell without leaving the overlay: Roam renders the chained next-column
+   * cells as this block's children (pinned fact 3) and they are hidden, not absent. A focus on a uid
+   * this table already owns is that escape and commits. A focus on a uid the table has never seen is
+   * the split remainder from pinned fact 6, which `repairStructure` merges back.
+   */
+  onOverlayFocusIn(event) {
+    const state = this.state; if (!state || state.finishing) return;
+    const focused = uidFromFocusTarget(event?.target);
+    if (!focused || focused === state.uid) return;
+    if (!this.view?.adapter?.baseCells?.has?.(focused)) return void this.scheduleStructureRepair({ commitWhenClean: true });
+    void this.commit(null);
+  }
+
+  scheduleStructureRepair({ commitWhenClean = false } = {}) {
+    if (!this.state || this.state.finishing) return null;
+    if (commitWhenClean) this.repairCommitWhenClean = true;
+    if (this.repairScheduled) return true;
+    this.repairScheduled = true;
+    void this.nextFrame().then(() => {
+      this.repairScheduled = false;
+      const commitWhenNothingToRepair = this.repairCommitWhenClean === true;
+      this.repairCommitWhenClean = false;
+      return this.repairStructure({ commitWhenClean: commitWhenNothingToRepair });
+    });
+    return true;
+  }
+
+  async repairStructure({ commitWhenClean = false } = {}) {
+    const state = this.state;
+    if (!state || state.finishing) return null;
+    const adapter = this.view?.adapter; const tableUid = this.view?.model?.tableUid;
+    if (!adapter?.baseTree || !tableUid) return null;
+    let tree = null;
+    try { tree = getTree(tableUid); } catch (error) { noteNativeEditorError(error); return null; }
+    if (!tree) return null;
+    // NOT gated on `nativeStructureSignature`: that walks row roots and first-child column chains,
+    // and the split remainder hangs off the cell as a SECOND child, so the signature of a damaged
+    // table is identical to the signature of a healthy one. The novel-uid diff is the detector.
+    const plan = nativeOverlayStrayRepair(adapter.baseTree, tree, state.uid);
+    if (!plan) {
+      if (commitWhenClean) await this.commit(null);
+      return null;
+    }
+    const cellRaw = nativeStoredRaw(String(this.textarea?.value ?? state.lastValue ?? ""));
+    const merged = `${cellRaw}${plan.text}`;
+    const after = deepClone(tree);
+    const parent = nativeTreeNode(after, plan.cellUid);
+    if (parent) parent.children = (parent.children || []).filter((child) => child.uid !== plan.strayUid);
+    patchTreeCellRaw(after, plan.cellUid, merged);
+    try {
+      if (merged !== cellRaw) {
+        adapter.recordSelfWrite?.(plan.cellUid, cellRaw, merged);
+        await updateBlock(plan.cellUid, nativePersistedRaw(merged));
+      }
+      await deleteBlock(plan.strayUid);
+      adapter.recordExpectedStructuralTransition?.(tree, after, [adapter.baseTree]);
+    } catch (error) { noteNativeEditorError(error); return null; }
+    const textarea = this.textarea;
+    if (textarea && this.state) {
+      setNativeTextareaValue(textarea, merged);
+      textarea.setSelectionRange?.(cellRaw.length, cellRaw.length);
+      textarea.focus?.();
+      this.state.lastValue = merged;
+    }
+    return plan;
+  }
+
+  /** Unmounts and unregisters everything. Writes nothing, ever. */
+  teardown() {
+    for (const dispose of this.mountDisposers.splice(0).reverse()) {
+      try { dispose(); } catch (error) { noteNativeEditorError(error); }
+    }
+    for (const dispose of this.listenerDisposers.splice(0)) {
+      try { dispose(); } catch (error) { noteNativeEditorError(error); }
+    }
+    for (const id of this.frames) { try { globalThis.cancelAnimationFrame?.(id); } catch (error) { noteNativeEditorError(error); } }
+    this.frames.clear();
+    this.repairScheduled = false; this.repairCommitWhenClean = false; this.popupJustClosed = false;
+    this.state?.cell?.classList?.remove("rg-cell--editing", "rg-cell--native-editing");
+    this.overlay?.remove?.();
+    this.overlay = null; this.textarea = null; this.state = null;
+  }
+
+  /**
+   * PINNED FACT 7: while typing in a native textarea Roam has NOT written `:block/string` yet, so
+   * the live `textarea.value` is the only source of truth for what the user typed.
+   */
+  async commit(movement = null) {
+    const state = this.state;
+    if (!state || state.finishing) return null;
+    state.finishing = true;
+    const { row, col, cell, uid } = state;
+    const beforeRaw = this.beforeRaw;
+    const live = this.textarea ? String(this.textarea.value ?? "") : null;
+    this.teardown();
+    let value = live;
+    if (value == null) {
+      try { value = pullNativeCell(uid)?.raw ?? beforeRaw; } catch (error) { noteNativeEditorError(error); value = beforeRaw; }
+    }
+    value = nativeStoredRaw(value);
+    try {
+      const current = pullNativeCell(uid);
+      const currentRaw = current ? current.raw : beforeRaw;
+      // `""` is stored as `" "` (nativePersistedRaw): both read back as raw `""`, so the write is
+      // still needed to stop Roam collapsing the block, but it is not a self-write to absorb.
+      if (currentRaw !== value) this.view.adapter?.recordSelfWrite?.(uid, currentRaw, value);
+      if (currentRaw !== value || value === "") await updateBlock(uid, nativePersistedRaw(value));
+      this.view.adapter?.patchBaseContent?.([{ uid, raw: value }]);
+    } catch (error) { noteNativeEditorError(error); }
+    const modelCell = this.view.model?.getCell?.(row, col);
+    if (modelCell && modelCell.uid === uid) modelCell.raw = value;
+    try { await this.onFinish?.({ row, col, cell, raw: beforeRaw, value, commit: true, movement }); }
+    catch (error) { noteNativeEditorError(error); }
+    this.view.session?.endNativeOverlayEdit?.(uid, { beforeRaw, afterRaw: value, commit: true });
+    return { uid, value, movement };
+  }
+
+  /** Byte-exact restore: whatever Roam flushed on blur is absorbed as a self-write, then the block
+   *  is rewritten to the exact string it held before the overlay opened. */
+  async cancel() {
+    const state = this.state;
+    if (!state || state.finishing) return null;
+    state.finishing = true;
+    const { row, col, cell, uid } = state;
+    const beforeRaw = this.beforeRaw;
+    const flushed = nativeStoredRaw(this.textarea ? String(this.textarea.value ?? "") : state.lastValue);
+    this.teardown();
+    try {
+      if (flushed !== beforeRaw) {
+        this.view.adapter?.recordSelfWrite?.(uid, null, flushed);
+        this.view.adapter?.recordSelfWrite?.(uid, flushed, beforeRaw);
+      }
+      await updateBlock(uid, nativePersistedRaw(beforeRaw));
+      this.view.adapter?.patchBaseContent?.([{ uid, raw: beforeRaw }]);
+    } catch (error) { noteNativeEditorError(error); }
+    const modelCell = this.view.model?.getCell?.(row, col);
+    if (modelCell && modelCell.uid === uid) modelCell.raw = beforeRaw;
+    try { await this.onFinish?.({ row, col, cell, raw: beforeRaw, value: beforeRaw, commit: false, movement: null }); }
+    catch (error) { noteNativeEditorError(error); }
+    this.view.session?.endNativeOverlayEdit?.(uid, { beforeRaw, afterRaw: beforeRaw, commit: false });
+    return { uid, value: beforeRaw };
+  }
+
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    const uid = this.state?.uid || null;
+    this.teardown();
+    if (uid) this.view?.session?.endNativeOverlayEdit?.(uid, { commit: false });
+  }
+}
+
 export class GridEditorController {
   constructor(view, { cellAt, dimensions, mountedCells = null, cellRange = null, navigateReference = null, revealReference = null, searchReferences = searchRoamReferenceSuggestions, searchRecents = searchRoamRecentSuggestions, enrichSuggestions = enrichRoamSuggestions, referenceSearchDelay = null, onFinish, viewport }) {
     this.view = view;
@@ -8054,6 +8592,7 @@ export class GridView {
     this.columnResizePreview = null;
     this.resizeCleanup = null;
     this.editorController = null;
+    this.nativeOverlay = null;
     this.referenceCounts = session?.referenceCounts || new Map();
     this.commentThreads = session?.commentThreads || new Map();
     this.commentArmed = false;
@@ -8127,6 +8666,8 @@ export class GridView {
   render() {
     this.editorController?.dispose();
     this.editorController = null;
+    this.nativeOverlay?.dispose();
+    this.nativeOverlay = null;
     this.clearSelectionPresentation();
     if (!this.toolbarElement) { this.toolbarElement = this.toolbar(); this.root.appendChild(this.toolbarElement); }
     else {
@@ -8187,6 +8728,9 @@ export class GridView {
         this.session?.editorFinished(this);
       },
     });
+    // The overlay reuses the controller's own finish closure — it renders the cell, moves the
+    // selection and re-claims the keyboard, which is exactly what a finished native edit needs too.
+    this.nativeOverlay = new NativeCellEditorOverlay(this, { onFinish: (result) => this.editorController?.onFinish?.(result) });
     this.chartsElement?.remove(); this.chartsElement = null;
     if (this.model.charts.length) {
       const charts = document.createElement("div"); charts.className = "rg-charts";
@@ -9133,7 +9677,21 @@ export class GridView {
     return this.beginEditLocal(row, col, initial, floating);
   }
 
-  beginEditLocal(row, col, initial = null, floating = false) {
+  /**
+   * A registered custom editor wins outright, and a formula, an F2-floating edit, a preview surface,
+   * a reference-context grid or a cell with no Roam block behind it can never use Roam's editor. The
+   * `==` escape is text, not a formula, so it takes the native path like any other value.
+   */
+  nativeOverlayEligible(row, col, initial, floating, customEditor) {
+    if (customEditor || floating || !this.nativeOverlay) return false;
+    if (this.surface === "preview" || this.context !== "source") return false;
+    if (!this.session || !nativeEditorEnabled()) return false;
+    const probe = String(initial ?? this.model.getRaw(row, col) ?? "");
+    if (probe.startsWith("=") && !probe.startsWith("==")) return false;
+    return Boolean(this.model.getCell(row, col)?.uid);
+  }
+
+  async beginEditLocal(row, col, initial = null, floating = false) {
     const merge = this.model.mergeAt(row, col); row = merge?.row ?? row; col = merge?.col ?? col;
     const cell = this.cells.get(`${row}:${col}`); if (!cell) return;
     const raw = this.model.getRaw(row, col);
@@ -9146,6 +9704,11 @@ export class GridView {
           if (candidate instanceof HTMLElement && "value" in candidate) { editor = candidate; break; }
         }
       } catch (error) { console.warn("[roam-grid] Cell editor failed", error); }
+    }
+    if (this.nativeOverlayEligible(row, col, initial, floating, editor)) {
+      const uid = this.model.getCell(row, col).uid;
+      const started = await this.nativeOverlay.start({ row, col, cell, uid, raw, initial });
+      if (started) return started;
     }
     return this.editorController?.start({ row, col, cell, raw, initial, floating, customEditor: editor });
   }
@@ -9550,6 +10113,7 @@ export class GridView {
   dispose({ releaseNative = true } = {}) {
     this.setCommentArmed(false);
     this.disposed = true; this.resizeCleanup?.(); if (!this.session) this.adapter.dispose?.();
+    this.nativeOverlay?.dispose(); this.nativeOverlay = null;
     this.editorController?.dispose(); this.editorController = null;
     this.closeInlineReferences();
     this.clearSelectionPresentation();
