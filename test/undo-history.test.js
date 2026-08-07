@@ -804,7 +804,7 @@ function localGrid() {
 
 function stubAdapter(model) {
   return Object.assign(Object.create(NativeTableAdapter.prototype), {
-    tableUid: "table0001", model, metadataStore: { createStaging: async () => "staging01" }, getBaseRaw: () => null,
+    tableUid: "table0001", model, metadataStore: { createStaging: async () => "staging01" }, getBaseRaw: () => null, selfWrites: new Map(),
   });
 }
 

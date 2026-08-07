@@ -453,3 +453,194 @@ test("row-deletion rollback attempts every root and formula restore after one mo
   assert.equal(flatten(tree).get(formulaUid).node.string, "=A10", "formula rollback continues after the move failure");
   assert.equal(calls.deletes.length, 0, "staging is retained when any row could not be restored");
 });
+
+/** Minimal session harness for the flush lanes: a plain object plus the real prototype methods. */
+function flushHarness({ model, adapter }) {
+  return {
+    model, adapter, tableUid: model.tableUid || "table0001", disposed: false,
+    structuralPending: false, metadataDirty: false, dirtyCells: new Map(), editRevisions: new Map(),
+    changeVersion: 0, savedVersion: 0, saveTimer: null, contentSavePromise: null, idleTimer: null,
+    views: new Set(), history: null, discardedEdits: null, nativeOverlayUids: new Set(),
+    setSaving() {}, scheduleReferenceCountRefresh() {}, refreshValues() {}, renderStructural() {},
+    coordinateForUid: NativeGridSession.prototype.coordinateForUid,
+    prunePersistenceUids: NativeGridSession.prototype.prunePersistenceUids,
+    queueChangedCells: NativeGridSession.prototype.queueChangedCells,
+    markChanged: NativeGridSession.prototype.markChanged,
+    flushSave: NativeGridSession.prototype.flushSave,
+    flushContentSave: NativeGridSession.prototype.flushContentSave,
+    commitMutation: NativeGridSession.prototype.commitMutation,
+    rememberDiscardedEdits: NativeGridSession.prototype.rememberDiscardedEdits,
+    promptDiscardedEdits: NativeGridSession.prototype.promptDiscardedEdits,
+    replaceModel(next) { this.model = next; return next; },
+  };
+}
+
+function structuralAdapterSpy(model, counters) {
+  return {
+    model,
+    save: async (payload) => {
+      counters.saves += 1;
+      const saved = new GridModel({ ...payload.snapshot(), tableUid: model.tableUid || "table0001" });
+      saved.baseSnapshot = saved.snapshot(); saved.baseFingerprint = "saved";
+      return saved;
+    },
+    saveContent: async () => { counters.contentSaves += 1; return { saved: [], skipped: [] }; },
+  };
+}
+
+test("a content edit landing behind a pending structural flush still flushes both", async () => {
+  const model = new GridModel({ rows: [[{ uid: "cell00001", raw: "one" }]], tableUid: "table0001" });
+  model.baseSnapshot = model.snapshot(); model.baseFingerprint = "base";
+  const counters = { saves: 0, contentSaves: 0 };
+  const session = flushHarness({ model, adapter: structuralAdapterSpy(model, counters) });
+  NativeGridSession.prototype.markChanged.call(session, true);
+  // A content-lane markChanged lands before the 0ms structural timer fires.
+  session.dirtyCells.set("cell00001", { uid: "cell00001", baseRaw: "base", raw: "one", revision: 1 });
+  session.editRevisions.set("cell00001", 1);
+  NativeGridSession.prototype.markChanged.call(session, false);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  clearTimeout(session.saveTimer);
+  assert.equal(counters.saves, 1, "the structural flush survived the content-lane markChanged");
+  assert.equal(session.structuralPending, false);
+  assert.equal(session.dirtyCells.size, 0, "the structural payload carried the pending content edit");
+});
+
+test("an empty content touch cannot advance savedVersion past a pending structural change", async () => {
+  const model = new GridModel({ rows: [[{ uid: "cell00001", raw: "one" }]], tableUid: "table0001" });
+  model.baseSnapshot = model.snapshot(); model.baseFingerprint = "base";
+  const counters = { saves: 0, contentSaves: 0 };
+  const session = flushHarness({ model, adapter: structuralAdapterSpy(model, counters) });
+  NativeGridSession.prototype.markChanged.call(session, true);
+  NativeGridSession.prototype.markChanged.call(session, false); // no dirty cells: a revert/no-op
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  clearTimeout(session.saveTimer);
+  assert.equal(counters.saves, 1, "the structural flush was not swallowed by the version guard");
+  assert.equal(session.structuralPending, false);
+});
+
+test("flushContentSave under a pending structural change reschedules the structural flush", async () => {
+  const model = new GridModel({ rows: [[{ uid: "cell00001", raw: "one" }]], tableUid: "table0001" });
+  model.baseSnapshot = model.snapshot(); model.baseFingerprint = "base";
+  const counters = { saves: 0, contentSaves: 0 };
+  const session = flushHarness({ model, adapter: structuralAdapterSpy(model, counters) });
+  session.structuralPending = true; session.metadataDirty = true; session.changeVersion = 1;
+  session.dirtyCells.set("cell00001", { uid: "cell00001", baseRaw: "base", raw: "one", revision: 1 });
+  await NativeGridSession.prototype.flushContentSave.call(session);
+  assert.equal(counters.saves, 0, "the content lane deferred to the structural lane");
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  clearTimeout(session.saveTimer);
+  assert.equal(counters.saves, 1, "the structural flush was rescheduled, not dropped");
+  assert.equal(session.dirtyCells.size, 0, "the structural payload drained the content edit");
+});
+
+test("a dirty entry whose value already matches its base drains instead of respinning the saver", async () => {
+  const model = new GridModel({ rows: [[{ uid: "cell00001", raw: "same" }]] });
+  let saves = 0;
+  const adapter = { saveContent: async () => { saves += 1; return { saved: [], skipped: ["cell00001"] }; } };
+  const session = flushHarness({ model, adapter });
+  // The shape a flushSave reconcile leaves behind when the value matched but the revision advanced.
+  session.dirtyCells.set("cell00001", { uid: "cell00001", baseRaw: "same", raw: "same", revision: 2 });
+  session.editRevisions.set("cell00001", 2);
+  session.changeVersion = 1;
+  await NativeGridSession.prototype.flushContentSave.call(session);
+  assert.equal(saves, 1);
+  assert.equal(session.dirtyCells.size, 0, "the no-op entry drained");
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(saves, 1, "the debounce did not re-arm");
+});
+
+test("a failed content save sets the pending edits aside for restore", async (t) => {
+  const tree = makeTree(); installApi(t, tree);
+  const adapter = new NativeTableAdapter(tree.uid, metadata());
+  const model = adapter.load();
+  const uid = model.getCell(0, 1).uid;
+  flatten(tree).get(uid).node.string = "external"; // saveContent throws CONFLICT before writing
+  const session = flushHarness({ model, adapter });
+  session.dirtyCells.set(uid, { uid, baseRaw: "0:1", raw: "local", revision: 1 });
+  session.editRevisions.set(uid, 1);
+  session.changeVersion = 1;
+  await NativeGridSession.prototype.flushContentSave.call(session);
+  assert.equal(session.dirtyCells.size, 0);
+  assert.equal(session.structuralPending, false);
+  assert.deepEqual(session.discardedEdits?.edits, [{ uid, raw: "local", baseRaw: "0:1" }], "the failed save's pending edit is restorable");
+});
+
+test("a failed structural save sets the pending edits aside for restore", async (t) => {
+  const tree = makeTree(); installApi(t, tree);
+  const adapter = new NativeTableAdapter(tree.uid, metadata());
+  const model = adapter.load();
+  const uid = model.getCell(1, 1).uid;
+  const session = flushHarness({ model, adapter });
+  session.structuralPending = true;
+  session.dirtyCells.set(uid, { uid, baseRaw: "1:1", raw: "local", revision: 1 });
+  session.editRevisions.set(uid, 1);
+  session.changeVersion = 1;
+  tree.children[0].string = "retitled elsewhere"; // fingerprint mismatch: adapter.save throws CONFLICT
+  await NativeGridSession.prototype.flushSave.call(session);
+  assert.equal(session.structuralPending, false);
+  assert.equal(session.dirtyCells.size, 0);
+  assert.deepEqual(session.discardedEdits?.edits, [{ uid, raw: "local", baseRaw: "1:1" }], "the failed save's pending edit is restorable");
+});
+
+test("an overlay-owned external change does not stale prior undo entries", () => {
+  const model = new GridModel({ rows: [[{ uid: "cell00001", raw: "base" }]], tableUid: "table0001" });
+  model.transact("grid edit", () => model.setRaw(0, 0, "ours"));
+  const entry = model.history.entries.at(-1);
+  assert.ok(entry, "the earlier grid edit was recorded");
+  const session = flushHarness({ model, adapter: { acceptExternalTree() {} } });
+  session.history = model.history;
+  session.nativeOverlayUids.add("cell00001");
+  NativeGridSession.prototype.handleExternalChange.call(session, model, { type: "content", structural: false, tree: {}, changes: [{ uid: "cell00001", raw: "typed" }] });
+  assert.equal(model.getRaw(0, 0), "typed", "the overlay keystroke still lands in the model");
+  assert.equal(entry.stale.has("cell00001"), false, "the prior entry was not poisoned");
+  assert.equal(model.history.entries.length, 1, "no per-keystroke undo entry was pushed");
+});
+
+test("a same-shape structural save absorbs its own watch echo", async (t) => {
+  const tree = makeTree(); const { emit } = installApi(t, tree);
+  const adapter = new NativeTableAdapter(tree.uid, { get: () => null, set: async () => {} });
+  const model = adapter.load();
+  const events = [];
+  adapter.watchExternal((next, event) => events.push(event));
+  const before = clone(tree);
+  model.setRaw(1, 1, "rewritten");
+  await adapter.save(model, { saveMetadata: false });
+  emit(before, tree);
+  assert.equal(events.length, 0, "the save's own echo was consumed as a self-write");
+});
+
+test("an exact self-write match beats a lingering null-from overlay entry", () => {
+  const adapter = new NativeTableAdapter("table0001", { get: () => null });
+  adapter.recordSelfWrite("cell00001", null, "flushed");
+  adapter.recordSelfWrite("cell00001", "flushed", "before");
+  adapter.recordSelfWrite("cell00001", "a", "b");
+  assert.equal(adapter.consumeSelfWrite("cell00001", "a", "b"), true, "the exact match is found past the wildcard");
+  assert.equal(adapter.selfWrites.get("cell00001")?.length, 2, "the unrelated wildcard pair survives");
+  assert.equal(adapter.consumeSelfWrite("cell00001", "flushed", "before"), true);
+  assert.equal(adapter.selfWrites.has("cell00001"), false, "consuming the restore write drops its paired wildcard");
+});
+
+test("a committing overlay edit records exactly one undo entry that rewinds to beforeRaw", async () => {
+  const model = new GridModel({ rows: [[{ uid: "cell00001", raw: "typed" }]], tableUid: "table0001" });
+  const session = flushHarness({ model, adapter: { getBaseRaw: () => "typed" } });
+  await NativeGridSession.prototype.endNativeOverlayEdit.call(session, "cell00001", { beforeRaw: "before", afterRaw: "typed", commit: true });
+  clearTimeout(session.saveTimer);
+  assert.equal(model.getRaw(0, 0), "typed");
+  assert.equal(session.dirtyCells.size, 0, "the patched base leaves no dirty diff behind");
+  assert.equal(model.history.entries.length, 1, "one undo entry for the whole overlay edit");
+  assert.equal(model.undo(), true);
+  assert.equal(model.getRaw(0, 0), "before");
+});
+
+test("a merge-covered overlay commit keeps the model at the written value", async () => {
+  const model = new GridModel({ rows: [[{ uid: "cell00001", raw: "a" }, { uid: "cell00002", raw: "typed" }]], tableUid: "table0001" });
+  // The merge landed externally AFTER the overlay wrote "typed": covered, non-empty. Pushed
+  // directly because a merge over a non-empty cell can never be built through the constructor.
+  model.merges.push({ row: 0, col: 0, rowSpan: 1, colSpan: 2, id: "merge0001" });
+  const session = flushHarness({ model, adapter: { getBaseRaw: () => "typed" } });
+  // cell00002 is merge-covered: recording the undo entry fails, but the graph and the adapter
+  // base already hold "typed" — the model must not be stranded at "before".
+  await NativeGridSession.prototype.endNativeOverlayEdit.call(session, "cell00002", { beforeRaw: "before", afterRaw: "typed", commit: true });
+  clearTimeout(session.saveTimer);
+  assert.equal(model.getRaw(0, 1), "typed", "the model matches the graph and base after the failed undo entry");
+});

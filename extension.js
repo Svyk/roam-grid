@@ -3178,7 +3178,14 @@ export class NativeTableAdapter {
   consumeSelfWrite(uid, from, to) {
     const now = Date.now();
     const queue = (this.selfWrites.get(uid) || []).filter((item) => item.expires > now);
-    const start = queue.findIndex((item) => item.from === from || item.from == null);
+    // An exact `from` match beats a lingering null-from wildcard (overlay cancel() records one to
+    // absorb Roam's blur flush): a wildcard found first would shadow a later exact match, turning
+    // our own write into a spurious conflict or swallowing a genuine external one.
+    let start = queue.findIndex((item) => item.from === from);
+    // The wildcard is the sibling of the restore write `{flushed → beforeRaw}` recorded right
+    // after it; when that sibling is consumed, the wildcard goes with it.
+    if (start > 0 && queue[start - 1].from == null && queue[start - 1].to === from) start -= 1;
+    if (start < 0) start = queue.findIndex((item) => item.from == null);
     let end = -1; let value = from;
     for (let index = start; index >= 0 && index < queue.length; index += 1) {
       const item = queue[index];
@@ -3378,9 +3385,18 @@ export class NativeTableAdapter {
     const sameShape = currentCells.length === model.rowCount && currentCells.every((row, rowIndex) => row.length === model.colCount && row.every((cell, colIndex) => cell.uid === model.rows[rowIndex][colIndex].uid));
     if (sameShape) {
       const updates = [];
-      currentCells.forEach((row, rowIndex) => row.forEach((cell, colIndex) => { const desired = model.getRaw(rowIndex, colIndex) === "" ? " " : model.getRaw(rowIndex, colIndex); if (cell.string !== desired) updates.push([cell.uid, desired]); }));
+      currentCells.forEach((row, rowIndex) => row.forEach((cell, colIndex) => {
+        const raw = model.getRaw(rowIndex, colIndex);
+        if (cell.string !== nativePersistedRaw(raw)) updates.push({ uid: cell.uid, from: nativeStoredRaw(cell.string), raw });
+      }));
       if (updates.length > getSetting("writes-native-budget")) throw new GridError("MUTATION_BUDGET", `This edit requires ${updates.length} Roam writes; copy to a large grid instead`);
-      for (const [uid, raw] of updates) await updateBlock(uid, raw);
+      // Record each rewrite so the pull watch absorbs our own echo instead of turning it into a
+      // conflict reload — the same contract saveContent follows.
+      for (const { uid, from, raw } of updates) {
+        this.recordSelfWrite(uid, from, raw);
+        try { await updateBlock(uid, nativePersistedRaw(raw)); }
+        catch (error) { this.consumeSelfWrite(uid, from, raw); throw error; }
+      }
       return;
     }
     return this.persistDeletionOnly(model, currentTree) || this.reconcile(model, currentTree);
@@ -3623,8 +3639,16 @@ export class NativeGridSession {
     if (before === after) return null;
     const coordinate = this.coordinateForUid(uid); if (!coordinate) return null;
     const cell = this.model.getCell(coordinate.row, coordinate.col); if (!cell) return null;
-    cell.raw = before;
-    return this.commitMutation(null, "Edit cell", (model) => model.setRaw(coordinate.row, coordinate.col, after), false);
+    return this.commitMutation(null, "Edit cell", (model) => {
+      // The rewind lives INSIDE the transaction: the overlay already wrote `after` to the graph
+      // and patched the adapter base, so if setRaw throws (e.g. the cell became merge-covered
+      // mid-edit) #run restores its snapshot and the model keeps `after` — rewinding first would
+      // strand the model at `before` while graph and base hold `after`.
+      const target = model.getCell(coordinate.row, coordinate.col);
+      if (!target || target.uid !== uid) return;
+      target.raw = before;
+      model.setRaw(coordinate.row, coordinate.col, after);
+    }, false);
   }
 
   setSaving(value) { for (const view of this.views) view.root?.classList?.toggle("rg-root--saving", value); }
@@ -3781,8 +3805,12 @@ export class NativeGridSession {
     this.changeVersion += 1;
     this.metadataDirty ||= layoutChanged; this.structuralPending ||= layoutChanged;
     clearTimeout(this.saveTimer);
-    if (!layoutChanged && !this.dirtyCells.size) { this.savedVersion = this.changeVersion; return; }
-    this.saveTimer = setTimeout(() => layoutChanged ? this.flushSave() : this.flushContentSave(), layoutChanged ? 0 : getSetting("writes-content-debounce-ms"));
+    // A content-lane change landing behind a pending structural one must neither cancel nor
+    // downgrade the structural flush: flushSave persists the whole snapshot, content included.
+    // Advancing savedVersion here would let flushSave's up-to-date guard swallow that save.
+    if (!layoutChanged && !this.dirtyCells.size && !this.structuralPending) { this.savedVersion = this.changeVersion; return; }
+    const structural = this.structuralPending;
+    this.saveTimer = setTimeout(() => structural ? this.flushSave() : this.flushContentSave(), structural ? 0 : getSetting("writes-content-debounce-ms"));
   }
 
   coordinateForUid(uid) {
@@ -3799,7 +3827,15 @@ export class NativeGridSession {
   }
 
   async flushContentSave() {
-    if (this.disposed || this.structuralPending || !this.dirtyCells.size) return;
+    if (this.disposed) return;
+    if (this.structuralPending) {
+      // Never strand a pending structural flush: the structural lane persists this content too,
+      // and an early return with no reschedule stops all persistence.
+      clearTimeout(this.saveTimer);
+      this.saveTimer = setTimeout(() => this.flushSave(), 0);
+      return;
+    }
+    if (!this.dirtyCells.size) return;
     if (this.contentSavePromise) return this.contentSavePromise;
     const batch = new Map([...this.dirtyCells].map(([uid, change]) => [uid, { ...change }]));
     const task = this.adapter.saveContent(batch); this.contentSavePromise = task;
@@ -3812,13 +3848,25 @@ export class NativeGridSession {
         if (currentRaw == null || currentRaw === saved.raw) this.dirtyCells.delete(saved.uid);
         else this.dirtyCells.set(saved.uid, { uid: saved.uid, baseRaw: saved.raw, raw: currentRaw, revision });
       }
+      for (const uid of result.skipped || []) {
+        // saveContent skips a change whose raw already equals its base (a flushSave reconcile can
+        // leave exactly that behind); keeping it would re-arm the debounce forever.
+        const dirty = this.dirtyCells.get(uid);
+        if (dirty && dirty.raw === dirty.baseRaw) this.dirtyCells.delete(uid);
+      }
       this.scheduleReferenceCountRefresh();
       if (!this.dirtyCells.size && !this.structuralPending) this.savedVersion = this.changeVersion;
     } catch (error) {
       toast(error.message, "danger", 8000);
+      // Capture BEFORE the clear/reload, exactly like the conflict lanes: a failed save must set
+      // the pending edits aside for restore, never silently destroy them.
+      let reloaded = null;
+      try { reloaded = this.adapter.load(); } catch { /* table may have disappeared */ }
+      const discarded = captureDiscardedEdits(this.dirtyCells, reloaded || { rows: [] });
       this.dirtyCells.clear(); this.structuralPending = false; this.metadataDirty = false;
       this.history?.invalidateRedo("content-save-error");
-      try { this.replaceModel(this.adapter.load()); this.changeVersion = this.savedVersion; } catch { /* table may have disappeared */ }
+      if (reloaded) { this.replaceModel(reloaded); this.changeVersion = this.savedVersion; }
+      this.rememberDiscardedEdits(discarded);
     } finally {
       if (this.contentSavePromise === task) this.contentSavePromise = null;
       if (!this.disposed && !this.structuralPending && this.dirtyCells.size) {
@@ -3859,8 +3907,9 @@ export class NativeGridSession {
       this.prunePersistenceUids();
       this.model.baseFingerprint = saved.baseFingerprint; this.model.baseSnapshot = saved.baseSnapshot; this.adapter.model = this.model;
       for (const [uid, dirty] of [...this.dirtyCells]) {
-        const savedRevision = payloadEditRevisions.get(uid) || 0;
-        if (dirty.revision <= savedRevision && dirty.raw === payloadRawByUid.get(uid)) this.dirtyCells.delete(uid);
+        // A value match drains the entry regardless of revision: the graph already holds the
+        // pending value, so keeping the entry would re-arm the content saver forever.
+        if (dirty.raw === payloadRawByUid.get(uid)) this.dirtyCells.delete(uid);
         else if (payloadRawByUid.has(uid)) this.dirtyCells.set(uid, { ...dirty, baseRaw: payloadRawByUid.get(uid) });
       }
       this.structuralPending = false;
@@ -3871,9 +3920,15 @@ export class NativeGridSession {
     } catch (error) {
       this.metadataDirty ||= saveMetadata;
       toast(error.message, "danger", 8000);
+      // Capture BEFORE the clear/reload, exactly like the conflict lanes: a failed save must set
+      // the pending edits aside for restore, never silently destroy them.
+      let reloaded = null;
+      try { reloaded = this.adapter.load(); } catch { /* table may have disappeared */ }
+      const discarded = captureDiscardedEdits(this.dirtyCells, reloaded || { rows: [] });
       this.dirtyCells.clear(); this.structuralPending = false;
       this.history?.invalidateRedo("structural-save-error");
-      try { this.replaceModel(this.adapter.load()); this.changeVersion = this.savedVersion; } catch { /* table may have disappeared */ }
+      if (reloaded) { this.replaceModel(reloaded); this.changeVersion = this.savedVersion; }
+      this.rememberDiscardedEdits(discarded);
     } finally { this.setSaving(false); }
   }
 
@@ -3913,11 +3968,14 @@ export class NativeGridSession {
     for (const change of event.changes || []) {
       const coordinate = this.coordinateForUid(change.uid); if (!coordinate) continue;
       const cell = this.model.getCell(coordinate.row, coordinate.col); if (!cell || cell.raw === change.raw) continue;
-      effective.push(change);
       // A block mounted in a native overlay is being typed into through Roam's own editor, so each
       // flush arrives here as an external change. Those are the user's in-flight keystrokes, not a
-      // novel edit from elsewhere: the single undo entry is pushed by `endNativeOverlayEdit`.
-      if (!rebasable.has(cell.uid) && !this.nativeOverlayUids?.has?.(cell.uid)) novel.push({ uid: cell.uid, from: cell.raw, to: change.raw });
+      // novel edit from elsewhere: the single undo entry is pushed by `endNativeOverlayEdit`, and
+      // they must not mark prior history entries stale either — that would stop ⌘Z from rewinding
+      // an earlier grid edit after an overlay edit lands.
+      const overlayOwned = this.nativeOverlayUids?.has?.(cell.uid) === true;
+      if (!overlayOwned) effective.push(change);
+      if (!rebasable.has(cell.uid) && !overlayOwned) novel.push({ uid: cell.uid, from: cell.raw, to: change.raw });
       cell.raw = change.raw; changed.push([coordinate.row, coordinate.col]);
     }
     // Only changes that actually moved a cell reach the history: an echo that
@@ -7528,7 +7586,8 @@ export class NativeCellEditorOverlay {
       const seed = String(initial);
       try {
         this.view.adapter?.recordSelfWrite?.(uid, this.beforeRaw, seed);
-        await updateBlock(uid, nativePersistedRaw(seed));
+        try { await updateBlock(uid, nativePersistedRaw(seed)); }
+        catch (error) { this.view.adapter?.consumeSelfWrite?.(uid, this.beforeRaw, seed); throw error; }
         this.view.adapter?.patchBaseContent?.([{ uid, raw: seed }]);
       } catch (error) { noteNativeEditorError(error); return null; }
     }
@@ -7709,7 +7768,8 @@ export class NativeCellEditorOverlay {
     try {
       if (merged !== cellRaw) {
         adapter.recordSelfWrite?.(plan.cellUid, cellRaw, merged);
-        await updateBlock(plan.cellUid, nativePersistedRaw(merged));
+        try { await updateBlock(plan.cellUid, nativePersistedRaw(merged)); }
+        catch (error) { adapter.consumeSelfWrite?.(plan.cellUid, cellRaw, merged); throw error; }
       }
       await deleteBlock(plan.strayUid);
       adapter.recordExpectedStructuralTransition?.(tree, after, [adapter.baseTree]);
@@ -7762,8 +7822,11 @@ export class NativeCellEditorOverlay {
       const currentRaw = current ? current.raw : beforeRaw;
       // `""` is stored as `" "` (nativePersistedRaw): both read back as raw `""`, so the write is
       // still needed to stop Roam collapsing the block, but it is not a self-write to absorb.
-      if (currentRaw !== value) this.view.adapter?.recordSelfWrite?.(uid, currentRaw, value);
-      if (currentRaw !== value || value === "") await updateBlock(uid, nativePersistedRaw(value));
+      if (currentRaw !== value) {
+        this.view.adapter?.recordSelfWrite?.(uid, currentRaw, value);
+        try { await updateBlock(uid, nativePersistedRaw(value)); }
+        catch (error) { this.view.adapter?.consumeSelfWrite?.(uid, currentRaw, value); throw error; }
+      } else if (value === "") await updateBlock(uid, nativePersistedRaw(value));
       this.view.adapter?.patchBaseContent?.([{ uid, raw: value }]);
     } catch (error) { noteNativeEditorError(error); }
     const modelCell = this.view.model?.getCell?.(row, col);
