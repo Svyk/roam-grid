@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.12.0
+
+Native editing, live templates, the range fix, and comment compose modes.
+
+- **Cells edit in Roam's own block editor.** A non-formula cell on an enhanced
+  native grid now mounts Roam's real editor over the cell, so `[[`, `((`, `#`,
+  `{{` and `/` open Roam's OWN menus — the same ones native `{{[[table]]}}`
+  cells get. Enter/Tab/Escape keep their grid meanings when no menu is open;
+  when a menu is open they drive the menu. Formula cells, the F2 floating
+  editor, large grids and registered custom editors keep the grid editor.
+  Setting: `Editing — Edit cells with Roam's own block editor` (default on);
+  two consecutive mount failures fall back to the grid editor for the session.
+- **Templates are real, editable tables.** `[[roam/grid/templates]]` now holds
+  a `roam-grid/template:: <name>` block with an actual `{{[[table]]}}` child
+  per template — open the page and edit the template like any other grid.
+  Legacy JSON records migrate automatically shortly after load (each original
+  is backed up to `[[roam/grid/metadata]]` first); a maintenance button retries
+  any that were skipped for exceeding the write budget.
+- **Live range references render again.** The claim pipeline is crash-isolated
+  per element (one bad block can no longer leave later embeds invisible),
+  transient empty reads are retried instead of cached as dead, the block
+  locator matches Roam's current DOM, and a raw-text fallback mounts ranges
+  even when Roam renders no component button. Degrades are traced at
+  `window.__rgDiag.rangeTrace`.
+- **Comment compose modes.** New `Comments — Composing and opening threads`
+  select (per device): "In place" (default) opens the inline Comments panel
+  with the cursor in an empty composer — nothing is written until Enter;
+  "Comment box" keeps the pre-0.12 dialog; "Right sidebar" opens the thread
+  the way Roam's own comment button does and starts the comment there, and
+  abandoning it unwinds exactly the blocks the gesture created. The old
+  sidebar switch migrates into the new select (settings schema v2, graph and
+  device layers).
+- Suite: 561 tests.
+
 ## 0.11.0
 
 Recents hardening. No new surface; this release makes the bare-opener recents

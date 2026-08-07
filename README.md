@@ -219,7 +219,7 @@ mouse-out is not a safe place to edit.
 
 ## Settings
 
-**Settings → Roam Depot → Roam Grid.** Forty-six controls in eight groups —
+**Settings → Roam Depot → Roam Grid.** Forty-eight controls in eight groups —
 Writes, Editing, Appearance, Sizing, New grids, Large grids, Comments, Ranges —
 plus four maintenance actions: apply display defaults to open grids, forget this
 device's overrides, clear local caches, and reset every setting.
