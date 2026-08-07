@@ -726,6 +726,12 @@ body.roam-body.dark .rg-portal {
   border-radius: 8px;
   font-size: 10px;
   line-height: 16px;
+  cursor: zoom-in;
+}
+
+/* Honest affordance: a second click on an image in the selected cell opens the lightbox. */
+.rg-cell--selected .rg-rich-host img {
+  cursor: zoom-in;
 }
 
 .rg-cell a,
@@ -1590,4 +1596,98 @@ body.roam-body.dark .rg-portal {
 @media (prefers-reduced-motion: reduce) {
   .rg-root *,
   .rg-toasts * { scroll-behavior: auto !important; transition: none !important; }
+}
+
+/* Image lightbox — a native modal <dialog> reusing the portal color tokens. */
+.rg-lightbox {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 92vw;
+  max-height: 92vh;
+  padding: 10px 12px 12px;
+  color: var(--rg-portal-color, #182026);
+  background: var(--rg-portal-bg, #fff);
+  border: 1px solid var(--rg-portal-border, #c5cbd3);
+  border-radius: 8px;
+  box-shadow: 0 12px 40px rgb(0 0 0 / 34%);
+}
+
+.rg-lightbox::backdrop {
+  background: rgb(16 22 26 / 62%);
+}
+
+.rg-lightbox-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.rg-lightbox-title {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rg-lightbox-counter {
+  flex: none;
+  color: var(--rg-portal-muted, #5f6b7c);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rg-lightbox-body {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  overflow: auto;
+}
+
+.rg-lightbox-image {
+  display: block;
+  max-width: 100%;
+}
+
+/* LP-1 in the dialog too: Roam persists the resize width inline on the wrapper, which defeats the
+   img cap. Neutralize the wrapper and hide the block-authoring chrome; the .rm-*/.react-* selectors
+   are allowed here only as descendants of the .rg-lightbox scope. */
+.rg-lightbox .rm-inline-img__resize,
+.rg-lightbox .react-resizable {
+  width: auto !important;
+  max-width: 100% !important;
+}
+
+.rg-lightbox .rm-inline-img__resize--hover,
+.rg-lightbox .react-resizable-handle,
+.rg-lightbox .image-extraction-icon-container {
+  display: none !important;
+}
+
+.rg-lightbox img.rm-inline-img {
+  max-width: 100%;
+  max-height: 78vh;
+  object-fit: contain;
+}
+
+/* 1:1 view — the image renders at its natural size and the body scrolls. */
+.rg-lightbox--actual-size .rg-lightbox-body {
+  align-items: flex-start;
+  justify-content: flex-start;
+}
+
+.rg-lightbox--actual-size img.rm-inline-img {
+  max-width: none;
+  max-height: none;
+  object-fit: none;
+}
+
+.rg-lightbox-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  justify-content: flex-end;
 }

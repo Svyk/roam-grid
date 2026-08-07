@@ -1,10 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  GridView,
   applyCellImageLayout,
   cellImageMarkdown,
+  claimKeyboard,
   imageDimensionCache,
+  keyboardOwner,
+  onGlobalKeydown,
+  openImageLightbox,
   paintRichCellContent,
+  releaseKeyboard,
+  removeImageFromRaw,
   renderStableCellContent,
   repaintMediaDecor,
   resolveImageLayout,
@@ -70,12 +77,15 @@ class MiniNode {
   setAttribute(name, value) { this[name] = String(value); }
   getAttribute(name) { return this[name] == null ? null : String(this[name]); }
   removeAttribute(name) { delete this[name]; }
+  focus() { globalThis.document.activeElement = this; }
+  showModal() { this.open = true; }
+  close() { this.open = false; this.dispatch("close"); }
   get isConnected() { for (let current = this; current; current = current.parentNode) if (current === globalThis.document?.body) return true; return false; }
 }
 
 function installMiniDom() {
   const body = new MiniNode("body");
-  globalThis.document = { body, createElement: (name) => new MiniNode(name), createTextNode: (text) => new MiniNode("#text", text) };
+  globalThis.document = { body, activeElement: null, createElement: (name) => new MiniNode(name), createTextNode: (text) => new MiniNode("#text", text), querySelector: (selector) => body.querySelector(selector) };
   globalThis.window = { addEventListener() {}, removeEventListener() {}, dispatchEvent() {} };
   return { body };
 }
@@ -330,4 +340,209 @@ test("repaintMediaDecor re-resolves every mounted cell from the live settings", 
   repaintMediaDecor(cells, null);
   assert.equal(first.classList.contains("rg-cell--media"), false, "switch off strips decor in place");
   assert.equal(first.style.getPropertyValue("--rg-img-max-h"), "");
+});
+
+// GOAL-IMG-2 — the lightbox, its delete rewrite, and the keyboard gestures that open it.
+
+test("removeImageFromRaw splices one image and preserves surrounding text and spacing", () => {
+  // Only image → empty string.
+  assert.equal(removeImageFromRaw("![cat](https://x/cat.png)", "https://x/cat.png"), "");
+  assert.equal(removeImageFromRaw("![cat](u)", "u", 0), "");
+
+  // Image embedded in prose keeps the text and both spaces around the removed token.
+  assert.equal(removeImageFromRaw("before ![a](u1) after", "u1"), "before  after");
+  assert.equal(removeImageFromRaw("![a](u1) tail", "u1"), " tail");
+
+  // Duplicate URLs in one cell are removed by occurrence index.
+  const dup = "![](u) mid ![](u) end";
+  assert.equal(removeImageFromRaw(dup, "u", 0), " mid ![](u) end", "occurrence 0 removes the first");
+  assert.equal(removeImageFromRaw(dup, "u", 1), "![](u) mid  end", "occurrence 1 removes the second");
+
+  // An unmatched url or occurrence returns the source unchanged, never a corrupted cell.
+  assert.equal(removeImageFromRaw("![a](u1)", "u2"), "![a](u1)");
+  assert.equal(removeImageFromRaw("![a](u1)", "u1", 3), "![a](u1)");
+  assert.equal(removeImageFromRaw(null, "u"), "");
+});
+
+function installLightboxRoam() {
+  const renders = []; const unmounts = [];
+  globalThis.window.roamAlphaAPI = { ui: { components: {
+    renderString: ({ el, string }) => { el.appendChild(new MiniNode("span", string)); renders.push(string); },
+    unmountNode: ({ el }) => unmounts.push(el),
+  } } };
+  return { renders, unmounts };
+}
+
+function makeLightboxOwner() {
+  const ownerRoot = new MiniNode("section"); ownerRoot.className = "rg-owner";
+  const calls = { keydown: 0 };
+  const ownerView = { root: ownerRoot, surface: "main", disposed: false, onKeydown: () => { calls.keydown += 1; } };
+  ownerRoot.__rgView = ownerView;
+  return { ownerRoot, ownerView, calls };
+}
+
+const footerButtons = (dialog) => dialog.querySelectorAll("button");
+const footerLabels = (dialog) => footerButtons(dialog).map((b) => b.textContent);
+
+test("openImageLightbox builds the dialog, counter, and header, and pages entries in order", (t) => {
+  const { body } = installMiniDom();
+  const { renders } = installLightboxRoam();
+  t.after(() => releaseKeyboard());
+  const { ownerRoot } = makeLightboxOwner();
+  const entries = [
+    { raw: "![a](u1)", alt: "a", url: "u1", row: 0, col: 0, cellImageIndex: 0, occurrence: 0 },
+    { raw: "![b](u2)", alt: "b", url: "u2", row: 1, col: 0, cellImageIndex: 0, occurrence: 0 },
+    { raw: "![c](u3)", alt: "c", url: "u3", row: 2, col: 0, cellImageIndex: 0, occurrence: 0 },
+  ];
+  const dialog = openImageLightbox({ ownerRoot, entries, startIndex: 0 });
+  assert.ok(dialog, "the lightbox returns its dialog");
+  assert.equal(dialog.classList.contains("rg-lightbox"), true);
+  assert.equal(dialog.classList.contains("rg-portal"), true);
+  assert.equal(dialog.open, true, "showModal was called");
+  assert.equal(body.contains(dialog), true);
+  assert.equal(dialog.querySelector(".rg-lightbox-title").textContent, "a");
+  assert.equal(dialog.querySelector(".rg-lightbox-counter").textContent, "1 / 3");
+  assert.equal(renders.at(-1), "![a](u1)", "the current image is rendered through renderString");
+
+  dialog.dispatch("keydown", { key: "ArrowRight", preventDefault() {} });
+  assert.equal(dialog.querySelector(".rg-lightbox-counter").textContent, "2 / 3");
+  assert.equal(renders.at(-1), "![b](u2)");
+
+  dialog.dispatch("keydown", { key: "ArrowLeft", preventDefault() {} });
+  assert.equal(dialog.querySelector(".rg-lightbox-counter").textContent, "1 / 3");
+  assert.equal(renders.at(-1), "![a](u1)");
+
+  dialog.dispatch("keydown", { key: "ArrowLeft", preventDefault() {} });
+  assert.equal(dialog.querySelector(".rg-lightbox-counter").textContent, "3 / 3", "ArrowLeft wraps from the first to the last");
+  assert.equal(renders.at(-1), "![c](u3)");
+});
+
+test("the open lightbox releases the grid keyboard and __rgDismiss returns focus and re-claims it", (t) => {
+  installMiniDom();
+  installLightboxRoam();
+  t.after(() => releaseKeyboard());
+  const { ownerRoot, ownerView, calls } = makeLightboxOwner();
+  claimKeyboard(ownerView);
+  assert.equal(keyboardOwner()?.view, ownerView, "the grid owns the keyboard before the lightbox opens");
+
+  const entries = [{ raw: "![a](u1)", alt: "a", url: "u1", row: 0, col: 0, cellImageIndex: 0, occurrence: 0 }];
+  const dialog = openImageLightbox({ ownerRoot, entries, startIndex: 0 });
+  assert.equal(keyboardOwner(), null, "opening the modal releases keyboard ownership");
+
+  // With ownership released, the extension's single window keydown handler must not reach the grid.
+  onGlobalKeydown({ key: "ArrowDown", metaKey: false, ctrlKey: false, shiftKey: false, target: { closest: () => null } });
+  assert.equal(calls.keydown, 0, "grid onKeydown does not fire while the lightbox is open");
+
+  dialog.__rgDismiss();
+  assert.equal(dialog.open, false, "__rgDismiss closes the dialog");
+  assert.equal(globalThis.document.body.contains(dialog), false, "the dialog is removed from the body");
+  assert.equal(globalThis.document.activeElement, ownerRoot, "focus returns to the grid root");
+  assert.equal(keyboardOwner()?.view, ownerView, "the grid re-claims the keyboard on close");
+
+  onGlobalKeydown({ key: "ArrowDown", metaKey: false, ctrlKey: false, shiftKey: false, target: { closest: () => null } });
+  assert.equal(calls.keydown, 1, "after close the grid keydown lane works again");
+});
+
+test("the lightbox Delete action rewrites the cell raw and invokes the commit callback", (t) => {
+  installMiniDom();
+  installLightboxRoam();
+  t.after(() => releaseKeyboard());
+  const { ownerRoot } = makeLightboxOwner();
+  const deleted = [];
+  const entries = [{ raw: "text ![a](u1) more", alt: "a", url: "u1", row: 2, col: 1, cellImageIndex: 0, occurrence: 0 }];
+  const dialog = openImageLightbox({ ownerRoot, entries, startIndex: 0, onDelete: (payload) => deleted.push(payload) });
+
+  const remove = footerButtons(dialog).find((b) => b.textContent === "Delete");
+  assert.ok(remove, "a delete affordance exists when onDelete is supplied");
+  remove.dispatch("click");
+
+  assert.equal(deleted.length, 1);
+  assert.equal(deleted[0].raw, "text  more", "the callback receives the raw with the image spliced out");
+  assert.equal(deleted[0].entry, entries[0]);
+  assert.equal(dialog.open, false, "the lightbox closes after a delete");
+});
+
+test("the lightbox hides Download for .enc images but keeps it otherwise, and omits Delete without a callback", (t) => {
+  installMiniDom();
+  installLightboxRoam();
+  t.after(() => releaseKeyboard());
+  const { ownerRoot } = makeLightboxOwner();
+
+  const enc = openImageLightbox({ ownerRoot, entries: [{ raw: "![s](u)", alt: "s", url: "https://f/scan.png.enc?alt=media&token=abc", row: 0, col: 0, cellImageIndex: 0, occurrence: 0 }], startIndex: 0 });
+  const encLabels = footerLabels(enc);
+  assert.equal(encLabels.includes("Download"), false, "a .enc blob cannot be fetched directly, so Download is hidden");
+  assert.equal(encLabels.includes("Copy markdown"), true);
+  assert.equal(encLabels.includes("Delete"), false, "no onDelete, no Delete button");
+  enc.__rgDismiss();
+
+  const plain = openImageLightbox({ ownerRoot, entries: [{ raw: "![p](u)", alt: "p", url: "https://x/p.png", row: 0, col: 0, cellImageIndex: 0, occurrence: 0 }], startIndex: 0 });
+  assert.equal(footerLabels(plain).includes("Download"), true, "a plain URL keeps Download");
+  plain.__rgDismiss();
+});
+
+test("Shift+Space opens the lightbox at the selected cell instead of beginning an edit", () => {
+  const spaceEvent = (fields) => ({ key: " ", metaKey: false, ctrlKey: false, altKey: false, shiftKey: false, target: { matches: () => false }, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, stopPropagation() {}, ...fields });
+
+  const shiftCalls = { beginEdit: [], lightbox: [] };
+  const shiftView = {
+    selection: { startRow: 1, endRow: 1, startCol: 2, endCol: 2 },
+    beginEdit: (...a) => shiftCalls.beginEdit.push(a),
+    openCellImageLightbox: (...a) => shiftCalls.lightbox.push(a),
+  };
+  const shiftSpace = spaceEvent({ shiftKey: true });
+  GridView.prototype.onKeydown.call(shiftView, shiftSpace);
+  assert.deepEqual(shiftCalls.beginEdit, [], "Shift+Space must NOT begin an edit seeded with a space");
+  assert.deepEqual(shiftCalls.lightbox, [[1, 2, 0]], "it opens the column lightbox at the selected cell's first image");
+  assert.equal(shiftSpace.defaultPrevented, true);
+
+  // A plain space still begins an edit — the new branch must not swallow ordinary typing.
+  const plainCalls = { beginEdit: [], lightbox: [] };
+  const plainView = {
+    selection: { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+    beginEdit: (...a) => plainCalls.beginEdit.push(a),
+    openCellImageLightbox: (...a) => plainCalls.lightbox.push(a),
+  };
+  GridView.prototype.onKeydown.call(plainView, spaceEvent({ shiftKey: false }));
+  assert.deepEqual(plainCalls.beginEdit, [[0, 0, " "]], "a plain space still begins an edit");
+  assert.deepEqual(plainCalls.lightbox, []);
+});
+
+test("the armed-click state machine only opens the lightbox on the second click of a selected image", () => {
+  installMiniDom();
+  const opened = [];
+  const view = {
+    selection: { startRow: 5, endRow: 5, startCol: 0, endCol: 0 }, // a different cell is selected first
+    imageClickArmed: false, imageClickDragged: false,
+    openCellImageLightbox: (...a) => opened.push(a),
+  };
+  const cell = new MiniNode("div"); cell.className = "rg-cell"; cell.dataset.row = "0"; cell.dataset.col = "0";
+  const content = new MiniNode("div"); content.className = "rg-cell-content"; cell.appendChild(content);
+  const host = new MiniNode("span"); host.className = "rg-rich-host"; content.appendChild(host);
+  const img = new MiniNode("img"); host.appendChild(img);
+  const imgEvent = (fields = {}) => ({ target: img, shiftKey: false, ...fields });
+
+  // First gesture: the cell is not yet the sole-selected cell, so the pointerdown does not arm.
+  GridView.prototype.armImageClick.call(view, 0, 0, imgEvent());
+  assert.equal(view.imageClickArmed, false, "an image click on an unselected cell does not arm");
+  view.selection = { startRow: 0, endRow: 0, startCol: 0, endCol: 0 }; // the click now selects the cell
+  assert.equal(GridView.prototype.handleCellImageClick.call(view, cell, imgEvent()), false, "the first click only selects");
+  assert.deepEqual(opened, []);
+
+  // Second gesture: the cell is now the sole-selected cell, so the pointerdown arms and the click opens.
+  GridView.prototype.armImageClick.call(view, 0, 0, imgEvent());
+  assert.equal(view.imageClickArmed, true, "a second pointerdown on the selected image arms");
+  assert.equal(GridView.prototype.handleCellImageClick.call(view, cell, imgEvent()), true);
+  assert.deepEqual(opened, [[0, 0, 0]], "the armed click opens the lightbox at the clicked image index");
+
+  // Shift disqualifies arming; a drag between down and up disqualifies the open.
+  GridView.prototype.armImageClick.call(view, 0, 0, imgEvent({ shiftKey: true }));
+  assert.equal(view.imageClickArmed, false, "a shift-click extends selection, it never opens the lightbox");
+  view.imageClickArmed = true; view.imageClickDragged = true;
+  assert.equal(GridView.prototype.handleCellImageClick.call(view, cell, imgEvent()), false, "a drag-select does not open the lightbox");
+
+  // The clip chip opens at image 0 regardless of the arm flag.
+  opened.length = 0; view.imageClickArmed = false; view.imageClickDragged = false;
+  const clip = new MiniNode("span"); clip.className = "rg-img-clip-chip"; cell.appendChild(clip);
+  assert.equal(GridView.prototype.handleCellImageClick.call(view, cell, { target: clip }), true);
+  assert.deepEqual(opened, [[0, 0, 0]], "clicking the +n clip chip opens the lightbox at the first image");
 });

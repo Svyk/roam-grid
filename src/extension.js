@@ -6418,6 +6418,113 @@ function showChoice(title, choices, ownerRoot = null) {
   });
 }
 
+/** A `.enc` firebase URL is an encrypted blob Roam decrypts through `renderString`; fetching it
+ *  directly (a plain download or new-tab open) returns ciphertext, so the download affordance hides
+ *  for it (LP-4). Matches `.enc` at the path end or before a query/fragment/param delimiter. */
+function isEncryptedImageUrl(url) {
+  return /\.enc(?:$|[?#&])/iu.test(String(url ?? ""));
+}
+
+/**
+ * The image lightbox: a native modal `<dialog>` that pages the whole column of images. It reuses the
+ * `showChoice` portal skeleton — `tagPortalOwner` + `createPortalThemeBridge` + `__rgDismiss` +
+ * backdrop dismiss — and renders the current `![alt](url)` through `renderString` into a host so the
+ * encrypted `.enc` blob decrypts exactly as it does in a cell (LP-3); we NEVER build an `<img src>`.
+ * Because a modal dialog owns the keyboard, opening RELEASES grid keyboard ownership and closing
+ * re-claims it after returning focus to the grid root — so a grid `onKeydown` can never fire under
+ * the open dialog (LP-9 is verified live).
+ * `entries:[{raw,alt,url,row,col,occurrence?}]`; `onDelete` (when supplied) receives
+ * `{entry, raw}` where `raw` is the cell string with this image removed, and performs the mutation.
+ */
+export function openImageLightbox({ ownerRoot = null, entries = [], startIndex = 0, onDelete = null } = {}) {
+  const list = Array.isArray(entries) ? entries.filter((entry) => entry && entry.url) : [];
+  if (!list.length) return null;
+  let index = clamp(Math.floor(Number(startIndex) || 0), 0, list.length - 1);
+  let actualSize = false;
+  const owner = portalOwnerRoot(ownerRoot);
+  const ownerView = ownerRoot?.__rgView || owner?.__rgView || null;
+
+  const dialog = document.createElement("dialog");
+  dialog.className = "rg-portal rg-lightbox";
+  dialog.setAttribute("role", "dialog"); dialog.setAttribute("aria-modal", "true");
+  const header = document.createElement("div"); header.className = "rg-lightbox-header";
+  const title = document.createElement("span"); title.className = "rg-lightbox-title";
+  const counter = document.createElement("span"); counter.className = "rg-lightbox-counter";
+  header.append(title, counter);
+  const body = document.createElement("div"); body.className = "rg-lightbox-body";
+  const host = document.createElement("span"); host.className = "rg-rich-host rg-lightbox-image";
+  body.appendChild(host);
+  const footer = document.createElement("div"); footer.className = "rg-lightbox-footer";
+  dialog.append(header, body, footer);
+  tagPortalOwner(dialog, owner?.dataset?.roamGridUid || gridViewUid(ownerView));
+  document.body.appendChild(dialog);
+  const theme = createPortalThemeBridge(owner, dialog);
+
+  let closed = false;
+  const unmountHost = () => { try { globalThis.window?.roamAlphaAPI?.ui?.components?.unmountNode?.({ el: host }); } catch { /* host may not be Roam-owned */ } };
+  const finish = () => {
+    if (closed) return; closed = true;
+    unmountHost(); theme.dispose(); dialog.remove();
+    ownerRoot?.focus?.({ preventScroll: true });
+    if (ownerView && !ownerView.disposed) claimKeyboard(ownerView);
+  };
+  const close = () => { if (!closed && dialog.open && typeof dialog.close === "function") dialog.close(); else finish(); };
+  dialog.__rgDismiss = () => close();
+  dialog.addEventListener("close", finish);
+
+  const updateFooter = (entry) => {
+    footer.replaceChildren();
+    footer.appendChild(button(actualSize ? "Fit" : "1:1", actualSize ? "Fit the image to the window" : "Show the image at actual size", () => {
+      actualSize = !actualSize; dialog.classList.toggle("rg-lightbox--actual-size", actualSize); updateFooter(list[index]);
+    }));
+    footer.appendChild(button("Open in tab", "Open the image in a new browser tab", () => { globalThis.window?.open?.(entry.url, "_blank", "noopener"); }));
+    footer.appendChild(button("Copy markdown", "Copy the image markdown to the clipboard", () => { globalThis.navigator?.clipboard?.writeText?.(`![${entry.alt || ""}](${entry.url})`); toast("Image markdown copied"); }));
+    if (!isEncryptedImageUrl(entry.url)) {
+      footer.appendChild(button("Download", "Download the image", () => {
+        try {
+          const anchor = document.createElement("a"); anchor.href = entry.url; anchor.download = String(entry.alt || ""); anchor.rel = "noopener";
+          document.body.appendChild(anchor); anchor.click?.(); anchor.remove();
+        } catch (error) { if (globalThis.window) globalThis.window.__RG_IMG_LAST_ERROR = String(error?.stack || error); }
+      }));
+    }
+    if (typeof onDelete === "function") {
+      footer.appendChild(button("Delete", "Remove this image from the cell", () => {
+        const raw = removeImageFromRaw(entry.raw, entry.url, entry.occurrence || 0);
+        try { onDelete({ entry, raw }); } catch (error) { if (globalThis.window) globalThis.window.__RG_IMG_LAST_ERROR = String(error?.stack || error); }
+        close();
+      }, "bp3-intent-danger"));
+    }
+  };
+  const renderCurrent = () => {
+    const entry = list[index];
+    title.textContent = String(entry.alt || "image");
+    counter.textContent = `${index + 1} / ${list.length}`;
+    updateFooter(entry);
+    unmountHost(); host.replaceChildren();
+    try {
+      const result = roam().ui.components.renderString({ el: host, string: `![${entry.alt || ""}](${entry.url})` });
+      if (result && typeof result.then === "function") result.catch(() => { host.textContent = String(entry.alt || entry.url); });
+    } catch (error) {
+      if (globalThis.window) globalThis.window.__RG_IMG_LAST_ERROR = String(error?.stack || error);
+      host.textContent = String(entry.alt || entry.url);
+    }
+  };
+  const go = (delta) => { index = (index + delta + list.length) % list.length; renderCurrent(); };
+
+  dialog.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowRight") { event.preventDefault(); go(1); }
+    else if (event.key === "ArrowLeft") { event.preventDefault(); go(-1); }
+    else if (event.key === "Escape") { event.preventDefault(); close(); }
+  });
+  // A click landing on the dialog itself (not a child) is a click on the modal backdrop.
+  dialog.addEventListener("mousedown", (event) => { if (event.target === dialog) close(); });
+
+  releaseKeyboard();
+  if (typeof dialog.showModal === "function") dialog.showModal(); else dialog.open = true;
+  renderCurrent();
+  return dialog;
+}
+
 function selectionMatrix(model, selection) {
   const range = normalizeRange(selection);
   const rows = [];
@@ -7196,6 +7303,20 @@ export function cellImageMarkdown(raw) {
 }
 
 /**
+ * Splices ONE image embed out of a cell string and returns the rewritten raw — pure, so the lightbox
+ * can preview the exact result before committing. `occurrenceIndex` disambiguates duplicate URLs in
+ * the same cell (a delete of the second `![](u)` leaves the first). The only image → `""`; an image
+ * embedded in prose leaves the surrounding text and spacing byte-for-byte, so nothing else shifts.
+ * An unmatched url/occurrence returns the source unchanged.
+ */
+export function removeImageFromRaw(raw, url, occurrenceIndex = 0) {
+  const source = String(raw ?? "");
+  const target = cellImageMarkdown(source).filter((image) => image.url === url)[Math.max(0, Math.floor(Number(occurrenceIndex) || 0))];
+  if (!target) return source;
+  return source.slice(0, target.start) + source.slice(target.end);
+}
+
+/**
  * Cell image layout resolution. IMG-1 reads the two global settings only and always resolves the
  * default fit/layout; IMG-3 layers the per-table `model.imageLayout` (cell → column → default)
  * UNDER this seam, so the signature and return shape are what both generations code against.
@@ -7344,6 +7465,47 @@ export function wireRichHostImages(content, host, cell = content?.closest?.(".rg
   }
   syncCellImageChips(cell, content);
   return true;
+}
+
+/**
+ * One lightbox entry per image across a set of `{row, raw}` rows in one column, in authored order.
+ * `cellImageIndex` (position within its own cell, matching DOM `<img>` order) locates the clicked
+ * image; `occurrence` (position among same-url images in that cell) drives `removeImageFromRaw` so a
+ * delete of a duplicated URL removes the right one.
+ */
+function imageEntriesFromCells(rowRaws, col) {
+  const entries = [];
+  for (const { row, raw } of rowRaws) {
+    const source = String(raw ?? "");
+    const seen = new Map();
+    cellImageMarkdown(source).forEach((image, cellImageIndex) => {
+      const occurrence = seen.get(image.url) || 0; seen.set(image.url, occurrence + 1);
+      entries.push({ raw: source, alt: image.alt, url: image.url, row, col, cellImageIndex, occurrence });
+    });
+  }
+  return entries;
+}
+
+/** The GridView / RangeGridView column walk: `model.getRaw(row, col)` over a row band (whole table
+ *  for the native grid, the clamped rectangle for a range excerpt), skipping merge-covered cells so
+ *  a merged image cell contributes once, from its origin. */
+function buildColumnImageEntries(model, col, { startRow = 0, endRow = (model?.rowCount ?? 0) - 1 } = {}) {
+  if (!model || col == null) return [];
+  const rowRaws = [];
+  for (let row = startRow; row <= endRow; row += 1) {
+    if (model.isCovered?.(row, col)) continue;
+    rowRaws.push({ row, raw: model.getRaw(row, col) });
+  }
+  return imageEntriesFromCells(rowRaws, col);
+}
+
+/** Resolves the entry index the lightbox should open at from a target cell + image position, then
+ *  degrades: the cell's requested image → the cell's first image → no entry (the caller no-ops so a
+ *  Shift+Space over an image-free cell opens nothing). */
+function imageEntryStartIndex(entries, row, imageIndex) {
+  let start = entries.findIndex((entry) => entry.row === row && entry.cellImageIndex === imageIndex);
+  if (start < 0) start = entries.findIndex((entry) => entry.row === row);
+  return start;
 }
 
 
@@ -9864,10 +10026,15 @@ export class GridView {
         const edgeRow = currentRow + (currentMerge?.rowSpan || 1) - 1;
         this.startRowResize(edgeRow, event); return;
       }
+      // Arm the image click BEFORE the selection changes: an image click opens the lightbox only on
+      // the SECOND click, when this cell was already the sole-selected one (LP-2 confirms our
+      // pointerdown preventDefault below already suppresses Roam's own image zoom).
+      this.armImageClick(currentRow, currentCol, event);
       if (event.shiftKey) this.extendSelection(currentRow, currentCol); else { this.anchor = { row: currentRow, col: currentCol }; this.select({ startRow: currentRow, endRow: currentRow, startCol: currentCol, endCol: currentCol }); }
       this.dragSelecting = true; this.root.focus({ preventScroll: true }); claimKeyboard(this); event.preventDefault();
     });
-    cell.addEventListener("pointerenter", () => { const currentRow = Number(cell.dataset.row); const currentCol = Number(cell.dataset.col); if (this.dragSelecting) this.extendSelection(currentRow, currentCol); if (this.fillStart) this.fillTarget = { row: currentRow, col: currentCol }; });
+    cell.addEventListener("pointerenter", () => { const currentRow = Number(cell.dataset.row); const currentCol = Number(cell.dataset.col); if (this.dragSelecting) { this.extendSelection(currentRow, currentCol); this.imageClickDragged = true; } if (this.fillStart) this.fillTarget = { row: currentRow, col: currentCol }; });
+    cell.addEventListener("click", (event) => this.handleCellImageClick(cell, event));
     cell.addEventListener("dblclick", () => this.beginEdit(Number(cell.dataset.row), Number(cell.dataset.col)));
     cell.addEventListener("contextmenu", (event) => { const currentRow = Number(cell.dataset.row); const currentCol = Number(cell.dataset.col); event.preventDefault(); if (!rangeContains(this.selection, currentRow, currentCol)) this.select({ startRow: currentRow, endRow: currentRow, startCol: currentCol, endCol: currentCol }); this.openMenu(cell, event.clientX, event.clientY); });
     cell.draggable = true;
@@ -10494,6 +10661,9 @@ export class GridView {
     }
     const moves = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1], Tab: [0, event.shiftKey ? -1 : 1] };
     if (moves[event.key]) { event.preventDefault(); const [dr, dc] = moves[event.key]; event.shiftKey && event.key !== "Tab" ? this.extendSelection(clamp(this.selection.endRow + dr, 0, this.model.rowCount - 1), clamp(this.selection.endCol + dc, 0, this.model.colCount - 1)) : this.moveSelection(dr, dc); return; }
+    // BEFORE the printable-char branch: a space is length-1, so Shift+Space would otherwise begin an
+    // edit seeded with " ". It opens the lightbox at the selected cell's first image instead.
+    if (event.key === " " && event.shiftKey && !command && !event.altKey) { event.preventDefault(); this.openCellImageLightbox(this.selection.startRow, this.selection.startCol, 0); return; }
     if (event.key.length === 1 && !command && !event.altKey) { event.preventDefault(); this.beginEdit(this.selection.startRow, this.selection.startCol, event.key); }
   }
 
@@ -10862,6 +11032,46 @@ export class GridView {
     return repaintMediaDecor(this.cells, this.model);
   }
 
+  /** Sets the image-click arming flag from the selection AS IT STANDS before this pointerdown; the
+   *  gesture only opens the lightbox when the pointed cell was already the sole-selected one. */
+  armImageClick(row, col, event) {
+    const sel = this.selection;
+    const sole = sel.startRow === sel.endRow && sel.startCol === sel.endCol && sel.startRow === row && sel.startCol === col;
+    this.imageClickArmed = sole && Boolean(event.target?.closest?.("img")) && !event.shiftKey;
+    this.imageClickDragged = false;
+  }
+
+  /** Consumes the arming flag on click: an armed click on a rendered `<img>` opens the lightbox at
+   *  that image; a click on the "+n hidden" clip chip opens at the cell's first image. Always resets
+   *  the flag so a stale arm can never fire on a later plain click. */
+  handleCellImageClick(cell, event) {
+    const armed = this.imageClickArmed; this.imageClickArmed = false;
+    if (armed && !this.imageClickDragged && event.target?.closest?.("img") && event.target?.closest?.(".rg-rich-host")) {
+      const images = [...cell.querySelectorAll("img")];
+      this.openCellImageLightbox(Number(cell.dataset.row), Number(cell.dataset.col), Math.max(0, images.indexOf(event.target.closest("img"))));
+      return true;
+    }
+    if (event.target?.closest?.(".rg-img-clip-chip")) {
+      this.openCellImageLightbox(Number(cell.dataset.row), Number(cell.dataset.col), 0);
+      return true;
+    }
+    return false;
+  }
+
+  /** Opens the lightbox over the whole column, starting at (row, imageIndex). No-ops when the target
+   *  cell has no image so Shift+Space over an image-free cell opens nothing. */
+  openCellImageLightbox(row, col, imageIndex = 0) {
+    const entries = buildColumnImageEntries(this.model, col);
+    const startIndex = imageEntryStartIndex(entries, row, imageIndex);
+    if (startIndex < 0) return null;
+    return openImageLightbox({
+      ownerRoot: this.root,
+      entries,
+      startIndex,
+      onDelete: ({ entry, raw }) => this.commitMutation("Remove image", (model) => model.setRaw(entry.row, entry.col, raw), false),
+    });
+  }
+
   /** The single source of effective header visibility for every layout read site in this class. */
   headersOn() {
     return headersVisible(this.model?.showHeaders);
@@ -11111,7 +11321,28 @@ export class RangeGridView {
     if (event.target?.closest?.(".rg-range-source")) return openRoamBlock(this.model.tableUid, "table");
     const cell = event.target?.closest?.(".rg-cell");
     if (!cell) return null;
+    // An image (or the clip chip) opens the lightbox over the excerpt's column; anything else keeps
+    // the excerpt's navigate-to-source behavior. A range is a read-only view, so no delete affordance.
+    const clickedImg = event.target?.closest?.(".rg-rich-host") ? event.target?.closest?.("img") : null;
+    if (clickedImg || event.target?.closest?.(".rg-img-clip-chip")) {
+      const opened = this.openRangeCellImageLightbox(cell, clickedImg);
+      if (opened) return opened;
+    }
     return openRoamBlock(cell.dataset?.uid, "cell");
+  }
+
+  /** Opens the lightbox over the excerpt's rendered rows in the clicked cell's column. Entries are
+   *  bounded to the clamped range (an excerpt shows only part of the source table). */
+  openRangeCellImageLightbox(cell, clickedImg) {
+    const row = Number(cell.dataset.row); const col = Number(cell.dataset.col);
+    if (!Number.isInteger(row) || !Number.isInteger(col)) return null;
+    const range = this.clampedRange();
+    const entries = buildColumnImageEntries(this.model, col, { startRow: range.startRow, endRow: range.endRow });
+    let imageIndex = 0;
+    if (clickedImg) { const images = [...cell.querySelectorAll("img")]; imageIndex = Math.max(0, images.indexOf(clickedImg)); }
+    const startIndex = imageEntryStartIndex(entries, row, imageIndex);
+    if (startIndex < 0) return null;
+    return openImageLightbox({ ownerRoot: this.root, entries, startIndex });
   }
 
   dispose({ releaseNative = true } = {}) {
@@ -11396,6 +11627,7 @@ export class LargeGridView {
         if (rangeContains(this.selection, row, col)) cell.classList.add("rg-cell--selected");
         cell.addEventListener("pointerdown", (event) => { if (event.button !== 0) return; if (event.target.closest?.(".rg-editor")) return; const anchorMerge = this.store.mergeAt(row, col); const anchorRow = anchorMerge?.row ?? row; const anchorCol = anchorMerge?.col ?? col; if (this.editorController?.insertReference(anchorRow, anchorCol, event)) return; this.anchor = { row: anchorRow, col: anchorCol }; this.selection = { startRow: anchorRow, endRow: anchorRow, startCol: anchorCol, endCol: anchorCol }; this.dragSelecting = true; this.root.focus(); claimKeyboard(this); this.updateLargeSelection(); event.preventDefault(); });
         cell.addEventListener("pointerenter", () => { if (this.dragSelecting) { this.selection = normalizeRange({ startRow: this.anchor.row, endRow: row, startCol: this.anchor.col, endCol: col }); this.scheduleRender(); } });
+        cell.addEventListener("click", (event) => { if (event.target.closest?.(".rg-img-clip-chip")) this.openLargeCellImageLightbox(row, col, 0); });
         cell.addEventListener("dblclick", () => this.beginEdit(row, col, cell)); this.canvas.appendChild(cell); this.cells.set(`${row}:${col}`, cell);
       }
     }
@@ -11503,7 +11735,32 @@ export class LargeGridView {
     if (event.key === "F2") { event.preventDefault(); const cell = this.cells.get(`${this.selection.startRow}:${this.selection.startCol}`); if (cell) this.beginEdit(this.selection.startRow, this.selection.startCol, cell, null, true); return; }
     const moves = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1], Tab: [0, event.shiftKey ? -1 : 1] };
     if (moves[event.key]) { event.preventDefault(); this.moveLargeSelection(...moves[event.key]); return; }
+    // BEFORE the printable-char branch (a space is length-1): Shift+Space opens the lightbox.
+    if (event.key === " " && event.shiftKey && !command && !event.altKey) { event.preventDefault(); this.openLargeCellImageLightbox(this.selection.startRow, this.selection.startCol, 0); return; }
     if (event.key.length === 1 && !command && !event.altKey) { event.preventDefault(); const cell = this.cells.get(`${this.selection.startRow}:${this.selection.startCol}`); if (cell) this.beginEdit(this.selection.startRow, this.selection.startCol, cell, event.key); }
+  }
+
+  /** Opens the lightbox over the RESIDENT rows of the column (only mounted cells hold a raw string in
+   *  the virtualized large grid). Deleting rewrites the store cell the same way an edit commit does. */
+  openLargeCellImageLightbox(row, col, imageIndex = 0) {
+    const rowRaws = [...this.cells.entries()]
+      .filter(([key]) => Number(key.split(":")[1]) === col)
+      .map(([key, cell]) => ({ row: Number(key.split(":")[0]), raw: cell?.dataset?.rgRaw ?? "" }))
+      .sort((a, b) => a.row - b.row);
+    const entries = imageEntriesFromCells(rowRaws, col);
+    const startIndex = imageEntryStartIndex(entries, row, imageIndex);
+    if (startIndex < 0) return null;
+    return openImageLightbox({
+      ownerRoot: this.root,
+      entries,
+      startIndex,
+      onDelete: async ({ entry, raw }) => {
+        this.recordLargeEdit("Remove image", await this.store.setCell(entry.row, entry.col, raw));
+        const affected = this.formulaEngine.invalidateCell(entry.row, entry.col);
+        this.scheduleSave();
+        await this.repaintLargeCells(affected);
+      },
+    });
   }
   ensureVisible(row, col) { const top = this.rowTop(row); const height = this.rowSpanHeight(row); const left = this.colLeft(col); const width = this.columnWidth(col); if (top < this.viewport.scrollTop + this.headerHeight()) this.viewport.scrollTop = top - this.headerHeight(); else if (top + height > this.viewport.scrollTop + this.viewport.clientHeight) this.viewport.scrollTop = top - this.viewport.clientHeight + height; if (left < this.viewport.scrollLeft + this.headerWidth()) this.viewport.scrollLeft = left - this.headerWidth(); else if (left + width > this.viewport.scrollLeft + this.viewport.clientWidth) this.viewport.scrollLeft = left - this.viewport.clientWidth + width; }
   async copy() { const range = normalizeRange(this.selection); const rows = await this.store.getRows(range.startRow, range.endRow + 1); const text = rows.map((row) => row.slice(range.startCol, range.endCol + 1).map((value) => quoteDelimited(value, "\t")).join("\t")).join("\n"); globalThis.navigator?.clipboard?.writeText(text); }
