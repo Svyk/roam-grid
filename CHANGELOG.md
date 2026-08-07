@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.11.0
+
+Recents hardening. No new surface; this release makes the bare-opener recents
+path fast on the first use and resilient on large graphs.
+
+- **Idle-time cache warm.** The recents caches (pages + blocks) are warmed on
+  idle after load, so the first bare `[[` / `((` opens from cache instead of
+  paying the query inline. Re-warms fire just before TTL expiry only while a
+  grid is mounted and the tab is visible. Background warms never count toward
+  the budget disarm. Diagnostics at `window.__rgDiag.recentsWarm`.
+- **Self-healing budget gate.** One slow fetch no longer kills bare openers for
+  the session: disarm now requires two consecutive over-budget inline fetches,
+  any fetch back under budget re-arms, and a fresh cache opens the menu whether
+  the gate is armed or not. State at `window.__rgDiag.recentsBudget`.
+- **Regression coverage.** DOM-level bare-opener tests across both tiers
+  (native tables and large grids), plus big-graph pipeline benchmarks
+  (20k pages / 30k blocks, operation-counting) and a static guard pinning the
+  budget semantics. Suite: 497 tests.
+- README gained a "Big-graph check" section with the live timing procedure.
+
 ## 0.10.0
 
 Cell autocomplete. The reported bug was that typing `[[` in a cell and stopping
