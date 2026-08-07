@@ -3744,10 +3744,13 @@ export class NativeGridSession {
     const anchorUid = applied.anchorUid;
     const children = getTree(anchorUid)?.children || [];
     const last = children[children.length - 1];
-    const bodyUid = last && !String(last.string ?? "").trim()
+    // A reused trailing empty block pre-existed this gesture: the abandon sweep must not delete it,
+    // so the provenance travels with the result as `createdBody`.
+    const reused = Boolean(last) && !String(last.string ?? "").trim();
+    const bodyUid = reused
       ? String(last.uid)
       : String(await createBlock(anchorUid, "", "last"));
-    return { ...applied, anchorUid, bodyUid };
+    return { ...applied, anchorUid, bodyUid, createdBody: !reused };
   }
 
   replaceModel(model, { render = true } = {}) {
@@ -6507,7 +6510,7 @@ export function queryCommentThreadIndex(pageUid, api = roam()) {
       [?anchor :block/uid ?anchorUid]
       [?anchor :block/refs ?cell]
       [?cell :block/uid ?cellUid]
-      [?comment :block/parents ?anchor]]`, page, commentsPage) || [];
+      [?anchor :block/children ?comment]]`, page, commentsPage) || [];
   for (const row of rows) {
     const cellUid = String(row?.[0] || ""); const threadUid = String(row?.[1] || "");
     if (!cellUid || !threadUid) continue;
@@ -6552,38 +6555,61 @@ export function commentThreadCount(entries) {
 
 /**
  * Sidebar compose writes the empty comment body BEFORE the user has typed anything, so abandoning
- * the gesture must unwind exactly the blocks that gesture created — never a level that pre-existed.
- * Pure: the caller re-reads the live body string and anchor child count at fire time and passes
- * them in, so a concurrent writer cannot lose blocks to a stale plan.  The returned list is
- * ordered child → parent.
+ * the gesture must unwind exactly the blocks that gesture created — never a level that pre-existed,
+ * and never a level a SECOND gesture has since hung its own blocks on.  Pure: the caller re-reads
+ * the live body string and the live child count of every level at fire time and passes them in, so
+ * a concurrent writer cannot lose blocks to a stale plan — a level whose live child count exceeds
+ * the one child this gesture created is treated as reused and aborts the unwind, regardless of the
+ * plan-time `existed` flags.  The returned list is ordered child → parent.
  */
-export function commentComposeCleanupPlan({ bodyUid, bodyString, existed = null, anchorChildCount = 0, anchorUid = null, authorUid = null, dateUid = null, containerUid = null } = {}) {
+export function commentComposeCleanupPlan({ bodyUid, bodyString, existed = null, anchorChildCount = 0, anchorUid = null, authorUid = null, dateUid = null, containerUid = null, createdBody = true, authorChildCount = null, dateChildCount = null, containerChildCount = null } = {}) {
   const deletes = [];
   if (!bodyUid || String(bodyString ?? "").trim()) return deletes;
+  // A reused pre-existing empty body belongs to no gesture: it stays, and because it stays the
+  // anchor keeps a live child, so nothing above it may unwind either.
+  if (createdBody === false) return deletes;
   deletes.push(bodyUid);
   if (existed?.anchor !== false || !anchorUid || Number(anchorChildCount) > 1) return deletes;
   deletes.push(anchorUid);
-  if (existed?.author !== false || !authorUid) return deletes;
+  if (existed?.author !== false || !authorUid || (authorChildCount != null && Number(authorChildCount) > 1)) return deletes;
   deletes.push(authorUid);
-  if (existed?.date !== false || !dateUid) return deletes;
+  if (existed?.date !== false || !dateUid || (dateChildCount != null && Number(dateChildCount) > 1)) return deletes;
   deletes.push(dateUid);
-  if (existed?.container !== false || !containerUid) return deletes;
+  if (existed?.container !== false || !containerUid || (containerChildCount != null && Number(containerChildCount) > 1)) return deletes;
   deletes.push(containerUid);
   return deletes;
+}
+
+/** The compose body is a live Roam textarea and Datascript lags until blur, so the sweep must read
+ *  the editor itself: a comment the user already typed is only visible in the textarea's value. */
+function liveCommentBodyValue(bodyUid) {
+  const doc = globalThis.document;
+  if (!doc) return null;
+  const suffix = `-${String(bodyUid)}`;
+  try {
+    const node = typeof doc.querySelector === "function" ? doc.querySelector(`[id$="${suffix}"]`) : null;
+    if (node && "value" in node) return String(node.value ?? "");
+  } catch { /* a non-standard document may not support attribute selectors */ }
+  const active = doc.activeElement;
+  if (active && String(active.id || "").endsWith(suffix) && "value" in active) return String(active.value ?? "");
+  return null;
 }
 
 /**
  * Arms the abandon sweep for one sidebar compose gesture: ONE capture-phase document `focusin`
  * listener (the first focus landing anywhere but the empty comment body ends the gesture) plus a
- * 90 s tracked-timeout safety net.  First fire wins and disposes both.  The sweep re-reads
- * `blockString(bodyUid)` and the anchor's live child count at fire time — the concurrent-writer
- * guard — then deletes the plan's blocks and refreshes the thread index so a comment the user DID
- * type in the sidebar reaches the badges.  The disposer is registered for onunload.
+ * 90 s tracked-timeout safety net that RE-ARMS while the caret is still in the body.  First real
+ * fire wins and disposes both, splicing the disposer out of `runtime.disposers`.  The sweep only
+ * runs while the extension is still loaded, treats a live textarea value as authoritative over the
+ * lagging Datascript read, and re-reads every level's live child count at fire time — the
+ * concurrent-writer guard — then deletes the plan's blocks and refreshes the thread index so a
+ * comment the user DID type in the sidebar reaches the badges.
  */
 export function armCommentAbandonCleanup({ session, targetUid, bodyUid, anchorUid, applied } = {}) {
   if (!bodyUid || !anchorUid || !globalThis.document?.addEventListener) return null;
   let fired = false;
   let timer = null;
+  const caretInBody = () => String(globalThis.document?.activeElement?.id || "").endsWith(`-${bodyUid}`);
   const onFocusIn = (event) => {
     // Focus inside the body itself (`block-input-<window-id>-<uid>`) means the user is composing.
     if (String(event?.target?.id || "").endsWith(`-${bodyUid}`)) return;
@@ -6592,22 +6618,38 @@ export function armCommentAbandonCleanup({ session, targetUid, bodyUid, anchorUi
   const disposer = () => {
     globalThis.document?.removeEventListener?.("focusin", onFocusIn, true);
     if (timer != null) { clearTimeout(timer); pendingTimers.delete(timer); timer = null; }
+    const index = runtime.disposers.indexOf(disposer);
+    if (index >= 0) runtime.disposers.splice(index, 1);
   };
-  const fire = () => {
+  const armTimer = () => { timer = trackedTimeout(() => fire({ viaTimer: true }), 90000); };
+  const fire = ({ viaTimer = false } = {}) => {
     if (fired) return;
+    // A timer maturing under a live caret means the user is still composing — re-arm, never sweep.
+    if (viaTimer && caretInBody()) { armTimer(); return; }
     fired = true;
     disposer();
     void (async () => {
       try {
+        // onunload nulled the API mid-gesture: deleting blocks now would be vandalism.
+        if (!runtime.extensionAPI) return;
+        const stored = blockString(bodyUid);
+        const live = liveCommentBodyValue(bodyUid);
+        // Sweep only when BOTH the live editor and the committed string are empty.
+        const bodyString = live != null && String(live).trim() ? live : stored;
+        const childCount = (uid) => (uid ? getTree(uid)?.children?.length ?? 0 : null);
         const deletes = commentComposeCleanupPlan({
           bodyUid,
-          bodyString: blockString(bodyUid),
+          bodyString,
           existed: applied?.existed,
-          anchorChildCount: getTree(anchorUid)?.children?.length ?? 0,
+          createdBody: applied?.createdBody !== false,
+          anchorChildCount: childCount(anchorUid) ?? 0,
           anchorUid,
           authorUid: applied?.authorUid,
           dateUid: applied?.dateUid,
           containerUid: applied?.containerUid,
+          authorChildCount: childCount(applied?.authorUid),
+          dateChildCount: childCount(applied?.dateUid),
+          containerChildCount: childCount(applied?.containerUid),
         });
         for (const uid of deletes) await deleteBlock(uid);
         session?.refreshCommentThreads?.();
@@ -6618,7 +6660,7 @@ export function armCommentAbandonCleanup({ session, targetUid, bodyUid, anchorUi
     })();
   };
   globalThis.document.addEventListener("focusin", onFocusIn, true);
-  timer = trackedTimeout(fire, 90000);
+  armTimer();
   runtime.disposers.push(disposer);
   return disposer;
 }
@@ -8761,6 +8803,7 @@ export class GridView {
     this.inlineReferencesMode = null;
     this.inlineReferencesPanel = null;
     this.inlineReferenceDisposers = new Set();
+    this.inlineCommentComposerDisposer = null;
     this.selectedCellElements = new Set();
     this.activeCellElement = null;
     this.selectionControls = new Set();
@@ -9423,6 +9466,7 @@ export class GridView {
     this.inlineReferencesPanel = null;
     this.inlineReferencesUid = null;
     this.inlineReferencesMode = null;
+    this.inlineCommentComposerDisposer = null;
     for (const badge of previousUid ? [this.referenceBadge(previousUid), this.commentBadge(previousUid)] : []) {
       badge?.setAttribute("aria-expanded", "false");
       badge?.removeAttribute("aria-controls");
@@ -9477,6 +9521,15 @@ export class GridView {
     const comments = mode === "comments";
     const threadUids = new Set(this.cellCommentThreads(uid).map((thread) => thread.threadUid));
     sources = sources.filter((source) => threadUids.has(source.uid) === comments);
+    if (comments) {
+      // Datalog can lag a just-written thread; the optimistic index (merged by writeCommentThread)
+      // already knows it.  Synthesize the missing anchors rather than render "No comments found.".
+      const present = new Set(sources.map((source) => source.uid));
+      for (const thread of this.cellCommentThreads(uid)) {
+        if (present.has(thread.threadUid)) continue;
+        sources.push({ uid: thread.threadUid, string: commentAnchorString(uid), pageTitle: "" });
+      }
+    }
     const coordinate = this.cellCoordinatesByUid.get(uid);
     const raw = coordinate ? this.model.getRaw(coordinate.row, coordinate.col) : "Referenced cell";
     const panel = document.createElement("section");
@@ -9666,6 +9719,12 @@ export class GridView {
     const panel = this.inlineReferencesPanel;
     if (!panel || this.inlineReferencesUid !== uid || this.inlineReferencesMode !== "comments") return null;
     panel.querySelector?.(".rg-inline-comment-composer")?.remove?.();
+    // Retire the previous composer's disposer too — removing the node alone leaks one dead
+    // `() => composer.remove()` into the panel's disposer set on every re-append.
+    if (this.inlineCommentComposerDisposer) {
+      this.inlineReferenceDisposers.delete(this.inlineCommentComposerDisposer);
+      this.inlineCommentComposerDisposer = null;
+    }
     const composer = document.createElement("div");
     composer.className = "rg-inline-comment-composer";
     const textarea = document.createElement("textarea");
@@ -9674,7 +9733,9 @@ export class GridView {
     textarea.setAttribute("aria-label", "Write a comment on this cell");
     composer.appendChild(textarea);
     panel.appendChild(composer);
-    this.inlineReferenceDisposers.add(() => composer.remove());
+    const composerDisposer = () => composer.remove();
+    this.inlineReferenceDisposers.add(composerDisposer);
+    this.inlineCommentComposerDisposer = composerDisposer;
     const commit = async () => {
       const text = String(textarea.value ?? "").trim();
       if (!text) return;
@@ -9692,6 +9753,9 @@ export class GridView {
         if (this.openCellReferences(uid, { mode: "comments" })) this.appendInlineCommentComposer(uid);
         return;
       }
+      // The header count was rendered at open time; bring it in line with the committed write.
+      const headerCount = panel.querySelector?.(".rg-inline-references-count");
+      if (headerCount) headerCount.textContent = String(this.cellCommentThreads(uid).length);
       if (composer.parentNode === panel) {
         textarea.value = "";
         textarea.focus();

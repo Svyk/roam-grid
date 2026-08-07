@@ -20,6 +20,7 @@ import {
   installCommentAffordance,
   mergeCommentThread,
   queryCommentThreadIndex,
+  runtime,
   setCommentArming,
   settingsCache,
 } from "../src/extension.js";
@@ -52,7 +53,15 @@ class MiniNode {
   appendChild(node) { if (node.parentNode) node.remove(); node.parentNode = this; this.children.push(node); return node; }
   remove() { if (!this.parentNode) return; this.parentNode.children = this.parentNode.children.filter((node) => node !== this); this.parentNode = null; }
   contains(node) { for (let current = node; current; current = current.parentNode) if (current === this) return true; return false; }
-  matches(selector) { return String(selector).split(",").some((part) => { const value = part.trim(); return value.startsWith(".") && value.slice(1).split(".").every((name) => this.classList.contains(name)); }); }
+  matches(selector) {
+    return String(selector).split(",").some((part) => {
+      const value = part.trim();
+      if (value.startsWith(".")) return value.slice(1).split(".").every((name) => this.classList.contains(name));
+      const idSuffix = /^\[id\$="(.+)"\]$/.exec(value);
+      if (idSuffix) return String(this.id || "").endsWith(idSuffix[1]);
+      return false;
+    });
+  }
   closest(selector) { for (let current = this; current; current = current.parentNode) if (current.matches?.(selector)) return current; return null; }
   querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
   querySelectorAll(selector) {
@@ -951,6 +960,7 @@ test("beginSidebarComment reuses a trailing empty body block instead of creating
   const result = await session.beginSidebarComment(TARGET_UID);
   assert.equal(result.anchorUid, "anch0001");
   assert.equal(result.bodyUid, "body0001", "the trailing empty child becomes the comment body");
+  assert.equal(result.createdBody, false, "a reused body pre-existed — the gesture did not create it");
   assert.equal(write.created.length, 0, "reusing creates nothing");
   assert.deepEqual(result.existed, { container: true, date: true, author: true, anchor: true });
   session.dispose();
@@ -969,6 +979,7 @@ test("beginSidebarComment creates the empty body when the anchor's last child ha
   assert.equal(write.created[0].string, "");
   assert.equal(write.created[0].order, "last");
   assert.equal(result.bodyUid, write.created[0].uid);
+  assert.equal(result.createdBody, true, "a freshly written empty block belongs to the gesture");
   session.dispose();
 });
 
@@ -1009,7 +1020,8 @@ test("commentComposeCleanupPlan unwinds child→parent only what the gesture cre
 
 test("the abandon sweep ignores focus in the body and unwinds an untouched gesture exactly once", async (t) => {
   const dom = installMiniDom();
-  t.after(() => { delete globalThis.window.roamAlphaAPI; });
+  t.after(() => { delete globalThis.window.roamAlphaAPI; runtime.extensionAPI = null; });
+  runtime.extensionAPI = {};
   const tree = fullTree({});
   tree.children[1].children[0].children[0].children[0].children.push({ uid: "body0001", string: "", order: 0, children: [] });
   const write = commentWriteApi({ tree });
@@ -1032,4 +1044,245 @@ test("the abandon sweep ignores focus in the body and unwinds an untouched gestu
   await new Promise(setImmediate);
   assert.equal(write.deleted.length, 5, "first fire wins — the sweep is disarmed");
   assert.equal(dom.documentListenerCountFor("focusin"), 0, "the listener is gone after firing");
+});
+
+// --- GOAL-FIX-A -----------------------------------------------------------
+
+test("a second gesture nesting under a shared level aborts the first gesture's unwind there", () => {
+  const allNew = { container: false, date: false, author: false, anchor: false };
+  const uids = { bodyUid: "bodyA", anchorUid: "anchorA", authorUid: "auth1", dateUid: "date1", containerUid: "cont1" };
+  // The catastrophic two-gesture scenario: gesture B reused the author and hung anchorB+bodyB on it.
+  assert.deepEqual(
+    commentComposeCleanupPlan({ ...uids, bodyString: "", existed: allNew, anchorChildCount: 1, authorChildCount: 2, dateChildCount: 1, containerChildCount: 1 }),
+    ["bodyA", "anchorA"],
+    "the author now holds gesture B's blocks — the unwind must stop below it",
+  );
+  assert.deepEqual(
+    commentComposeCleanupPlan({ ...uids, bodyString: "", existed: allNew, anchorChildCount: 1, authorChildCount: 1, dateChildCount: 2, containerChildCount: 1 }),
+    ["bodyA", "anchorA", "auth1"],
+    "a shared date level keeps itself and the container",
+  );
+  assert.deepEqual(
+    commentComposeCleanupPlan({ ...uids, bodyString: "", existed: allNew, anchorChildCount: 1, authorChildCount: 1, dateChildCount: 1, containerChildCount: 2 }),
+    ["bodyA", "anchorA", "auth1", "date1"],
+    "a shared container is never deleted",
+  );
+  assert.deepEqual(
+    commentComposeCleanupPlan({ ...uids, bodyString: "", existed: allNew, anchorChildCount: 1, authorChildCount: 1, dateChildCount: 1, containerChildCount: 1 }),
+    ["bodyA", "anchorA", "auth1", "date1", "cont1"],
+    "control: untouched levels still unwind end to end",
+  );
+});
+
+test("the sweep re-reads live child counts, so a second sidebar gesture's blocks survive the first gesture's sweep", async (t) => {
+  const dom = installMiniDom();
+  t.after(() => { delete globalThis.window.roamAlphaAPI; runtime.extensionAPI = null; });
+  runtime.extensionAPI = {};
+  // Gesture A created container→date→author→anchorA→bodyA.  Before A's sweep fired, 💬 on cell B
+  // (no focus change — the button's pointerdown is preventDefaulted) reused the author and added
+  // anchorB + bodyB beneath it.
+  const tree = fullTree({});
+  const author = tree.children[1].children[0].children[0];
+  author.children[0].children.push({ uid: "bodyA", string: "", order: 0, children: [] });
+  author.children.push({ uid: "anchorB", string: "((cell0002))", order: 1, children: [{ uid: "bodyB", string: "", order: 0, children: [] }] });
+  const write = commentWriteApi({ tree });
+  globalThis.window.roamAlphaAPI = write.api;
+  const applied = { existed: { container: false, date: false, author: false, anchor: false }, anchorUid: "anch0001", authorUid: "auth0001", dateUid: "date0001", containerUid: "cont0001", createdBody: true };
+
+  armCommentAbandonCleanup({ session: { refreshCommentThreads: () => {} }, targetUid: TARGET_UID, bodyUid: "bodyA", anchorUid: "anch0001", applied });
+  dom.fireDocument("focusin", { target: { id: "block-input-body-elsewhere" } });
+  await new Promise(setImmediate);
+  assert.deepEqual(write.deleted, ["bodyA", "anch0001"], "the shared author — with gesture B's anchor and body inside — must survive");
+});
+
+test("the 90 s safety net re-arms while the caret is still in the comment body", async (t) => {
+  const dom = installMiniDom();
+  const realSetTimeout = globalThis.setTimeout;
+  const scheduled = [];
+  globalThis.setTimeout = (callback) => { scheduled.push(callback); return scheduled.length; };
+  t.after(() => {
+    globalThis.setTimeout = realSetTimeout;
+    delete globalThis.window.roamAlphaAPI;
+    runtime.extensionAPI = null;
+  });
+  runtime.extensionAPI = {};
+  const tree = fullTree({});
+  tree.children[1].children[0].children[0].children[0].children.push({ uid: "body0001", string: "", order: 0, children: [] });
+  const write = commentWriteApi({ tree });
+  globalThis.window.roamAlphaAPI = write.api;
+  const applied = { existed: { container: false, date: false, author: false, anchor: false }, anchorUid: "anch0001", authorUid: "auth0001", dateUid: "date0001", containerUid: "cont0001", createdBody: true };
+
+  armCommentAbandonCleanup({ session: { refreshCommentThreads: () => {} }, targetUid: TARGET_UID, bodyUid: "body0001", anchorUid: "anch0001", applied });
+  assert.equal(scheduled.length, 1, "the safety net is armed");
+
+  // The caret is live in the body when the timer matures.  The fake activeElement carries no
+  // `value`, so the live-editor guard cannot be what saves the body — only the re-arm can.
+  globalThis.document.activeElement = { id: "block-input-sidebar-block-anch0001-body0001" };
+  scheduled[0]();
+  await new Promise(setImmediate);
+  assert.equal(write.deleted.length, 0, "a timer fire under a live caret must not sweep");
+  assert.equal(scheduled.length, 2, "the timer re-arms for another 90 s");
+  assert.equal(dom.documentListenerCountFor("focusin"), 1, "the focus listener stays installed");
+
+  globalThis.document.activeElement = null;
+  scheduled[1]();
+  await new Promise(setImmediate);
+  assert.equal(write.deleted.length, 5, "once the caret is gone the next timer fire sweeps");
+  assert.equal(dom.documentListenerCountFor("focusin"), 0, "and the sweep disarms as usual");
+});
+
+test("the sweep trusts the live textarea over an empty Datascript read", async (t) => {
+  const dom = installMiniDom();
+  t.after(() => { delete globalThis.window.roamAlphaAPI; runtime.extensionAPI = null; });
+  runtime.extensionAPI = {};
+  const tree = fullTree({});
+  tree.children[1].children[0].children[0].children[0].children.push({ uid: "body0001", string: "", order: 0, children: [] });
+  const write = commentWriteApi({ tree });
+  globalThis.window.roamAlphaAPI = write.api;
+  const applied = { existed: { container: false, date: false, author: false, anchor: false }, anchorUid: "anch0001", authorUid: "auth0001", dateUid: "date0001", containerUid: "cont0001", createdBody: true };
+
+  // Typed-but-uncommitted: Datascript still reads "" (write-behind), the textarea holds the text.
+  const editor = new MiniNode("textarea");
+  editor.id = "block-input-sidebar-block-anch0001-body0001";
+  editor.value = "half-typed comment";
+  globalThis.document.body.appendChild(editor);
+
+  armCommentAbandonCleanup({ session: { refreshCommentThreads: () => {} }, targetUid: TARGET_UID, bodyUid: "body0001", anchorUid: "anch0001", applied });
+  dom.fireDocument("focusin", { target: { id: "block-input-body-other000" } });
+  await new Promise(setImmediate);
+  assert.equal(write.deleted.length, 0, "a comment visible in the live editor is never swept");
+
+  editor.value = "   ";
+  dom.fireDocument("focusin", { target: { id: "block-input-body-third000" } });
+  await new Promise(setImmediate);
+  assert.equal(write.deleted.length, 0, "control: the sweep disarmed after the first fire, so nothing more can delete");
+});
+
+test("a reused pre-existing empty body is never deleted by the sweep", async (t) => {
+  assert.deepEqual(
+    commentComposeCleanupPlan({ bodyUid: "b", bodyString: "", existed: { container: false, date: false, author: false, anchor: false }, anchorChildCount: 1, createdBody: false }),
+    [],
+    "the gesture created nothing — the cleanup has nothing to unwind",
+  );
+
+  const dom = installMiniDom();
+  t.after(() => { delete globalThis.window.roamAlphaAPI; runtime.extensionAPI = null; });
+  runtime.extensionAPI = {};
+  const tree = fullTree({});
+  tree.children[1].children[0].children[0].children[0].children.push({ uid: "body0001", string: "", order: 0, children: [] });
+  const write = commentWriteApi({ tree });
+  globalThis.window.roamAlphaAPI = write.api;
+  const applied = { existed: { container: true, date: true, author: true, anchor: true }, anchorUid: "anch0001", authorUid: "auth0001", dateUid: "date0001", containerUid: "cont0001", createdBody: false };
+
+  armCommentAbandonCleanup({ session: { refreshCommentThreads: () => {} }, targetUid: TARGET_UID, bodyUid: "body0001", anchorUid: "anch0001", applied });
+  dom.fireDocument("focusin", { target: { id: "block-input-body-other000" } });
+  await new Promise(setImmediate);
+  assert.equal(write.deleted.length, 0, "someone else's empty block is left exactly where it was");
+});
+
+test("the thread index counts the anchor's direct children, never nested replies", () => {
+  const { api, calls } = recordingApi([[":page-entity-42"], [[TARGET_UID, "thr00001", 2]]]);
+  const index = queryCommentThreadIndex(PAGE_UID, api);
+  assert.equal(calls.length, 2);
+  assert.ok(calls[1].query.includes("[?anchor :block/children ?comment]"), "the count walks direct children only");
+  assert.ok(!calls[1].query.includes(":block/parents"), "a parents clause counts every nested reply as a comment");
+  assert.deepEqual(index.get(TARGET_UID), [{ threadUid: "thr00001", count: 2 }]);
+});
+
+test("a fired sweep splices its disposer out of runtime.disposers", async (t) => {
+  const dom = installMiniDom();
+  t.after(() => { delete globalThis.window.roamAlphaAPI; runtime.extensionAPI = null; });
+  runtime.extensionAPI = {};
+  const tree = fullTree({});
+  tree.children[1].children[0].children[0].children[0].children.push({ uid: "body0001", string: "", order: 0, children: [] });
+  const write = commentWriteApi({ tree });
+  globalThis.window.roamAlphaAPI = write.api;
+  const applied = { existed: { container: false, date: false, author: false, anchor: false }, anchorUid: "anch0001", authorUid: "auth0001", dateUid: "date0001", containerUid: "cont0001", createdBody: true };
+
+  const before = runtime.disposers.length;
+  armCommentAbandonCleanup({ session: { refreshCommentThreads: () => {} }, targetUid: TARGET_UID, bodyUid: "body0001", anchorUid: "anch0001", applied });
+  assert.equal(runtime.disposers.length, before + 1, "control: arming registers the disposer");
+  dom.fireDocument("focusin", { target: { id: "block-input-body-other000" } });
+  await new Promise(setImmediate);
+  assert.equal(runtime.disposers.length, before, "a fired sweep must not leak its disposer into onunload");
+});
+
+test("re-appending the inline composer retires the stale disposer", async (t) => {
+  t.after(() => { settingsCache.clear(); delete globalThis.window.roamAlphaAPI; });
+  const { view } = composeView("In place", { session: {} });
+  globalThis.window.roamAlphaAPI = { q: () => [] };
+  await view.composeCellCommentInline(TARGET_UID, 0, 0);
+  const afterFirst = view.inlineReferenceDisposers.size;
+  assert.equal(afterFirst, 1, "control: one composer, one disposer");
+  view.appendInlineCommentComposer(TARGET_UID);
+  assert.equal(view.inlineReferenceDisposers.size, afterFirst, "the re-append replaces the disposer instead of stacking a corpse");
+  assert.equal(view.inlineReferencesPanel.querySelectorAll(".rg-inline-comment-composer").length, 1);
+});
+
+test("an unload mid-sweep vetoes the deletes", async (t) => {
+  const dom = installMiniDom();
+  t.after(() => { delete globalThis.window.roamAlphaAPI; runtime.extensionAPI = null; });
+  const tree = fullTree({});
+  tree.children[1].children[0].children[0].children[0].children.push({ uid: "body0001", string: "", order: 0, children: [] });
+  const write = commentWriteApi({ tree });
+  globalThis.window.roamAlphaAPI = write.api;
+  const applied = { existed: { container: false, date: false, author: false, anchor: false }, anchorUid: "anch0001", authorUid: "auth0001", dateUid: "date0001", containerUid: "cont0001", createdBody: true };
+
+  runtime.extensionAPI = {};
+  armCommentAbandonCleanup({ session: { refreshCommentThreads: () => {} }, targetUid: TARGET_UID, bodyUid: "body0001", anchorUid: "anch0001", applied });
+  runtime.extensionAPI = null; // onunload lands before the async sweep body runs
+  dom.fireDocument("focusin", { target: { id: "block-input-body-other000" } });
+  await new Promise(setImmediate);
+  assert.equal(write.deleted.length, 0, "a torn-down runtime must never delete blocks");
+});
+
+test("a first comment renders the optimistic thread when datalog lags the write", async (t) => {
+  t.after(() => { settingsCache.clear(); delete globalThis.window.roamAlphaAPI; });
+  const session = { commentThreads: new Map() };
+  const { view } = composeView("In place", { session });
+  session.addCellComment = async (uid) => {
+    // What NativeGridSession.writeCommentThread does: merge optimistically + sync each view's copy.
+    mergeCommentThread(session.commentThreads, uid, "anch0001");
+    view.commentThreads = session.commentThreads;
+    return { commentUid: "c1", anchorUid: "anch0001" };
+  };
+  globalThis.window.roamAlphaAPI = { q: () => [] }; // datalog never sees the write within the test
+
+  await view.composeCellCommentInline(TARGET_UID, 0, 0);
+  const textarea = view.inlineReferencesPanel.querySelector(".rg-inline-comment-input");
+  textarea.value = "First!";
+  textarea.dispatch("keydown", { key: "Enter" });
+  await new Promise(setImmediate);
+
+  const panel = view.inlineReferencesPanel;
+  assert.ok(panel, "the panel rebuilt after the first comment");
+  assert.equal(panel.querySelector(".rg-inline-references-empty"), null, "the lagging datalog must not surface 'No comments found.'");
+  assert.equal(panel.querySelector(".rg-inline-references-count").textContent, "1", "the header counts the optimistic thread");
+  assert.ok(panel.querySelector(".rg-inline-reference-item"), "the just-written thread renders from the optimistic index");
+});
+
+test("a follow-up commit refreshes the panel header count without a reopen", async (t) => {
+  t.after(() => { settingsCache.clear(); delete globalThis.window.roamAlphaAPI; });
+  const session = { commentThreads: new Map([[TARGET_UID, [{ threadUid: "thr00001", count: 1 }]]]) };
+  const { view } = composeView("In place", { session });
+  view.commentThreads = session.commentThreads;
+  globalThis.window.roamAlphaAPI = {
+    q: (query) => (query.includes("[?source :block/refs ?target]") ? [["thr00001", `((${TARGET_UID}))`, "Page"]] : []),
+  };
+  session.addCellComment = async (uid) => {
+    mergeCommentThread(session.commentThreads, uid, "thr00002");
+    view.commentThreads = session.commentThreads;
+    return { commentUid: "c2", anchorUid: "thr00002" };
+  };
+
+  await view.composeCellCommentInline(TARGET_UID, 0, 0);
+  const panel = view.inlineReferencesPanel;
+  assert.equal(panel.querySelector(".rg-inline-references-count").textContent, "1", "control: one thread at open");
+  const textarea = panel.querySelector(".rg-inline-comment-input");
+  textarea.value = "Second";
+  textarea.dispatch("keydown", { key: "Enter" });
+  await new Promise(setImmediate);
+
+  assert.equal(view.inlineReferencesPanel, panel, "a cell that already had a thread does not reopen the panel");
+  assert.equal(panel.querySelector(".rg-inline-references-count").textContent, "2", "the header count refreshes after the commit");
 });
