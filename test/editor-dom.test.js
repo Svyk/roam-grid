@@ -1874,6 +1874,13 @@ function installOverlayDom() {
       for (const listener of [...(listeners.get("pointerdown") || [])]) listener(event);
       return event;
     },
+    // Roam owns the capture phase above our overlay node. Firing at document level is how the
+    // wedge reaches us when Roam has already stopped the event from travelling any further down.
+    fireDocument(type, fields = {}) {
+      const event = { type, key: "", isComposing: false, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, stopPropagation() {}, ...fields };
+      for (const listener of [...(listeners.get(type) || [])]) listener(event);
+      return event;
+    },
   };
 }
 
@@ -2666,6 +2673,202 @@ test("a frame cancelled by teardown still resolves the promise start() is awaiti
   const raced = await Promise.race([pending, new Promise((resolve) => setTimeout(() => resolve("pending"), 50))]);
   assert.equal(raced, "null", "a cancelled frame must still resolve — otherwise beginEditLocal is retained forever");
   assert.equal(settled, "null");
+});
+
+/* --------------------------------------------------------------------------------------------
+ * GOAL-FIX-E — the Escape wedge. Reproduced live: `test` + ` [[` opens Roam's menu and auto-pairs
+ * to `test [[]]`, then two Escapes leave the overlay mounted and `test [[]]` in the graph. Every
+ * test below is one of the seams that let that happen.
+ * ------------------------------------------------------------------------------------------ */
+
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+function autoPairHarness() {
+  return makeOverlayHarness({ strings: { cell00001: "test", cell00002: "Beta" } });
+}
+
+test("a second Escape cancels even while Roam's portal still reads open over an auto-paired [[]]", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = autoPairHarness();
+  await startOverlay(harness, { raw: "test" });
+  const node = harness.cell.querySelector(".rg-native-cell-editor");
+  // Roam auto-paired the brackets and parked the caret between them.
+  harness.overlay.textarea.value = "test [[]]";
+  harness.overlay.textarea.setSelectionRange(7, 7);
+  harness.dom.state.popupOpen = true;
+
+  let fired = keydownOn(node, { key: "Escape", target: harness.overlay.textarea });
+  assert.equal(fired.event.defaultPrevented, false, "the first Escape is lent to Roam so its menu closes");
+  assert.equal(harness.overlay.active, true);
+  assert.deepEqual(harness.roamRecord.updates, []);
+
+  // A human's second keystroke is many frames later, so the one-frame marker has long expired…
+  await settle();
+  assert.equal(harness.overlay.popupJustClosed, false);
+  // …and Roam re-renders its portal while the caret sits inside `[[]]`, so the probe still says OPEN.
+  assert.equal(harness.overlay.nativeAutocompleteOpen(), true, "sanity: the probe reads the menu as open");
+
+  fired = keydownOn(node, { key: "Escape", target: harness.overlay.textarea });
+  assert.equal(fired.event.defaultPrevented, true, "the loan is spent — this Escape is the overlay's cancel");
+  assert.equal(harness.overlay.active, false, "the overlay tears down instead of wedging");
+  await settle();
+  assert.equal(harness.cell.querySelector(".rg-native-cell-editor"), null);
+  assert.equal(harness.cell.classList.contains("rg-cell--native-editing"), false);
+  assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "test" }], "byte-exact restore, not the auto-paired value");
+  assert.deepEqual(harness.adapter.selfWrites, [
+    { uid: "cell00001", from: null, to: "test [[]]" },
+    { uid: "cell00001", from: "test [[]]", to: "test" },
+  ], "Roam's flush and the restore are both absorbed");
+  assert.equal(harness.roamRecord.strings.cell00001, "test");
+  assert.deepEqual(harness.finishes.at(-1), { row: 0, col: 0, cell: harness.cell, raw: "test", value: "test", commit: false, movement: null });
+});
+
+test("typing after a menu closes lends Escape to the menu again", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = autoPairHarness();
+  await startOverlay(harness, { raw: "test" });
+  const node = harness.cell.querySelector(".rg-native-cell-editor");
+  harness.dom.state.popupOpen = true;
+  keydownOn(node, { key: "Escape", target: harness.overlay.textarea });
+  await settle();
+  // A new trigger typed into the cell is a new menu episode, not a continuation of the old one.
+  node.dispatch("input", { target: harness.overlay.textarea });
+  const fired = keydownOn(node, { key: "Escape", target: harness.overlay.textarea });
+  assert.equal(fired.event.defaultPrevented, false, "the fresh menu gets its own closing Escape");
+  assert.equal(harness.overlay.active, true);
+  harness.overlay.dispose();
+});
+
+test("an Escape Roam never lets reach the overlay still cancels the edit", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = autoPairHarness();
+  await startOverlay(harness, { raw: "test" });
+  harness.overlay.textarea.value = "test [[]]";
+  harness.overlay.textarea.setSelectionRange(7, 7);
+  harness.dom.state.popupOpen = true;
+
+  // Roam stops the keydown in the capture phase above us: the overlay-scoped listener never fires.
+  let event = harness.dom.fireDocument("keydown", { key: "Escape", target: harness.overlay.textarea });
+  assert.equal(event.defaultPrevented, false, "the menu-closing Escape is still Roam's");
+  assert.equal(harness.overlay.active, true);
+  await settle();
+
+  harness.dom.state.popupOpen = false;
+  event = harness.dom.fireDocument("keydown", { key: "Escape", target: harness.overlay.textarea });
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(harness.overlay.active, false, "the document-level backstop owns the cancel");
+  await settle();
+  assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "test" }]);
+  assert.equal(harness.cell.querySelector(".rg-native-cell-editor"), null);
+});
+
+test("an Escape whose keydown is swallowed outright is recovered from the keyup", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = autoPairHarness();
+  await startOverlay(harness, { raw: "test" });
+  harness.overlay.textarea.value = "test [[]]";
+  harness.dom.state.popupOpen = true;
+
+  harness.dom.fireDocument("keyup", { key: "Escape", target: harness.overlay.textarea });
+  assert.equal(harness.overlay.active, true, "the first Escape still belongs to the open menu");
+  await settle();
+  harness.dom.state.popupOpen = false;
+  harness.dom.fireDocument("keyup", { key: "Escape", target: harness.overlay.textarea });
+  assert.equal(harness.overlay.active, false);
+  await settle();
+  assert.deepEqual(harness.roamRecord.updates, [{ uid: "cell00001", string: "test" }]);
+
+  // A keyup that follows a keydown we already answered must not cancel a second time.
+  const second = autoPairHarness();
+  await startOverlay(second, { raw: "test" });
+  const node = second.cell.querySelector(".rg-native-cell-editor");
+  keydownOn(node, { key: "Escape", target: second.overlay.textarea });
+  assert.equal(second.overlay.active, false, "no menu was ever open, so the first Escape cancels");
+  await settle();
+  second.dom.fireDocument("keyup", { key: "Escape", target: second.overlay.textarea });
+  assert.equal(second.roamRecord.updates.length, 1, "the keyup is spent by its own keydown");
+
+  // An Escape belonging to some other part of Roam is not ours to answer.
+  const other = autoPairHarness();
+  await startOverlay(other, { raw: "test" });
+  const elsewhere = new OverlayNode("input"); other.dom.body.appendChild(elsewhere);
+  globalThis.document.activeElement = elsewhere;
+  other.dom.fireDocument("keydown", { key: "Escape", target: elsewhere });
+  assert.equal(other.overlay.active, true, "the edit is not cancelled by an Escape aimed somewhere else");
+  other.overlay.dispose();
+});
+
+test("cancel re-applies the restored bytes when Roam's blur flush lands after the restore write", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = autoPairHarness();
+  await startOverlay(harness, { raw: "test" });
+  harness.overlay.textarea.value = "test [[]]";
+  const frames = harness.overlay.nextFrame.bind(harness.overlay);
+  let ticks = 0;
+  harness.overlay.nextFrame = () => {
+    ticks += 1;
+    // PINNED FACT 7: the flush happens at blur, which teardown just caused — after our write.
+    if (ticks === 1) harness.roamRecord.strings.cell00001 = "test [[]]";
+    return frames();
+  };
+
+  const result = await harness.overlay.cancel();
+  assert.deepEqual(result, { uid: "cell00001", value: "test" });
+  assert.deepEqual(harness.roamRecord.updates, [
+    { uid: "cell00001", string: "test" },
+    { uid: "cell00001", string: "test" },
+  ], "the write-behind is detected and undone");
+  assert.equal(harness.roamRecord.strings.cell00001, "test", "the graph does not keep the value the user cancelled");
+  assert.deepEqual(harness.adapter.selfWrites.at(-1), { uid: "cell00001", from: "test [[]]", to: "test" }, "the reconcile write is recorded so its echo is absorbed");
+  assert.deepEqual(harness.adapter.patches.at(-1), { uid: "cell00001", raw: "test" });
+
+  // A cancel Roam never overwrote must not write twice.
+  const quiet = autoPairHarness();
+  await startOverlay(quiet, { raw: "test" });
+  quiet.overlay.textarea.value = "test [[]]";
+  await quiet.overlay.cancel();
+  assert.deepEqual(quiet.roamRecord.updates, [{ uid: "cell00001", string: "test" }], "nothing diverged, so nothing is rewritten");
+});
+
+test("focus leaving the overlay for <body> finishes the edit instead of wedging it", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  await startOverlay(harness);
+  const node = harness.cell.querySelector(".rg-native-cell-editor");
+
+  node.dispatch("focusout", { target: harness.overlay.textarea });
+  await settle();
+  assert.equal(harness.overlay.active, true, "focus that settles back inside the overlay is Roam re-rendering");
+
+  globalThis.document.activeElement = null;
+  harness.dom.state.popupOpen = true;
+  node.dispatch("focusout", { target: harness.overlay.textarea });
+  await settle();
+  assert.equal(harness.overlay.active, true, "Roam's own menu owns focus while it is open");
+
+  harness.dom.state.popupOpen = false;
+  node.dispatch("focusout", { target: harness.overlay.textarea });
+  await settle();
+  assert.equal(harness.overlay.active, false, "focus on <body> with no menu open must finish the edit");
+  assert.equal(harness.cell.querySelector(".rg-native-cell-editor"), null);
+  assert.equal(harness.cell.classList.contains("rg-cell--editing"), false);
+  assert.equal(harness.finishes.at(-1)?.commit, true, "the existing discrimination applies: a focus-away is a commit, like a click-away");
+
+  // Focus that lands on another cell of this grid belongs to the pointerdown/focusin lanes.
+  const grid = makeOverlayHarness();
+  await startOverlay(grid);
+  const sibling = new OverlayNode("div"); sibling.className = "rg-cell"; grid.root.appendChild(sibling);
+  globalThis.document.activeElement = sibling;
+  grid.cell.querySelector(".rg-native-cell-editor").dispatch("focusout", { target: grid.overlay.textarea });
+  await settle();
+  assert.equal(grid.overlay.active, true);
+  grid.overlay.dispose();
 });
 
 test("accepting a function suggestion twice does not rewrite the committed text", async () => {

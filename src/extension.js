@@ -7634,7 +7634,13 @@ export class NativeCellEditorOverlay {
     this.frames = new Map();
     this.repairScheduled = false;
     this.repairCommitWhenClean = false;
+    this.repairRunning = false;
     this.popupJustClosed = false;
+    // FIX-E: exactly ONE Escape per typing episode is lent to Roam's menu; every Escape after that
+    // is the overlay's cancel, whatever the popup probe reads.
+    this.escapeDeferred = false;
+    this.escapeKeydownSeen = false;
+    this.focusCheckScheduled = false;
     this.disposed = false;
     this.starting = null;
     this.pendingSeed = null;
@@ -7768,11 +7774,20 @@ export class NativeCellEditorOverlay {
     this.pendingSeed = null;
     this.listen(overlay, "keydown", (event) => this.interceptKeydown(event), true);
     this.listen(overlay, "paste", (event) => this.interceptPaste(event), true);
-    this.listen(overlay, "input", () => { this.state && (this.state.lastValue = String(this.textarea?.value ?? this.state.lastValue)); this.scheduleStructureRepair(); }, true);
+    // Typing starts a new menu episode, so the one Escape lent to Roam is lent again.
+    this.listen(overlay, "input", () => { this.escapeDeferred = false; this.state && (this.state.lastValue = String(this.textarea?.value ?? this.state.lastValue)); this.scheduleStructureRepair(); }, true);
     this.listen(overlay, "compositionstart", () => { if (this.state) this.state.composing = true; }, true);
     this.listen(overlay, "compositionend", () => { if (this.state) this.state.composing = false; }, true);
     this.listen(overlay, "focusin", (event) => this.onOverlayFocusIn(event), true);
+    this.listen(overlay, "focusout", () => this.scheduleFocusEscapeCheck(), true);
     this.listen(globalThis.document, "pointerdown", (event) => this.onDocumentPointerDown(event), true);
+    // FIX-E backstops. The overlay-scoped capture listener is beaten by anything Roam registers on
+    // an ANCESTOR in the capture phase that calls `stopPropagation` — the Escape then never reaches
+    // the overlay at all and the edit wedges with no way out. A same-node listener still runs after
+    // a `stopPropagation`, so a document-capture keydown recovers that case, and a document-capture
+    // keyup recovers the case where the keydown itself is swallowed outright.
+    this.listen(globalThis.document, "keydown", (event) => this.onDocumentKeydown(event), true);
+    this.listen(globalThis.document, "keyup", (event) => this.onDocumentKeyup(event), true);
     noteNativeEditorSuccess();
     return this.state;
   }
@@ -7804,15 +7819,25 @@ export class NativeCellEditorOverlay {
     return null;
   }
 
-  /** PINNED FACT 5: Roam's menu portal is a direct child of `<body>`. The trigger-context fallback
-   *  only applies on a session where that selector has never matched anything at all, and only to a
-   *  context that opened DURING this edit — a cell that already reads `… #done` at mount is text,
-   *  not a menu, and trusting it passes Enter through into a block split. */
-  nativeAutocompleteOpen() {
+  /** PINNED FACT 5: Roam's menu portal is a direct child of `<body>`. Returns the live portal node
+   *  or null. Separate from `nativeAutocompleteOpen` because the focus-leave fallback must consult
+   *  the REAL menu only — never the trigger-context stand-in, which reads an auto-paired `[[]]` at
+   *  the caret as an open menu and would re-wedge the overlay. */
+  nativeAutocompletePortal() {
     let node = null;
     try { node = globalThis.document?.querySelector?.(".rm-autocomplete__results") || null; }
-    catch (error) { noteNativeEditorError(error); node = null; }
-    if (node) { runtime.nativeEditorSawPopup = true; return nativeOverlayNodeVisible(node); }
+    catch (error) { noteNativeEditorError(error); return null; }
+    if (!node) return null;
+    runtime.nativeEditorSawPopup = true;
+    return nativeOverlayNodeVisible(node) ? node : null;
+  }
+
+  /** The trigger-context fallback only applies on a session where the portal selector has never
+   *  matched anything at all, and only to a context that opened DURING this edit — a cell that
+   *  already reads `… #done` at mount is text, not a menu, and trusting it passes Enter through
+   *  into a block split. */
+  nativeAutocompleteOpen() {
+    if (this.nativeAutocompletePortal()) return true;
     if (runtime.nativeEditorSawPopup) return false;
     const textarea = this.textarea; if (!textarea) return false;
     const value = String(textarea.value ?? "");
@@ -7847,6 +7872,9 @@ export class NativeCellEditorOverlay {
     if (command && (key === "ArrowUp" || key === "ArrowDown")) return void this.swallow(event);
     // …while ⌘/Ctrl+Enter passes straight through to Roam's TODO toggle (see above).
     if (command && key === "Enter") return;
+    // Escape is answered before the shared popup probe below: `handleEscapeKey` owns its own
+    // discrimination so the document-level backstops can reuse it verbatim.
+    if (key === "Escape") { this.escapeKeydownSeen = true; this.handleEscapeKey(event, { scoped: true }); return; }
     const popup = !this.popupJustClosed && this.nativeAutocompleteOpen();
     if (key === "Enter" && !event.shiftKey) {
       if (popup) return void this.scheduleStructureRepair();
@@ -7860,12 +7888,6 @@ export class NativeCellEditorOverlay {
       void this.commit(tabMovement(undefined, event.shiftKey));
       return;
     }
-    if (key === "Escape") {
-      if (popup) { this.markPopupJustClosed(); return; }
-      event.preventDefault?.(); event.stopPropagation?.();
-      void this.cancel();
-      return;
-    }
     const textarea = this.textarea;
     const value = String(textarea?.value ?? "");
     const start = Number.isFinite(Number(textarea?.selectionStart)) ? Number(textarea.selectionStart) : 0;
@@ -7877,6 +7899,61 @@ export class NativeCellEditorOverlay {
     if (key === "Delete" && collapsed && end === value.length) return void this.swallow(event);
     if (key === "ArrowUp" && !value.slice(0, start).includes("\n")) { if (popup) return; return void this.swallow(event); }
     if (key === "ArrowDown" && !value.slice(end).includes("\n")) { if (popup) return; return void this.swallow(event); }
+  }
+
+  /**
+   * FIX-E, the wedge. Escape used to be handed back to Roam on EVERY keystroke the popup probe read
+   * as open, so an edit whose menu had been opened could never be cancelled: Roam re-renders its
+   * portal while the caret sits inside an auto-paired `[[]]`, the probe kept answering "open", the
+   * overlay kept deferring, `cancel()` never ran, and the modified value reached the graph on the
+   * later blur flush. The one-frame `popupJustClosed` marker is far too short to bridge two human
+   * keystrokes, so it cannot stand in for ownership either.
+   *
+   * The rule is now positional, not probed: at most ONE Escape per typing episode is lent to the
+   * menu. `input` opens a new episode; everything else after the loan is the overlay's cancel.
+   */
+  handleEscapeKey(event, { scoped = false } = {}) {
+    const state = this.state;
+    if (!state || state.finishing) return false;
+    if (state.composing || event?.isComposing) return false;
+    // Overlay-scoped and document-scoped listeners both see the same event in real Roam.
+    if (event?.__rgOverlayEscapeHandled) return false;
+    if (!scoped && !this.escapeBelongsToOverlay(event)) return false;
+    if (event) event.__rgOverlayEscapeHandled = true;
+    if (!this.escapeDeferred && !this.popupJustClosed && this.nativeAutocompleteOpen()) {
+      this.escapeDeferred = true;
+      this.markPopupJustClosed();
+      return false;
+    }
+    event?.preventDefault?.(); event?.stopPropagation?.();
+    this.escapeDeferred = false;
+    void this.cancel();
+    return true;
+  }
+
+  /** A document-level Escape is this overlay's only when the edit it belongs to is this edit. */
+  escapeBelongsToOverlay(event) {
+    const target = event?.target || null;
+    if (target && (target === this.textarea || this.overlay?.contains?.(target))) return true;
+    if (target?.closest?.(".rm-autocomplete__results")) return true;
+    const active = globalThis.document?.activeElement || null;
+    return Boolean(active && (active === this.textarea || this.overlay?.contains?.(active)));
+  }
+
+  onDocumentKeydown(event) {
+    if (String(event?.key ?? "") !== "Escape") return;
+    if (!this.state || this.state.finishing) return;
+    this.escapeKeydownSeen = true;
+    this.handleEscapeKey(event);
+  }
+
+  /** Last resort: the keydown was swallowed outright above us, so the keyup is the only evidence
+   *  the user asked to escape. Same ownership rule, so a menu-closing Escape is still Roam's. */
+  onDocumentKeyup(event) {
+    if (String(event?.key ?? "") !== "Escape") return;
+    if (this.escapeKeydownSeen) { this.escapeKeydownSeen = false; return; }
+    if (!this.state || this.state.finishing) return;
+    this.handleEscapeKey(event);
   }
 
   interceptPaste(event) {
@@ -7912,6 +7989,38 @@ export class NativeCellEditorOverlay {
     void this.commit(null);
   }
 
+  /** Checked a frame late: a blur is only a real departure once the browser has settled focus, and
+   *  Roam blurs and refocuses its own textarea freely while it re-renders the block. */
+  scheduleFocusEscapeCheck() {
+    if (!this.state || this.state.finishing || this.focusCheckScheduled) return null;
+    this.focusCheckScheduled = true;
+    void this.nextFrame().then(() => {
+      this.focusCheckScheduled = false;
+      this.finishIfFocusLeft();
+    });
+    return true;
+  }
+
+  /**
+   * FIX-E, the never-wedge floor. Focus can leave Roam's textarea for `<body>` with no menu open and
+   * no click of ours to observe (Roam's own Escape handling does exactly that). Left alone the
+   * overlay stays mounted over a cell nobody can type into, so the edit finishes here instead. Focus
+   * that stays inside the overlay, inside Roam's menu, or anywhere in this grid belongs to the
+   * pointerdown and focusin lanes, which already discriminate those.
+   */
+  finishIfFocusLeft() {
+    const state = this.state;
+    if (!state || state.finishing) return false;
+    if (this.repairScheduled || this.repairRunning) return false;
+    const active = globalThis.document?.activeElement || null;
+    if (active && this.overlay?.contains?.(active)) return false;
+    if (active?.closest?.(".rm-autocomplete__results")) return false;
+    if (this.nativeAutocompletePortal()) return false;
+    if (active && this.view?.root?.contains?.(active)) return false;
+    void this.commit(null);
+    return true;
+  }
+
   scheduleStructureRepair({ commitWhenClean = false } = {}) {
     if (!this.state || this.state.finishing) return null;
     if (commitWhenClean) this.repairCommitWhenClean = true;
@@ -7931,6 +8040,14 @@ export class NativeCellEditorOverlay {
     if (!state || state.finishing) return null;
     const adapter = this.view?.adapter; const tableUid = this.view?.model?.tableUid;
     if (!adapter?.baseTree || !tableUid) return null;
+    // The writes below blur and refocus Roam's textarea; without this the focus-leave floor would
+    // read a mid-repair frame as the user walking away and commit on top of the repair.
+    this.repairRunning = true;
+    try { return await this.repairStructureOnce({ commitWhenClean, adapter, tableUid, state }); }
+    finally { this.repairRunning = false; }
+  }
+
+  async repairStructureOnce({ commitWhenClean, adapter, tableUid, state }) {
     let tree = null;
     try { tree = getTree(tableUid); } catch (error) { noteNativeEditorError(error); return null; }
     if (!tree) return null;
@@ -7999,6 +8116,7 @@ export class NativeCellEditorOverlay {
     }
     this.frames.clear();
     this.repairScheduled = false; this.repairCommitWhenClean = false; this.popupJustClosed = false;
+    this.escapeDeferred = false; this.escapeKeydownSeen = false; this.focusCheckScheduled = false;
     this.claimedUid = null; this.mountTriggerContext = null;
     this.state?.cell?.classList?.remove("rg-cell--editing", "rg-cell--native-editing");
     this.overlay?.remove?.();
@@ -8069,7 +8187,36 @@ export class NativeCellEditorOverlay {
     try { await this.onFinish?.({ row, col, cell, raw: beforeRaw, value: beforeRaw, commit: false, movement: null }); }
     catch (error) { noteNativeEditorError(error); }
     this.view.session?.endNativeOverlayEdit?.(uid, { beforeRaw, afterRaw: beforeRaw, commit: false });
+    // Only a cancel that had something to undo can lose the write-behind race (PINNED FACT 7).
+    if (flushed !== beforeRaw) await this.reconcileCancelWrite(uid, beforeRaw);
     return { uid, value: beforeRaw };
+  }
+
+  /**
+   * FIX-E write-behind. PINNED FACT 7 says Roam flushes its textarea to `:block/string` at blur —
+   * which is the blur `teardown()` just caused, and it can land AFTER the restore write above. The
+   * graph would then hold the exact value the user cancelled, with nothing left mounted to notice.
+   * Re-read for a few frames and re-apply `beforeRaw`, recording the self-write so the adapter
+   * absorbs the echo instead of reloading the grid.
+   */
+  async reconcileCancelWrite(uid, beforeRaw, { attempts = 3 } = {}) {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      await this.nextFrame();
+      let current = null;
+      try { current = pullNativeCell(uid); }
+      catch (error) { noteNativeEditorError(error); return false; }
+      if (!current) continue;
+      const raw = nativeStoredRaw(current.raw);
+      if (raw === beforeRaw) continue;
+      try {
+        this.view.adapter?.recordSelfWrite?.(uid, raw, beforeRaw);
+        try { await updateBlock(uid, nativePersistedRaw(beforeRaw)); }
+        catch (error) { this.view.adapter?.consumeSelfWrite?.(uid, raw, beforeRaw); throw error; }
+        this.view.adapter?.patchBaseContent?.([{ uid, raw: beforeRaw }]);
+      } catch (error) { noteNativeEditorError(error); return false; }
+      return true;
+    }
+    return false;
   }
 
   dispose() {

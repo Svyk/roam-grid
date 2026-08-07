@@ -253,13 +253,17 @@ Five measured facts about Roam shape the whole class:
   `roamEditorTriggerContext` as a plausibly-open menu.
 
 `interceptKeydown` is a capture-phase listener on the overlay root, so a swallow
-stops the event before Roam's own handlers see it:
+stops the event before Roam's own handlers see it. Escape alone is answered by
+`handleEscapeKey`, which the overlay listener and two document-capture backstops
+(keydown, then keyup) share: an ancestor capture handler that calls
+`stopPropagation` would otherwise keep the cancel Escape from ever arriving, and
+an edit that cannot be cancelled is an overlay wedged over the cell.
 
 | Key | Menu open | Menu closed |
 |---|---|---|
 | Enter | pass (select a row) + schedule the split check | commit, `enterMovement()` |
 | Tab / Shift+Tab | pass + schedule the split check | commit, `tabMovement()` |
-| Escape | pass (Roam closes the menu), menu treated closed for one frame | cancel |
+| Escape | pass ONCE per typing episode (Roam closes the menu); every later Escape cancels | cancel |
 | Backspace at caret 0 | swallow — would merge the cell into the previous chain block |
 | Delete at the end | swallow — would forward-merge the hidden next-column cell |
 | ArrowUp/Down past the line | pass (menu nav) | swallow (caret clamp) |
@@ -274,8 +278,13 @@ and finishes through the editor controller's own `onFinish` closure — the same
 one the grid editor uses, so the cell renders, the selection moves and the grid
 re-claims the keyboard exactly as before. `cancel()` restores `beforeRaw`
 byte-for-byte, recording both the blur flush and the restore as self-writes so
-neither surfaces as somebody else's edit. `dispose()` unmounts and NEVER writes:
-a mid-edit disposal must not clobber what Roam last saved.
+neither surfaces as somebody else's edit; `reconcileCancelWrite` then re-reads
+the block for a few frames, because Roam's blur flush can land AFTER the restore
+and re-persist the value the user just cancelled. `dispose()` unmounts and NEVER
+writes: a mid-edit disposal must not clobber what Roam last saved. If focus
+leaves the overlay for something outside the grid with no menu open,
+`finishIfFocusLeft` finishes the edit a frame later rather than leaving the
+overlay mounted.
 
 Keyboard ownership needs no new code. The mounted input matches the hardened
 `ROAM_BLOCK_INPUT_SELECTOR`, so focusing it already runs `onGlobalFocusIn` →
