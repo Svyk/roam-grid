@@ -5424,7 +5424,11 @@ export class LargeGridStore {
   }
 }
 
-function roamBlockInputFor(target) { return target?.closest?.(".rm-block-input,[id^='block-input-']") || null; }
+// BEM double-underscore is current Roam; the single-dash class is kept for compat and the
+// `block-input-` id prefix is the safety net that never depends on Roam's class names.
+const ROAM_BLOCK_INPUT_SELECTOR = ".rm-block__input,.rm-block-input,[id^='block-input-']";
+
+function roamBlockInputFor(target) { return target?.closest?.(ROAM_BLOCK_INPUT_SELECTOR) || null; }
 
 /**
  * A block-input id carries a window path before the uid — `block-input-sidebar-block-<window>-<uid>`
@@ -9461,6 +9465,7 @@ export class RangeGridView {
     this.themeBridge?.dispose?.(); this.themeBridge = null;
     this.cells.clear(); this.cellCoordinatesByUid.clear();
     this.session?.removeView(this);
+    this.host?.classList?.remove?.("rg-range-host");
     if (releaseNative) this.nativeElement?.classList.add("rg-range-restored");
   }
 }
@@ -10229,6 +10234,24 @@ function mountNativeInstance(nativeElement, info, surface = instanceSurface(nati
   return view;
 }
 
+/**
+ * Ring-buffered diagnostics for the range claim pipeline — every degrade and success point calls
+ * this, so a silent invisibility can be reconstructed from `window.__rgDiag.rangeTrace` after the
+ * fact. The console line exists only behind an explicit localStorage opt-in.
+ */
+export function traceRange(stage, detail = null) {
+  const target = globalThis.window;
+  if (target) {
+    const diag = (target.__rgDiag ||= {});
+    const entry = { at: Date.now(), stage, detail };
+    const trace = (diag.rangeTrace ||= []);
+    trace.push(entry);
+    if (trace.length > 32) trace.splice(0, trace.length - 32);
+    diag.rangeLast = entry;
+  }
+  try { if (globalThis.localStorage?.["roam-grid:debug"]) console.debug("[roam-grid] range", stage, detail ?? ""); } catch { /* localStorage can be blocked */ }
+}
+
 export function rangeButtonsWithin(root) {
   if (!root) return [];
   const values = [];
@@ -10249,20 +10272,24 @@ export function rangeBlockUid(element) {
  * Parses the range spec behind a rendered component button.  Specs are cached per block uid and
  * invalidated when Roam replaces the button node, so a re-render costs one identity comparison.
  */
-export function rangeInstanceInfo(button, entries = runtime.rangeSpecs, readString = blockString) {
+export function rangeInstanceInfo(button, entries = runtime.rangeSpecs, readString = blockString, trace = traceRange) {
   if (!button) return null;
   // The live-references escape hatch lives here because this is the mount path's only discovery
-  // call: with it off nothing is parsed and nothing is cached, so `scanMounts` falls into its
+  // call: with it off nothing is parsed and nothing is cached, so the claim pass falls into its
   // no-spec branch and un-hides the raw component, and turning it back on parses on the next scan.
-  if (getSetting("ranges-live-references") === false) return null;
-  const blockUid = rangeBlockUid(button.closest?.(".rm-block__input"));
-  if (!blockUid) return null;
+  if (getSetting("ranges-live-references") === false) { trace("refs-off"); return null; }
+  const blockUid = uidFromFocusTarget(button) || rangeBlockUid(roamBlockInputFor(button));
+  if (!blockUid) { trace("no-uid"); return null; }
   const cached = entries?.get?.(blockUid);
   if (cached && cached.button === button) return cached.info;
   let text = "";
   try { text = readString(blockUid) || ""; } catch { text = ""; }
+  // An empty read is transient (the block is still mounting) — caching it would kill this button
+  // for the session, so only a definitive non-empty non-spec may cache a null.
+  if (!text) { trace("empty-read", blockUid); return null; }
   const spec = parseRangeComponent(text);
-  const info = spec ? { ...spec, blockUid } : null;
+  if (!spec) { trace("no-spec", blockUid); entries?.set?.(blockUid, { button, info: null }); return null; }
+  const info = { ...spec, blockUid };
   entries?.set?.(blockUid, { button, info });
   return info;
 }
@@ -10276,6 +10303,101 @@ function mountRangeInstance(button, info, surface = instanceSurface(button)) {
   runtime.views.add(view); runtime.viewsByNative.set(button, view);
   button.classList.remove("rg-range-restored");
   return view;
+}
+
+/**
+ * Fallback discovery for blocks where Roam rendered NO component button (pinned live-probe fact 1:
+ * the bare-uid form renders nothing). textContent is a PREFILTER ONLY — the authoritative string
+ * is always the Datascript read, never DOM text.
+ */
+export function rangeTextHostsWithin(root) {
+  if (!root) return [];
+  const candidates = [];
+  if (root.matches?.(ROAM_BLOCK_INPUT_SELECTOR)) candidates.push(root);
+  for (const node of root.querySelectorAll?.(ROAM_BLOCK_INPUT_SELECTOR) || []) if (!candidates.includes(node)) candidates.push(node);
+  return candidates.filter((host) => String(host.textContent || "").includes("roam-grid-range"));
+}
+
+function mountRangeTextHost(host, info, surface = instanceSurface(host)) {
+  const current = runtime.viewsByNative.get(host);
+  if (current?.root?.isConnected) return current;
+  const session = getOrCreateNativeSession(info.tableUid);
+  const view = new RangeGridView({ host, session, range: info.range, label: info.label, nativeElement: host, surface });
+  view.root.dataset.roamGridUid = info.tableUid; view.root.dataset.roamGridInstance = cryptoId();
+  runtime.views.add(view); runtime.viewsByNative.set(host, view);
+  return view;
+}
+
+function mountRangeClaim(element, info) {
+  return element?.matches?.(RANGE_BUTTON_SELECTOR) ? mountRangeInstance(element, info) : mountRangeTextHost(element, info);
+}
+
+function noteRangeLoopError(error, trace, button = null) {
+  if (globalThis.window) globalThis.window.__RG_U3_LAST_ERROR = String(error?.stack || error);
+  trace("loop-error", String(error?.message || error));
+  // A pre-hidden button whose processing died must fail VISIBLE, never invisible.
+  button?.classList?.add?.("rg-range-restored");
+}
+
+/**
+ * The range half of `scanMounts`, factored out so it is directly testable and crash-isolated:
+ * every element is processed in its own try/catch, so one throw can no longer abandon the rest of
+ * the loop and leave pre-hidden buttons invisible. A button we do not claim must be un-hidden, or
+ * the pre-paint rule leaves blank space.
+ */
+export function claimRangeMounts(root, {
+  entries = runtime.rangeSpecs,
+  metadataEntries = runtime.metadata?.entries,
+  readString = blockString,
+  mount = mountRangeClaim,
+  trace = traceRange,
+  viewsByNative = runtime.viewsByNative,
+} = {}) {
+  if (!root || !metadataEntries) return;
+  for (const button of rangeButtonsWithin(root)) {
+    if (viewsByNative.get(button)?.root?.isConnected) continue;
+    let info = null;
+    try {
+      info = rangeInstanceInfo(button, entries, readString, trace);
+      if (!info) { button.classList.add("rg-range-restored"); continue; }
+      const entry = metadataEntries.get(info.tableUid);
+      if (!entry) { trace("no-metadata", info.tableUid); button.classList.add("rg-range-restored"); continue; }
+      if (entry.value?.mode === "large") { trace("large-source", info.tableUid); button.classList.add("rg-range-restored"); continue; }
+    } catch (error) { noteRangeLoopError(error, trace, button); continue; }
+    try {
+      mount(button, info);
+      trace("mounted", info.tableUid);
+    } catch (error) {
+      if (globalThis.window) globalThis.window.__RG_U3_LAST_ERROR = String(error?.stack || error);
+      trace("mount-error", info.tableUid);
+      console.error("[roam-grid] Range mount failed", info.tableUid, error);
+      button.classList.add("rg-range-restored");
+      button.parentElement?.querySelector?.(".rg-range")?.remove();
+    }
+  }
+  // Raw-string fallback: a host whose component Roam never rendered as a button still mounts,
+  // discovered by text but verified by the Datascript read. The button path wins — a host that
+  // contains any range button was already handled above.
+  for (const host of rangeTextHostsWithin(root)) {
+    try {
+      if (viewsByNative.get(host)?.root?.isConnected) continue;
+      if (rangeButtonsWithin(host).length) continue;
+      if (getSetting("ranges-live-references") === false) { trace("refs-off"); continue; }
+      const blockUid = uidFromFocusTarget(host) || rangeBlockUid(host);
+      if (!blockUid) { trace("no-uid"); continue; }
+      let text = "";
+      try { text = readString(blockUid) || ""; } catch { text = ""; }
+      if (!text) { trace("empty-read", blockUid); continue; }
+      const spec = parseRangeComponent(text);
+      if (!spec) { trace("no-spec", blockUid); continue; }
+      const entry = metadataEntries.get(spec.tableUid);
+      if (!entry) { trace("no-metadata", spec.tableUid); continue; }
+      if (entry.value?.mode === "large") { trace("large-source", spec.tableUid); continue; }
+      mount(host, { ...spec, blockUid });
+      host.classList.add("rg-range-host");
+      trace("text-mounted", spec.tableUid);
+    } catch (error) { noteRangeLoopError(error, trace); }
+  }
 }
 
 function cleanupDisconnectedViews() {
@@ -10371,34 +10493,24 @@ async function scanMounts() {
   const roots = runtime.pendingScanRoots.size ? [...runtime.pendingScanRoots] : [document]; runtime.pendingScanRoots.clear();
   for (const root of roots) {
     for (const nativeElement of nativeTablesWithin(root)) {
-      const info = nativeTableInstanceInfo(nativeElement); if (!info || runtime.viewsByNative.get(nativeElement)?.root?.isConnected) continue;
-      try { mountNativeInstance(nativeElement, info); }
-      catch (error) {
-        console.error("[roam-grid] Mount failed", info.uid, error);
+      let info = null;
+      try {
+        info = nativeTableInstanceInfo(nativeElement); if (!info || runtime.viewsByNative.get(nativeElement)?.root?.isConnected) continue;
+        mountNativeInstance(nativeElement, info);
+      } catch (error) {
+        console.error("[roam-grid] Mount failed", info?.uid, error);
         nativeElement.classList.remove("rg-native-hidden", "rg-native-pending");
         nativeElement.parentElement?.querySelector?.(".rg-root")?.remove();
-        toast(`Roam Grid could not enhance ${info.uid}: ${error.message}`, "danger", 10000);
+        toast(`Roam Grid could not enhance ${info?.uid || "table"}: ${error.message}`, "danger", 10000);
       }
     }
-    // A range button we do not claim must be un-hidden, or the pre-paint rule leaves blank space.
-    for (const button of rangeButtonsWithin(root)) {
-      if (runtime.viewsByNative.get(button)?.root?.isConnected) continue;
-      const info = rangeInstanceInfo(button);
-      const entry = info ? runtime.metadata.entries.get(info.tableUid) : null;
-      if (!entry || entry.value?.mode === "large") { button.classList.add("rg-range-restored"); continue; }
-      try { mountRangeInstance(button, info); }
-      catch (error) {
-        console.error("[roam-grid] Range mount failed", info.tableUid, error);
-        button.classList.add("rg-range-restored");
-        button.parentElement?.querySelector?.(".rg-range")?.remove();
-      }
-    }
+    claimRangeMounts(root);
   }
   for (const [uid, entry] of runtime.metadata.entries) {
     if (entry.value.mode !== "large" || runtime.largeMounts.get(uid)?.root?.isConnected || mounting.has(uid)) continue;
-    const block = findBlockElement(uid); if (!block) continue;
     mounting.add(uid);
     try {
+      const block = findBlockElement(uid); if (!block) continue;
       const marker = block.querySelector(".rm-block__input") || block.firstElementChild;
       const store = await new LargeGridStore(uid).initialize(); const view = new LargeGridView({ host: block, store, markerElement: marker });
       view.root.dataset.roamGridUid = uid; view.root.__rgView = view; runtime.largeMounts.set(uid, view);

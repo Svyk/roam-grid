@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import {
+  claimRangeMounts,
   clearUndoHistories,
   formatRangeComponent,
   GridModel,
@@ -15,9 +16,11 @@ import {
   rangeButtonsWithin,
   rangeInstanceInfo,
   rangeRenderPlan,
+  rangeTextHostsWithin,
   resolveSourceModel,
   selectionBlockReferenceMatrix,
   settingsCache,
+  traceRange,
 } from "../src/extension.js";
 
 function persistedModel() {
@@ -213,7 +216,15 @@ class MiniNode {
   matches(selector) {
     return String(selector).split(",").some((part) => {
       const value = part.trim();
-      return value.startsWith(".") && value.slice(1).split(".").every((name) => this.classList.contains(name));
+      if (value.startsWith(".")) return value.slice(1).split(".").every((name) => this.classList.contains(name));
+      const prefix = /^\[id\^='([^']+)'\]$/.exec(value);
+      if (prefix) return String(this.id || "").startsWith(prefix[1]);
+      const exists = /^\[data-([a-z-]+)\]$/.exec(value);
+      if (exists) {
+        const key = exists[1].replace(/-([a-z])/g, (match, letter) => letter.toUpperCase());
+        return this.dataset?.[key] != null || this.getAttribute?.(exists[0].slice(1, -1)) != null;
+      }
+      return false;
     });
   }
   closest(selector) { for (let current = this; current; current = current.parentNode) if (current.matches?.(selector)) return current; return null; }
@@ -611,30 +622,77 @@ test("range buttons are discovered by their single Roam-rendered class", () => {
   assert.deepEqual(rangeButtonsWithin(null), []);
 });
 
-test("a range spec is read once per block and re-read when Roam replaces the button node", () => {
+/**
+ * The host-node shape is parameterized so locator assertions cannot pass by construction: the
+ * hardened selector must find the host from ANY one of its signals (BEM class, legacy single-dash
+ * class, `block-input-` id prefix), and the uid from the id suffix or a data-uid attribute.
+ */
+function rangeHostVariant(variant, uid = "blk123456") {
+  const host = new MiniNode("div");
+  if (variant === "bem") { host.className = "rm-block__input"; host.id = `block-input-main-window-${uid}`; }
+  else if (variant === "dash") { host.className = "rm-block-input"; host.id = `block-input-main-window-${uid}`; }
+  else if (variant === "id") { host.id = `block-input-main-window-${uid}`; }
+  else if (variant === "data-uid") { host.className = "rm-block__input"; host.dataset.uid = uid; }
+  else throw new Error(`unknown range host variant: ${variant}`);
+  return host;
+}
+const RANGE_HOST_VARIANTS = ["bem", "dash", "id", "data-uid"];
+
+function rangeButtonIn(host) {
+  const button = new MiniNode("button"); button.className = "rm-xparser-default-roam-grid-range"; host.appendChild(button);
+  return button;
+}
+
+for (const variant of RANGE_HOST_VARIANTS) {
+  test(`a range spec is read once per block and re-read when Roam replaces the button node (${variant} host)`, () => {
+    installMiniDom();
+    const reads = [];
+    const readString = (uid) => { reads.push(uid); return "{{roam-grid-range: ((tbl00001)) B2:D5}}"; };
+    const entries = new Map();
+    const input = rangeHostVariant(variant);
+    const button = rangeButtonIn(input);
+
+    const first = rangeInstanceInfo(button, entries, readString);
+    assert.deepEqual(first, { tableUid: "tbl00001", range: { startRow: 1, endRow: 4, startCol: 1, endCol: 3 }, label: "B2:D5", blockUid: "blk123456" });
+    assert.equal(rangeInstanceInfo(button, entries, readString), first, "a cached spec is returned by identity");
+    assert.deepEqual(reads, ["blk123456"], "the cache spares the second read");
+
+    const replacement = rangeButtonIn(input);
+    rangeInstanceInfo(replacement, entries, readString);
+    assert.deepEqual(reads, ["blk123456", "blk123456"], "a replaced button node invalidates the cache");
+
+    const orphan = new MiniNode("button"); orphan.className = "rm-xparser-default-roam-grid-range";
+    assert.equal(rangeInstanceInfo(orphan, entries, readString), null, "a button with no block input resolves to nothing");
+
+    const plain = rangeHostVariant(variant, "blk999999");
+    const plainButton = rangeButtonIn(plain);
+    assert.equal(rangeInstanceInfo(plainButton, entries, () => "just some text"), null);
+    assert.equal(rangeInstanceInfo(plainButton, entries, () => { throw new Error("pull failed"); }), null, "a failed read is not a crash");
+  });
+}
+
+test("an empty read is never cached, but a definitive non-spec caches its null", () => {
   installMiniDom();
-  const reads = [];
-  const readString = (uid) => { reads.push(uid); return "{{roam-grid-range: ((tbl00001)) B2:D5}}"; };
   const entries = new Map();
-  const input = new MiniNode("div"); input.className = "rm-block__input"; input.id = "block-input-main-window-blk123456";
-  const button = new MiniNode("button"); button.className = "rm-xparser-default-roam-grid-range"; input.appendChild(button);
+  const button = rangeButtonIn(rangeHostVariant("bem"));
+  const reads = [];
+  let value = "";
+  const readString = (uid) => { reads.push(uid); return value; };
 
-  const first = rangeInstanceInfo(button, entries, readString);
-  assert.deepEqual(first, { tableUid: "tbl00001", range: { startRow: 1, endRow: 4, startCol: 1, endCol: 3 }, label: "B2:D5", blockUid: "blk123456" });
-  assert.equal(rangeInstanceInfo(button, entries, readString), first, "a cached spec is returned by identity");
-  assert.deepEqual(reads, ["blk123456"], "the cache spares the second read");
+  assert.equal(rangeInstanceInfo(button, entries, readString), null, "an empty read resolves to nothing");
+  assert.equal(entries.size, 0, "a transient empty read must not be cached — the next scan retries");
+  value = "{{roam-grid-range: ((tbl00001)) B2:D5}}";
+  assert.equal(rangeInstanceInfo(button, entries, readString)?.tableUid, "tbl00001", "the retried read parses");
+  assert.deepEqual(reads, ["blk123456", "blk123456"]);
 
-  const replacement = new MiniNode("button"); replacement.className = "rm-xparser-default-roam-grid-range"; input.appendChild(replacement);
-  rangeInstanceInfo(replacement, entries, readString);
-  assert.deepEqual(reads, ["blk123456", "blk123456"], "a replaced button node invalidates the cache");
-
-  const orphan = new MiniNode("button"); orphan.className = "rm-xparser-default-roam-grid-range";
-  assert.equal(rangeInstanceInfo(orphan, entries, readString), null, "a button with no block input resolves to nothing");
-
-  const plain = new MiniNode("div"); plain.className = "rm-block__input"; plain.id = "block-input-main-window-blk999999";
-  const plainButton = new MiniNode("button"); plainButton.className = "rm-xparser-default-roam-grid-range"; plain.appendChild(plainButton);
-  assert.equal(rangeInstanceInfo(plainButton, entries, () => "just some text"), null);
-  assert.equal(rangeInstanceInfo(plainButton, entries, () => { throw new Error("pull failed"); }), null, "a failed read is not a crash");
+  const garbageEntries = new Map();
+  const garbageButton = rangeButtonIn(rangeHostVariant("bem", "blk777777"));
+  const garbageReads = [];
+  const readGarbage = (uid) => { garbageReads.push(uid); return "just some text"; };
+  assert.equal(rangeInstanceInfo(garbageButton, garbageEntries, readGarbage), null);
+  assert.deepEqual(garbageEntries.get("blk777777"), { button: garbageButton, info: null }, "a non-empty non-spec is definitive and caches the null");
+  assert.equal(rangeInstanceInfo(garbageButton, garbageEntries, readGarbage), null);
+  assert.deepEqual(garbageReads, ["blk777777"], "the cached null spares the re-read");
 });
 
 test("with live range references off no spec is parsed, read, or cached", (t) => {
@@ -643,17 +701,179 @@ test("with live range references off no spec is parsed, read, or cached", (t) =>
   const reads = [];
   const readString = (uid) => { reads.push(uid); return "{{roam-grid-range: ((tbl00001)) B2:D5}}"; };
   const entries = new Map();
-  const input = new MiniNode("div"); input.className = "rm-block__input"; input.id = "block-input-main-window-blk123456";
-  const button = new MiniNode("button"); button.className = "rm-xparser-default-roam-grid-range"; input.appendChild(button);
+  const button = rangeButtonIn(rangeHostVariant("bem"));
 
   settingsCache.set("ranges-live-references", false);
-  assert.equal(rangeInstanceInfo(button, entries, readString), null, "off means scanMounts never gets a spec to mount");
+  assert.equal(rangeInstanceInfo(button, entries, readString), null, "off means the claim pass never gets a spec to mount");
   assert.deepEqual(reads, [], "and the source block is never read");
   assert.equal(entries.size, 0, "a null must not be cached, or turning the setting back on would stay dead");
 
   settingsCache.set("ranges-live-references", true);
   assert.equal(rangeInstanceInfo(button, entries, readString).tableUid, "tbl00001", "back on parses on the very next scan");
   assert.deepEqual(reads, ["blk123456"]);
+});
+
+test("text-content candidate hosts are found by the hardened selector and the marker substring", () => {
+  installMiniDom();
+  const host = rangeHostVariant("bem");
+  host.textContent = "see {{roam-grid-range: ((tbl00001)) B2:D5}} here";
+  const plain = new MiniNode("div"); plain.textContent = "nothing relevant";
+  const marked = new MiniNode("div"); marked.textContent = "roam-grid-range with no block-input signal";
+  const root = new MiniNode("div"); root.append(host, plain, marked);
+
+  assert.deepEqual(rangeTextHostsWithin(root), [host], "only block-input hosts containing the marker qualify");
+  assert.deepEqual(rangeTextHostsWithin(host), [host], "a host passed as the scan root matches itself");
+  assert.deepEqual(rangeTextHostsWithin(null), []);
+});
+
+// ---------------------------------------------------------------------------
+// GOAL-U3 — claimRangeMounts: crash isolation, caching gates, text-host fallback
+// ---------------------------------------------------------------------------
+
+function claimDeps({ strings = new Map(), tables = new Map([["tbl00001", "native"]]), mount, traced = [], reads = [] } = {}) {
+  return {
+    entries: new Map(),
+    metadataEntries: new Map([...tables].map(([uid, mode]) => [uid, { value: { mode } }])),
+    readString: (uid) => { reads.push(uid); return strings.get(uid) ?? ""; },
+    mount: mount || (() => {}),
+    trace: (stage, detail) => traced.push({ stage, detail }),
+    viewsByNative: new Map(),
+  };
+}
+
+test("claimRangeMounts mounts a claimed range button and traces the success", () => {
+  installMiniDom();
+  const host = rangeHostVariant("bem"); const button = rangeButtonIn(host);
+  const root = new MiniNode("div"); root.appendChild(host);
+  const mounted = []; const traced = [];
+  claimRangeMounts(root, claimDeps({
+    strings: new Map([["blk123456", "{{roam-grid-range: ((tbl00001)) B2:D5}}"]]),
+    mount: (element, info) => mounted.push({ element, info }),
+    traced,
+  }));
+
+  assert.equal(mounted.length, 1);
+  assert.equal(mounted[0].element, button);
+  assert.equal(mounted[0].info.tableUid, "tbl00001");
+  assert.deepEqual(traced.map((entry) => entry.stage), ["mounted"]);
+  assert.equal(button.classList.contains("rg-range-restored"), false, "a claimed button stays hidden");
+});
+
+test("a throw while processing one button still processes the rest and fails visible", () => {
+  installMiniDom();
+  const firstHost = rangeHostVariant("bem", "blk111111"); const first = rangeButtonIn(firstHost);
+  const secondHost = rangeHostVariant("bem", "blk222222"); const second = rangeButtonIn(secondHost);
+  const root = new MiniNode("div"); root.append(firstHost, secondHost);
+  const mounted = []; const traced = [];
+  let calls = 0;
+  claimRangeMounts(root, claimDeps({
+    strings: new Map([
+      ["blk111111", "{{roam-grid-range: ((tbl00001)) B2:D5}}"],
+      ["blk222222", "{{roam-grid-range: ((tbl00001)) A1:B2}}"],
+    ]),
+    mount: (element) => { calls += 1; if (calls === 1) throw new Error("mount exploded"); mounted.push(element); },
+    traced,
+  }));
+
+  assert.equal(mounted.length, 1, "button #2 is processed even though button #1's mount threw");
+  assert.equal(mounted[0], second);
+  assert.equal(first.classList.contains("rg-range-restored"), true, "the failed button fails VISIBLE");
+  assert.match(String(globalThis.window.__RG_U3_LAST_ERROR || ""), /mount exploded/, "the forensic surface records the throw");
+  assert.deepEqual(traced.map((entry) => entry.stage), ["mount-error", "mounted"]);
+});
+
+test("an unclaimed button is un-hidden and the degrade stage is traced", () => {
+  installMiniDom();
+  const noMetaHost = rangeHostVariant("bem", "blk111111"); const noMeta = rangeButtonIn(noMetaHost);
+  const largeHost = rangeHostVariant("bem", "blk222222"); const large = rangeButtonIn(largeHost);
+  const root = new MiniNode("div"); root.append(noMetaHost, largeHost);
+  const mounted = []; const traced = [];
+  claimRangeMounts(root, claimDeps({
+    strings: new Map([
+      ["blk111111", "{{roam-grid-range: ((tbl00001)) B2:D5}}"],
+      ["blk222222", "{{roam-grid-range: ((tbl00002)) A1:B2}}"],
+    ]),
+    tables: new Map([["tbl00002", "large"]]),
+    mount: (element) => mounted.push(element),
+    traced,
+  }));
+
+  assert.equal(mounted.length, 0);
+  assert.equal(noMeta.classList.contains("rg-range-restored"), true, "no metadata → raw component stays visible");
+  assert.equal(large.classList.contains("rg-range-restored"), true, "a large-mode source is never range-mounted");
+  assert.deepEqual(traced.map((entry) => entry.stage), ["no-metadata", "large-source"]);
+});
+
+test("with live range references off the claim pass reads nothing", (t) => {
+  t.after(() => settingsCache.clear());
+  installMiniDom();
+  const host = rangeHostVariant("bem"); const button = rangeButtonIn(host);
+  const root = new MiniNode("div"); root.appendChild(host);
+  const reads = []; const traced = []; const mounted = [];
+  settingsCache.set("ranges-live-references", false);
+  claimRangeMounts(root, claimDeps({
+    strings: new Map([["blk123456", "{{roam-grid-range: ((tbl00001)) B2:D5}}"]]),
+    mount: (element) => mounted.push(element),
+    traced, reads,
+  }));
+
+  assert.deepEqual(reads, [], "off means no Datascript reads at all");
+  assert.equal(mounted.length, 0);
+  assert.equal(button.classList.contains("rg-range-restored"), true, "off un-hides the raw component");
+  assert.deepEqual(traced.map((entry) => entry.stage), ["refs-off"]);
+});
+
+test("a raw-text host with no rendered button mounts with the host-hide class", () => {
+  installMiniDom();
+  const host = rangeHostVariant("bem");
+  host.textContent = "{{roam-grid-range: ((tbl00001)) B2:D5}}";
+  const root = new MiniNode("div"); root.appendChild(host);
+  const mounted = []; const traced = [];
+  claimRangeMounts(root, claimDeps({
+    strings: new Map([["blk123456", "{{roam-grid-range: ((tbl00001)) B2:D5}}"]]),
+    mount: (element, info) => mounted.push({ element, info }),
+    traced,
+  }));
+
+  assert.equal(mounted.length, 1);
+  assert.equal(mounted[0].element, host, "the text host itself is the mount element");
+  assert.equal(mounted[0].info.blockUid, "blk123456");
+  assert.equal(host.classList.contains("rg-range-host"), true, "the host-hide class lands only after a successful mount");
+  assert.deepEqual(traced.map((entry) => entry.stage), ["text-mounted"]);
+});
+
+test("the button path wins: a host with a claimed button is never text-claimed", () => {
+  installMiniDom();
+  const host = rangeHostVariant("bem"); const button = rangeButtonIn(host);
+  button.textContent = "{{roam-grid-range: ((tbl00001)) B2:D5}}";
+  const root = new MiniNode("div"); root.appendChild(host);
+  const mounted = []; const traced = [];
+  claimRangeMounts(root, claimDeps({
+    strings: new Map([["blk123456", "{{roam-grid-range: ((tbl00001)) B2:D5}}"]]),
+    mount: (element, info) => mounted.push({ element, info }),
+    traced,
+  }));
+
+  assert.equal(mounted.length, 1, "exactly one mount — the text pass must skip the host");
+  assert.equal(mounted[0].element, button);
+  assert.equal(host.classList.contains("rg-range-host"), false);
+  assert.deepEqual(traced.map((entry) => entry.stage), ["mounted"]);
+});
+
+test("traceRange keeps a 32-entry ring buffer plus the latest entry", () => {
+  installMiniDom();
+  for (let index = 0; index < 40; index += 1) traceRange("mounted", `detail-${index}`);
+  const diag = globalThis.window.__rgDiag;
+  assert.equal(diag.rangeTrace.length, 32, "the buffer is capped");
+  assert.equal(diag.rangeTrace[0].detail, "detail-8", "the oldest entries fall off");
+  assert.equal(diag.rangeLast.detail, "detail-39");
+});
+
+test("disposing a range view lifts a raw-text host's hide", () => {
+  const { view, host } = mountRange("A1:B2");
+  host.classList.add("rg-range-host");
+  view.dispose({ releaseNative: true });
+  assert.equal(host.classList.contains("rg-range-host"), false);
 });
 
 test("range block uids come from the dataset first and the block-input id suffix second", () => {
@@ -671,6 +891,7 @@ test("range block uids come from the dataset first and the block-input id suffix
 test("the raw range component's pre-paint rule is the only CSS selector without a .rg- class", async () => {
   const css = (await readFile(new URL("../extension.css", import.meta.url), "utf8")).replace(/\/\*[\s\S]*?\*\//g, "");
   assert.match(css, /\.rm-xparser-default-roam-grid-range:not\(\.rg-range-restored\)\s*\{\s*display: none !important;\s*\}/);
+  assert.match(css, /\.rg-range-host:not\(:focus-within\) > :not\(\.rg-root\)\s*\{\s*display: none !important;\s*\}/, "the raw-text host hide is rg-scoped and focus-within exempt");
 
   const selectors = [];
   for (const rule of css.matchAll(/([^{}]+)\{/g)) {

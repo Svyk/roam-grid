@@ -17,6 +17,14 @@
   display: none !important;
 }
 
+/* A range mounted from a raw-text host (Roam rendered no component button) hides the host's other
+   children instead of a button. The :focus-within exemption keeps the block editable: clicking
+   swaps in Roam's textarea and lifts the hide. The subject is extension-owned .rg-range-host, so
+   the one-exception sweep above is unaffected; view disposal removes the class. */
+.rg-range-host:not(:focus-within) > :not(.rg-root) {
+  display: none !important;
+}
+
 .rg-root {
   --rg-border: var(--bc-menu, #d3d8de);
   --rg-border-strong: var(--bc-main, #c5cbd3);

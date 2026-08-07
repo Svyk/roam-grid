@@ -129,7 +129,27 @@ Cell content, the theme bridge, and the `grid-template-*` track math are the
 shared helpers, so a repeat render writes nothing. Mounting mirrors the native
 trio (`rangeButtonsWithin` / `rangeInstanceInfo` / `mountRangeInstance`) inside
 the same added-node-scoped, synchronous scan; specs are cached per block uid and
-invalidated when Roam replaces the button node.
+invalidated when Roam replaces the button node. An empty Datascript read is
+transient — the block is still mounting — so it is never cached and the next
+scan retries; only a definitive non-empty non-spec caches a null. The block host
+is located by `roamBlockInputFor`, which accepts the current BEM
+`rm-block__input` class, the legacy single-dash class, or the `block-input-` id
+prefix, so a Roam class rename cannot orphan the pipeline.
+
+The range loop is factored into `claimRangeMounts` and every element is
+processed in its own try/catch: one throw restores that button visible
+(`rg-range-restored`), records `window.__RG_U3_LAST_ERROR`, and lets the rest of
+the loop run — a single failure can no longer leave every later pre-hidden
+button invisible. Every degrade and success point also calls `traceRange`, a
+32-entry ring buffer at `window.__rgDiag.rangeTrace` (plus `rangeLast`), so a
+silent invisibility can be reconstructed after the fact; the console line
+appears only with `localStorage["roam-grid:debug"]` set. Blocks where Roam
+renders no component button at all are found by `rangeTextHostsWithin` — a
+textContent prefilter only, always verified by the Datascript read — and mount
+with the host given `rg-range-host`, whose CSS hides the host's other children
+until `:focus-within` lifts the hide for editing; view disposal removes the
+class. A host containing any range button is owned by the button path and never
+text-claimed.
 
 The pre-paint rule
 `.rm-xparser-default-roam-grid-range:not(.rg-range-restored)` is the single
