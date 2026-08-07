@@ -71,6 +71,9 @@ const DEFAULT_RANGE_RENDERED_CELLS = 2000;
 const DEFAULT_LARGE_CACHE_MB = 256;
 const COMMENT_TRIGGER_HOVER = "Hover";
 const COMMENT_TRIGGER_MODIFIER = "Cmd/Ctrl + hover";
+const COMMENT_COMPOSE_IN_PLACE = "In place";
+const COMMENT_COMPOSE_BOX = "Comment box";
+const COMMENT_COMPOSE_SIDEBAR = "Right sidebar";
 const NOTIFY_ALL = "All";
 const NOTIFY_WARNINGS = "Warnings and errors";
 const NOTIFY_ERRORS = "Errors only";
@@ -95,10 +98,12 @@ const CHUNK_CACHE_BODIES = "bodies";
 const CHUNK_CACHE_META = "meta";
 const CHUNK_CACHE_OPEN_MS = 3000;
 const DEVICE_SETTINGS_PREFIX = "roam-grid:settings:";
-const SETTINGS_VERSION = 1;
+const SETTINGS_VERSION = 2;
 const SETTINGS_VERSION_KEY = "settingsVersion";
 const LEGACY_BUDGET_KEY = "nativeMutationBudget";
 const NATIVE_BUDGET_KEY = "writes-native-budget";
+const LEGACY_SIDEBAR_COMMENTS_KEY = "comments-open-in-sidebar";
+const COMMENT_COMPOSE_MODE_KEY = "comments-compose-mode";
 
 /**
  * Flat settings schema. Roam's panel supports switch/input/select/button rows only, so grouping is
@@ -149,7 +154,7 @@ const SETTING_DESCRIPTORS = [
   { key: "comments-enabled", group: "Comments", name: "Enable cell comments", description: "Read and write native Roam comment threads from grid cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => { view.updateReferenceCountBadges(); view.syncCommentAffordance?.(); } },
   { key: "comments-affordance-trigger", group: "Comments", name: "Show the comment button", description: "Whether the 💬 button appears as soon as the pointer enters a cell, or only while Cmd/Ctrl is held — Roam's own gesture for a block. Hover is the default because a grid cell is a much denser, more deliberate target than a block.", control: "select", type: "enum", default: COMMENT_TRIGGER_HOVER, items: [COMMENT_TRIGGER_HOVER, COMMENT_TRIGGER_MODIFIER], scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.syncCommentAffordance?.() },
   { key: "comments-badges", group: "Comments", name: "Show comment badges", description: "Mark cells that carry a comment thread.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges() },
-  { key: "comments-open-in-sidebar", group: "Comments", name: "Open comment threads in the right sidebar", description: "Open a cell's comment thread in the right sidebar instead of inline.", control: "switch", type: "bool", default: false, scope: "device", apply: "immediate", stage: "live" },
+  { key: COMMENT_COMPOSE_MODE_KEY, group: "Comments", name: "Composing and opening threads", description: "Where a new comment is written and where a cell's thread opens. “In place” opens the inline Comments panel with the cursor in an empty comment, ready to type. “Comment box” asks in a dialog first — the pre-0.12 behaviour. “Right sidebar” sends the thread to the right sidebar and starts the comment there, the way Roam's own comment button works.", control: "select", type: "enum", default: COMMENT_COMPOSE_IN_PLACE, items: [COMMENT_COMPOSE_IN_PLACE, COMMENT_COMPOSE_BOX, COMMENT_COMPOSE_SIDEBAR], scope: "device", apply: "immediate", stage: "live" },
   { key: "ranges-live-references", group: "Ranges", name: "Render live range references", description: "Render {{roam-grid-range: …}} components as a live view of the source cells. With this off the component stays as its raw text; views already on screen keep rendering until Roam next redraws their block.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
   { key: "ranges-max-rendered-cells", group: "Ranges", name: "Maximum cells in a rendered range", description: "How many cells a rendered range may paint. A larger range renders whole rows up to this many cells and says so in its caption.", control: "input", type: "int", default: DEFAULT_RANGE_RENDERED_CELLS, min: 1, max: 50000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "large-cache-enabled", group: "Large grids", name: "Cache large-grid chunks on this device", description: "Keep downloaded chunks in IndexedDB so reopening a large grid is instant. Takes effect the next time Roam Grid loads.", control: "switch", type: "bool", default: true, scope: "device", apply: "next-op", stage: "live" },
@@ -311,8 +316,25 @@ export function planSettingsMigration(storedVersion, storedValues = {}) {
   const values = storedValues || {};
   const writes = [];
   if (values[LEGACY_BUDGET_KEY] != null && values[NATIVE_BUDGET_KEY] == null) writes.push([NATIVE_BUDGET_KEY, coerceSetting(SETTINGS[NATIVE_BUDGET_KEY], values[LEGACY_BUDGET_KEY])]);
+  if (values[LEGACY_SIDEBAR_COMMENTS_KEY] === true && values[COMMENT_COMPOSE_MODE_KEY] == null) writes.push([COMMENT_COMPOSE_MODE_KEY, COMMENT_COMPOSE_SIDEBAR]);
   writes.push([SETTINGS_VERSION_KEY, SETTINGS_VERSION]);
   return { from, to: SETTINGS_VERSION, writes };
+}
+
+/**
+ * Device-shadow counterpart to `planSettingsMigration`: the legacy sidebar switch was
+ * device-scoped, so its value usually lives in the localStorage shadow rather than the graph.
+ * Pure — the caller persists the returned values (`writeDeviceSettings` also drops any key the
+ * current schema no longer declares).
+ */
+export function planDeviceSettingsMigration(deviceValues = {}) {
+  const values = deviceValues && typeof deviceValues === "object" && !Array.isArray(deviceValues) ? deviceValues : {};
+  if (!Object.hasOwn(values, LEGACY_SIDEBAR_COMMENTS_KEY)) return { changed: false, values };
+  const next = { ...values };
+  const legacy = next[LEGACY_SIDEBAR_COMMENTS_KEY];
+  delete next[LEGACY_SIDEBAR_COMMENTS_KEY];
+  if (legacy === true && next[COMMENT_COMPOSE_MODE_KEY] == null) next[COMMENT_COMPOSE_MODE_KEY] = COMMENT_COMPOSE_SIDEBAR;
+  return { changed: true, values: next };
 }
 
 /** Device-scoped keys read device-first; the graph-synced value is only ever a seed. */
@@ -3627,20 +3649,45 @@ export class NativeGridSession {
     return next;
   }
 
-  async addCellComment(targetUid, body) {
+  async writeCommentThread(targetUid, body) {
     const api = roam();
     const pageUid = blockPageUid(targetUid, api);
     if (!pageUid) throw new GridError("COMMENT_PAGE_UNKNOWN", "Could not resolve the page that holds this cell");
     const dateTitle = api.util?.dateToPageTitle?.(new Date());
     const plan = commentThreadPlan(getTree(pageUid), { pageUid, targetUid, dateTitle, authorTitle: commentAuthorTitle(api) });
     const applied = await applyCommentThreadPlan(plan, { body });
-    mergeCommentThread(this.commentThreads, String(targetUid), applied.anchorUid);
-    for (const view of this.views) {
-      view.commentThreads = this.commentThreads;
-      // RangeGridView deliberately omits updateCommentBadges — this `?.` is what lets a range excerpt skip comment chrome. Keep it.
-      view.updateCommentBadges?.([String(targetUid)]);
+    // An empty body writes no comment block (`applyCommentThreadPlan` skips it), so merging the
+    // anchor optimistically would invent a badge the next datalog refresh has to retract.
+    if (applied.commentUid) {
+      mergeCommentThread(this.commentThreads, String(targetUid), applied.anchorUid);
+      for (const view of this.views) {
+        view.commentThreads = this.commentThreads;
+        // RangeGridView deliberately omits updateCommentBadges — this `?.` is what lets a range excerpt skip comment chrome. Keep it.
+        view.updateCommentBadges?.([String(targetUid)]);
+      }
     }
     return applied;
+  }
+
+  async addCellComment(targetUid, body) {
+    return this.writeCommentThread(targetUid, body);
+  }
+
+  /** Creates the container → date → author → anchor chain with no body; a composer fills it in. */
+  async ensureCommentThread(targetUid) {
+    return this.writeCommentThread(targetUid, "");
+  }
+
+  /** Sidebar compose needs the thread on the page before Roam can focus a comment block in it. */
+  async beginSidebarComment(targetUid) {
+    const applied = await this.ensureCommentThread(targetUid);
+    const anchorUid = applied.anchorUid;
+    const children = getTree(anchorUid)?.children || [];
+    const last = children[children.length - 1];
+    const bodyUid = last && !String(last.string ?? "").trim()
+      ? String(last.uid)
+      : String(await createBlock(anchorUid, "", "last"));
+    return { ...applied, anchorUid, bodyUid };
   }
 
   replaceModel(model, { render = true } = {}) {
@@ -6406,6 +6453,79 @@ export function commentThreadCount(entries) {
   return (entries || []).reduce((total, entry) => total + Math.max(0, Number(entry?.count) || 0), 0);
 }
 
+/**
+ * Sidebar compose writes the empty comment body BEFORE the user has typed anything, so abandoning
+ * the gesture must unwind exactly the blocks that gesture created — never a level that pre-existed.
+ * Pure: the caller re-reads the live body string and anchor child count at fire time and passes
+ * them in, so a concurrent writer cannot lose blocks to a stale plan.  The returned list is
+ * ordered child → parent.
+ */
+export function commentComposeCleanupPlan({ bodyUid, bodyString, existed = null, anchorChildCount = 0, anchorUid = null, authorUid = null, dateUid = null, containerUid = null } = {}) {
+  const deletes = [];
+  if (!bodyUid || String(bodyString ?? "").trim()) return deletes;
+  deletes.push(bodyUid);
+  if (existed?.anchor !== false || !anchorUid || Number(anchorChildCount) > 1) return deletes;
+  deletes.push(anchorUid);
+  if (existed?.author !== false || !authorUid) return deletes;
+  deletes.push(authorUid);
+  if (existed?.date !== false || !dateUid) return deletes;
+  deletes.push(dateUid);
+  if (existed?.container !== false || !containerUid) return deletes;
+  deletes.push(containerUid);
+  return deletes;
+}
+
+/**
+ * Arms the abandon sweep for one sidebar compose gesture: ONE capture-phase document `focusin`
+ * listener (the first focus landing anywhere but the empty comment body ends the gesture) plus a
+ * 90 s tracked-timeout safety net.  First fire wins and disposes both.  The sweep re-reads
+ * `blockString(bodyUid)` and the anchor's live child count at fire time — the concurrent-writer
+ * guard — then deletes the plan's blocks and refreshes the thread index so a comment the user DID
+ * type in the sidebar reaches the badges.  The disposer is registered for onunload.
+ */
+export function armCommentAbandonCleanup({ session, targetUid, bodyUid, anchorUid, applied } = {}) {
+  if (!bodyUid || !anchorUid || !globalThis.document?.addEventListener) return null;
+  let fired = false;
+  let timer = null;
+  const onFocusIn = (event) => {
+    // Focus inside the body itself (`block-input-<window-id>-<uid>`) means the user is composing.
+    if (String(event?.target?.id || "").endsWith(`-${bodyUid}`)) return;
+    fire();
+  };
+  const disposer = () => {
+    globalThis.document?.removeEventListener?.("focusin", onFocusIn, true);
+    if (timer != null) { clearTimeout(timer); pendingTimers.delete(timer); timer = null; }
+  };
+  const fire = () => {
+    if (fired) return;
+    fired = true;
+    disposer();
+    void (async () => {
+      try {
+        const deletes = commentComposeCleanupPlan({
+          bodyUid,
+          bodyString: blockString(bodyUid),
+          existed: applied?.existed,
+          anchorChildCount: getTree(anchorUid)?.children?.length ?? 0,
+          anchorUid,
+          authorUid: applied?.authorUid,
+          dateUid: applied?.dateUid,
+          containerUid: applied?.containerUid,
+        });
+        for (const uid of deletes) await deleteBlock(uid);
+        session?.refreshCommentThreads?.();
+      } catch (error) {
+        if (globalThis.window) globalThis.window.__RG_U4_LAST_ERROR = String(error?.stack || error);
+        console.warn("[roam-grid] Comment abandon cleanup failed", targetUid, error);
+      }
+    })();
+  };
+  globalThis.document.addEventListener("focusin", onFocusIn, true);
+  timer = trackedTimeout(fire, 90000);
+  runtime.disposers.push(disposer);
+  return disposer;
+}
+
 function isMac() { return /Mac|iPhone|iPad/.test(globalThis.navigator?.platform || ""); }
 
 export function requiresRoamRichRender(raw) {
@@ -8627,10 +8747,10 @@ export class GridView {
   }
 
   /** Opens the cell's comment thread where 0.8.2 already puts references: the view-local inline panel.
-   *  `comments-open-in-sidebar` (default OFF) restores Roam's own right-sidebar behaviour. */
+   *  `comments-compose-mode` = "Right sidebar" restores Roam's own right-sidebar behaviour. */
   openCellComments(uid) {
     const threads = this.cellCommentThreads(uid);
-    if (getSetting("comments-open-in-sidebar") && threads.length) {
+    if (getSetting(COMMENT_COMPOSE_MODE_KEY) === COMMENT_COMPOSE_SIDEBAR && threads.length) {
       try {
         roam().ui?.rightSidebar?.addWindow?.({ window: { type: "block", "block-uid": threads[0].threadUid } });
         return true;
@@ -8762,10 +8882,118 @@ export class GridView {
     const merge = this.model.mergeAt(row, col);
     const uid = this.model.getCell(merge?.row ?? row, merge?.col ?? col)?.uid;
     if (!uid || String(uid).startsWith("rg_")) { toast(`Cell ${cellLabel(row, col)} does not have a persisted Roam UID yet`, "warning"); return null; }
-    const body = await showPrompt(`Comment on ${cellLabel(merge?.row ?? row, merge?.col ?? col)}`, "", this.root);
+    const mode = getSetting(COMMENT_COMPOSE_MODE_KEY);
+    if (mode === COMMENT_COMPOSE_BOX) return this.addCellCommentViaPrompt(uid, merge?.row ?? row, merge?.col ?? col);
+    if (mode === COMMENT_COMPOSE_SIDEBAR) return this.composeCellCommentSidebar(uid);
+    return this.composeCellCommentInline(uid, merge?.row ?? row, merge?.col ?? col);
+  }
+
+  /** The pre-0.12 compose path: ask in a dialog first, write once on OK. */
+  async addCellCommentViaPrompt(uid, row, col) {
+    const body = await showPrompt(`Comment on ${cellLabel(row, col)}`, "", this.root);
     if (body == null || !String(body).trim()) return null;
     try { return await this.session.addCellComment(uid, String(body).trim()); }
     catch (error) { toast(`Could not add the comment: ${error.message}`, "danger"); return null; }
+  }
+
+  /** Roam's own gesture: the thread opens in the right sidebar with the caret in an empty comment. */
+  async composeCellCommentSidebar(uid) {
+    let applied;
+    try { applied = await this.session.beginSidebarComment(uid); }
+    catch (error) {
+      if (globalThis.window) globalThis.window.__RG_U4_LAST_ERROR = String(error?.stack || error);
+      toast(`Could not start the comment: ${error.message}`, "danger");
+      return null;
+    }
+    const { anchorUid, bodyUid } = applied;
+    armCommentAbandonCleanup({ session: this.session, targetUid: uid, bodyUid, anchorUid, applied });
+    try {
+      roam().ui?.rightSidebar?.addWindow?.({ window: { type: "block", "block-uid": anchorUid } });
+    } catch (error) {
+      if (globalThis.window) globalThis.window.__RG_U4_LAST_ERROR = String(error?.stack || error);
+      toast(`Could not open the comment thread: ${error.message}`, "danger");
+      return null;
+    }
+    this.focusSidebarCommentBody(anchorUid, bodyUid);
+    return applied;
+  }
+
+  /**
+   * The sidebar mounts asynchronously, so the focus is retried a few times before giving up with a
+   * toast.  The window-id is deterministic (`sidebar-block-<anchorUid>`) — verified live — but it is
+   * still checked against `getWindows()` and scanned from that listing when the direct id misses.
+   */
+  focusSidebarCommentBody(anchorUid, bodyUid, attemptsLeft = 3) {
+    if (this.disposed) return;
+    try {
+      const sidebar = roam().ui?.rightSidebar;
+      const deterministic = `sidebar-block-${anchorUid}`;
+      let windowId = deterministic;
+      const windows = sidebar?.getWindows?.() || [];
+      const match = windows.find((win) => win?.["window-id"] === deterministic) || windows.find((win) => win?.["block-uid"] === anchorUid);
+      if (match?.["window-id"]) windowId = match["window-id"];
+      roam().ui?.setBlockFocusAndSelection?.({ location: { "block-uid": bodyUid, "window-id": windowId } });
+    } catch (error) {
+      if (globalThis.window) globalThis.window.__RG_U4_LAST_ERROR = String(error?.stack || error);
+    }
+    if (String(globalThis.document?.activeElement?.id || "").endsWith(`-${bodyUid}`)) return;
+    if (attemptsLeft > 1) trackedTimeout(() => this.focusSidebarCommentBody(anchorUid, bodyUid, attemptsLeft - 1), 150);
+    else toast("Comment thread opened in the sidebar — click the empty comment to type.");
+  }
+
+  /** Default compose: the inline comments panel opens with an ephemeral composer already focused. */
+  async composeCellCommentInline(uid, row, col) {
+    // `openCellReferences` TOGGLES a same-uid comments panel closed — never call it blind here.
+    const alreadyOpen = this.inlineReferencesUid === uid && this.inlineReferencesMode === "comments" && this.inlineReferencesPanel;
+    if (!alreadyOpen && !this.openCellReferences(uid, { mode: "comments" })) return this.addCellCommentViaPrompt(uid, row, col);
+    return this.appendInlineCommentComposer(uid);
+  }
+
+  /**
+   * The composer writes NOTHING until Enter — no abandoned-block lifecycle exists in this mode.
+   * Registered in the panel's disposer list, so closing the panel takes the composer with it.
+   */
+  appendInlineCommentComposer(uid) {
+    const panel = this.inlineReferencesPanel;
+    if (!panel || this.inlineReferencesUid !== uid || this.inlineReferencesMode !== "comments") return null;
+    panel.querySelector?.(".rg-inline-comment-composer")?.remove?.();
+    const composer = document.createElement("div");
+    composer.className = "rg-inline-comment-composer";
+    const textarea = document.createElement("textarea");
+    textarea.className = "rg-inline-comment-input";
+    textarea.placeholder = "Write a comment…  Enter saves · Shift+Enter newline · Esc closes";
+    textarea.setAttribute("aria-label", "Write a comment on this cell");
+    composer.appendChild(textarea);
+    panel.appendChild(composer);
+    this.inlineReferenceDisposers.add(() => composer.remove());
+    const commit = async () => {
+      const text = String(textarea.value ?? "").trim();
+      if (!text) return;
+      // A cell with no prior thread showed "No comments found." — the panel must be rebuilt to
+      // render the new thread, so it is closed and reopened after the write lands.
+      const reopen = !this.cellCommentThreads(uid).length;
+      try { await this.session.addCellComment(uid, text); }
+      catch (error) {
+        if (globalThis.window) globalThis.window.__RG_U4_LAST_ERROR = String(error?.stack || error);
+        toast(`Could not add the comment: ${error.message}`, "danger");
+        return;
+      }
+      if (reopen) {
+        this.closeInlineReferences();
+        if (this.openCellReferences(uid, { mode: "comments" })) this.appendInlineCommentComposer(uid);
+        return;
+      }
+      if (composer.parentNode === panel) {
+        textarea.value = "";
+        textarea.focus();
+      }
+    };
+    textarea.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); event.stopPropagation(); void commit(); }
+      else if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); composer.remove(); }
+    });
+    textarea.focus();
+    return composer;
   }
 
   select(range) {
@@ -10719,6 +10947,10 @@ export async function initializeSettings(extensionAPI, { storage = globalThis.lo
       stored[descriptor.key] = descriptor.default;
     }
   }
+  // The legacy sidebar switch was device-scoped, so its value lives in the localStorage shadow:
+  // migrate the shadow before the cache reads it. Storage-only — works when the graph forbids writes.
+  const deviceMigration = planDeviceSettingsMigration(readDeviceSettings(storage));
+  if (deviceMigration.changed) writeDeviceSettings(deviceMigration.values, storage);
   refreshSettingsCache(extensionAPI, storage);
   // Roam renders each row's value once, so anything that rewrites values behind the panel's back
   // has to hand it a fresh config rather than mutating the live rows.

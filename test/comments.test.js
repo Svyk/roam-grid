@@ -7,9 +7,11 @@ import {
   SETTINGS,
   applyCommentThreadPlan,
   applySettingsChange,
+  armCommentAbandonCleanup,
   clearUndoHistories,
   commentAnchorString,
   commentArmingState,
+  commentComposeCleanupPlan,
   commentHoverAlways,
   commentThreadCount,
   commentThreadPlan,
@@ -73,7 +75,7 @@ class MiniNode {
     }
     return event;
   }
-  focus() {}
+  focus() { if (globalThis.document) globalThis.document.activeElement = this; }
   scrollIntoView() {}
   getBoundingClientRect() { return { left: 0, right: 100, top: 0, bottom: 30, width: 100, height: 30 }; }
 }
@@ -109,6 +111,11 @@ function installMiniDom() {
     fireWindow(type, fields = {}) {
       const event = { type, key: "", ...fields };
       for (const listener of [...(windowListeners.get(type) || [])]) listener(event);
+      return event;
+    },
+    fireDocument(type, fields = {}) {
+      const event = { type, key: "", ...fields };
+      for (const listener of [...(documentListeners.get(type) || [])]) listener(event);
       return event;
     },
   };
@@ -705,4 +712,324 @@ test("turning cell comments off removes the hover affordance, and turning them b
     applySettingsChange(SETTINGS["comments-enabled"], true);
     assert.equal(root.listenerCount("pointerover"), 1);
   } finally { gridViews.delete(view); settingsCache.delete("comments-enabled"); view.setCommentArmed(false); useTrigger("Hover"); }
+});
+
+/** A roamAlphaAPI fake rich enough for the comment WRITE path: tree pulls, page/author lookups,
+ *  block create/update/delete recording. The tree is the fixture — queries resolve against it. */
+function commentWriteApi({ tree = null, threadRows = [] } = {}) {
+  const created = []; const updated = []; const deleted = [];
+  let uidCounter = 0;
+  const findIn = (node, uid) => {
+    if (!node) return null;
+    if (node.uid === uid) return node;
+    for (const child of node.children || []) { const found = findIn(child, uid); if (found) return found; }
+    return null;
+  };
+  const api = {
+    util: { dateToPageTitle: () => DATE_TITLE, generateUID: () => `new${String(++uidCounter)}00000`.slice(0, 9) },
+    user: { uid: () => "user0001" },
+    data: { pull: () => ({ ":block/string": "" }) },
+    q: (query, ...args) => {
+      if (query.includes("(pull ?block")) return [[findIn(tree, String(args[0]))]];
+      if (query.includes("[?block :block/page ?page]")) return [[PAGE_UID]];
+      if (query.includes(":user/uid")) return [[AUTHOR_TITLE]];
+      if (query.includes("[?page :node/title ?title]")) return [[":comments-entity"]];
+      return threadRows;
+    },
+    createBlock: async ({ location, block }) => { created.push({ parentUid: location["parent-uid"], order: location.order, uid: block.uid, string: block.string }); return block.uid; },
+    updateBlock: async ({ block }) => { updated.push(block); },
+    deleteBlock: async ({ block }) => { deleted.push(block.uid); },
+  };
+  return { api, created, updated, deleted, findIn };
+}
+
+test("applying a plan with an empty body creates no comment block and reports commentUid null", async () => {
+  const creates = [];
+  const plan = commentThreadPlan({ uid: PAGE_UID, children: [] }, planOptions());
+  const applied = await applyCommentThreadPlan(plan, {
+    body: "",
+    create: async (parentUid, string, order, uid) => { creates.push({ parentUid, string, order, uid }); return uid; },
+    update: async () => {},
+  });
+  assert.equal(creates.length, 4, "only the thread levels are created");
+  assert.ok(creates.every((call) => call.string !== ""), "no empty body block may be written");
+  assert.equal(applied.commentUid, null, "an empty body means no comment uid");
+  assert.equal(applied.anchorUid, "gen4", "the anchor still resolves for the composer to write into");
+});
+
+test("an empty-body thread write does not optimistically merge or repaint badges", async (t) => {
+  installMiniDom();
+  t.after(() => { delete globalThis.window.roamAlphaAPI; });
+  const { session } = commentSession({});
+  const write = commentWriteApi({ tree: fullTree() });
+  globalThis.window.roamAlphaAPI = write.api;
+  let repaints = 0;
+  session.addView({ root: new MiniNode("section"), updateCommentBadges: () => { repaints += 1; }, updateReferenceCountBadges: () => {} });
+
+  const applied = await session.writeCommentThread(TARGET_UID, "");
+  assert.equal(applied.commentUid, null);
+  assert.equal(write.created.length, 0, "the thread already existed and an empty body writes nothing");
+  assert.equal(session.commentThreads.has(TARGET_UID), false, "merging would invent a badge the refresh must retract");
+  assert.equal(repaints, 0);
+
+  // Positive control: a real body merges and repaints exactly like before the refactor.
+  const written = await session.writeCommentThread(TARGET_UID, "Ship it");
+  assert.ok(written.commentUid, "control: a non-empty body gets a comment uid");
+  assert.equal(write.created.length, 1);
+  assert.deepEqual(session.commentThreads.get(TARGET_UID), [{ threadUid: "anch0001", count: 1 }]);
+  assert.equal(repaints, 1, "control: the real write repaints");
+  session.dispose();
+});
+
+function composeView(mode, { session = {} } = {}) {
+  installMiniDom();
+  const built = badgeView({ referenceCounts: [], commentThreads: [] });
+  Object.assign(built.view, {
+    surface: "document",
+    disposed: false,
+    session,
+    inlineReferenceDisposers: new Set(),
+  });
+  settingsCache.set("comments-enabled", true);
+  settingsCache.set("comments-compose-mode", mode);
+  return built;
+}
+
+test("the compose dispatcher routes each mode to its composer and defaults to inline", async (t) => {
+  t.after(() => settingsCache.clear());
+  for (const [mode, expected] of [["In place", "inline"], ["Comment box", "prompt"], ["Right sidebar", "sidebar"], ["Garbage", "inline"]]) {
+    const { view } = composeView(mode);
+    const calls = [];
+    view.composeCellCommentInline = async (uid) => { calls.push(["inline", uid]); return "inline"; };
+    view.addCellCommentViaPrompt = async (uid) => { calls.push(["prompt", uid]); return "prompt"; };
+    view.composeCellCommentSidebar = async (uid) => { calls.push(["sidebar", uid]); return "sidebar"; };
+    const result = await view.addCellComment(0, 0);
+    assert.deepEqual(calls, [[expected, TARGET_UID]], `${mode} must route to ${expected}`);
+    assert.equal(result, expected);
+  }
+});
+
+test("the inline composer appends focused, commits trimmed text on Enter, and stays for a follow-up", async (t) => {
+  t.after(() => { settingsCache.clear(); delete globalThis.window.roamAlphaAPI; });
+  const written = [];
+  const session = { addCellComment: async (uid, text) => { written.push([uid, text]); return { commentUid: "c1", anchorUid: "anch0001" }; } };
+  const { view } = composeView("In place", { session });
+  view.commentThreads = new Map([[TARGET_UID, [{ threadUid: "thr00001", count: 1 }]]]);
+  globalThis.window.roamAlphaAPI = { q: () => [] };
+
+  await view.composeCellCommentInline(TARGET_UID, 0, 0);
+  const panel = view.inlineReferencesPanel;
+  assert.ok(panel, "the comments panel opened");
+  const composer = panel.querySelector(".rg-inline-comment-composer");
+  assert.ok(composer, "the composer is appended into the panel");
+  const textarea = composer.querySelector(".rg-inline-comment-input");
+  assert.ok(textarea);
+  assert.equal(textarea.placeholder, "Write a comment…  Enter saves · Shift+Enter newline · Esc closes");
+  assert.equal(globalThis.document.activeElement, textarea, "the composer takes focus immediately");
+
+  textarea.value = "  Ship it  ";
+  textarea.dispatch("keydown", { key: "Enter" });
+  await new Promise(setImmediate);
+  assert.deepEqual(written, [[TARGET_UID, "Ship it"]], "Enter commits the trimmed text through the session");
+  assert.equal(textarea.value, "", "the composer clears after a commit");
+  assert.equal(globalThis.document.activeElement, textarea, "focus stays for a follow-up comment");
+  assert.equal(view.inlineReferencesPanel, panel, "a cell that already had a thread keeps its panel");
+
+  textarea.value = "   ";
+  textarea.dispatch("keydown", { key: "Enter" });
+  await new Promise(setImmediate);
+  assert.equal(written.length, 1, "an empty Enter is a no-op");
+});
+
+test("the inline composer writes nothing until Enter: Escape removes only the composer", async (t) => {
+  t.after(() => { settingsCache.clear(); delete globalThis.window.roamAlphaAPI; });
+  const written = [];
+  const { view } = composeView("In place", { session: { addCellComment: async (uid, text) => { written.push(text); } } });
+  globalThis.window.roamAlphaAPI = { q: () => [] };
+  await view.composeCellCommentInline(TARGET_UID, 0, 0);
+  const panel = view.inlineReferencesPanel;
+  const composer = panel.querySelector(".rg-inline-comment-composer");
+  const textarea = composer.querySelector(".rg-inline-comment-input");
+
+  textarea.value = "half a thought";
+  textarea.dispatch("keydown", { key: "Escape" });
+  assert.equal(written.length, 0, "Escape never writes");
+  assert.equal(panel.querySelector(".rg-inline-comment-composer"), null, "the composer is gone");
+  assert.equal(view.inlineReferencesPanel, panel, "the panel itself stays open");
+});
+
+test("composing inline does not toggle an already-open panel closed", async (t) => {
+  t.after(() => { settingsCache.clear(); delete globalThis.window.roamAlphaAPI; });
+  const { view } = composeView("In place", { session: {} });
+  globalThis.window.roamAlphaAPI = { q: () => [] };
+  await view.composeCellCommentInline(TARGET_UID, 0, 0);
+  const panel = view.inlineReferencesPanel;
+  await view.composeCellCommentInline(TARGET_UID, 0, 0);
+  assert.equal(view.inlineReferencesPanel, panel, "the open panel is reused, not toggled");
+  assert.equal(panel.querySelectorAll(".rg-inline-comment-composer").length, 1, "exactly one composer lives in the panel");
+});
+
+test("the inline composer falls back to the prompt box when the panel cannot open", async (t) => {
+  t.after(() => settingsCache.clear());
+  const { view } = composeView("In place", { session: {} });
+  const calls = [];
+  view.openCellReferences = () => false;
+  view.addCellCommentViaPrompt = async (uid, row, col) => { calls.push([uid, row, col]); return "prompt"; };
+  const result = await view.composeCellCommentInline(TARGET_UID, 0, 0);
+  assert.deepEqual(calls, [[TARGET_UID, 0, 0]]);
+  assert.equal(result, "prompt");
+});
+
+test("a first comment on a cell rebuilds the panel and re-appends a focused composer", async (t) => {
+  t.after(() => { settingsCache.clear(); delete globalThis.window.roamAlphaAPI; });
+  const written = [];
+  const session = { addCellComment: async (uid, text) => { written.push(text); return { commentUid: "c1", anchorUid: "anch0001" }; } };
+  const { view } = composeView("In place", { session });
+  globalThis.window.roamAlphaAPI = { q: () => [] };
+
+  await view.composeCellCommentInline(TARGET_UID, 0, 0);
+  const firstPanel = view.inlineReferencesPanel;
+  assert.ok(firstPanel.querySelector(".rg-inline-references-empty"), "control: no prior thread shows the empty state");
+  const firstComposer = firstPanel.querySelector(".rg-inline-comment-composer");
+  const textarea = firstComposer.querySelector(".rg-inline-comment-input");
+  textarea.value = "First!";
+  textarea.dispatch("keydown", { key: "Enter" });
+  await new Promise(setImmediate);
+
+  assert.deepEqual(written, ["First!"]);
+  const panel = view.inlineReferencesPanel;
+  assert.ok(panel && panel !== firstPanel, "the stale empty-state panel is replaced");
+  assert.equal(firstPanel.parentNode, null, "the old panel is detached");
+  const composer = panel.querySelector(".rg-inline-comment-composer");
+  assert.ok(composer, "a fresh composer is appended to the rebuilt panel");
+  assert.equal(globalThis.document.activeElement, composer.querySelector(".rg-inline-comment-input"), "and it is focused");
+});
+
+test("the badge click still toggles the panel closed with a composer attached", async (t) => {
+  t.after(() => { settingsCache.clear(); delete globalThis.window.roamAlphaAPI; });
+  const { view, cell } = composeView("In place", { session: {} });
+  view.commentThreads = new Map([[TARGET_UID, [{ threadUid: "thr00001", count: 2 }]]]);
+  globalThis.window.roamAlphaAPI = { q: () => [] };
+  view.updateReferenceCountBadges([TARGET_UID]);
+  const badge = cell.querySelector(".rg-cell-comment-count");
+  assert.ok(badge, "control: the comment badge exists");
+
+  await view.composeCellCommentInline(TARGET_UID, 0, 0);
+  const composer = view.inlineReferencesPanel.querySelector(".rg-inline-comment-composer");
+  badge.dispatch("click");
+  assert.equal(view.inlineReferencesPanel, null, "the toggle closes the panel");
+  assert.equal(composer.parentNode, null, "the panel's disposer list takes the composer with it");
+});
+
+test("openCellComments sends an existing thread to the sidebar only in sidebar mode", (t) => {
+  t.after(() => { settingsCache.clear(); delete globalThis.window.roamAlphaAPI; });
+  const { view } = composeView("In place", { session: {} });
+  view.commentThreads = new Map([[TARGET_UID, [{ threadUid: "thr00001", count: 1 }]]]);
+  const opened = [];
+  globalThis.window.roamAlphaAPI = { q: () => [], ui: { rightSidebar: { addWindow: (spec) => opened.push(spec) } } };
+
+  settingsCache.set("comments-compose-mode", "Right sidebar");
+  assert.equal(view.openCellComments(TARGET_UID), true);
+  assert.deepEqual(opened, [{ window: { type: "block", "block-uid": "thr00001" } }]);
+  assert.equal(view.inlineReferencesPanel, null, "sidebar mode never opens the inline panel");
+
+  settingsCache.set("comments-compose-mode", "In place");
+  assert.equal(view.openCellComments(TARGET_UID), true);
+  assert.equal(opened.length, 1, "inline mode leaves the sidebar alone");
+  assert.ok(view.inlineReferencesPanel, "inline mode opens the panel");
+});
+
+test("beginSidebarComment reuses a trailing empty body block instead of creating one", async (t) => {
+  installMiniDom();
+  t.after(() => { delete globalThis.window.roamAlphaAPI; });
+  const { session } = commentSession({});
+  const tree = fullTree({ comments: ["first"] });
+  tree.children[1].children[0].children[0].children[0].children.push({ uid: "body0001", string: "", order: 1, children: [] });
+  const write = commentWriteApi({ tree });
+  globalThis.window.roamAlphaAPI = write.api;
+
+  const result = await session.beginSidebarComment(TARGET_UID);
+  assert.equal(result.anchorUid, "anch0001");
+  assert.equal(result.bodyUid, "body0001", "the trailing empty child becomes the comment body");
+  assert.equal(write.created.length, 0, "reusing creates nothing");
+  assert.deepEqual(result.existed, { container: true, date: true, author: true, anchor: true });
+  session.dispose();
+});
+
+test("beginSidebarComment creates the empty body when the anchor's last child has text", async (t) => {
+  installMiniDom();
+  t.after(() => { delete globalThis.window.roamAlphaAPI; });
+  const { session } = commentSession({});
+  const write = commentWriteApi({ tree: fullTree({ comments: ["first"] }) });
+  globalThis.window.roamAlphaAPI = write.api;
+
+  const result = await session.beginSidebarComment(TARGET_UID);
+  assert.equal(write.created.length, 1);
+  assert.equal(write.created[0].parentUid, "anch0001");
+  assert.equal(write.created[0].string, "");
+  assert.equal(write.created[0].order, "last");
+  assert.equal(result.bodyUid, write.created[0].uid);
+  session.dispose();
+});
+
+test("commentComposeCleanupPlan unwinds child→parent only what the gesture created", () => {
+  const allNew = { container: false, date: false, author: false, anchor: false };
+  const uids = { bodyUid: "b", anchorUid: "a", authorUid: "au", dateUid: "d", containerUid: "c" };
+  assert.deepEqual(
+    commentComposeCleanupPlan({ ...uids, bodyString: "", existed: allNew, anchorChildCount: 1 }),
+    ["b", "a", "au", "d", "c"],
+    "all-created + empty body unwinds the whole chain, child first",
+  );
+  assert.deepEqual(
+    commentComposeCleanupPlan({ ...uids, bodyString: "", existed: { container: true, date: true, author: true, anchor: true }, anchorChildCount: 1 }),
+    ["b"],
+    "a pre-existing anchor stops the unwind at the body",
+  );
+  assert.deepEqual(
+    commentComposeCleanupPlan({ ...uids, bodyString: "typed", existed: allNew, anchorChildCount: 1 }),
+    [],
+    "a non-empty body keeps everything",
+  );
+  assert.deepEqual(
+    commentComposeCleanupPlan({ ...uids, bodyString: "", existed: allNew, anchorChildCount: 2 }),
+    ["b"],
+    "an anchor that gained a sibling keeps its level and everything above it",
+  );
+  assert.deepEqual(
+    commentComposeCleanupPlan({ ...uids, bodyString: "", existed: { container: true, date: true, author: true, anchor: false }, anchorChildCount: 1 }),
+    ["b", "a"],
+    "only the gesture-created levels unwind",
+  );
+  assert.deepEqual(
+    commentComposeCleanupPlan({ bodyUid: "b", bodyString: "", existed: null, anchorChildCount: 0 }),
+    ["b"],
+    "unknown provenance unwinds the body only",
+  );
+});
+
+test("the abandon sweep ignores focus in the body and unwinds an untouched gesture exactly once", async (t) => {
+  const dom = installMiniDom();
+  t.after(() => { delete globalThis.window.roamAlphaAPI; });
+  const tree = fullTree({});
+  tree.children[1].children[0].children[0].children[0].children.push({ uid: "body0001", string: "", order: 0, children: [] });
+  const write = commentWriteApi({ tree });
+  globalThis.window.roamAlphaAPI = write.api;
+  let refreshed = 0;
+  const session = { refreshCommentThreads: () => { refreshed += 1; } };
+  const applied = { existed: { container: false, date: false, author: false, anchor: false }, anchorUid: "anch0001", authorUid: "auth0001", dateUid: "date0001", containerUid: "cont0001" };
+
+  armCommentAbandonCleanup({ session, targetUid: TARGET_UID, bodyUid: "body0001", anchorUid: "anch0001", applied });
+  dom.fireDocument("focusin", { target: { id: "block-input-sidebar-block-anch0001-body0001" } });
+  await new Promise(setImmediate);
+  assert.equal(write.deleted.length, 0, "focus inside the comment body is composing, not abandoning");
+
+  dom.fireDocument("focusin", { target: { id: "block-input-body-other000" } });
+  await new Promise(setImmediate);
+  assert.deepEqual(write.deleted, ["body0001", "anch0001", "auth0001", "date0001", "cont0001"], "child→parent unwind of exactly the gesture's blocks");
+  assert.equal(refreshed, 1, "the thread index refreshes after the sweep");
+
+  dom.fireDocument("focusin", { target: { id: "block-input-body-third000" } });
+  await new Promise(setImmediate);
+  assert.equal(write.deleted.length, 5, "first fire wins — the sweep is disarmed");
+  assert.equal(dom.documentListenerCountFor("focusin"), 0, "the listener is gone after firing");
 });

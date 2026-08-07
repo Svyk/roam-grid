@@ -444,6 +444,33 @@ write affordance on a read-only surface is the defect GOAL-R1 closed.
 Comment writes land on the page rather than the table subtree, so the table's
 pull watch never sees them. The new anchor uid is merged optimistically into
 `session.commentThreads`, and the later datalog refresh diffs to an empty set.
+The merge is gated on a comment block actually being written: an empty-body
+thread write (`ensureCommentThread`) creates the chain but merges nothing,
+because a merged anchor with no comment would invent a badge the refresh then
+has to retract.
+
+`comments-compose-mode` (device scope, default **In place**) routes
+`GridView.addCellComment` to one of three composers, and `openCellComments`
+reads the same value to decide where an existing thread opens. **Comment box**
+is the pre-0.12 prompt dialog, extracted unchanged. **In place** opens the
+inline comments panel and appends an ephemeral composer textarea into it,
+registered in the panel's disposer list so closing the panel takes the composer
+with it; the composer writes nothing until Enter, so the default mode has no
+abandoned-block lifecycle at all. **Right sidebar** is the only mode that
+creates an empty comment block before the user types: `beginSidebarComment`
+ensures the thread, then reuses the anchor's trailing empty child or creates
+one, opens `sidebar-block-<anchorUid>` (a deterministic window-id, verified
+against `getWindows()`), and focuses the body with `setBlockFocusAndSelection`,
+retried against the sidebar's async mount. Because the empty body exists before
+any typing, the gesture arms `armCommentAbandonCleanup`: one capture-phase
+`focusin` listener (focus landing anywhere but the body ends the gesture) plus
+a 90 s tracked-timeout safety net, first fire wins. The sweep re-reads the body
+string and the anchor's live child count at fire time — a concurrent writer
+must never lose blocks to a stale plan — and `commentComposeCleanupPlan`
+unwinds child→parent only the levels the gesture itself created. The legacy
+`comments-open-in-sidebar` switch is migrated onto the enum by
+`planSettingsMigration` (graph) and `planDeviceSettingsMigration` (the
+localStorage shadow, where a device-scoped value actually lives).
 
 `LargeGridView` intentionally implements neither `syncCommentAffordance` nor
 `setCommentArmed`: large-grid

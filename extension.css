@@ -616,6 +616,35 @@ body.roam-body.dark .rg-portal {
   font-size: 12px;
 }
 
+.rg-inline-comment-composer {
+  padding: 8px 10px 10px;
+  background: var(--rg-bg);
+  border-top: 1px solid var(--rg-border);
+}
+
+.rg-inline-comment-input {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 30px;
+  max-height: 120px;
+  padding: 5px 8px;
+  overflow-y: auto;
+  color: var(--rg-color, inherit);
+  background: color-mix(in srgb, var(--rg-bg) 88%, var(--rg-header));
+  border: 1px solid var(--rg-border);
+  border-radius: 4px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  resize: vertical;
+}
+
+.rg-inline-comment-input:focus {
+  border-color: var(--rg-active);
+  outline: none;
+}
+
 .rg-cell--align-left { text-align: left; }
 .rg-cell--align-center { text-align: center; }
 .rg-cell--align-right { text-align: right; }

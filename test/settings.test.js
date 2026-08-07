@@ -30,6 +30,7 @@ import {
   largeGridMounts,
   notificationAllowed,
   pinnedGridThemePalette,
+  planDeviceSettingsMigration,
   planSettingsMigration,
   readDeviceSettings,
   readEnhancedUidCache,
@@ -90,7 +91,7 @@ const TODAYS_CONSTANTS = {
   "comments-enabled": true,
   "comments-affordance-trigger": "Hover",
   "comments-badges": true,
-  "comments-open-in-sidebar": false,
+  "comments-compose-mode": "In place",
   "ranges-live-references": true,
   "ranges-max-rendered-cells": 2000,
   "large-cache-enabled": true,
@@ -108,7 +109,7 @@ const TODAYS_CONSTANTS = {
  */
 const PENDING_KEYS = [];
 
-const COMMENT_KEYS = ["comments-enabled", "comments-affordance-trigger", "comments-badges", "comments-open-in-sidebar"];
+const COMMENT_KEYS = ["comments-enabled", "comments-affordance-trigger", "comments-badges", "comments-compose-mode"];
 
 const RANGE_KEYS = ["ranges-live-references", "ranges-max-rendered-cells"];
 
@@ -264,28 +265,103 @@ test("coerceSetting returns undefined for an unknown descriptor", () => {
 
 test("migration from a legacy nativeMutationBudget produces exactly the expected write list", () => {
   const plan = planSettingsMigration(undefined, { nativeMutationBudget: 900 });
-  assert.deepEqual(plan.writes, [["writes-native-budget", 900], ["settingsVersion", 1]]);
+  assert.deepEqual(plan.writes, [["writes-native-budget", 900], ["settingsVersion", 2]]);
   assert.equal(plan.from, 0);
-  assert.equal(plan.to, 1);
+  assert.equal(plan.to, 2);
 });
 
 test("migration coerces the legacy value and skips it when the new key already exists", () => {
-  assert.deepEqual(planSettingsMigration(0, { nativeMutationBudget: "99999" }).writes, [["writes-native-budget", 5000], ["settingsVersion", 1]]);
-  assert.deepEqual(planSettingsMigration(0, { nativeMutationBudget: 900, "writes-native-budget": 700 }).writes, [["settingsVersion", 1]]);
-  assert.deepEqual(planSettingsMigration(0, {}).writes, [["settingsVersion", 1]]);
+  assert.deepEqual(planSettingsMigration(0, { nativeMutationBudget: "99999" }).writes, [["writes-native-budget", 5000], ["settingsVersion", 2]]);
+  assert.deepEqual(planSettingsMigration(0, { nativeMutationBudget: 900, "writes-native-budget": 700 }).writes, [["settingsVersion", 2]]);
+  assert.deepEqual(planSettingsMigration(0, {}).writes, [["settingsVersion", 2]]);
 });
 
 test("migration is idempotent at the current version and never downgrades a future one", () => {
-  const atCurrent = planSettingsMigration(1, { nativeMutationBudget: 900 });
+  const atCurrent = planSettingsMigration(2, { nativeMutationBudget: 900, "comments-open-in-sidebar": true });
   assert.deepEqual(atCurrent.writes, []);
-  assert.equal(atCurrent.to, 1);
+  assert.equal(atCurrent.to, 2);
   const fromFuture = planSettingsMigration(7, { nativeMutationBudget: 900 });
   assert.deepEqual(fromFuture.writes, [], "a future version must not be rewritten backwards");
   assert.equal(fromFuture.from, 7);
-  assert.equal(fromFuture.to, 7, "the plan must keep the future version, not downgrade to 1");
+  assert.equal(fromFuture.to, 7, "the plan must keep the future version, not downgrade to 2");
   assert.deepEqual(planSettingsMigration("7", {}).writes, []);
-  const replay = planSettingsMigration(atCurrent.to, { nativeMutationBudget: 900, "writes-native-budget": 900, settingsVersion: 1 });
+  const replay = planSettingsMigration(atCurrent.to, { nativeMutationBudget: 900, "writes-native-budget": 900, settingsVersion: 2 });
   assert.deepEqual(replay.writes, [], "re-running the plan after applying it writes nothing");
+});
+
+test("the v1 sidebar switch migrates to the compose-mode enum, value-gated", () => {
+  assert.deepEqual(
+    planSettingsMigration(1, { "comments-open-in-sidebar": true }).writes,
+    [["comments-compose-mode", "Right sidebar"], ["settingsVersion", 2]],
+    "a legacy true becomes the sidebar compose mode",
+  );
+  assert.deepEqual(
+    planSettingsMigration(1, { "comments-open-in-sidebar": false }).writes,
+    [["settingsVersion", 2]],
+    "a legacy false was the default already — stamp only",
+  );
+  assert.deepEqual(
+    planSettingsMigration(1, { "comments-open-in-sidebar": true, "comments-compose-mode": "Comment box" }).writes,
+    [["settingsVersion", 2]],
+    "an explicit compose mode always wins over the legacy switch",
+  );
+  assert.deepEqual(
+    planSettingsMigration(0, { nativeMutationBudget: 900, "comments-open-in-sidebar": true }).writes,
+    [["writes-native-budget", 900], ["comments-compose-mode", "Right sidebar"], ["settingsVersion", 2]],
+    "from 0 every pending migration applies in order",
+  );
+});
+
+test("planDeviceSettingsMigration maps the legacy boolean and drops its key", () => {
+  const absent = planDeviceSettingsMigration({ "appearance-theme": "Dark" });
+  assert.equal(absent.changed, false, "no legacy key means no write");
+  assert.deepEqual(absent.values, { "appearance-theme": "Dark" });
+
+  const mapped = planDeviceSettingsMigration({ "comments-open-in-sidebar": true, "appearance-theme": "Dark" });
+  assert.equal(mapped.changed, true);
+  assert.deepEqual(mapped.values, { "appearance-theme": "Dark", "comments-compose-mode": "Right sidebar" });
+
+  const off = planDeviceSettingsMigration({ "comments-open-in-sidebar": false });
+  assert.equal(off.changed, true);
+  assert.deepEqual(off.values, {}, "false was the default — the key is only dropped");
+
+  const explicit = planDeviceSettingsMigration({ "comments-open-in-sidebar": true, "comments-compose-mode": "In place" });
+  assert.deepEqual(explicit.values, { "comments-compose-mode": "In place" }, "an existing enum value is never overwritten");
+
+  const input = { "comments-open-in-sidebar": true };
+  planDeviceSettingsMigration(input);
+  assert.deepEqual(input, { "comments-open-in-sidebar": true }, "the planner is pure — the input is not mutated");
+});
+
+test("initializeSettings migrates a device shadow holding the legacy switch", async (t) => {
+  t.after(() => settingsCache.clear());
+  const fake = makeApi({ values: { settingsVersion: 2 } });
+  const storage = makeStorage({ [deviceSettingsKey()]: '{"comments-open-in-sidebar":true,"appearance-theme":"Dark"}' });
+  await initializeSettings(fake.api, { storage });
+  const shadow = JSON.parse(storage.data.get(deviceSettingsKey()));
+  assert.deepEqual(shadow, { "appearance-theme": "Dark", "comments-compose-mode": "Right sidebar" }, "the shadow ends with the enum, never the legacy key");
+  assert.equal(getSetting("comments-compose-mode"), "Right sidebar", "the migrated value is what the cache resolves");
+  assert.ok(!fake.writes.some(([key]) => key === "comments-open-in-sidebar"), "the legacy key is never written to the graph");
+});
+
+test("initializeSettings migrates the device shadow even when the graph forbids writes", async (t) => {
+  t.after(() => settingsCache.clear());
+  const fake = makeApi({ canSet: false });
+  const storage = makeStorage({ [deviceSettingsKey()]: '{"comments-open-in-sidebar":true}' });
+  await initializeSettings(fake.api, { storage });
+  assert.deepEqual(JSON.parse(storage.data.get(deviceSettingsKey())), { "comments-compose-mode": "Right sidebar" });
+  assert.equal(getSetting("comments-compose-mode"), "Right sidebar");
+  assert.equal(fake.counters.set, 0, "canSet:false still means zero graph writes");
+});
+
+test("the compose-mode panel row is a select with exactly the three modes", () => {
+  const rows = buildSettingsPanelConfig().settings;
+  const row = rows.find((candidate) => candidate.id === "comments-compose-mode");
+  assert.ok(row, "the row ships in the panel");
+  assert.equal(row.action.type, "select");
+  assert.deepEqual(row.action.items, ["In place", "Comment box", "Right sidebar"]);
+  assert.equal(SETTINGS["comments-compose-mode"].scope, "device", "compose preference stays per-device like the switch it replaces");
+  assert.equal(SETTINGS["comments-open-in-sidebar"], undefined, "the legacy descriptor is gone from the schema");
 });
 
 test("resolveSettingValue reads device-scoped keys device-first and treats the graph value as a seed", () => {
@@ -332,7 +408,7 @@ test("getSetting reads the cache and never touches extensionAPI after a refresh"
   let observed = null;
   for (let index = 0; index < 200; index += 1) observed = getSetting("writes-native-budget");
   for (let index = 0; index < 200; index += 1) getSetting("editing-enter-direction");
-  for (let index = 0; index < 200; index += 1) getSetting("comments-open-in-sidebar");
+  for (let index = 0; index < 200; index += 1) getSetting("comments-compose-mode");
   assert.equal(observed, 777);
   assert.equal(getSetting("editing-enter-direction"), "Right", "the cache holds the coerced value");
   assert.equal(fake.reads() - readsAfterRefresh, 0, "600 getSetting calls must add zero extensionAPI reads");
@@ -441,7 +517,7 @@ test("the panel omits pending rows but the schema still resolves them", async ()
   assert.equal(SETTINGS["large-gc-orphans"].default, false, "irreversible deletion is opt-in");
   assert.match(SETTINGS["large-gc-orphans"].name, /irreversible/i, "the row must say so where the user reads it");
   refreshSettingsCache(makeApi().api, makeStorage());
-  assert.equal(getSetting("comments-open-in-sidebar"), false);
+  assert.equal(getSetting("comments-compose-mode"), "In place");
   assert.equal(getSetting("large-cache-max-mb"), 256);
   assert.ok(ids.includes("writes-native-budget"));
   for (const key of MAINTENANCE_KEYS) assert.ok(ids.includes(key), `${key} must be rendered as a maintenance button`);
@@ -501,7 +577,7 @@ test("initializeSettings seeds only unset live keys and creates one panel", asyn
   const storage = makeStorage();
   await initializeSettings(fake.api, { storage });
   assert.equal(fake.counters.panel, 1);
-  assert.deepEqual(fake.writes.slice(0, 2), [["writes-native-budget", 900], ["settingsVersion", 1]], "migration writes come first");
+  assert.deepEqual(fake.writes.slice(0, 2), [["writes-native-budget", 900], ["settingsVersion", 2]], "migration writes come first");
   const written = new Map(fake.writes);
   assert.equal(written.get("writes-native-budget"), 900, "the migrated value must not be overwritten by the default");
   assert.ok(!written.has("editing-tab-direction"), "an already-set key is not reseeded");

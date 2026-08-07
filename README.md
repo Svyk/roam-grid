@@ -167,6 +167,17 @@ itself, on the cell's own page — so they appear in Roam's own comment UI and
 survive uninstalling this extension. Commented cells get their own badge, kept
 separate from the linked-reference count so neither number is inflated.
 
+Where a new comment is written is your choice, per device, under **Comments —
+Composing and opening threads**. **In place** (the default) opens the inline
+Comments panel with the cursor already in an empty comment — Enter saves,
+Shift+Enter adds a newline, Escape closes the composer, and nothing is written
+until you press Enter. **Comment box** asks in a dialog first, the pre-0.12
+behaviour. **Right sidebar** opens the thread in Roam's right sidebar with the
+caret in an empty comment, the way Roam's own comment button works; if you
+click away without typing, the empty thread blocks the gesture created are
+removed again. The same choice decides where an existing thread opens when you
+click a cell's comment badge.
+
 ### Live range references
 
 Paste `{{roam-grid-range: ((tableUid)) B2:D5}}` into any block to embed a
@@ -215,7 +226,7 @@ device's overrides, clear local caches, and reset every setting.
 
 Most settings sync with your graph. Presentation choices that are properly
 per-device — toolbar density, theme, maximum grid width, large-grid overscan,
-chunk cache size, and whether comment threads open in the right sidebar — are
+chunk cache size, and how comment threads are composed and opened — are
 stored on the device instead.
 
 Two settings deserve a note. **Capture grid undo history** (on) is what makes

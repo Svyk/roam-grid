@@ -150,7 +150,7 @@ test("settings initialization performs zero writes when the graph forbids them",
 
   const writable = { settings: { get: () => null, set: async (key, value) => writes.push([key, value]), panel: { create: async () => {} } } };
   await initializeSettings(writable, { storage: null });
-  assert.deepEqual(writes[0], ["settingsVersion", 1]);
+  assert.deepEqual(writes[0], ["settingsVersion", 2]);
   assert.ok(writes.some(([key, value]) => key === "writes-native-budget" && value === 1200));
   const seeded = writes.length;
 
