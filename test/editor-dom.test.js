@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { FormulaEngine, GridEditorController, GridModel, GridView, NativeCellEditorOverlay, NativeGridSession, RegistrySet, claimKeyboard, formulaCanPointReference, keyboardOwner, moveFormulaReferenceCoordinate, nativeEditorEnabled, nativeOverlayStrayRepair, paintRichCellContent, queryBlockReferenceSources, recentsCacheReady, recentsDisabled, releaseKeyboard, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, resetNativeEditorHealth, resetRoamRecents, resetSuggestionRendering, roamSuggestionPlainText, runtime, sanitizeNativePasteText, searchRoamRecentSuggestions, settingsCache, syncPortalThemeFromRoot, wrapSelectionOnPair } from "../src/extension.js";
@@ -1955,6 +1955,18 @@ function overlaySession() {
   };
 }
 
+// FIX-E5 test isolation: an overlay whose edit ended in an async cancel (e.g. the focus-floor)
+// leaves a reconcile poll running on real timers. Left alone it fires DURING a later test and
+// writes into that test's swapped `roamAlphaAPI`, which is exactly the cross-test bleed that made
+// `:2932` flake ~37% of full-suite runs. Every overlay a harness builds is tracked here and
+// disposed after each test — dispose() bumps the reconcile epoch and cancels the poll's pending
+// timers (FIX-E5), so no poll outlives the test that spawned it. Proper isolation, not gaming.
+const liveOverlays = new Set();
+afterEach(() => {
+  for (const overlay of liveOverlays) { try { overlay.dispose(); } catch { /* idempotent, best-effort */ } }
+  liveOverlays.clear();
+});
+
 function makeOverlayHarness({ strings = { cell00001: "Alpha", cell00002: "Beta" }, tree = null, mode = "ok" } = {}) {
   const dom = installOverlayDom();
   const roamRecord = installOverlayRoam({ strings, tree, mode });
@@ -1967,6 +1979,7 @@ function makeOverlayHarness({ strings = { cell00001: "Alpha", cell00002: "Beta" 
   const view = { model, adapter, session, root, surface: "main", context: "source" };
   const overlay = new NativeCellEditorOverlay(view, { onFinish: async (result) => { finishes.push(result); } });
   view.nativeOverlay = overlay;
+  liveOverlays.add(overlay);
   return { dom, roamRecord, model, adapter, session, root, cell, view, overlay, finishes };
 }
 
@@ -2316,6 +2329,41 @@ test("cancel restores the exact bytes the cell held, absorbing whatever Roam flu
   assert.equal(harness.model.getRaw(0, 0), "Alpha");
   assert.deepEqual(harness.finishes, [{ row: 0, col: 0, cell: harness.cell, raw: "Alpha", value: "Alpha", commit: false, movement: null }]);
   assert.deepEqual(harness.session.calls.end, [{ uid: "cell00001", beforeRaw: "Alpha", afterRaw: "Alpha", commit: false }]);
+});
+
+// FIX-E5 — the real re-edit-revert bug. Cancelling an edit spawns a ~1.5s reconcile poll bound to
+// the OLD `beforeRaw`. Before FIX-E5 that poll had no notion its edit was over: re-edit the SAME
+// cell and commit a new value inside the window, and a late poll iteration sees the block diverge
+// from the old `beforeRaw` and "corrects" it — silently reverting the just-committed value.
+// The reconcile runs on 0-delay macrotasks here (rAF is microtask-based in this harness), so the
+// interleaving is deterministic: start #2 and commit run entirely in microtask land and no poll
+// iteration fires until `await cancelPromise` drains them — every iteration therefore observes the
+// committed value, and the epoch guard must keep them from touching it.
+test("a stale cancel reconcile never reverts a value a newer edit committed to the same cell", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); releaseKeyboard(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  await startOverlay(harness);                  // edit #1 on cell00001 ("Alpha")
+  harness.overlay.textarea.value = "typed";     // diverged, so cancel has something to reconcile
+  harness.overlay.reconcileDelayMs = 0;         // poll on 0-delay macrotasks, drained deterministically below
+
+  const cancelPromise = harness.overlay.cancel(); // reconcile bound to beforeRaw "Alpha"; DO NOT await yet
+  await settle();                               // let cancel restore "Alpha" and PARK the reconcile poll
+  assert.equal(harness.roamRecord.strings.cell00001, "Alpha", "cancel restored the pre-edit bytes");
+
+  // The user immediately re-edits the SAME cell and commits a new value — all in microtask land, so
+  // the parked reconcile poll cannot fire between here and the commit.
+  await startOverlay(harness, { raw: "Alpha" });
+  harness.overlay.textarea.value = "NewValue";
+  await harness.overlay.commit(null);
+  assert.equal(harness.roamRecord.strings.cell00001, "NewValue", "the new edit committed its value");
+  const updatesAfterCommit = harness.roamRecord.updates.length;
+
+  // Now drive the stale reconcile poll to completion. It must NOT write the old "Alpha" back.
+  await cancelPromise;
+
+  assert.equal(harness.roamRecord.strings.cell00001, "NewValue", "the stale reconcile must not revert the committed value");
+  assert.deepEqual(harness.roamRecord.updates.slice(updatesAfterCommit), [], "no updateBlock back to the old beforeRaw after the new commit");
 });
 
 test("dispose is idempotent, unmounts, and never writes what Roam last saved", async (t) => {

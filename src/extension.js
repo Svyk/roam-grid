@@ -7644,6 +7644,13 @@ export class NativeCellEditorOverlay {
     // FIX-E backstop cadence: Roam's blur flush lands hundreds of ms out, so the reconcile poll
     // waits this long between reads. An instance field so a test can drop it to run fast.
     this.reconcileDelayMs = 130;
+    // FIX-E5: the reconcile poll (a cancel backstop) runs for ~1.5s and must not outlive its edit.
+    // `reconcileEpoch` is bumped on every start/commit/cancel/dispose; the poll captures the epoch
+    // it was born under and bails the instant a newer edit/action supersedes it, so a stale poll
+    // can never re-apply an old `beforeRaw` over a value a later edit committed to the same cell.
+    // The poll's pending timer handles live here too, so a superseding action cancels them outright.
+    this.reconcileEpoch = 0;
+    this.reconcileTimers = new Map();
     this.popupJustClosed = false;
     // FIX-E: exactly ONE Escape per typing episode is lent to Roam's menu; every Escape after that
     // is the overlay's cancel, whatever the popup probe reads.
@@ -7735,6 +7742,9 @@ export class NativeCellEditorOverlay {
   }
 
   async startOnce({ row, col, cell, uid, raw, initial = null }) {
+    // FIX-E5: a new edit episode supersedes any reconcile poll still running from a prior cancel —
+    // bump first so the re-edit-same-cell case (cancel → immediate re-edit) can never be reverted.
+    this.bumpReconcileEpoch();
     if (this.state) await this.commit(null);
     if (this.disposed) return null;
     const session = this.view?.session || null;
@@ -8185,6 +8195,8 @@ export class NativeCellEditorOverlay {
     const state = this.state;
     if (!state || state.finishing) return null;
     state.finishing = true;
+    // FIX-E5: committing a value ends this edit and supersedes any earlier cancel's reconcile poll.
+    this.bumpReconcileEpoch();
     const { row, col, cell, uid } = state;
     const beforeRaw = this.beforeRaw;
     const live = this.textarea ? String(this.textarea.value ?? "") : null;
@@ -8228,6 +8240,10 @@ export class NativeCellEditorOverlay {
     const state = this.state;
     if (!state || state.finishing) return null;
     state.finishing = true;
+    // FIX-E5: bump BEFORE spawning this cancel's own reconcile poll so the poll captures the fresh
+    // epoch; any later start/commit/cancel/dispose then bumps past it and aborts the stale poll,
+    // while THIS cancel's poll still runs its full budget as long as nothing newer supersedes it.
+    this.bumpReconcileEpoch();
     const { row, col, cell, uid } = state;
     const beforeRaw = this.beforeRaw;
     const flushed = nativeStoredRaw(this.textarea ? String(this.textarea.value ?? "") : state.lastValue);
@@ -8253,6 +8269,35 @@ export class NativeCellEditorOverlay {
     return { uid, value: beforeRaw };
   }
 
+  /** FIX-E5: the reconcile poll's inter-read wait. The timer id AND its resolver are tracked on the
+   *  instance (mirroring the `frames` pattern) so a superseding start/commit/cancel/dispose can
+   *  cancel the pending wait — `clearTimeout` stops the real timer and `resolve()` still wakes the
+   *  awaiting loop, which then sees the bumped epoch (or `disposed`) and bails. Without waking it the
+   *  awaited promise would leak; without clearing it a stray timer would outlive the edit. */
+  reconcileDelay(delayMs) {
+    return new Promise((resolve) => {
+      const id = trackedTimeout(() => { this.reconcileTimers.delete(id); resolve(); }, delayMs);
+      this.reconcileTimers.set(id, resolve);
+    });
+  }
+
+  /** Cancels every pending reconcile timer and wakes its awaiting loop so nothing survives the edit. */
+  cancelReconcileTimers() {
+    for (const [id, resolve] of this.reconcileTimers) {
+      try { clearTimeout(id); } catch (error) { noteNativeEditorError(error); }
+      pendingTimers.delete(id);
+      try { resolve(); } catch (error) { noteNativeEditorError(error); }
+    }
+    this.reconcileTimers.clear();
+  }
+
+  /** FIX-E5: mark that a new edit episode or terminal action has begun. A running reconcile poll,
+   *  captured under the previous epoch, aborts before its next write; its pending timers are cancelled. */
+  bumpReconcileEpoch() {
+    this.reconcileEpoch += 1;
+    this.cancelReconcileTimers();
+  }
+
   /**
    * FIX-E write-behind BACKSTOP. `settleTextareaValue` already makes Roam's blur flush persist
    * `beforeRaw`, so this rarely fires — but if a flush still lands on `:block/string` AFTER the
@@ -8260,21 +8305,32 @@ export class NativeCellEditorOverlay {
    * value the user cancelled with nothing mounted to notice. Poll on a real cadence for up to
    * ~1.5s, re-applying `beforeRaw` on every divergence and recording the self-write so the adapter
    * absorbs the echo, and stop only once the value has stayed `beforeRaw` across two reads.
+   *
+   * FIX-E5: this poll belongs to ONE cancel episode. It captures its birth epoch; if a newer edit,
+   * commit, cancel, or dispose bumps `reconcileEpoch` (or the overlay is disposed), it bails BEFORE
+   * touching the graph. Otherwise a poll bound to the cancelled-to `beforeRaw` would, up to ~1.5s
+   * later, silently revert whatever a subsequent edit committed to the same cell.
    */
   async reconcileCancelWrite(uid, beforeRaw, { attempts = 12, delayMs = 130 } = {}) {
     // Poll the WHOLE budget rather than stopping at the first stable read: Roam's flush timing is
     // not known, and a poll that quit early could return just before a late flush landed. Every
     // divergence in the window is re-applied, so the graph ends at `beforeRaw` regardless of when
     // the flush arrives inside it.
+    const epoch = this.reconcileEpoch;
     let corrected = false;
     for (let attempt = 0; attempt < attempts; attempt += 1) {
-      await new Promise((resolve) => trackedTimeout(resolve, delayMs));
+      await this.reconcileDelay(delayMs);
+      // After the wait: a newer edit/action (or disposal) supersedes this poll — abort untouched.
+      if (this.disposed || this.reconcileEpoch !== epoch) return corrected;
       let current = null;
       try { current = pullNativeCell(uid); }
       catch (error) { noteNativeEditorError(error); return corrected; }
       if (!current) { continue; }
       const raw = nativeStoredRaw(current.raw);
       if (raw === beforeRaw) { continue; }
+      // Before the write: re-check, so a supersession that lands between the read and the write
+      // (e.g. a fresh commit to this cell) is never overwritten with the stale `beforeRaw`.
+      if (this.disposed || this.reconcileEpoch !== epoch) return corrected;
       try {
         this.view.adapter?.recordSelfWrite?.(uid, raw, beforeRaw);
         try { await updateBlock(uid, nativePersistedRaw(beforeRaw)); }
@@ -8289,6 +8345,8 @@ export class NativeCellEditorOverlay {
   dispose() {
     if (this.disposed) return;
     this.disposed = true;
+    // FIX-E5: disposal is terminal — abort any in-flight reconcile poll and drop its pending timers.
+    this.bumpReconcileEpoch();
     const uid = this.state?.uid || null;
     this.teardown();
     if (uid) this.view?.session?.endNativeOverlayEdit?.(uid, { commit: false });
