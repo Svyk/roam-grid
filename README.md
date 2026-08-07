@@ -294,6 +294,21 @@ whose injected table commands write through `window.roamGrid.v1`.
   images, embeds) is painted by Roam's own renderer, so it inherits Roam's
   rendering behaviour for that content.
 
+## Big-graph check
+
+The bare `[[` / `((` openers are budget-gated at `RECENTS_BUDGET_MS` (250 ms).
+To time the two recents queries against a live graph, open the browser console
+on that graph and run:
+
+```js
+t0 = performance.now(); roamAlphaAPI.q('[:find ?title ?uid ?time :where [?p :node/title ?title] [?p :block/uid ?uid] [(get-else $ ?p :edit/time 0) ?time]]'); console.log("pages", performance.now() - t0);
+t0 = performance.now(); roamAlphaAPI.q('[:find ?uid ?string ?time :in $ ?since :where [?b :edit/time ?time] [(> ?time ?since)] [?b :block/string ?string] [(!= ?string "")] [?b :block/uid ?uid]]', Date.now() - 7*24*60*60*1000); console.log("blocks", performance.now() - t0);
+```
+
+Compare each against 250 ms. Two consecutive over-budget inline fetches disarm
+bare openers to cached recents only; any fetch at or under budget re-arms them.
+`window.__rgDiag.recentsBudget` shows the live ledger.
+
 ## License
 
 MIT. Roam Grid is an independent MIT implementation. The GPL-licensed
