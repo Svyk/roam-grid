@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
+import extension, {
   GridModel,
   GridView,
   LargeGridView,
@@ -8,6 +8,7 @@ import {
   applyCellImageLayout,
   cellImageMarkdown,
   claimKeyboard,
+  dismissOwnedLightboxes,
   imageDimensionCache,
   keyboardOwner,
   onGlobalKeydown,
@@ -90,7 +91,7 @@ class MiniNode {
 
 function installMiniDom() {
   const body = new MiniNode("body");
-  globalThis.document = { body, activeElement: null, createElement: (name) => new MiniNode(name), createTextNode: (text) => new MiniNode("#text", text), querySelector: (selector) => body.querySelector(selector) };
+  globalThis.document = { body, activeElement: null, createElement: (name) => new MiniNode(name), createTextNode: (text) => new MiniNode("#text", text), querySelector: (selector) => body.querySelector(selector), querySelectorAll: (selector) => body.querySelectorAll(selector) };
   globalThis.window = { addEventListener() {}, removeEventListener() {}, dispatchEvent() {} };
   return { body };
 }
@@ -657,6 +658,153 @@ test("the lightbox hides Download for .enc images but keeps it otherwise, and om
   const plain = openImageLightbox({ ownerRoot, entries: [{ raw: "![p](u)", alt: "p", url: "https://x/p.png", row: 0, col: 0, cellImageIndex: 0, occurrence: 0 }], startIndex: 0 });
   assert.equal(footerLabels(plain).includes("Download"), true, "a plain URL keeps Download");
   plain.__rgDismiss();
+});
+
+// GOAL-IMG-FIX — the six post-review image fixes.
+
+test("FIX-2: dismissOwnedLightboxes tears down the disposed session's lightbox and unmounts its host", (t) => {
+  const { body } = installMiniDom();
+  const { unmounts } = installLightboxRoam();
+  t.after(() => releaseKeyboard());
+  const ownerRoot = new MiniNode("section"); ownerRoot.className = "rg-owner"; ownerRoot.dataset.roamGridUid = "tbl-own";
+  const dialog = openImageLightbox({ ownerRoot, entries: [{ raw: "![a](u1)", alt: "a", url: "u1", row: 0, col: 0, cellImageIndex: 0, occurrence: 0 }], startIndex: 0 });
+  assert.equal(dialog.dataset.rgLightboxOwner, "tbl-own", "the lightbox carries its owning session's uid as a passive marker");
+  const host = dialog.querySelector(".rg-lightbox-image");
+
+  dismissOwnedLightboxes("some-other-uid");
+  assert.equal(dialog.open, true, "an unrelated session's disposal leaves the lightbox open");
+
+  dismissOwnedLightboxes("tbl-own");
+  assert.equal(dialog.open, false, "the owning session's disposal closes the modal");
+  assert.equal(body.contains(dialog), false, "the dialog is removed from the body");
+  assert.ok(unmounts.includes(host), "the renderString host is unmountNode'd, not merely dropped");
+});
+
+test("FIX-2: onunload sweeps an open lightbox, dismissing it through __rgDismiss", async (t) => {
+  const { body } = installMiniDom();
+  const { unmounts } = installLightboxRoam();
+  t.after(() => releaseKeyboard());
+  const ownerRoot = new MiniNode("section"); ownerRoot.className = "rg-owner"; ownerRoot.dataset.roamGridUid = "tbl-unload";
+  const dialog = openImageLightbox({ ownerRoot, entries: [{ raw: "![a](u1)", alt: "a", url: "u1", row: 0, col: 0, cellImageIndex: 0, occurrence: 0 }], startIndex: 0 });
+  const host = dialog.querySelector(".rg-lightbox-image");
+  assert.equal(dialog.open, true);
+
+  await extension.onunload();
+
+  assert.equal(dialog.open, false, "onunload closed the orphaned modal instead of leaving it behind its backdrop");
+  assert.equal(body.contains(dialog), false, "and removed it from the body");
+  assert.ok(unmounts.includes(host), "and unmounted its renderString host");
+});
+
+test("FIX-3: auto-fit distributes a merged cell's height across every spanned row", async (t) => {
+  t.after(() => settingsCache.clear());
+  settingsCache.clear();
+  installMiniDom();
+  // The merge's covered cells must be empty for the region to be valid; the origin holds the content.
+  const grid = new GridModel({ rows: [["x"], [""], [""]], merges: [{ id: "m1", row: 0, col: 0, rowSpan: 3, colSpan: 1 }] });
+  const stubCell = (scrollHeight) => {
+    const cell = new MiniNode("div"); cell.className = "rg-cell";
+    const content = new MiniNode("div"); content.className = "rg-cell-content";
+    content.scrollHeight = scrollHeight;
+    cell.appendChild(content);
+    return cell;
+  };
+  // Only the merge origin mounts a cell; the two covered rows have none of their own.
+  const cells = new Map([["0:0", stubCell(300)]]);
+  const view = {
+    model: grid, cells,
+    selection: { startRow: 0, endRow: 2, startCol: 0, endCol: 0 },
+    commitMutation: (label, mutation) => { grid.transact(label, mutation); return Promise.resolve(grid); },
+  };
+
+  await GridView.prototype.measureSelectedRowHeights.call(view);
+
+  assert.notEqual(grid.getRowHeight(1), null, "the second spanned row is sized, not left clipping at default");
+  assert.notEqual(grid.getRowHeight(2), null, "the third spanned row too");
+  const total = grid.getRowHeight(0) + grid.getRowHeight(1) + grid.getRowHeight(2);
+  assert.ok(total >= 300, `the summed spanned height (${total}) must cover the 300px content`);
+  assert.equal(grid.history.entries.at(-1).label, "Auto-fit rows");
+
+  grid.undo();
+  assert.equal(grid.getRowHeight(0), null, "undo restores the auto rows");
+  assert.equal(grid.getRowHeight(1), null);
+  assert.equal(grid.getRowHeight(2), null);
+});
+
+test("FIX-4: the lightbox hides Open-in-tab for .enc images and keeps it for plain URLs", (t) => {
+  installMiniDom();
+  installLightboxRoam();
+  t.after(() => releaseKeyboard());
+  const { ownerRoot } = makeLightboxOwner();
+
+  const enc = openImageLightbox({ ownerRoot, entries: [{ raw: "![s](u)", alt: "s", url: "https://f/scan.png.enc?alt=media&token=abc", row: 0, col: 0, cellImageIndex: 0, occurrence: 0 }], startIndex: 0 });
+  const encLabels = footerLabels(enc);
+  assert.equal(encLabels.includes("Open in tab"), false, "a .enc blob opens ciphertext in a new tab, so the affordance hides");
+  assert.equal(encLabels.includes("Download"), false, "Download stays hidden for .enc too");
+  assert.equal(encLabels.includes("Copy markdown"), true, "Copy markdown remains — it copies the embed markdown, not the bytes");
+  enc.__rgDismiss();
+
+  const plain = openImageLightbox({ ownerRoot, entries: [{ raw: "![p](u)", alt: "p", url: "https://x/p.png", row: 0, col: 0, cellImageIndex: 0, occurrence: 0 }], startIndex: 0 });
+  const plainLabels = footerLabels(plain);
+  assert.equal(plainLabels.includes("Open in tab"), true, "a plain URL keeps Open in tab");
+  assert.equal(plainLabels.includes("Download"), true);
+  plain.__rgDismiss();
+});
+
+test("FIX-5: the large grid writes a column-scoped image layout through the store", (t) => {
+  t.after(() => settingsCache.clear());
+  settingsCache.clear();
+  const calls = [];
+  const view = {
+    selection: { startRow: 0, endRow: 9, startCol: 1, endCol: 1 },
+    store: { manifest: { imageLayout: undefined, columnIds: ["cA", "cB", "cC"] }, setImageLayout: (value) => calls.push(value) },
+    scheduleSave() { this.saved = true; },
+    scheduleRender() { this.rendered = true; },
+  };
+  LargeGridView.prototype.setSelectedColumnImageLayout.call(view, "size", "xl");
+  assert.deepEqual(calls.at(-1), { columns: { cB: { size: "xl" } }, cells: {} }, "the selected column gets the size, keyed by its columnId");
+  assert.equal(view.saved, true);
+  assert.equal(view.rendered, true);
+
+  view.store.manifest.imageLayout = { columns: { cB: { size: "xl", fit: "cover" } }, cells: {} };
+  LargeGridView.prototype.setSelectedColumnImageLayout.call(view, "size", null);
+  assert.deepEqual(calls.at(-1), { columns: { cB: { fit: "cover" } }, cells: {} }, "clearing size keeps a chosen fit");
+
+  view.store.manifest.imageLayout = { columns: { cB: { fit: "cover" } }, cells: {} };
+  LargeGridView.prototype.setSelectedColumnImageLayout.call(view, "fit", null);
+  assert.deepEqual(calls.at(-1), { columns: {}, cells: {} }, "an emptied column entry is dropped entirely");
+});
+
+test("FIX-6: the lightbox delete re-resolves the cell by uid after a row shift", (t) => {
+  installMiniDom();
+  installLightboxRoam();
+  t.after(() => releaseKeyboard());
+  const model = new GridModel({ rows: [[{ uid: "u0", raw: "![a](x)" }], [{ uid: "u1", raw: "![b](y)" }]] });
+  const adapter = {
+    coordinateForUid: (uid) => {
+      for (let r = 0; r < model.rowCount; r += 1) for (let c = 0; c < model.colCount; c += 1) if (model.getCell(r, c)?.uid === uid) return { row: r, col: c };
+      return null;
+    },
+  };
+  const ownerRoot = new MiniNode("section"); ownerRoot.className = "rg-owner"; ownerRoot.dataset.roamGridUid = "tbl-6";
+  const view = {
+    model, adapter, root: ownerRoot,
+    commitMutation: (label, mutation) => { mutation(model); return Promise.resolve(model); },
+  };
+  ownerRoot.__rgView = view;
+
+  const dialog = GridView.prototype.openCellImageLightbox.call(view, 1, 0, 0);
+  assert.ok(dialog, "the lightbox opened at the (1,0) image");
+
+  // An external row insert shifts u1 from row 1 to row 2 while the modal is open.
+  model.rows.unshift([{ uid: "inserted", raw: "" }]);
+
+  const remove = dialog.querySelectorAll("button").find((b) => b.textContent === "Delete");
+  assert.ok(remove, "the delete affordance exists");
+  remove.dispatch("click");
+
+  assert.equal(model.getRaw(2, 0), "", "the delete targets u1's CURRENT cell, resolved by uid, not the stale (1,0)");
+  assert.equal(model.getRaw(1, 0), "![a](x)", "the cell that shifted into row 1 is untouched");
 });
 
 test("Shift+Space opens the lightbox at the selected cell instead of beginning an edit", () => {

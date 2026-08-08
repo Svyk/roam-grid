@@ -12,6 +12,7 @@ import {
   isRoamBlockInput,
   NativeCellEditorOverlay,
   keyboardOwner,
+  openImageLightbox,
   portalOwnerUid,
   releaseKeyboard,
   uidFromFocusTarget,
@@ -69,6 +70,7 @@ class Node {
   get parentElement() { return this.parentNode; }
   get isConnected() { for (let current = this; current; current = current.parentNode) if (current === globalThis.document?.body) return true; return false; }
   append(...nodes) { nodes.forEach((node) => this.appendChild(typeof node === "string" ? new Node("#text", node) : node)); }
+  replaceChildren(...nodes) { this.children.forEach((node) => { node.parentNode = null; }); this.children = []; this.append(...nodes); }
   appendChild(node) { if (node.parentNode) node.remove(); node.parentNode = this; this.children.push(node); return node; }
   prepend(...nodes) { for (const node of [...nodes].reverse()) { if (node.parentNode) node.remove(); node.parentNode = this; this.children.unshift(node); } }
   remove() { if (!this.parentNode) return; this.parentNode.children = this.parentNode.children.filter((node) => node !== this); this.parentNode = null; }
@@ -841,6 +843,77 @@ test("commit refocuses the grid and reclaims the keyboard before the block write
     assert.equal(keyboardOwner()?.view, view, "the grid owns the keyboard again even before onFinish runs");
     assert.deepEqual(record.updates, [{ uid: "a1", string: "typed" }]);
   } finally { clearTimeout(session.saveTimer); uninstall(); session.dispose(); }
+});
+
+/* --------------------------------------------------------------------------------------------
+ * FIX-1 — the open image lightbox must not let the concealed grid re-claim the keyboard.
+ *
+ * Pre-fix the modal `<dialog>` carried the keyboard-owning `data-rg-owner` tag, so a pointerdown
+ * anywhere inside it made `onGlobalPointerDown` re-claim the keyboard for the still-mounted grid;
+ * the next ArrowRight/printable then drove `moveSelection`/`beginEdit` on the hidden grid instead
+ * of paging the lightbox. This reproduces that exact sequence against the real exported functions.
+ * ------------------------------------------------------------------------------------------ */
+
+function installLightboxRoam() {
+  globalThis.window.roamAlphaAPI = { ui: { components: { renderString: () => {}, unmountNode: () => {} } } };
+}
+
+test("FIX-1: a pointerdown in the open lightbox cannot hand the keyboard to the concealed grid", () => {
+  const dom = installDom();
+  installLightboxRoam();
+  releaseKeyboard();
+  const uninstall = installKeyboardOwnership();
+  const { view, cell, root, session } = makeGrid(dom);
+  const counts = { move: 0, edit: 0 };
+  view.moveSelection = () => { counts.move += 1; };
+  view.beginEdit = () => { counts.edit += 1; };
+  const entries = [
+    { raw: "![a](u1)", alt: "a", url: "u1", row: 0, col: 0, cellImageIndex: 0, occurrence: 0 },
+    { raw: "![b](u2)", alt: "b", url: "u2", row: 1, col: 0, cellImageIndex: 0, occurrence: 0 },
+    { raw: "![c](u3)", alt: "c", url: "u3", row: 2, col: 0, cellImageIndex: 0, occurrence: 0 },
+  ];
+  let dialog = null;
+  try {
+    dom.firePointerDown(cell);
+    assert.equal(keyboardOwner()?.view, view, "the grid owns the keyboard before the lightbox opens");
+
+    dialog = openImageLightbox({ ownerRoot: root, entries, startIndex: 0 });
+    assert.ok(dialog, "the lightbox opened");
+    assert.equal(dialog.dataset.rgOwner, undefined, "the modal must NOT carry the keyboard-owning owner tag");
+    assert.equal(dialog.dataset.rgLightboxOwner, "table-a", "it carries the passive owner marker instead");
+    assert.equal(keyboardOwner(), null, "opening the modal releases keyboard ownership");
+
+    // The proven trigger: a pointerdown on a footer button, then keys at the window/capture level.
+    const footer = dialog.querySelectorAll("button")[0];
+    assert.ok(footer, "the lightbox footer has buttons (no <input> to catch the grid's editor guard)");
+    dom.firePointerDown(footer);
+    assert.equal(keyboardOwner(), null, "a pointerdown inside the modal must not re-claim the keyboard for the grid");
+
+    dom.fireKeydown(footer, { key: "ArrowRight" });
+    dom.fireKeydown(footer, { key: "x" });
+    assert.equal(counts.move, 0, "ArrowRight must not move the concealed grid's selection");
+    assert.equal(counts.edit, 0, "a printable key must not begin editing the concealed grid");
+
+    // And the lightbox itself still pages: its own capture listener advances the index.
+    assert.equal(dialog.querySelector(".rg-lightbox-counter").textContent, "1 / 3");
+    dialog.dispatch("keydown", { key: "ArrowRight" });
+    assert.equal(dialog.querySelector(".rg-lightbox-counter").textContent, "2 / 3", "the lightbox pages instead");
+    assert.equal(counts.move, 0, "and paging the lightbox still leaves the grid untouched");
+
+    // Defense in depth: even a STRAY re-claim cannot route the modal's keys to the grid. The footer
+    // is rebuilt on every page, so re-grab a live in-modal element as the keydown target.
+    const liveFooter = dialog.querySelectorAll("button")[0];
+    claimKeyboard(view);
+    assert.equal(keyboardOwner()?.view, view, "simulate a stray re-claim while the modal is open");
+    dom.fireKeydown(liveFooter, { key: "ArrowRight" });
+    dom.fireKeydown(liveFooter, { key: "y" });
+    assert.equal(counts.move, 0, "the .rg-lightbox guard keeps keys off the grid despite the stray owner");
+    assert.equal(counts.edit, 0);
+  } finally {
+    dialog?.__rgDismiss?.();
+    uninstall();
+    session.dispose();
+  }
 });
 
 test("beginEdit on another view finishes a live native overlay before mounting a second one", async () => {

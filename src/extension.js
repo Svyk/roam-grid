@@ -5898,6 +5898,11 @@ export function onGlobalFocusIn(event) {
  * browser's native undo — so `preventDefault()` is what keeps ⌘Z from reaching a text input.
  */
 export function onGlobalKeydown(event) {
+  // This window listener fires BEFORE any dialog-level listener, so a modal lightbox cannot rely on
+  // stopImmediatePropagation alone to keep its keys off the concealed grid: if a stray re-claim left
+  // the grid owning the keyboard, route nothing to it while a lightbox owns the screen (FIX-1). Keys
+  // typed into the modal are handled by the lightbox's own capture listener on the dialog.
+  if (event?.target?.closest?.(".rg-lightbox")) return;
   const owner = runtime.keyboardOwner;
   if (!owner?.view || owner.view.disposed) return;
   const undoCombo = (event.metaKey || event.ctrlKey) && String(event.key ?? "").toLowerCase() === "z";
@@ -6503,7 +6508,13 @@ export function openImageLightbox({ ownerRoot = null, entries = [], startIndex =
   body.appendChild(host);
   const footer = document.createElement("div"); footer.className = "rg-lightbox-footer";
   dialog.append(header, body, footer);
-  tagPortalOwner(dialog, owner?.dataset?.roamGridUid || gridViewUid(ownerView));
+  // A modal lightbox must NOT carry the keyboard-owning `data-rg-owner` tag: a pointerdown inside it
+  // would make `onGlobalPointerDown` re-claim the keyboard for the concealed grid, after which its
+  // ←/→/printable keys drive the hidden grid instead of the lightbox (FIX-1). The theme bridge takes
+  // the owner root directly and needs no tag; a passive `data-rg-lightbox-owner` marker lets the
+  // session-teardown sweep (FIX-2) find this portal WITHOUT arming the pointerdown re-claim.
+  const lightboxOwnerUid = owner?.dataset?.roamGridUid || gridViewUid(ownerView);
+  if (lightboxOwnerUid) dialog.dataset.rgLightboxOwner = lightboxOwnerUid;
   document.body.appendChild(dialog);
   const theme = createPortalThemeBridge(owner, dialog);
 
@@ -6524,7 +6535,11 @@ export function openImageLightbox({ ownerRoot = null, entries = [], startIndex =
     footer.appendChild(button(actualSize ? "Fit" : "1:1", actualSize ? "Fit the image to the window" : "Show the image at actual size", () => {
       actualSize = !actualSize; dialog.classList.toggle("rg-lightbox--actual-size", actualSize); updateFooter(list[index]);
     }));
-    footer.appendChild(button("Open in tab", "Open the image in a new browser tab", () => { globalThis.window?.open?.(entry.url, "_blank", "noopener"); }));
+    // A `.enc` blob is only decryptable through Roam's renderString; a raw new-tab open (like a raw
+    // download) returns undecryptable ciphertext, so both affordances hide for it (LP-4, FIX-4).
+    if (!isEncryptedImageUrl(entry.url)) {
+      footer.appendChild(button("Open in tab", "Open the image in a new browser tab", () => { globalThis.window?.open?.(entry.url, "_blank", "noopener"); }));
+    }
     footer.appendChild(button("Copy markdown", "Copy the image markdown to the clipboard", () => { globalThis.navigator?.clipboard?.writeText?.(`![${entry.alt || ""}](${entry.url})`); toast("Image markdown copied"); }));
     if (!isEncryptedImageUrl(entry.url)) {
       footer.appendChild(button("Download", "Download the image", () => {
@@ -6558,11 +6573,13 @@ export function openImageLightbox({ ownerRoot = null, entries = [], startIndex =
   };
   const go = (delta) => { index = (index + delta + list.length) % list.length; renderCurrent(); };
 
+  // Capture-phase with stopImmediatePropagation so a key the open lightbox handles can never ALSO
+  // reach the concealed grid — belt to the `onGlobalKeydown` `.rg-lightbox` guard's braces (FIX-1).
   dialog.addEventListener("keydown", (event) => {
-    if (event.key === "ArrowRight") { event.preventDefault(); go(1); }
-    else if (event.key === "ArrowLeft") { event.preventDefault(); go(-1); }
-    else if (event.key === "Escape") { event.preventDefault(); close(); }
-  });
+    if (event.key === "ArrowRight") { event.preventDefault(); event.stopImmediatePropagation?.(); go(1); }
+    else if (event.key === "ArrowLeft") { event.preventDefault(); event.stopImmediatePropagation?.(); go(-1); }
+    else if (event.key === "Escape") { event.preventDefault(); event.stopImmediatePropagation?.(); close(); }
+  }, true);
   // A click landing on the dialog itself (not a child) is a click on the modal backdrop.
   dialog.addEventListener("mousedown", (event) => { if (event.target === dialog) close(); });
 
@@ -7569,12 +7586,14 @@ export function wireRichHostImages(content, host, cell = content?.closest?.(".rg
  */
 function imageEntriesFromCells(rowRaws, col) {
   const entries = [];
-  for (const { row, raw } of rowRaws) {
+  for (const { row, raw, uid = null } of rowRaws) {
     const source = String(raw ?? "");
     const seen = new Map();
     cellImageMarkdown(source).forEach((image, cellImageIndex) => {
       const occurrence = seen.get(image.url) || 0; seen.set(image.url, occurrence + 1);
-      entries.push({ raw: source, alt: image.alt, url: image.url, row, col, cellImageIndex, occurrence });
+      // `uid` (when the source can supply one — native cells do, large JSON rows do not) lets a delete
+      // re-resolve the current (row, col) so a concurrent external row insert can't misdirect it. FIX-6.
+      entries.push({ raw: source, alt: image.alt, url: image.url, row, col, cellImageIndex, occurrence, uid });
     });
   }
   return entries;
@@ -7588,7 +7607,7 @@ function buildColumnImageEntries(model, col, { startRow = 0, endRow = (model?.ro
   const rowRaws = [];
   for (let row = startRow; row <= endRow; row += 1) {
     if (model.isCovered?.(row, col)) continue;
-    rowRaws.push({ row, raw: model.getRaw(row, col) });
+    rowRaws.push({ row, raw: model.getRaw(row, col), uid: model.getCell?.(row, col)?.uid ?? null });
   }
   return imageEntriesFromCells(rowRaws, col);
 }
@@ -11109,9 +11128,9 @@ export class GridView {
    */
   measureSelectedRowHeights() {
     const range = normalizeRange(this.selection);
-    const measured = [];
+    const heights = new Map();
+    const record = (row, value) => { if (value > 0) heights.set(row, Math.max(heights.get(row) || 0, value)); };
     for (let row = range.startRow; row <= range.endRow; row += 1) {
-      let height = 0;
       for (let col = 0; col < this.model.colCount; col += 1) {
         if (this.model.isCovered(row, col)) continue;
         const cell = this.cells.get(`${row}:${col}`);
@@ -11120,11 +11139,15 @@ export class GridView {
         const styles = globalThis.getComputedStyle?.(content);
         const padding = (Number.parseFloat(styles?.paddingTop) || 0) + (Number.parseFloat(styles?.paddingBottom) || 0);
         const span = this.model.mergeAt(row, col)?.rowSpan || 1;
-        height = Math.max(height, Math.ceil(((Number(content.scrollHeight) || 0) + padding) / span));
+        // A merged cell's content spans N rows: sizing only the origin (with the covered rows left at
+        // default) clips a tall image to a fraction of it. Give EACH spanned row its per-row share so
+        // the summed spanned height covers the content — including covered rows the outer loop skips. FIX-3.
+        const share = Math.ceil(((Number(content.scrollHeight) || 0) + padding) / span);
+        for (let target = row; target < row + span; target += 1) record(target, share);
       }
-      if (height > 0) measured.push([row, height]);
     }
-    if (!measured.length) return Promise.resolve(null);
+    if (!heights.size) return Promise.resolve(null);
+    const measured = [...heights.entries()].sort((a, b) => a[0] - b[0]);
     const defaultHeight = getSetting("sizing-default-row-height");
     return this.commitMutation("Auto-fit rows", () => {
       for (const [row, height] of measured) {
@@ -11331,7 +11354,13 @@ export class GridView {
       ownerRoot: this.root,
       entries,
       startIndex,
-      onDelete: ({ entry, raw }) => this.commitMutation("Remove image", (model) => model.setRaw(entry.row, entry.col, raw), false),
+      onDelete: ({ entry, raw }) => {
+        // Re-resolve the cell by its uid so a concurrent external row insert/reorder while the modal
+        // was open can't send the delete to a shifted (row, col). Falls back to the captured
+        // coordinate when the uid is gone (a correct-looking cell, never a wrong write). FIX-6.
+        const coord = (entry.uid && this.adapter?.coordinateForUid?.(entry.uid)) || { row: entry.row, col: entry.col };
+        return this.commitMutation("Remove image", (model) => model.setRaw(coord.row, coord.col, raw), false);
+      },
     });
   }
 
@@ -11754,7 +11783,7 @@ export class LargeGridView {
     const pinnedTheme = pinnedGridThemePalette(); if (pinnedTheme) applyGridThemeValues(this.root, pinnedTheme);
     this.host.appendChild(this.root);
     const toolbar = document.createElement("div"); toolbar.className = "rg-toolbar";
-    toolbar.append(button("↶", "Undo (⌘Z)", () => { void this.undo(); }, "rg-toolbar-primary"), button("↷", "Redo (⌘⇧Z)", () => { void this.redo(); }, "rg-toolbar-primary"), button("Merge", "Safely merge selection", () => this.merge()), button("Unmerge", "Unmerge selection", () => this.unmerge()), button("⇤", "Align selection left", () => this.alignSelection("left")), button("≡", "Center selection", () => this.alignSelection("center")), button("⇥", "Align selection right", () => this.alignSelection("right")), button("fx", "Show or hide formula-cell coloring", () => this.toggleFormulaColors()), button("Labels", "Show or hide row and column labels", () => this.toggleHeaders()), button("Rows", "Row height presets for the selected rows", (event) => this.openRowHeightMenu(event.currentTarget)), button("Save", "Commit dirty chunks", () => this.flush()), button("Export", "Export visible selection", () => this.exportSelection()), button("Native copy", "Copy to a native table when within the write budget", () => copyLargeToNative(this.store)));
+    toolbar.append(button("↶", "Undo (⌘Z)", () => { void this.undo(); }, "rg-toolbar-primary"), button("↷", "Redo (⌘⇧Z)", () => { void this.redo(); }, "rg-toolbar-primary"), button("Merge", "Safely merge selection", () => this.merge()), button("Unmerge", "Unmerge selection", () => this.unmerge()), button("⇤", "Align selection left", () => this.alignSelection("left")), button("≡", "Center selection", () => this.alignSelection("center")), button("⇥", "Align selection right", () => this.alignSelection("right")), button("fx", "Show or hide formula-cell coloring", () => this.toggleFormulaColors()), button("Labels", "Show or hide row and column labels", () => this.toggleHeaders()), button("Layout", "Row height and image size/fit for the selection", (event) => this.openLayoutMenu(event.currentTarget)), button("Save", "Commit dirty chunks", () => this.flush()), button("Export", "Export visible selection", () => this.exportSelection()), button("Native copy", "Copy to a native table when within the write budget", () => copyLargeToNative(this.store)));
     this.status = document.createElement("span"); this.status.className = "rg-status";
     // Large-grid cells are JSON rows in a chunk file, not Roam blocks, so there is nothing for a
     // native comment thread to anchor to.  There is deliberately no alternate comment store.
@@ -12000,7 +12029,29 @@ export class LargeGridView {
     this.scheduleSave(true); this.scheduleRender();
   }
 
-  openRowHeightMenu(anchor) {
+  /**
+   * Column-scoped image size/fit for the large grid (FIX-5). Large cells are JSON rows with no block
+   * uid, so only the COLUMN layer is writable here; the write rides `store.setImageLayout` (journaled
+   * and merge-safe, proven in large-grid-merge). `null` clears just that field, falling back to the
+   * global default. The row-preset gesture already skips undo for large-grid metadata, so this does too.
+   */
+  setSelectedColumnImageLayout(kind, value) {
+    const range = normalizeRange(this.selection);
+    const layout = normalizeImageLayout(this.store.manifest.imageLayout);
+    for (let col = range.startCol; col <= range.endCol; col += 1) {
+      const columnId = this.store.manifest.columnIds?.[col];
+      if (!columnId) continue;
+      const entry = { ...layout.columns[columnId] };
+      if (value == null) delete entry[kind]; else entry[kind] = value;
+      if (Object.keys(entry).length) layout.columns[columnId] = entry; else delete layout.columns[columnId];
+    }
+    this.store.setImageLayout(layout);
+    this.scheduleSave(true); this.scheduleRender();
+  }
+
+  /** The large-grid layout menu: row-height presets plus the column-scoped image size/fit groups —
+   *  the same combined shape the native context menu uses (row height beside image layout). */
+  openLayoutMenu(anchor) {
     const existing = document.querySelector(".rg-context-menu"); existing?.__rgDismiss?.(); existing?.remove();
     const menu = document.createElement("div"); menu.className = "bp3-menu rg-context-menu";
     let theme = null; let closed = false; let closeTimer = null;
@@ -12011,10 +12062,15 @@ export class LargeGridView {
       this.root.focus?.({ preventScroll: true }); claimKeyboard(this);
     };
     const item = (label, action) => { const element = button(label, label, () => { dismiss(); action(); }); element.className = "bp3-menu-item"; return element; };
-    const section = document.createElement("div"); section.className = "rg-menu-section"; section.textContent = "Row height";
-    menu.append(section);
+    const heading = (text) => { const section = document.createElement("div"); section.className = "rg-menu-section"; section.textContent = text; menu.append(section); };
+    heading("Row height");
     for (const [label, height] of ROW_HEIGHT_PRESETS) menu.append(item(`${label} (${height} px)`, () => this.setSelectedRowHeights(height)));
     menu.append(item("Reset row height", () => this.setSelectedRowHeights(null)));
+    heading("Image size");
+    for (const [label, size] of IMAGE_SIZE_MENU) menu.append(item(label, () => this.setSelectedColumnImageLayout("size", size)));
+    menu.append(item("Column default", () => this.setSelectedColumnImageLayout("size", null)));
+    heading("Image fit");
+    for (const [label, fit] of IMAGE_FIT_MENU) menu.append(item(label, () => this.setSelectedColumnImageLayout("fit", fit)));
     menu.__rgDismiss = dismiss;
     tagPortalOwner(menu, gridViewUid(this));
     document.body.appendChild(menu);
@@ -12472,8 +12528,23 @@ function claimNativeInstances(root) {
   }
 }
 
+/**
+ * Body-mounted lightboxes a session owns must be torn down with it (FIX-2). A modal `<dialog>` left
+ * open by `showModal()` blocks the whole page behind its inert `::backdrop`, and its inner
+ * `renderString` host leaks unless the portal's own `__rgDismiss` runs — which calls `unmountNode`,
+ * not just `remove()`. The lightbox carries a passive `data-rg-lightbox-owner` marker (FIX-1) rather
+ * than the keyboard-owning `data-rg-owner` tag, so we match on it here.
+ */
+export function dismissOwnedLightboxes(uid) {
+  if (!uid || typeof document?.querySelectorAll !== "function") return;
+  for (const portal of [...document.querySelectorAll(".rg-lightbox")]) {
+    if (portal.dataset?.rgLightboxOwner === String(uid)) portal.__rgDismiss?.();
+  }
+}
+
 function disposeNativeSession(uid, releaseNative = false) {
   const session = runtime.sessions.get(uid); if (!session) return;
+  dismissOwnedLightboxes(uid);
   for (const view of [...session.views]) {
     runtime.views.delete(view); runtime.viewsByNative.delete?.(view.nativeElement);
     view.dispose({ releaseNative });
@@ -13016,7 +13087,9 @@ async function onunload() {
   resetRoamRecents();
   resetSuggestionRendering();
   clearTrackedTimers();
-  document.querySelectorAll(".rg-toasts,.rg-dialog-overlay,.rg-context-menu").forEach((element) => {
+  // `.rg-lightbox` joins the sweep so an open modal dialog is dismissed via its `__rgDismiss` (which
+  // unmounts the renderString host), not merely orphaned behind its inert backdrop on unload (FIX-2).
+  document.querySelectorAll(".rg-toasts,.rg-dialog-overlay,.rg-context-menu,.rg-lightbox").forEach((element) => {
     if (element.__rgDismiss) element.__rgDismiss(); else element.remove();
   });
   if (globalThis.window?.roamGrid?.v1?.version === VERSION) delete globalThis.window.roamGrid.v1;
