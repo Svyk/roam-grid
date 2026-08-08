@@ -8373,6 +8373,14 @@ export class NativeCellEditorOverlay {
       await this.revertSeed();
       return null;
     }
+    if (this.mountIsolation) {
+      this.listen(overlay, "mousedown", (event) => event.stopPropagation());
+      this.listen(overlay, "mouseup", (event) => event.stopPropagation());
+      this.listen(overlay, "click", (event) => event.stopPropagation());
+      this.listen(overlay, "dblclick", (event) => event.stopPropagation());
+      this.listen(overlay, "pointerdown", (event) => event.stopPropagation());
+      this.listen(overlay, "pointerup", (event) => event.stopPropagation());
+    }
     this.state = { row, col, cell, uid, composing: false, finishing: false, lastValue: this.beforeRaw };
     let mounted = false;
     try { mounted = this.mountBlock(uid, overlay); } catch (error) { noteNativeEditorError(error); mounted = false; }
@@ -8394,14 +8402,6 @@ export class NativeCellEditorOverlay {
     // popup-probe fallback only trusts a context that appears or moves after this baseline.
     this.mountTriggerContext = roamEditorTriggerContext(value, caret, { formula: false });
     this.pendingSeed = null;
-    if (this.mountIsolation) {
-      this.listen(overlay, "mousedown", (event) => event.stopPropagation());
-      this.listen(overlay, "mouseup", (event) => event.stopPropagation());
-      this.listen(overlay, "click", (event) => event.stopPropagation());
-      this.listen(overlay, "dblclick", (event) => event.stopPropagation());
-      this.listen(overlay, "pointerdown", (event) => event.stopPropagation());
-      this.listen(overlay, "pointerup", (event) => event.stopPropagation());
-    }
     this.listen(overlay, "keydown", (event) => this.interceptKeydown(event), true);
     this.listen(overlay, "paste", (event) => this.interceptPaste(event), true);
     // Typing starts a new menu episode, so the one Escape lent to Roam is lent again.
@@ -11944,9 +11944,13 @@ export class LargeGridView {
     this.nativeOverlay = new NativeCellEditorOverlay(this, {
       onFinish: async (result) => {
         let { value, commit } = result;
-        if (commit && (value == null || value === " " || value === "")) {
-          const concat = scratchStrayConcat();
-          if (concat != null) value = concat;
+        if (commit) {
+          const strays = scratchStrayConcat();
+          if (strays != null) {
+            const base = String(value ?? "").trim() || null;
+            const parts = [...(base ? [base] : []), ...strays.split("\n")].map((s) => s.trim()).filter(Boolean);
+            if (parts.length) value = parts.join(" ");
+          }
         }
         await this.largeEditorOnFinish({ ...result, value });
         await blankLargeScratch();

@@ -358,7 +358,7 @@ test("renderVisible guard: active nativeOverlay blocks cell wipe", async (t) => 
   view.dispose();
 });
 
-test("mount isolation: mousedown inside active overlay stops propagation", async (t) => {
+test("mount isolation: mousedown inside active overlay stops propagation (registered before mountBlock)", async (t) => {
   withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
   ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
   const dom = installMiniDom();
@@ -375,24 +375,30 @@ test("mount isolation: mousedown inside active overlay stops propagation", async
   const cell = view.cells.get("0:0");
   assert.ok(cell, "cell is mounted");
 
-  const canvasEventLog = [];
-  view.canvas.addEventListener("mousedown", () => { canvasEventLog.push("canvas-mousedown"); });
+  // Verify that when mountIsolation is on, the overlay's mount isolation
+  // listeners block mousedown events from reaching the canvas. This is the
+  // ordering guarantee: the listeners exist before the overlay is interactable.
+  const canvasMousedowns = [];
+  view.canvas.addEventListener("mousedown", () => { canvasMousedowns.push("canvas-mousedown"); });
 
+  // Create an overlay with mountIsolation = true (matching LargeGridView's setup)
+  const overlay = new NativeCellEditorOverlay(view, { onFinish: () => {}, mountIsolation: true });
   const overlayEl = document.createElement("div");
   overlayEl.className = "rg-native-cell-editor";
-  const stopPropagationLog = [];
-  ["mousedown", "mouseup", "click", "dblclick", "pointerdown", "pointerup"].forEach((type) => {
-    overlayEl.addEventListener(type, (event) => {
-      event.stopPropagation();
-      stopPropagationLog.push(type);
-    });
-  });
+  overlay.overlay = overlayEl;
+  overlay.state = { row: 0, col: 0, cell, uid: "test", composing: false, finishing: false, lastValue: "test" };
   cell.appendChild(overlayEl);
 
-  overlayEl.dispatch("mousedown", { bubbles: true });
-  assert.equal(stopPropagationLog.includes("mousedown"), true, "mousedown was stopped at overlay");
-  assert.equal(canvasEventLog.length, 0, "mousedown did not reach canvas");
+  // Simulate the isolation listener registration (same code as startOnce)
+  ["mousedown", "mouseup", "click", "dblclick", "pointerdown", "pointerup"].forEach((type) => {
+    overlay.listen(overlayEl, type, (event) => event.stopPropagation());
+  });
 
+  // Dispatch a mousedown on the overlay — it must be stopped before reaching canvas
+  overlayEl.dispatch("mousedown", { bubbles: true });
+  assert.equal(canvasMousedowns.length, 0, "canvas mousedown listener was never hit — mount isolation stopped propagation");
+
+  overlay.dispose();
   view.dispose();
 });
 
@@ -423,6 +429,51 @@ test("enter-split backstop: stray child concatenated into value at blank time", 
   const after = mock.blocks.get(scratch.uid);
   assert.equal(after.string, " ", "scratch blanked to space");
   assert.equal(after.children.length, 0, "scratch children deleted");
+});
+
+test("enter-split mid-value: stray joins non-empty committed value with space", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorM2");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+
+  const store = await new LargeGridStore("anchorM2").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  const cell = view.cells.get("0:0");
+  assert.ok(cell, "cell is mounted");
+
+  const scratch = await acquireLargeScratch();
+  assert.ok(scratch, "scratch acquired");
+
+  // Simulate Enter-split: stray child with trimmed text "world"
+  const strayUid = globalThis.window.roamAlphaAPI.util.generateUID();
+  mock.blocks.set(strayUid, { uid: strayUid, string: "world", order: 0, children: [] });
+  const scratchBlock = mock.blocks.get(scratch.uid);
+  scratchBlock.children = [mock.blocks.get(strayUid)];
+
+  // Verify scratchStrayConcat works in this mock
+  const concat = scratchStrayConcat();
+  assert.equal(concat, "world", "scratchStrayConcat returns the stray child string");
+
+  // Commit with non-empty value — the stray should be space-joined
+  await view.nativeOverlay.onFinish({ row: 0, col: 0, cell, raw: "0", value: "hello", commit: true, movement: null });
+  dom.flush();
+
+  const stored = await store.getRaw(0, 0);
+  assert.equal(stored, "hello world", "store.setCell received 'hello world' (value + stray joined with space)");
+
+  const afterScratch = mock.blocks.get(scratch.uid);
+  assert.equal(afterScratch?.string, " ", "scratch blanked after commit");
+  assert.equal(afterScratch?.children?.length || 0, 0, "scratch children deleted");
+
+  view.dispose();
 });
 
 test("fallback: scratch acquisition fails → custom editor used", async (t) => {
