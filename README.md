@@ -3,7 +3,7 @@
 Turn a native Roam table into a real spreadsheet — formulas, merges, sorting,
 resizing, charts, comments — without moving a single cell out of your graph.
 
-Version 0.12.0. Your table's rows and columns stay ordinary nested Roam blocks,
+Version 0.13.0. Your table's rows and columns stay ordinary nested Roam blocks,
 so links, `((block references))`, search, exports, and the plain Roam renderer
 keep working exactly as before. Turn Roam Grid off and the table is still there.
 
