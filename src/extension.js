@@ -11953,7 +11953,7 @@ export class LargeGridView {
     this.root = document.createElement("section"); this.root.className = "rg-root rg-large-root"; this.root.tabIndex = 0;
     this.cells = new Map(); this.cellValueTokens = new WeakMap(); this.editorController = null; this.nativeOverlay = null; this.editingPending = false;
     this.formulaEngine = new AsyncFormulaEngine(this.store, runtime.registries.formulaFunctions, runtime.registries.formulaFunctionMetadata);
-    this.saveTimer = null; this.renderToken = 0; this.dragSelecting = false; this.boundUp = () => { this.dragSelecting = false; };
+    this.saveTimer = null; this.renderToken = 0; this.dragSelecting = false; this.dragOrigin = null; this.boundUp = () => { this.dragSelecting = false; this.dragOrigin = null; };
     this.metricsRows = []; this.metricsExtra = new Float64Array(1); this.metricsDefaultHeight = 0;
     this.rowMetricsKey = null; this.rowResizePreview = null; this.columnResizePreview = null; this.resizeCleanup = null;
     this.disposed = false; this.root.__rgView = this;
@@ -12129,9 +12129,9 @@ export class LargeGridView {
         cell.style.width = `${width}px`; cell.style.height = `${this.rowSpanHeight(row, merge?.rowSpan || 1)}px`;
         const raw = this.store.peekRaw(row, col);
         void this.renderLargeCellValue(cell, raw, row, col, engine);
-        if (rangeContains(this.selection, row, col)) cell.classList.add("rg-cell--selected");
-        cell.addEventListener("pointerdown", (event) => { if (event.button !== 0) return; if (event.target.closest?.(".rg-editor")) return; const anchorMerge = this.store.mergeAt(row, col); const anchorRow = anchorMerge?.row ?? row; const anchorCol = anchorMerge?.col ?? col; if (this.editorController?.insertReference(anchorRow, anchorCol, event)) return; this.anchor = { row: anchorRow, col: anchorCol }; this.selection = { startRow: anchorRow, endRow: anchorRow, startCol: anchorCol, endCol: anchorCol }; this.dragSelecting = true; this.root.focus(); claimKeyboard(this); this.updateLargeSelection(); event.preventDefault(); });
-        cell.addEventListener("pointerenter", () => { if (this.dragSelecting) { this.selection = normalizeRange({ startRow: this.anchor.row, endRow: row, startCol: this.anchor.col, endCol: col }); this.scheduleRender(); } });
+        if (this.isCellSelected(row, col, merge)) cell.classList.add("rg-cell--selected");
+        cell.addEventListener("pointerdown", (event) => { if (event.button !== 0) return; if (event.target.closest?.(".rg-editor")) return; const anchorMerge = this.store.mergeAt(row, col); const anchorRow = anchorMerge?.row ?? row; const anchorCol = anchorMerge?.col ?? col; if (this.editorController?.insertReference(anchorRow, anchorCol, event)) return; this.anchor = { row: anchorRow, col: anchorCol }; this.selection = { startRow: anchorRow, endRow: anchorRow, startCol: anchorCol, endCol: anchorCol }; this.dragSelecting = true; this.dragOrigin = { x: event.clientX, y: event.clientY }; this.root.focus({ preventScroll: true }); claimKeyboard(this); this.updateLargeSelection(); event.preventDefault(); });
+        cell.addEventListener("pointerenter", (event) => { if (!this.dragSelecting) return; if (this.dragOrigin && Math.abs(event.clientX - this.dragOrigin.x) < 4 && Math.abs(event.clientY - this.dragOrigin.y) < 4) return; this.selection = normalizeRange({ startRow: this.anchor.row, endRow: row, startCol: this.anchor.col, endCol: col }); this.updateLargeSelection(); });
         cell.addEventListener("click", (event) => { if (event.target.closest?.(".rg-img-clip-chip")) this.openLargeCellImageLightbox(row, col, 0); });
         cell.addEventListener("dragover", (event) => { const files = Boolean(event.dataTransfer?.types?.includes?.("Files")); cell.classList.toggle("rg-cell--drop-target", files); if (files) event.preventDefault(); });
         cell.addEventListener("dragleave", (event) => { if (!event.relatedTarget || !cell.contains(event.relatedTarget)) cell.classList.remove("rg-cell--drop-target"); });
@@ -12204,11 +12204,15 @@ export class LargeGridView {
     return affected;
   }
 
+  isCellSelected(row, col, merge = this.store.mergeAt(row, col)) {
+    return rangeContains(this.selection, row, col) || Boolean(merge && rangesOverlap(this.selection, { startRow: merge.row, endRow: merge.row + merge.rowSpan - 1, startCol: merge.col, endCol: merge.col + merge.colSpan - 1 }));
+  }
+
   updateLargeSelection() {
     for (const cell of this.cells.values()) {
       const row = Number(cell.dataset.row); const col = Number(cell.dataset.col);
       const merge = this.store.mergeAt(row, col);
-      const selected = rangeContains(this.selection, row, col) || merge && rangesOverlap(this.selection, { startRow: merge.row, endRow: merge.row + merge.rowSpan - 1, startCol: merge.col, endCol: merge.col + merge.colSpan - 1 });
+      const selected = this.isCellSelected(row, col, merge);
       cell.classList.toggle("rg-cell--selected", Boolean(selected));
     }
   }
@@ -12474,7 +12478,7 @@ export class LargeGridView {
     this.invalidateLargeCells(coordinates); await this.store.commit(); this.scheduleRender();
     return { manifest: deepClone(this.store.manifest) };
   }
-  dispose({ keepStore = false } = {}) { this.disposed = true; ++this.renderToken; clearTimeout(this.saveTimer); if (this.nativeOverlay?.active) { void this.nativeOverlay.commit(null).catch(() => {}); } else { this.nativeOverlay?.dispose(); } this.nativeOverlay = null; if (!keepStore) this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; releaseKeyboard(this); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden");
+  dispose({ keepStore = false } = {}) { this.disposed = true; this.dragSelecting = false; this.dragOrigin = null; ++this.renderToken; clearTimeout(this.saveTimer); if (this.nativeOverlay?.active) { void this.nativeOverlay.commit(null).catch(() => {}); } else { this.nativeOverlay?.dispose(); } this.nativeOverlay = null; if (!keepStore) this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; releaseKeyboard(this); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden");
     this.markerElement?.querySelector?.(".rm-xparser-default-grid")?.classList.remove("rg-large-marker-hidden");
     this.markerElement?.querySelector?.("[data-tag='roam/grid']")?.classList.remove("rg-large-marker-hidden"); }
 }
