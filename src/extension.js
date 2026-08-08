@@ -11769,7 +11769,7 @@ export class LargeGridView {
     this.host = host; this.store = store; this.markerElement = markerElement; this.model = null;
     this.selection = { startRow: 0, endRow: 0, startCol: 0, endCol: 0 }; this.anchor = { row: 0, col: 0 };
     this.root = document.createElement("section"); this.root.className = "rg-root rg-large-root"; this.root.tabIndex = 0;
-    this.cells = new Map(); this.cellValueTokens = new WeakMap(); this.editorController = null;
+    this.cells = new Map(); this.cellValueTokens = new WeakMap(); this.editorController = null; this.editingPending = false;
     this.formulaEngine = new AsyncFormulaEngine(this.store, runtime.registries.formulaFunctions, runtime.registries.formulaFunctionMetadata);
     this.saveTimer = null; this.renderToken = 0; this.dragSelecting = false; this.boundUp = () => { this.dragSelecting = false; };
     this.metricsRows = []; this.metricsExtra = new Float64Array(1); this.metricsDefaultHeight = 0;
@@ -11888,7 +11888,7 @@ export class LargeGridView {
     });
   }
   async renderVisible(token = this.renderToken) {
-    if (this.editorController?.state && !this.editorController.state.floating) return;
+    if (this.editingPending || (this.editorController?.state && !this.editorController.state.floating)) return;
     const { rowCount, colCount } = this.store.manifest; this.status.textContent = `${rowCount.toLocaleString()} × ${colCount}`;
     const headerHeight = this.headerHeight(); const headerWidth = this.headerWidth();
     this.rebuildRowMetrics(); this.canvas.style.width = `${this.totalWidth()}px`; this.canvas.style.height = `${headerHeight + this.rowOffset(rowCount)}px`;
@@ -12097,11 +12097,15 @@ export class LargeGridView {
   async beginEdit(row, col, cell = this.cells.get(`${row}:${col}`), initial = null, floating = false) {
     if (!cell) return;
     const merge = this.store.mergeAt(row, col); row = merge?.row ?? row; col = merge?.col ?? col;
-    // Editing a row whose stored bytes never arrived would save a cell built on rows we never read.
     const chunkIndex = this.store.chunkIndexForRow(row);
     if (this.store.unreadableChunks.has(chunkIndex)) return toast(`Chunk ${chunkIndex} is unreadable — reload it before editing these rows`, "warning");
-    const raw = await this.store.getRaw(row, col);
-    return this.editorController?.start({ row, col, cell, raw, initial, floating });
+    this.editingPending = true;
+    try {
+      const raw = this.store.cache.has(chunkIndex) ? this.store.peekRaw(row, col) : await this.store.getRaw(row, col);
+      return this.editorController?.start({ row, col, cell, raw, initial, floating });
+    } finally {
+      this.editingPending = false;
+    }
   }
   onKeydown(event) {
     if (event.target.matches("textarea,input")) return; event.stopPropagation(); const command = event.metaKey || event.ctrlKey;
