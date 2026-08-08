@@ -724,8 +724,8 @@ export function enhancedUidGuardCss(uids) {
 
 // The large marker is Roam's grid xparser button (span.rm-xparser-default-grid); the guard targets
 // only that button so prose or other renderings in the same block are never blanked, and the
-// :not() handoff releases the instant LargeGridView.mount() adds .rg-large-marker-hidden to the
-// block input wrapper that carries the button.
+// :not() handoff releases the instant LargeGridView.mount() adds .rg-large-marker-hidden to
+// the button element itself.
 export function largeGridGuardCss(uids) {
   const selectors = [];
   const unique = [...new Set([...uids].map(String).filter(Boolean))].sort();
@@ -11825,6 +11825,8 @@ export class LargeGridView {
   }
   mount() {
     this.markerElement?.classList.add("rg-large-marker-hidden");
+    const markerButton = this.markerElement?.querySelector?.(".rm-xparser-default-grid") || this.markerElement?.querySelector?.("[data-tag='roam/grid']");
+    markerButton?.classList.add("rg-large-marker-hidden");
     applyToolbarPreset(this.root); applyGridMaxWidth(this.root);
     const pinnedTheme = pinnedGridThemePalette(); if (pinnedTheme) applyGridThemeValues(this.root, pinnedTheme);
     this.host.appendChild(this.root);
@@ -11929,12 +11931,12 @@ export class LargeGridView {
   scheduleRender() {
     const token = ++this.renderToken;
     requestAnimationFrame(() => {
-      if (token !== this.renderToken) return;
+      if (this.disposed || token !== this.renderToken) return;
       void this.renderVisible(token).catch((error) => toast(`Large grid render failed: ${error.message}`, "danger", 8000));
     });
   }
   async renderVisible(token = this.renderToken) {
-    if (this.editingPending || (this.editorController?.state && !this.editorController.state.floating)) return;
+    if (this.disposed || this.editingPending || (this.editorController?.state && !this.editorController.state.floating)) return;
     const { rowCount, colCount } = this.store.manifest; this.status.textContent = `${rowCount.toLocaleString()} × ${colCount}`;
     const headerHeight = this.headerHeight(); const headerWidth = this.headerWidth();
     this.rebuildRowMetrics(); this.canvas.style.width = `${this.totalWidth()}px`; this.canvas.style.height = `${headerHeight + this.rowOffset(rowCount)}px`;
@@ -12145,12 +12147,13 @@ export class LargeGridView {
     const merge = this.store.mergeAt(row, col); row = merge?.row ?? row; col = merge?.col ?? col;
     const chunkIndex = this.store.chunkIndexForRow(row);
     if (this.store.unreadableChunks.has(chunkIndex)) return toast(`Chunk ${chunkIndex} is unreadable — reload it before editing these rows`, "warning");
-    this.editingPending = true;
+    const cached = this.store.cache.has(chunkIndex);
+    if (cached) this.editingPending = true;
     try {
-      const raw = this.store.cache.has(chunkIndex) ? this.store.peekRaw(row, col) : await this.store.getRaw(row, col);
+      const raw = cached ? this.store.peekRaw(row, col) : await this.store.getRaw(row, col);
       return this.editorController?.start({ row, col, cell, raw, initial, floating });
     } finally {
-      this.editingPending = false;
+      if (cached) this.editingPending = false;
     }
   }
   onKeydown(event) {
@@ -12311,7 +12314,9 @@ export class LargeGridView {
     this.invalidateLargeCells(coordinates); await this.store.commit(); this.scheduleRender();
     return { manifest: deepClone(this.store.manifest) };
   }
-  dispose({ keepStore = false } = {}) { this.disposed = true; clearTimeout(this.saveTimer); if (!keepStore) this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; releaseKeyboard(this); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden"); }
+  dispose({ keepStore = false } = {}) { this.disposed = true; ++this.renderToken; clearTimeout(this.saveTimer); if (!keepStore) this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; releaseKeyboard(this); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden");
+    this.markerElement?.querySelector?.(".rm-xparser-default-grid")?.classList.remove("rg-large-marker-hidden");
+    this.markerElement?.querySelector?.("[data-tag='roam/grid']")?.classList.remove("rg-large-marker-hidden"); }
 }
 
 function downloadText(text, filename, type = "text/plain") {
@@ -12458,7 +12463,7 @@ async function newLargeGrid() {
   try {
     const anchorUid = await insertNearFocus("{{[[roam/grid]]}}"); const store = await new LargeGridStore(anchorUid).initialize();
     const metadataModel = applyDisplayDefaults(new GridModel({ rows: [[""]], columnIds: store.manifest.columnIds, widths: store.manifest.widths, frozenRows: store.manifest.frozenRows, frozenCols: store.manifest.frozenCols, merges: store.manifest.merges, charts: store.manifest.charts }));
-    await runtime.metadata.set(anchorUid, metadataModel, "large"); scheduleScan(); toast(`Created a ${store.manifest.rowCount.toLocaleString()} × ${store.manifest.colCount} large grid.`, "success");
+    await runtime.metadata.set(anchorUid, metadataModel, "large"); syncEnhancedUidGuard(); scheduleScan(); toast(`Created a ${store.manifest.rowCount.toLocaleString()} × ${store.manifest.colCount} large grid.`, "success");
   } catch (error) { toast(error.message, "danger", 8000); }
 }
 
@@ -12846,9 +12851,10 @@ function cleanupDisconnectedViews() {
     if (mount.root?.isConnected && runtime.metadata?.has(uid)) continue;
     if (!runtime.metadata?.has(uid)) { mount.dispose(); runtime.largeMounts.delete(uid); runtime.largeStores.delete(uid); }
     else {
+      const store = mount.store;
       mount.dispose({ keepStore: true }); runtime.largeMounts.delete(uid);
       const prior = runtime.largeStores.get(uid); if (prior) clearTimeout(prior.idleTimer);
-      runtime.largeStores.set(uid, { store: mount.store, idleTimer: setTimeout(() => { runtime.largeStores.delete(uid); mount.store.dispose(); }, getSetting("session-idle-ms")) });
+      runtime.largeStores.set(uid, { store, idleTimer: setTimeout(() => { runtime.largeStores.delete(uid); store.dispose(); }, getSetting("session-idle-ms")) });
     }
   }
 }
@@ -12964,6 +12970,14 @@ async function scanMounts() {
       // An unload can land during the initialize await; mounting a live view (+listeners +timers)
       // into a torn-down runtime would leak it. The metadata re-check is the liveness probe.
       if (!runtime.metadata || !runtime.extensionAPI) continue;
+      const old = runtime.largeMounts.get(uid);
+      if (old && !old.root?.isConnected) {
+        old.markedUid = uid;
+        old.dispose({ keepStore: true });
+        if (old.store && !old.store.disposed && !runtime.largeStores.has(uid)) {
+          runtime.largeStores.set(uid, { store: old.store, idleTimer: setTimeout(() => { runtime.largeStores.delete(uid); old.store.dispose(); }, getSetting("session-idle-ms")) });
+        }
+      }
       const view = new LargeGridView({ host: block, store, markerElement: marker });
       if (!runtime.metadata) { try { view.dispose(); } catch { /* mid-unload */ } continue; }
       view.root.dataset.roamGridUid = uid; view.root.__rgView = view; runtime.largeMounts.set(uid, view);
