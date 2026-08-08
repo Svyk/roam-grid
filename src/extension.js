@@ -1,4 +1,4 @@
-const VERSION = "0.12.0";
+const VERSION = "0.13.0";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const RANGE_COMPONENT_NAME = "roam-grid-range";
@@ -7602,6 +7602,29 @@ function imageEntryStartIndex(entries, row, imageIndex) {
   return start;
 }
 
+/**
+ * Shared image-file upload for paste AND drag-drop (LP-7): serial `file.upload` calls, one
+ * progress toast up front, the verbatim `![](…)` markdown strings back in file order. A failed
+ * upload records the forensic trace, toasts once here (so no caller double-toasts), and rethrows —
+ * the caller decides what the cell keeps.
+ */
+export async function uploadImageEmbeds(files) {
+  const list = [...(files || [])];
+  if (!list.length) return [];
+  toast(`Uploading ${list.length} image${list.length === 1 ? "" : "s"}…`);
+  const embeds = [];
+  for (const file of list) {
+    try {
+      embeds.push(await roam().file.upload({ file, toast: { hide: true } }));
+    } catch (error) {
+      if (globalThis.window) globalThis.window.__RG_IMG_LAST_ERROR = String(error?.stack || error);
+      toast(`Image upload failed: ${error.message}`, "danger");
+      throw error;
+    }
+  }
+  return embeds;
+}
+
 
 /** Roam's own uid shape: nine characters of `[A-Za-z0-9_-]`. Custom uids exist and are longer, which
  *  is why this only ever ADDS a row rather than deciding what the query means. */
@@ -10133,8 +10156,9 @@ export class GridView {
     cell.addEventListener("contextmenu", (event) => { const currentRow = Number(cell.dataset.row); const currentCol = Number(cell.dataset.col); event.preventDefault(); if (!rangeContains(this.selection, currentRow, currentCol)) this.select({ startRow: currentRow, endRow: currentRow, startCol: currentCol, endCol: currentCol }); this.openMenu(cell, event.clientX, event.clientY); });
     cell.draggable = true;
     cell.addEventListener("dragstart", (event) => { const currentRow = Number(cell.dataset.row); const currentCol = Number(cell.dataset.col); if (!rangeContains(this.selection, currentRow, currentCol)) this.select({ startRow: currentRow, endRow: currentRow, startCol: currentCol, endCol: currentCol }); event.dataTransfer.setData("application/x-roam-grid-range", JSON.stringify(this.selection)); });
-    cell.addEventListener("dragover", (event) => { if (event.dataTransfer.types.includes("application/x-roam-grid-range")) event.preventDefault(); });
-    cell.addEventListener("drop", (event) => { const raw = event.dataTransfer.getData("application/x-roam-grid-range"); if (!raw) return; event.preventDefault(); const range = JSON.parse(raw); this.commitMutation("Move range", () => this.model.moveRange(range, Number(cell.dataset.row), Number(cell.dataset.col)), true); });
+    cell.addEventListener("dragover", (event) => this.handleCellDragOver(cell, event));
+    cell.addEventListener("dragleave", (event) => this.handleCellDragLeave(cell, event));
+    cell.addEventListener("drop", (event) => this.handleCellDrop(cell, event));
     return cell;
   }
 
@@ -10781,11 +10805,10 @@ export class GridView {
     const images = [...(event.clipboardData?.files || [])].filter((file) => file.type.startsWith("image/"));
     if (images.length) {
       event.preventDefault(); const row = this.selection.startRow; const col = this.selection.startCol; const previous = this.model.getRaw(row, col);
-      toast(`Uploading ${images.length} image${images.length === 1 ? "" : "s"}…`);
       try {
-        const embeds = []; for (const file of images) embeds.push(await roam().file.upload({ file, toast: { hide: true } }));
+        const embeds = await uploadImageEmbeds(images);
         await this.commitMutation("Paste image", () => this.model.setRaw(row, col, [previous, ...embeds].filter(Boolean).join(" ")), false);
-      } catch (error) { toast(`Image upload failed: ${error.message}`, "danger"); }
+      } catch (error) { if (globalThis.window) globalThis.window.__RG_IMG_LAST_ERROR = String(error?.stack || error); }
       return;
     }
     const text = event.clipboardData?.getData("text/plain"); if (!text) return;
@@ -10793,6 +10816,55 @@ export class GridView {
     if (referenced) { event.preventDefault(); await this.pasteReferencedRange(referenced); return; }
     event.preventDefault(); const matrix = parseDelimited(text, text.includes("\t") ? "\t" : detectDelimiter(text));
     await this.pasteMatrix(matrix);
+  }
+
+  /**
+   * Drag-drop parity with paste: OS image files land at the DROPPED-ON cell (never the selection),
+   * appended after any existing content through the ordinary undoable mutation lane. Fire-and-forget
+   * from the drop event — the upload toast and failure path live in `uploadImageEmbeds`.
+   */
+  async dropImageFiles(files, row, col) {
+    try {
+      const embeds = await uploadImageEmbeds(files);
+      if (!embeds.length) return;
+      const previous = this.model.getRaw(row, col);
+      await this.commitMutation("Drop image", () => this.model.setRaw(row, col, [previous, ...embeds].filter(Boolean).join(" ")), false);
+    } catch (error) { if (globalThis.window) globalThis.window.__RG_IMG_LAST_ERROR = String(error?.stack || error); }
+  }
+
+  /** LP-8: preventDefault on dragover is what lets the drop happen at all, and it beats Roam's
+   *  global file-drop lane. Only Files transfers earn the `.rg-cell--drop-target` highlight. */
+  handleCellDragOver(cell, event) {
+    const types = event.dataTransfer?.types;
+    const files = Boolean(types?.includes?.("Files"));
+    cell.classList.toggle("rg-cell--drop-target", files);
+    if (files || types?.includes?.("application/x-roam-grid-range")) { event.preventDefault(); return true; }
+    return false;
+  }
+
+  /** dragleave fires when entering a child too; only a real exit clears the highlight. */
+  handleCellDragLeave(cell, event) {
+    if (event.relatedTarget && cell.contains?.(event.relatedTarget)) return false;
+    cell.classList.remove("rg-cell--drop-target");
+    return true;
+  }
+
+  /** One drop lane for both payloads: an in-grid range move, else OS image files. A drop of
+   *  non-image files falls through untouched so Roam keeps its own file handling. */
+  handleCellDrop(cell, event) {
+    cell.classList.remove("rg-cell--drop-target");
+    const row = Number(cell.dataset.row); const col = Number(cell.dataset.col);
+    const raw = event.dataTransfer?.getData?.("application/x-roam-grid-range");
+    if (raw) {
+      event.preventDefault(); const range = JSON.parse(raw);
+      this.commitMutation("Move range", () => this.model.moveRange(range, row, col), true);
+      return "range";
+    }
+    const images = [...(event.dataTransfer?.files || [])].filter((file) => file.type.startsWith("image/"));
+    if (!images.length) return null;
+    event.preventDefault();
+    void this.dropImageFiles(images, row, col);
+    return "images";
   }
 
   async pasteReferencedRange(spec, resolve = resolveSourceModel) {
@@ -11691,6 +11763,17 @@ export class LargeGridView {
     this.viewport = document.createElement("div"); this.viewport.className = "rg-large-viewport";
     this.canvas = document.createElement("div"); this.canvas.className = "rg-large-canvas"; this.viewport.appendChild(this.canvas);
     this.root.append(toolbar, this.viewport); this.root.addEventListener("paste", (event) => this.onPaste(event));
+    // LP-8: the viewport claims Files drags so a drop between mounted cells still lands; a drop on
+    // a mounted cell is owned by that cell's own handler (the bubble is ignored here).
+    this.viewport.addEventListener("dragover", (event) => { if (event.dataTransfer?.types?.includes?.("Files")) event.preventDefault(); });
+    this.viewport.addEventListener("drop", (event) => {
+      if (event.target?.closest?.(".rg-cell")) return;
+      const images = [...(event.dataTransfer?.files || [])].filter((file) => file.type.startsWith("image/"));
+      if (!images.length) return;
+      event.preventDefault();
+      const { row, col } = this.dropCellAt(event.clientX, event.clientY);
+      void this.dropImageFiles(images, row, col);
+    });
     this.editorController = new GridEditorController(this, {
       viewport: this.viewport,
       dimensions: () => ({ rowCount: this.store.manifest.rowCount, colCount: this.store.manifest.colCount }),
@@ -11819,6 +11902,15 @@ export class LargeGridView {
         cell.addEventListener("pointerdown", (event) => { if (event.button !== 0) return; if (event.target.closest?.(".rg-editor")) return; const anchorMerge = this.store.mergeAt(row, col); const anchorRow = anchorMerge?.row ?? row; const anchorCol = anchorMerge?.col ?? col; if (this.editorController?.insertReference(anchorRow, anchorCol, event)) return; this.anchor = { row: anchorRow, col: anchorCol }; this.selection = { startRow: anchorRow, endRow: anchorRow, startCol: anchorCol, endCol: anchorCol }; this.dragSelecting = true; this.root.focus(); claimKeyboard(this); this.updateLargeSelection(); event.preventDefault(); });
         cell.addEventListener("pointerenter", () => { if (this.dragSelecting) { this.selection = normalizeRange({ startRow: this.anchor.row, endRow: row, startCol: this.anchor.col, endCol: col }); this.scheduleRender(); } });
         cell.addEventListener("click", (event) => { if (event.target.closest?.(".rg-img-clip-chip")) this.openLargeCellImageLightbox(row, col, 0); });
+        cell.addEventListener("dragover", (event) => { const files = Boolean(event.dataTransfer?.types?.includes?.("Files")); cell.classList.toggle("rg-cell--drop-target", files); if (files) event.preventDefault(); });
+        cell.addEventListener("dragleave", (event) => { if (!event.relatedTarget || !cell.contains(event.relatedTarget)) cell.classList.remove("rg-cell--drop-target"); });
+        cell.addEventListener("drop", (event) => {
+          cell.classList.remove("rg-cell--drop-target");
+          const images = [...(event.dataTransfer?.files || [])].filter((file) => file.type.startsWith("image/"));
+          if (!images.length) return;
+          event.preventDefault();
+          void this.dropImageFiles(images, row, col);
+        });
         cell.addEventListener("dblclick", () => this.beginEdit(row, col, cell)); this.canvas.appendChild(cell); this.cells.set(`${row}:${col}`, cell);
       }
     }
@@ -11998,12 +12090,13 @@ export class LargeGridView {
     if (images.length) {
       event.preventDefault();
       try {
-        const embeds = []; for (const file of images) embeds.push(await roam().file.upload({ file, toast: { hide: true } }));
+        const embeds = await uploadImageEmbeds(images);
         const row = this.selection.startRow; const col = this.selection.startCol;
-        this.recordLargeEdit("Paste image", await this.store.setCell(row, col, embeds.join(" ")));
+        const previous = await this.store.getRaw(row, col);
+        this.recordLargeEdit("Paste image", await this.store.setCell(row, col, [previous, ...embeds].filter(Boolean).join(" ")));
         await this.repaintLargeCells(this.invalidateLargeCells([[row, col]]));
         this.scheduleSave();
-      } catch (error) { toast(error.message, "danger"); }
+      } catch (error) { if (globalThis.window) globalThis.window.__RG_IMG_LAST_ERROR = String(error?.stack || error); }
       return;
     }
     const text = event.clipboardData?.getData("text/plain"); if (!text) return;
@@ -12016,6 +12109,32 @@ export class LargeGridView {
     this.recordLargeEdit("Paste", await this.store.applyMatrix(startRow, startCol, matrix));
     const coordinates = matrix.flatMap((values, row) => values.map((_value, col) => [startRow + row, startCol + col]));
     this.invalidateLargeCells(coordinates); this.scheduleSave(); this.scheduleRender();
+  }
+  /** Drag-drop parity with paste: OS image files append at the dropped cell through the store, one
+   *  journaled edit. A covered coordinate normalizes to its merge origin before the write. */
+  async dropImageFiles(files, row, col) {
+    try {
+      const embeds = await uploadImageEmbeds(files);
+      if (!embeds.length) return;
+      const merge = this.store.mergeAt?.(row, col);
+      if (merge) { row = merge.row; col = merge.col; }
+      const previous = await this.store.getRaw(row, col);
+      this.recordLargeEdit("Drop image", await this.store.setCell(row, col, [previous, ...embeds].filter(Boolean).join(" ")));
+      await this.repaintLargeCells(this.invalidateLargeCells([[row, col]]));
+      this.scheduleSave();
+    } catch (error) { if (globalThis.window) globalThis.window.__RG_IMG_LAST_ERROR = String(error?.stack || error); }
+  }
+
+  /** A Files drop between mounted cells still lands in a cell: the offsets walk the same column
+   *  metrics the renderer uses, so the drop coordinate matches what the cursor was visually over. */
+  dropCellAt(clientX, clientY) {
+    const rect = this.canvas.getBoundingClientRect();
+    const x = clientX - rect.left; const y = clientY - rect.top;
+    const row = clamp(this.rowAtOffset(y), 0, Math.max(0, this.store.manifest.rowCount - 1));
+    const { colCount } = this.store.manifest;
+    let col = 0; let left = this.headerWidth();
+    while (col < colCount - 1 && left + this.columnWidth(col) < x) { left += this.columnWidth(col); col += 1; }
+    return { row, col };
   }
   /** A large grid cannot host a range view (its cells are JSON rows with no block uid), so a range
    *  component pastes the referenced values instead — the same live `((uid))` matrix a native grid

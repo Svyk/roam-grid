@@ -578,6 +578,42 @@ cells are JSON rows with no block uid, so there is nothing to anchor a native
 thread to. The status element explains this and points at **Copy/convert table**.
 No alternate comment store exists.
 
+## Images in cells
+
+Roam's own `renderString` is the only image producer; the extension styles and
+measures over Roam's `<img>` and never mutates the React-owned host subtree
+beyond `loading`/`decoding`/`title` hints. Roam persists its resize width as an
+inline style on the `.rm-inline-img__resize` / `.react-resizable` wrappers, which
+defeats `max-width` on the image — so the cap lands on the wrapper, scoped under
+`.rg-cell--media`, with the height ceiling in `--rg-img-max-h`. One capture-phase
+`load`+`error` listener pair per cell content div records natural sizes in a
+session-only cache and drives the extension-owned chips (broken-image fallback,
+`+n hidden` clip), which are appended to the cell, never the host. Encrypted
+`.enc` uploads decrypt transparently inside renderString; the extension never
+builds an `<img src=".enc">` itself.
+
+The lightbox is a native `<dialog>` rendered by the same renderString path, so
+encrypted images work there too. Opening it releases the grid's keyboard claim
+and closing restores focus to the grid root; the grid keydown lane cannot fire
+while it is open. Delete splices one occurrence out of the cell markdown through
+the ordinary undoable mutation lane.
+
+Per-table layout lives in `model.imageLayout` (chart-pattern JSON: `columns`
+keyed by stable column ID, `cells` keyed by cell UID), resolved cell → column →
+global defaults, threaded through snapshot/restore, JSON, metadata, undo, and
+the large-grid manifest. Column-only on large grids — JSON rows have no cell
+UIDs. Row-height presets and the one-shot "Auto-fit selected rows" measurement
+(click-time `scrollHeight` reads, never reactive) are the image-companion row
+controls on both views.
+
+Image input is one path in both grid types: paste and OS-file drag-drop both
+call the shared serial `uploadImageEmbeds` (Roam's `file.upload` returns the
+verbatim `![](…)` markdown) and APPEND the markup after the cell's existing
+content. A drop writes the dropped-on cell, not the selection; dragover
+`preventDefault` on Files transfers is what claims the drop ahead of Roam's
+global file lane, and only Files transfers earn the `.rg-cell--drop-target`
+highlight. Non-image files fall through to Roam untouched.
+
 ## Theme bridge
 
 Before the native renderer is hidden, the view samples Roam's actual host,

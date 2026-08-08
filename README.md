@@ -156,6 +156,34 @@ automatic sizing from the `⋯` menu. Hide the A/B/C and 1/2/3 headers for a tab
 that still looks native. Tables fit their block width by default and can be
 switched to fixed widths with horizontal scrolling.
 
+### Images
+
+Paste an image from the clipboard, or drag image files straight onto a cell —
+the file uploads through Roam's own storage and the cell gains ordinary
+`![](url)` markdown, appended after anything already there. This works the same
+in native grids and large grids, and dragging over a cell highlights the exact
+cell that will take the file. Non-image files still go to Roam.
+
+Rendered images are capped to the cell instead of overflowing it: the ceiling
+is **Images — Maximum image height in cells (px)** (default 180), Contain never
+enlarges a small image, and a broken or dead link collapses to a small chip
+naming the image rather than leaving a hole. Rows with an explicit height clip
+and show a `+n hidden` chip. The whole decoration can be switched off with
+**Images — Render images in cells**.
+
+Click an image in the selected cell (or press `Shift+Space`, or click the clip
+chip) to open the lightbox: a gallery of every image in the column with
+arrow-key paging, fit ↔ actual size, open in a tab, copy the markdown, download
+(hidden for encrypted uploads), and an undoable delete that removes just that
+image from the cell. Images inside live range references open the same
+lightbox.
+
+Per table, the `⋯` menu offers **Image size** (Small, Medium, Large, Extra
+large, Fill width) and **Image fit** (Contain, Fill & crop, Original size) for
+whole columns — or for just the selected cells — plus **Row height** presets
+and **Auto-fit selected rows**, which measures the rendered content once and
+pins the height that fits. All of it is undoable.
+
 ### Comments
 
 Hover a cell to reveal a 💬; click it (or press `Cmd/Ctrl-Alt-=`) to start a

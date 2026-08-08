@@ -739,6 +739,13 @@ body.roam-body.dark .rg-portal {
   cursor: zoom-in;
 }
 
+/* A Files drag hovering a cell has claimed the drop (dragover preventDefault, LP-8); the dashed
+   outline says the CELL takes the file, not the page. */
+.rg-cell--drop-target {
+  outline: 2px dashed var(--rg-active);
+  outline-offset: -2px;
+}
+
 .rg-cell a,
 .rg-cell .rm-page-ref,
 .rg-cell .rm-block-ref {

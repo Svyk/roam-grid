@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.13.0
+
+Images in cells.
+
+- **Cells render images properly.** `![](url)` markdown renders contained in
+  the cell — Roam's persisted resize width on its own wrapper no longer defeats
+  the cap — with the height ceiling at **Images — Maximum image height in
+  cells (px)** (default 180). A broken or dead image collapses to a chip naming
+  it, fixed-height rows clip with a `+n hidden` chip, and **Images — Render
+  images in cells** switches the whole decoration off for the exact pre-0.13
+  rendering. Encrypted (`.enc`) uploads work everywhere, decrypted by Roam's
+  own renderer.
+- **Lightbox.** Click an image in the selected cell, press `Shift+Space`, or
+  click a clip chip to open a gallery of the column's images: arrow-key paging,
+  fit ↔ actual size, open in tab, copy markdown, download (hidden for encrypted
+  uploads), and an undoable delete that splices just that image out of the
+  cell. Live range references open the same lightbox.
+- **Per-table layout.** The `⋯` menu sets image size (Small / Medium / Large /
+  Extra large / Fill width) and fit (Contain / Fill & crop / Original size) per
+  column or per selected cells, persisted in the table's metadata and fully
+  undoable. Row-height presets (32/56/96/160) land on both grid types, and
+  **Auto-fit selected rows** measures the rendered content once and pins the
+  height that fits.
+- **Image input parity.** Pasting an image into a LARGE grid now appends after
+  the cell's existing content instead of overwriting it (the 0.12 bug), and
+  image files can be dragged straight from the OS onto a cell in either grid
+  type — the target cell highlights, the upload runs through Roam's storage,
+  and the markdown appends. Non-image files still belong to Roam.
+- Suite: 667 tests.
+
 ## 0.12.0
 
 Native editing, live templates, the range fix, and comment compose modes.

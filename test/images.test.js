@@ -4,6 +4,7 @@ import {
   GridModel,
   GridView,
   LargeGridView,
+  RangeGridView,
   applyCellImageLayout,
   cellImageMarkdown,
   claimKeyboard,
@@ -17,7 +18,9 @@ import {
   renderStableCellContent,
   repaintMediaDecor,
   resolveImageLayout,
+  runtime,
   settingsCache,
+  uploadImageEmbeds,
   wireRichHostImages,
 } from "../src/extension.js";
 
@@ -721,4 +724,216 @@ test("the armed-click state machine only opens the lightbox on the second click 
   const clip = new MiniNode("span"); clip.className = "rg-img-clip-chip"; cell.appendChild(clip);
   assert.equal(GridView.prototype.handleCellImageClick.call(view, cell, { target: clip }), true);
   assert.deepEqual(opened, [[0, 0, 0]], "clicking the +n clip chip opens the lightbox at the first image");
+});
+
+// GOAL-IMG-4 — the shared upload helper, paste/drop append parity, and range click branching.
+
+function installUploadRoam(upload) {
+  globalThis.window.roamAlphaAPI = { file: { upload } };
+}
+
+function imagePasteEvent(files) {
+  return { defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, clipboardData: { files, getData: () => "" } };
+}
+
+test("uploadImageEmbeds uploads serially in file order and returns the verbatim markup (LP-7)", async (t) => {
+  t.after(() => { delete globalThis.window.roamAlphaAPI; });
+  installMiniDom();
+  const log = [];
+  installUploadRoam(async ({ file }) => {
+    log.push(`start:${file.name}`);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    log.push(`end:${file.name}`);
+    return `![](https://up/${file.name})`;
+  });
+  const files = [{ name: "a.png", type: "image/png" }, { name: "b.png", type: "image/png" }];
+  const embeds = await uploadImageEmbeds(files);
+  assert.deepEqual(embeds, ["![](https://up/a.png)", "![](https://up/b.png)"], "the full markdown strings come back in drop/paste order");
+  assert.deepEqual(log, ["start:a.png", "end:a.png", "start:b.png", "end:b.png"], "uploads stay serial, one file at a time");
+  assert.deepEqual(await uploadImageEmbeds([]), [], "no files short-circuits before any upload or toast");
+  assert.deepEqual(await uploadImageEmbeds(null), [], "a missing file list is an empty result, not a crash");
+});
+
+test("uploadImageEmbeds toasts the failure, records the forensic trace, and rethrows", async (t) => {
+  t.after(() => { delete globalThis.window.roamAlphaAPI; runtime.extensionAPI = null; delete globalThis.window.__RG_IMG_LAST_ERROR; });
+  const { body } = installMiniDom();
+  runtime.extensionAPI = {};
+  installUploadRoam(async ({ file }) => {
+    if (file.name === "bad.png") throw new Error("upload exploded");
+    return `![](https://up/${file.name})`;
+  });
+  const files = [{ name: "ok.png", type: "image/png" }, { name: "bad.png", type: "image/png" }];
+  await assert.rejects(() => uploadImageEmbeds(files), /upload exploded/);
+  assert.match(String(globalThis.window.__RG_IMG_LAST_ERROR), /upload exploded/, "the forensic surface carries the stack");
+  const danger = body.querySelectorAll(".rg-toast--danger");
+  assert.equal(danger.length, 1, "the helper owns the failure toast so no caller double-toasts");
+  assert.match(danger[0].textContent, /Image upload failed: upload exploded/);
+});
+
+test("GridView.onPaste appends uploaded embeds after the cell's existing text", async (t) => {
+  t.after(() => { delete globalThis.window.roamAlphaAPI; });
+  installMiniDom();
+  installUploadRoam(async ({ file }) => `![](https://up/${file.name})`);
+  const grid = new GridModel({ rows: [["existing text", ""], ["", ""]] });
+  const commits = [];
+  const view = {
+    model: grid,
+    selection: { startRow: 0, endRow: 0, startCol: 0, endCol: 0 },
+    commitMutation: (label, mutation, structural) => { commits.push({ label, structural }); grid.transact(label, mutation); return Promise.resolve(grid); },
+  };
+  const event = imagePasteEvent([{ name: "cat.png", type: "image/png" }]);
+  await GridView.prototype.onPaste.call(view, event);
+  assert.equal(event.defaultPrevented, true);
+  assert.equal(grid.getRaw(0, 0), "existing text ![](https://up/cat.png)", "paste appends, it never overwrites");
+  assert.deepEqual(commits, [{ label: "Paste image", structural: false }]);
+});
+
+test("LargeGridView.onPaste appends after the existing cell content like GridView (LP-7 parity)", async (t) => {
+  t.after(() => { delete globalThis.window.roamAlphaAPI; });
+  installMiniDom();
+  installUploadRoam(async ({ file }) => `![](https://up/${file.name})`);
+  const writes = [];
+  const view = {
+    selection: { startRow: 4, endRow: 4, startCol: 2, endCol: 2 },
+    store: {
+      manifest: { rowCount: 100, colCount: 26 },
+      getRaw: async (row, col) => (row === 4 && col === 2 ? "existing text" : ""),
+      setCell: async (row, col, raw) => { writes.push({ row, col, raw }); return [{ row, col, value: raw }]; },
+    },
+    recordLargeEdit() {}, invalidateLargeCells: () => [], repaintLargeCells: async () => {}, scheduleSave() {},
+  };
+  const event = imagePasteEvent([{ name: "cat.png", type: "image/png" }]);
+  await LargeGridView.prototype.onPaste.call(view, event);
+  assert.equal(event.defaultPrevented, true);
+  assert.deepEqual(writes, [{ row: 4, col: 2, raw: "existing text ![](https://up/cat.png)" }], "the large-grid paste must APPEND — overwriting silently destroys the cell (the overwrite bug)");
+});
+
+test("a file drop writes the DROPPED-ON cell, not the selection", async (t) => {
+  t.after(() => { delete globalThis.window.roamAlphaAPI; });
+  installMiniDom();
+  installUploadRoam(async ({ file }) => `![](https://up/${file.name})`);
+  const grid = new GridModel({ rows: [["", ""], ["", ""], ["", ""]] });
+  grid.transact("seed", () => grid.setRaw(2, 1, "prior"));
+  const commits = [];
+  const view = {
+    model: grid,
+    selection: { startRow: 0, endRow: 0, startCol: 0, endCol: 0 }, // the selection sits elsewhere
+    commitMutation: (label, mutation, structural) => { commits.push({ label, structural }); grid.transact(label, mutation); return Promise.resolve(grid); },
+    dropImageFiles: GridView.prototype.dropImageFiles,
+  };
+  const cell = new MiniNode("div"); cell.className = "rg-cell rg-cell--drop-target"; cell.dataset.row = "2"; cell.dataset.col = "1";
+  const event = {
+    defaultPrevented: false, preventDefault() { this.defaultPrevented = true; },
+    dataTransfer: { types: ["Files"], files: [{ name: "drop.png", type: "image/png" }], getData: () => "" },
+  };
+  assert.equal(GridView.prototype.handleCellDrop.call(view, cell, event), "images");
+  assert.equal(event.defaultPrevented, true);
+  await new Promise((resolve) => setTimeout(resolve, 10)); // dropImageFiles is fire-and-forget
+  assert.equal(grid.getRaw(2, 1), "prior ![](https://up/drop.png)", "the drop appends at the dropped-on cell");
+  assert.equal(grid.getRaw(0, 0), "", "the selection's cell is untouched");
+  assert.equal(commits.at(-1).label, "Drop image");
+  assert.equal(cell.classList.contains("rg-cell--drop-target"), false, "the highlight clears on drop");
+});
+
+test("handleCellDrop keeps the range-move lane and lets non-image files fall through", async () => {
+  installMiniDom();
+  const grid = new GridModel({ rows: [["a", ""], ["", ""]] });
+  const commits = [];
+  const view = {
+    model: grid,
+    commitMutation: (label, mutation, structural) => { commits.push({ label, structural }); grid.transact(label, mutation); return Promise.resolve(grid); },
+  };
+  const cell = new MiniNode("div"); cell.className = "rg-cell"; cell.dataset.row = "1"; cell.dataset.col = "1";
+
+  const move = {
+    defaultPrevented: false, preventDefault() { this.defaultPrevented = true; },
+    dataTransfer: { types: ["application/x-roam-grid-range"], files: [], getData: (type) => (type === "application/x-roam-grid-range" ? JSON.stringify({ startRow: 0, endRow: 0, startCol: 0, endCol: 0 }) : "") },
+  };
+  assert.equal(GridView.prototype.handleCellDrop.call(view, cell, move), "range");
+  assert.equal(move.defaultPrevented, true);
+  assert.equal(commits[0].label, "Move range", "the in-grid drag still moves the range");
+  assert.equal(grid.getRaw(1, 1), "a");
+
+  const pdf = {
+    defaultPrevented: false, preventDefault() { this.defaultPrevented = true; },
+    dataTransfer: { types: ["Files"], files: [{ name: "spec.pdf", type: "application/pdf" }], getData: () => "" },
+  };
+  assert.equal(GridView.prototype.handleCellDrop.call(view, cell, pdf), null, "a non-image file is not ours");
+  assert.equal(pdf.defaultPrevented, false, "Roam keeps its own file-drop behavior for non-images");
+});
+
+test("cell dragover preventDefaults only for Files and grid-range transfers", () => {
+  installMiniDom();
+  const cell = new MiniNode("div"); cell.className = "rg-cell";
+  const over = (types) => ({ defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, dataTransfer: { types } });
+
+  const files = over(["Files"]);
+  assert.equal(GridView.prototype.handleCellDragOver.call({}, cell, files), true);
+  assert.equal(files.defaultPrevented, true, "claiming the drop beats Roam's global handler (LP-8)");
+  assert.equal(cell.classList.contains("rg-cell--drop-target"), true, "the highlight says the cell takes the file");
+
+  const text = over(["text/plain"]);
+  assert.equal(GridView.prototype.handleCellDragOver.call({}, cell, text), false);
+  assert.equal(text.defaultPrevented, false, "a text drag is none of the grid's business");
+  assert.equal(cell.classList.contains("rg-cell--drop-target"), false, "and earns no highlight");
+
+  const range = over(["application/x-roam-grid-range"]);
+  assert.equal(GridView.prototype.handleCellDragOver.call({}, cell, range), true);
+  assert.equal(range.defaultPrevented, true, "the in-grid range drag still works");
+  assert.equal(cell.classList.contains("rg-cell--drop-target"), false, "a range move gets no file highlight");
+
+  cell.classList.add("rg-cell--drop-target");
+  GridView.prototype.handleCellDragLeave.call({}, cell, { relatedTarget: null });
+  assert.equal(cell.classList.contains("rg-cell--drop-target"), false, "leaving the cell clears the highlight");
+  cell.classList.add("rg-cell--drop-target");
+  const child = new MiniNode("span"); cell.appendChild(child);
+  GridView.prototype.handleCellDragLeave.call({}, cell, { relatedTarget: child });
+  assert.equal(cell.classList.contains("rg-cell--drop-target"), true, "dragleave into a child is not a leave");
+});
+
+test("LargeGridView.dropImageFiles appends at the dropped cell through the store", async (t) => {
+  t.after(() => { delete globalThis.window.roamAlphaAPI; });
+  installMiniDom();
+  installUploadRoam(async ({ file }) => `![](https://up/${file.name})`);
+  const writes = []; let saved = false; let repainted = 0;
+  const view = {
+    store: {
+      mergeAt: () => null,
+      getRaw: async () => "prior",
+      setCell: async (row, col, raw) => { writes.push({ row, col, raw }); return [{ row, col, value: raw }]; },
+    },
+    recordLargeEdit() {}, invalidateLargeCells: () => [], repaintLargeCells: async () => { repainted += 1; }, scheduleSave() { saved = true; },
+  };
+  await LargeGridView.prototype.dropImageFiles.call(view, [{ name: "d.png", type: "image/png" }], 7, 3);
+  assert.deepEqual(writes, [{ row: 7, col: 3, raw: "prior ![](https://up/d.png)" }], "append, never overwrite");
+  assert.equal(saved, true);
+  assert.equal(repainted, 1);
+});
+
+test("RangeGridView.onClick branches: source icon → table, image → lightbox, else the cell's block", (t) => {
+  t.after(() => { delete globalThis.window.roamAlphaAPI; });
+  installMiniDom();
+  const opened = [];
+  globalThis.window.roamAlphaAPI = { ui: { mainWindow: { openBlock: ({ block }) => opened.push(block.uid) } } };
+  const lightboxes = [];
+  const view = {
+    model: { tableUid: "tbl00001" },
+    openRangeCellImageLightbox: (cell, img) => { lightboxes.push([cell.dataset.uid, Boolean(img)]); return { fake: true }; },
+  };
+
+  const source = new MiniNode("span"); source.className = "rg-range-source";
+  RangeGridView.prototype.onClick.call(view, { target: source });
+  assert.deepEqual(opened, ["tbl00001"], "the caption icon opens the source table");
+
+  const cell = new MiniNode("div"); cell.className = "rg-cell"; cell.dataset.uid = "celluid01"; cell.dataset.row = "0"; cell.dataset.col = "0";
+  const content = new MiniNode("div"); content.className = "rg-cell-content"; cell.appendChild(content);
+  const host = new MiniNode("span"); host.className = "rg-rich-host"; content.appendChild(host);
+  const img = new MiniNode("img"); host.appendChild(img);
+  RangeGridView.prototype.onClick.call(view, { target: img });
+  assert.deepEqual(lightboxes, [["celluid01", true]], "an image click opens the lightbox…");
+  assert.deepEqual(opened, ["tbl00001"], "…and never navigates away");
+
+  const text = new MiniNode("span"); content.appendChild(text);
+  RangeGridView.prototype.onClick.call(view, { target: text });
+  assert.deepEqual(opened, ["tbl00001", "celluid01"], "any other click keeps navigate-to-source");
 });
