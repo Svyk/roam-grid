@@ -2049,7 +2049,7 @@ test("a plain source cell edits through Roam's block editor and a formula, F2, p
   assert.equal(controllerStarts.at(-1).customEditor, null);
 });
 
-test("two consecutive mount failures retire the native editor for the session with one toast", async (t) => {
+test("three consecutive mount failures disarm the native editor for 30 s with one toast per cooldown", async (t) => {
   t.after(() => { resetNativeEditorHealth(); runtime.extensionAPI = null; settingsCache.clear(); });
   resetNativeEditorHealth();
   runtime.extensionAPI = { settings: {} };
@@ -2057,18 +2057,24 @@ test("two consecutive mount failures retire the native editor for the session wi
 
   assert.equal(await startOverlay(harness), null);
   assert.equal(runtime.nativeEditorFailures, 1);
-  assert.equal(runtime.nativeEditorDisabled, false);
-  assert.equal(nativeEditorEnabled(), true, "one failure is a fallback, not a retirement");
+  assert.equal(runtime.nativeEditorDisabledUntil, 0);
+  assert.equal(nativeEditorEnabled(), true, "one failure is a fallback, not a cooldown");
   assert.equal(harness.cell.classList.contains("rg-cell--native-editing"), false, "a failed mount leaves no overlay chrome behind");
   assert.equal(harness.cell.children.length, 0);
 
   assert.equal(await startOverlay(harness), null);
-  assert.equal(runtime.nativeEditorDisabled, true);
-  assert.equal(nativeEditorEnabled(), false);
+  assert.equal(runtime.nativeEditorFailures, 2);
+  assert.equal(runtime.nativeEditorDisabledUntil, 0);
+  assert.equal(nativeEditorEnabled(), true, "two failures is still a fallback, not a cooldown");
+
+  assert.equal(await startOverlay(harness), null);
+  assert.ok(runtime.nativeEditorDisabledUntil > Date.now(), "three consecutive failures start a cooldown");
+  assert.equal(nativeEditorEnabled(), false, "inside the cooldown the native editor is disabled");
+  assert.equal(runtime.nativeEditorFailures, 0, "the counter is zeroed so the toast fires once per cooldown");
   assert.equal(globalThis.document.body.querySelectorAll(".rg-toast").length, 1);
 
   assert.equal(await startOverlay(harness), null);
-  assert.equal(globalThis.document.body.querySelectorAll(".rg-toast").length, 1, "the retirement toast is said once");
+  assert.equal(globalThis.document.body.querySelectorAll(".rg-toast").length, 1, "the toast is said once per cooldown");
 
   resetNativeEditorHealth();
   const focusFailure = makeOverlayHarness({ mode: "no-textarea" });
@@ -3139,4 +3145,56 @@ test("accepting a function suggestion twice does not rewrite the committed text"
   flush();
   assert.equal(editor.value, committed, "a stale menu frame must not rewrite what the first accept committed (=SUM(M()");
   controller.dispose();
+});
+
+// F2a — pollUntil keeps probing past the frame count that pollFrames would have capped.
+test("pollUntil keeps probing until the predicate returns truthy or the time budget elapses", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  const overlay = harness.overlay;
+  // The test harness installs requestAnimationFrame → queueMicrotask, so every `nextFrame()`
+  // completes in a single event-loop spin. We build a probe that returns false for 3 frames
+  // and then finds the textarea on frame 4 — pollFrames(3) stopped at frame 3 and would
+  // have returned null.
+  let calls = 0;
+  const targetNode = harness.cell.querySelector(".rg-native-cell-editor") || harness.cell;
+  const probe = () => { calls += 1; return calls < 4 ? null : targetNode; };
+  const start = await overlay.pollUntil(probe, 200);
+  assert.ok(start, "pollUntil kept probing past frame 3");
+  assert.ok(calls >= 4, `got ${calls} probes — pollFrames(3) would have stopped at 3`);
+  harness.overlay.teardown();
+});
+
+// F2b — the 30 s cooldown re-arms after time elapses, unlike the old permanent flag.
+test("the native-editor breaker re-arms after the cooldown elapses", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); runtime.extensionAPI = null; settingsCache.clear(); });
+  resetNativeEditorHealth();
+  runtime.extensionAPI = { settings: {} };
+  // Trip the breaker: 3 consecutive failures.
+  for (let i = 0; i < 3; i += 1) {
+    const harness = makeOverlayHarness({ mode: "no-render-block" });
+    await startOverlay(harness);
+    harness.overlay.teardown();
+  }
+  assert.ok(runtime.nativeEditorDisabledUntil > Date.now(), "the cooldown is active");
+  assert.equal(nativeEditorEnabled(), false);
+
+  // Fast-forward past the cooldown by setting the timestamp to a moment ago.
+  runtime.nativeEditorDisabledUntil = Date.now() - 1;
+  assert.equal(nativeEditorEnabled(), true, "the native editor re-arms after the cooldown");
+});
+
+// F2h — nextFrame must not hang when requestAnimationFrame is suspended (e.g. background tab).
+test("nextFrame resolves via the timeout race when requestAnimationFrame drops callbacks", async (t) => {
+  t.after(() => { resetNativeEditorHealth(); settingsCache.clear(); });
+  resetNativeEditorHealth();
+  const harness = makeOverlayHarness();
+  // Simulate suspended rAF — the no-op returns an id but NEVER calls the callback.
+  globalThis.requestAnimationFrame = () => { return 1; };
+  const started = Date.now();
+  await harness.overlay.nextFrame();
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 400, `resolved via timeout after ~${elapsed}ms (not the rAF that will never fire)`);
+  harness.overlay.teardown();
 });

@@ -241,7 +241,7 @@ test("eligibility: formula =x uses custom editor, ==x uses native, floating F2 u
   view.dispose();
 });
 
-test("eligibility: setting off or runtime.nativeEditorDisabled → custom editor", async (t) => {
+test("eligibility: setting off or runtime.nativeEditorDisabledUntil cooldown → custom editor", async (t) => {
   withSettings({ "editing-native-editor": false, "large-chunk-rows": 40, "large-overscan-rows": 0 });
   ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
   const dom = installMiniDom();

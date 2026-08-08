@@ -245,7 +245,7 @@ export const runtime = {
   commentArmed: false,
   // Native-overlay health is per session, never persisted: a graph that cannot mount Roam's editor
   // today may be able to after a reload, and a disabled flag on disk would outlive the cause.
-  nativeEditorDisabled: false,
+  nativeEditorDisabledUntil: 0,
   nativeEditorFailures: 0,
   nativeEditorSawPopup: false,
   recentsDisabled: false,
@@ -8101,22 +8101,24 @@ function noteNativeEditorError(error) {
 
 /** `getSetting !== false` rather than `=== true`, so a graph that has never seen the key opts in. */
 export function nativeEditorEnabled() {
-  return getSetting("editing-native-editor") !== false && !runtime.nativeEditorDisabled;
+  return getSetting("editing-native-editor") !== false && Date.now() >= (runtime.nativeEditorDisabledUntil || 0);
 }
 
-/** Two CONSECUTIVE mount/focus failures retire the overlay for the session, with one toast. */
+/** Three CONSECUTIVE mount/focus failures disarm the overlay for 30 s, with one toast per cooldown. */
 export function noteNativeEditorFailure() {
   runtime.nativeEditorFailures = (Number(runtime.nativeEditorFailures) || 0) + 1;
-  if (runtime.nativeEditorFailures < 2 || runtime.nativeEditorDisabled) return runtime.nativeEditorFailures;
-  runtime.nativeEditorDisabled = true;
-  toast("Roam Grid: native editor unavailable — using the grid editor", "warning");
+  if (runtime.nativeEditorFailures < 3) return runtime.nativeEditorFailures;
+  const now = Date.now();
+  if (now >= (runtime.nativeEditorDisabledUntil || 0)) toast("Roam Grid: native editor temporarily unavailable (cooldown 30 s) — using the grid editor", "warning");
+  runtime.nativeEditorDisabledUntil = now + 30_000;
+  runtime.nativeEditorFailures = 0;
   return runtime.nativeEditorFailures;
 }
 
 export function noteNativeEditorSuccess() { runtime.nativeEditorFailures = 0; return runtime.nativeEditorFailures; }
 
 export function resetNativeEditorHealth() {
-  runtime.nativeEditorFailures = 0; runtime.nativeEditorDisabled = false; runtime.nativeEditorSawPopup = false;
+  runtime.nativeEditorFailures = 0; runtime.nativeEditorDisabledUntil = 0; runtime.nativeEditorSawPopup = false;
   return runtime;
 }
 
@@ -8269,13 +8271,28 @@ export class NativeCellEditorOverlay {
    *  ESCAPE_BLUR_WINDOW_MS without a wall-clock wait. */
   now() { return globalThis.performance?.now?.() ?? Date.now(); }
 
+  /** F2h: races requestAnimationFrame against a tracked ~500ms timeout so await points never
+   *  hang when rAF is suspended (e.g. background tabs). The faster of the two wins; the loser
+   *  is cancelled. Teardown force-settles both via the usual frames map + tracked timer sweep. */
   nextFrame() {
     return new Promise((resolve) => {
       if (typeof globalThis.requestAnimationFrame !== "function") { trackedTimeout(resolve, 16); return; }
-      // The resolver rides alongside the id: teardown cancels the frame, and a cancelled frame
-      // must still resolve — `start()`'s poll loop awaits it and would otherwise hang forever.
-      const id = globalThis.requestAnimationFrame(() => { this.frames.delete(id); resolve(); });
+      let settled = false;
+      const id = globalThis.requestAnimationFrame(() => {
+        if (settled) return;
+        settled = true;
+        this.frames.delete(id);
+        clearTimeout(timerId);
+        resolve();
+      });
       this.frames.set(id, resolve);
+      const timerId = trackedTimeout(() => {
+        if (settled) return;
+        settled = true;
+        globalThis.cancelAnimationFrame?.(id);
+        this.frames.delete(id);
+        resolve();
+      }, 500);
     });
   }
 
@@ -8289,6 +8306,18 @@ export class NativeCellEditorOverlay {
       await this.nextFrame();
     }
     return null;
+  }
+
+  /** F2a: time-based poll — keeps probing until the predicate returns truthy or `ms` elapses.
+   *  Each retry is one nextFrame() tick (which may time out at 500ms when rAF is suspended). */
+  async pollUntil(probe, ms) {
+    const start = this.now();
+    let result = probe();
+    while (!result && !this.disposed && this.now() - start < ms) {
+      await this.nextFrame();
+      try { result = probe(); } catch (error) { noteNativeEditorError(error); result = null; }
+    }
+    return result;
   }
 
   blockInput() { return this.overlay?.querySelector?.(ROAM_BLOCK_INPUT_SELECTOR) || null; }
@@ -8387,7 +8416,7 @@ export class NativeCellEditorOverlay {
     let mounted = false;
     try { mounted = this.mountBlock(uid, overlay); } catch (error) { noteNativeEditorError(error); mounted = false; }
     if (!mounted) return this.failStart();
-    const host = await this.pollFrames(() => this.blockInput(), 5);
+    const host = await this.pollUntil(() => this.blockInput(), 250);
     if (!host || !this.state) return this.failStart();
     overlay.classList.add("rg-native-cell-editor--ready");
     session?.beginNativeOverlayEdit?.(uid);
@@ -8411,7 +8440,7 @@ export class NativeCellEditorOverlay {
       if (!this.state || !this.overlay) return this.failStart();
     }
     try { synthesizeBlockClick(host); } catch (error) { noteNativeEditorError(error); }
-    const textarea = await this.pollFrames(() => this.hostTextarea(), 3);
+    const textarea = await this.pollUntil(() => this.hostTextarea(), 350);
     if (!textarea || !this.state) return this.failStart();
     this.textarea = textarea;
     if (this.seedThroughTextarea) {

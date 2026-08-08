@@ -343,7 +343,7 @@ test("onunload resets the session health flags so a reload starts clean", async 
   try {
     await extension.onload({ extensionAPI });
     await Promise.resolve();
-    runtime.nativeEditorDisabled = true;
+    runtime.nativeEditorDisabledUntil = Date.now() + 60_000;
     runtime.nativeEditorFailures = 7;
     runtime.nativeEditorSawPopup = true;
     runtime.recentsDisabled = true;
@@ -353,7 +353,7 @@ test("onunload resets the session health flags so a reload starts clean", async 
     assert.equal(nativeEditorEnabled(), false, "the health flags are live before unload");
 
     await extension.onunload();
-    assert.equal(runtime.nativeEditorDisabled, false);
+    assert.equal(runtime.nativeEditorDisabledUntil, 0);
     assert.equal(runtime.nativeEditorFailures, 0);
     assert.equal(runtime.nativeEditorSawPopup, false);
     assert.equal(runtime.recentsDisabled, false);
