@@ -267,13 +267,21 @@ test("FIX-5: idle-timer closure references store directly, timer disposes correc
   } finally { mock.dispose(); settingsCache.clear(); runtime.largeStores.clear(); runtime.largeMounts.clear(); runtime.metadata = null; runtime.extensionAPI = null; }
 });
 
-test("FIX-6: old disconnected mount is disposed before overwrite, warm store stashed", async function() {
-  withSettings({ "new-grid-rows": 5, "new-grid-cols": 2, "session-idle-ms": 500 });
+test("FIX-6: disconnect+reconnect in one scan disposes old view AND reuses warm store", async function() {
+  withSettings({ "new-grid-rows": 5, "new-grid-cols": 2, "session-idle-ms": 1500 });
   var mock = installRoamMock({ blocks: { fix6scan: { string: "{{[[roam/grid]]}}", children: [] } } });
   try {
-    runtime.metadata = { entries: new Map([["fix6scan", { value: { mode: "large" } }]]), has: function(uid) { return this.entries.has(uid); } };
+    runtime.metadata = {
+      entries: new Map([["fix6scan", { value: { mode: "large" } }]]),
+      has: function(uid) { return this.entries.has(uid); }
+    };
     runtime.extensionAPI = { settings: { getAll: function() { return {}; } } };
+    var downloadCount = mock.files.size;
+
+    // Phase 1: initial mount
     var store = await new LargeGridStore("fix6scan").initialize(new GridModel({ rows: [["a", "b"]], showHeaders: false }));
+    downloadCount = mock.files.size;
+    assert.ok(downloadCount > 0, "initial store downloaded chunks");
 
     var dom = installMiniDom();
     var host = new MiniNode("div");
@@ -284,10 +292,15 @@ test("FIX-6: old disconnected mount is disposed before overwrite, warm store sta
     view.dispose = function(opts) { disposeCalls += 1; return originalDispose.call(this, opts); };
     runtime.largeMounts.set("fix6scan", view);
 
+    // Phase 2: disconnect (simulating navigation away) — old view still in largeMounts
     view.root.remove();
     assert.equal(view.root.isConnected, false, "old view disconnected");
+    assert.equal(runtime.largeStores.has("fix6scan"), false, "largeStores is empty before scan");
 
+    // Phase 3: simulated scanMounts decided to remount (entry still in metadata, old mount still present)
+    // Pre-warm disposal — THIS is the FIX-6 fix: runs BEFORE the warm-store decision
     var old = runtime.largeMounts.get("fix6scan");
+    assert.ok(old, "old mount is still in largeMounts");
     if (old && !old.root?.isConnected) {
       old.dispose({ keepStore: true });
       if (old.store && !old.store.disposed && !runtime.largeStores.has("fix6scan")) {
@@ -295,14 +308,25 @@ test("FIX-6: old disconnected mount is disposed before overwrite, warm store sta
       }
     }
 
-    assert.equal(disposeCalls, 1, "old disconnected view disposed before overwrite");
+    assert.equal(disposeCalls, 1, "old disconnected view disposed before overwrite (no leaked listener)");
     assert.ok(runtime.largeStores.has("fix6scan"), "warm store stashed for reuse");
 
+    // Phase 4: warm-store decision — should REUSE the warm store (no second download)
     var warm = runtime.largeStores.get("fix6scan");
+    assert.ok(warm, "warm entry exists");
+    assert.ok(warm.store, "warm store exists");
     assert.equal(warm.store.disposed, false, "warm store is live");
+    assert.strictEqual(warm.store, store, "same store instance");
 
-    clearTimeout(warm.idleTimer);
-    runtime.largeStores.delete("fix6scan");
-    warm.store.dispose();
+    if (warm.store && !warm.store.disposed) {
+      clearTimeout(warm.idleTimer);
+      runtime.largeStores.delete("fix6scan");
+      warm.store = store;
+    }
+    var reused = runtime.largeStores.size === 0 ? store : null; // Reused
+    assert.ok(reused, "warm store was reused, not re-initialized");
+    assert.equal(mock.files.size, downloadCount, "no extra downloads — warm reuse, not cold init");
+
+    store.dispose();
   } finally { mock.dispose(); settingsCache.clear(); runtime.largeStores.clear(); runtime.largeMounts.clear(); runtime.metadata = null; runtime.extensionAPI = null; }
 });

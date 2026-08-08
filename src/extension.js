@@ -12963,6 +12963,15 @@ async function scanMounts() {
     try {
       const block = findBlockElement(uid); if (!block) continue;
       const marker = block.querySelector(".rm-block__input") || block.firstElementChild;
+      // Dispose any disconnected mount from a prior scan so its store is warm-reusable
+      // and no old-listener leak survives. Must run BEFORE the warm-store decision.
+      const old = runtime.largeMounts.get(uid);
+      if (old && !old.root?.isConnected) {
+        old.dispose({ keepStore: true });
+        if (old.store && !old.store.disposed && !runtime.largeStores.has(uid)) {
+          runtime.largeStores.set(uid, { store: old.store, idleTimer: setTimeout(() => { runtime.largeStores.delete(uid); old.store.dispose(); }, getSetting("session-idle-ms")) });
+        }
+      }
       let store;
       const warm = runtime.largeStores.get(uid);
       if (warm?.store && !warm.store.disposed) { clearTimeout(warm.idleTimer); runtime.largeStores.delete(uid); store = warm.store; }
@@ -12970,14 +12979,6 @@ async function scanMounts() {
       // An unload can land during the initialize await; mounting a live view (+listeners +timers)
       // into a torn-down runtime would leak it. The metadata re-check is the liveness probe.
       if (!runtime.metadata || !runtime.extensionAPI) continue;
-      const old = runtime.largeMounts.get(uid);
-      if (old && !old.root?.isConnected) {
-        old.markedUid = uid;
-        old.dispose({ keepStore: true });
-        if (old.store && !old.store.disposed && !runtime.largeStores.has(uid)) {
-          runtime.largeStores.set(uid, { store: old.store, idleTimer: setTimeout(() => { runtime.largeStores.delete(uid); old.store.dispose(); }, getSetting("session-idle-ms")) });
-        }
-      }
       const view = new LargeGridView({ host: block, store, markerElement: marker });
       if (!runtime.metadata) { try { view.dispose(); } catch { /* mid-unload */ } continue; }
       view.root.dataset.roamGridUid = uid; view.root.__rgView = view; runtime.largeMounts.set(uid, view);
