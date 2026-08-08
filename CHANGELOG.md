@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.16.0
+
+Large-grid selection + native-editor reliability.
+
+- **First click on a large grid no longer paints a multi-cell range.** The
+  pointerdown focus call scrolled the grid into view under a stationary cursor,
+  and the per-cell drag-extend read the resulting `pointerenter` as a drag.
+  Focus now uses `preventScroll`, drag-extend ignores enters until the pointer
+  has actually moved (~4px), repaints in place instead of tearing down the
+  canvas mid-press, and the render/update selection paints now agree on merged
+  cells.
+- **Native `[[` / `((` sticks instead of falling back.** The post-click textarea
+  poll budget (50ms) sat inside the measured 30–60ms hydration latency, and two
+  misses retired the native lane for the whole session. Polls are now time-based
+  (250/350ms), the breaker is a 30s cooldown (3 strikes) instead of permanent,
+  and rAF waits can no longer wedge in background tabs.
+- **Scratch-block rotation.** Every large-cell edit gets a fresh scratch child
+  uid, so the previous edit's commit/blank write echoes can no longer unmount
+  the next edit's editor; a live edit is committed before the next cell's
+  acquire so rapid cell→cell edits can't grab the pre-rotation uid.
+- **Editing large grids no longer loses edits around saves.** Saves defer while
+  an editor is open (the manifest pointer write force-remounted the view
+  mid-typing), a warm remount with dirty chunks reschedules its save, the
+  settle wait only trusts quiet frames after hydration has started, a
+  virtualization detach during the chunk fetch re-resolves the cell, the grace
+  refocus can recover twice, and a stale-blank textarea now cancels instead of
+  committing — including on dispose.
+- Suite: 721 tests.
+
 ## 0.15.0
 
 Large-grid native editor.
