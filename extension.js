@@ -25,7 +25,9 @@ const MIN_COL_WIDTH = 56;
 const MAX_COL_WIDTH = 640;
 const FORMULA_REFERENCE_COLORS = ["#d9822b", "#8f398f", "#0f9960", "#106ba3", "#c23030", "#5c7080"];
 const PREPAINT_STYLE_ID = "roam-grid-prepaint-guard";
+const PREPAINT_LARGE_STYLE_ID = "roam-grid-prepaint-guard-large";
 const ENHANCED_UID_CACHE_PREFIX = "roam-grid:enhanced-uids:";
+const LARGE_UID_CACHE_PREFIX = "roam-grid:large-uids:";
 const SESSION_IDLE_MS = 1500;
 const MAX_GUARD_UIDS = 2000;
 const MAX_UNDO_ENTRIES = 100;
@@ -229,6 +231,7 @@ export const runtime = {
   views: gridViews,
   viewsByNative: new WeakMap(),
   guardStyle: null,
+  guardLargeStyle: null,
   pendingScanRoots: new Set(),
   rangeSpecs: new Map(),
   scanQueued: false,
@@ -294,6 +297,26 @@ export function readEnhancedUidCache(storage = globalThis.localStorage, key = gr
 }
 
 export function writeEnhancedUidCache(uids, storage = globalThis.localStorage, key = graphCacheKey()) {
+  const values = [...new Set([...uids].map(String).filter(Boolean))].sort();
+  try { storage?.setItem?.(key, JSON.stringify(values)); } catch { /* localStorage can be unavailable in hardened browsers */ }
+  return values;
+}
+
+export function largeUidCacheKey(hash = globalThis.location?.hash || "") {
+  return `${LARGE_UID_CACHE_PREFIX}${graphKeyName(hash)}`;
+}
+
+export function readLargeUidCache(storage = globalThis.localStorage, key = largeUidCacheKey()) {
+  try {
+    const parsed = JSON.parse(storage?.getItem?.(key) || "[]");
+    return new Set(Array.isArray(parsed) ? parsed.filter((uid) => typeof uid === "string" && uid.length > 0) : []);
+  } catch (error) {
+    if (globalThis.window) globalThis.window.__RG_LG_LAST_ERROR = String(error && error.stack || error);
+    return new Set();
+  }
+}
+
+export function writeLargeUidCache(uids, storage = globalThis.localStorage, key = largeUidCacheKey()) {
   const values = [...new Set([...uids].map(String).filter(Boolean))].sort();
   try { storage?.setItem?.(key, JSON.stringify(values)); } catch { /* localStorage can be unavailable in hardened browsers */ }
   return values;
@@ -694,6 +717,28 @@ export function enhancedUidGuardCss(uids) {
       `[id$="${escaped}"] .rm-table:not(.rg-native-hidden)`,
       `.rm-block-ref[data-uid="${escaped}"] .rm-table:not(.rg-native-hidden)`,
       `[data-uid="${escaped}"] .rm-table:not(.rg-native-hidden)`,
+    );
+  }
+  return selectors.length ? `${selectors.join(",\n")} { visibility: hidden !important; pointer-events: none !important; }` : "";
+}
+
+// The large marker is Roam's grid xparser button (span.rm-xparser-default-grid); the guard targets
+// only that button so prose or other renderings in the same block are never blanked, and the
+// :not() handoff releases the instant LargeGridView.mount() adds .rg-large-marker-hidden to the
+// block input wrapper that carries the button.
+export function largeGridGuardCss(uids) {
+  const selectors = [];
+  const unique = [...new Set([...uids].map(String).filter(Boolean))].sort();
+  if (unique.length > MAX_GUARD_UIDS) {
+    console.warn(`[roam-grid] Skipping the large-grid pre-paint guard: ${unique.length} cached grid uids exceeds the ${MAX_GUARD_UIDS} cap`);
+    return "";
+  }
+  for (const uid of unique) {
+    const escaped = cssAttributeValue(uid);
+    selectors.push(
+      `[id$="${escaped}"] .rm-xparser-default-grid:not(.rg-large-marker-hidden)`,
+      `.rm-block-ref[data-uid="${escaped}"] .rm-xparser-default-grid:not(.rg-large-marker-hidden)`,
+      `[data-uid="${escaped}"] .rm-xparser-default-grid:not(.rg-large-marker-hidden)`,
     );
   }
   return selectors.length ? `${selectors.join(",\n")} { visibility: hidden !important; pointer-events: none !important; }` : "";
@@ -12475,18 +12520,36 @@ function nativeMetadataUids() {
   return new Set([...runtime.metadata?.entries || []].filter(([, entry]) => entry?.value?.mode !== "large").map(([uid]) => uid));
 }
 
+export function largeMetadataUids() {
+  return new Set([...runtime.metadata?.entries || []].filter(([, entry]) => entry?.value?.mode === "large").map(([uid]) => uid));
+}
+
+function installLargeGridGuard(uids) {
+  if (!globalThis.document?.head) return null;
+  const style = runtime.guardLargeStyle || document.getElementById(PREPAINT_LARGE_STYLE_ID) || document.createElement("style");
+  style.id = PREPAINT_LARGE_STYLE_ID; style.textContent = largeGridGuardCss(uids);
+  if (!style.isConnected) document.head.appendChild(style);
+  runtime.guardLargeStyle = style;
+  return style;
+}
+
 function installEnhancedUidGuard(uids) {
   if (!globalThis.document?.head) return null;
   const style = runtime.guardStyle || document.getElementById(PREPAINT_STYLE_ID) || document.createElement("style");
   style.id = PREPAINT_STYLE_ID; style.textContent = enhancedUidGuardCss(uids);
   if (!style.isConnected) document.head.appendChild(style);
   runtime.guardStyle = style;
+  // The large pre-paint guard rides the same install/sync cycle so both guards stay in lockstep;
+  // at load time the cached large uids are installed before metadata has been read.
+  installLargeGridGuard(readLargeUidCache());
   return style;
 }
 
 function syncEnhancedUidGuard() {
   if (!runtime.metadata) return installEnhancedUidGuard(readEnhancedUidCache());
-  const uids = nativeMetadataUids(); writeEnhancedUidCache(uids); return installEnhancedUidGuard(uids);
+  const uids = nativeMetadataUids(); writeEnhancedUidCache(uids);
+  const largeUids = largeMetadataUids(); writeLargeUidCache(largeUids);
+  return installEnhancedUidGuard(uids);
 }
 
 function nativeTablesWithin(root) {
@@ -12975,7 +13038,9 @@ export async function runMaintenanceAction(key, { extensionAPI = runtime.extensi
   }
   if (key === "maintenance-clear-caches") {
     try { storage?.removeItem?.(graphCacheKey()); } catch { /* localStorage can be unavailable in hardened browsers */ }
+    try { storage?.removeItem?.(largeUidCacheKey()); } catch { /* localStorage can be unavailable in hardened browsers */ }
     writeEnhancedUidCache([], storage);
+    writeLargeUidCache([], storage);
     runtime.gridThemePalette = null; runtime.gridThemeSignature = null;
     for (const session of runtime.sessions.values()) session.themePalette = null;
     toast("Cleared the local Roam Grid caches.", "success");
@@ -13084,6 +13149,7 @@ async function onunload() {
   settingsCache.clear();
   imageDimensionCache.clear();
   runtime.guardStyle?.remove(); runtime.guardStyle = null;
+  runtime.guardLargeStyle?.remove(); runtime.guardLargeStyle = null;
   for (const dispose of runtime.disposers.splice(0)) try { dispose(); } catch { /* no-op */ }
   cancelRecentsWarm();
   // Session health is per load, never persisted: a reload must start from a clean slate instead of

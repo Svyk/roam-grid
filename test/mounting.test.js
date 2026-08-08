@@ -10,11 +10,17 @@ import extension, {
   graphCacheKey,
   installPortalObservers,
   instanceSurface,
+  largeGridGuardCss,
+  largeMetadataUids,
+  largeUidCacheKey,
   nativeTableInstanceInfo,
   portalObservers,
   readEnhancedUidCache,
+  readLargeUidCache,
+  runtime,
   syncGridThemeFromHost,
   writeEnhancedUidCache,
+  writeLargeUidCache,
 } from "../src/extension.js";
 
 test("graph-scoped enhanced UID cache is sorted, validated, and corruption-safe", () => {
@@ -46,6 +52,49 @@ test("pre-paint guard emits exactly three selector families per uid, including b
     assert.ok(selectors.includes(`[data-uid="${uid}"] .rm-table:not(.rg-native-hidden)`));
   }
   assert.doesNotMatch(css, /display:\s*none/);
+});
+
+test("large-grid pre-paint guard targets the raw grid marker with a non-collapsing hide and the mount handoff", () => {
+  const css = largeGridGuardCss(new Set(["uidLarge"]));
+  assert.match(css, /\[id\$="uidLarge"\] \.rm-xparser-default-grid:not\(\.rg-large-marker-hidden\)/);
+  assert.match(css, /\.rm-block-ref\[data-uid="uidLarge"\] \.rm-xparser-default-grid:not\(\.rg-large-marker-hidden\)/);
+  assert.match(css, /visibility: hidden !important/);
+  assert.doesNotMatch(css, /display:\s*none/);
+});
+
+test("large-grid pre-paint guard emits three selector families per uid and caps over-budget sets", () => {
+  const css = largeGridGuardCss(new Set(["uidLarge", "otherLarge"]));
+  const selectors = css.slice(0, css.indexOf("{")).split(",").map((selector) => selector.trim()).filter(Boolean);
+  assert.equal(selectors.length, 6);
+  for (const uid of ["uidLarge", "otherLarge"]) {
+    assert.ok(selectors.includes(`[id$="${uid}"] .rm-xparser-default-grid:not(.rg-large-marker-hidden)`));
+    assert.ok(selectors.includes(`.rm-block-ref[data-uid="${uid}"] .rm-xparser-default-grid:not(.rg-large-marker-hidden)`));
+    assert.ok(selectors.includes(`[data-uid="${uid}"] .rm-xparser-default-grid:not(.rg-large-marker-hidden)`));
+  }
+  assert.doesNotMatch(css, /display:\s*none/);
+});
+
+test("large metadata uids collect only large-mode entries and skip native-mode ones", () => {
+  const previousMetadata = runtime.metadata;
+  runtime.metadata = { entries: new Map([
+    ["largeUid", { value: { mode: "large" } }],
+    ["nativeUid", { value: { mode: "native" } }],
+  ]) };
+  try {
+    assert.deepEqual([...largeMetadataUids()], ["largeUid"]);
+  } finally { runtime.metadata = previousMetadata; }
+});
+
+test("graph-scoped large UID cache is a separate key, sorted, validated, and corruption-safe", () => {
+  const values = new Map();
+  const storage = { getItem: (key) => values.get(key), setItem: (key, value) => values.set(key, value) };
+  const key = largeUidCacheKey("#/app/Svy/page/abc");
+  assert.equal(key, "roam-grid:large-uids:Svy");
+  assert.notEqual(key, graphCacheKey("#/app/Svy/page/abc"));
+  assert.deepEqual(writeLargeUidCache(["z-grid", "a-grid", "z-grid"], storage, key), ["a-grid", "z-grid"]);
+  assert.deepEqual([...readLargeUidCache(storage, key)], ["a-grid", "z-grid"]);
+  values.set(key, "not-json");
+  assert.deepEqual([...readLargeUidCache(storage, key)], []);
 });
 
 test("native table instance resolution prefers the canonical UID on a block reference", () => {
