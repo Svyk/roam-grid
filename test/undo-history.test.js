@@ -42,6 +42,7 @@ function corruptUndoOp(op) {
     case "setHeaderRows": return { ...op, rowUids: op.rowUids.length ? [] : ["c00"] };
     case "setHeaderCols": return { ...op, columnIds: op.columnIds.length ? [] : ["col0"] };
     case "setCharts": return { ...op, charts: op.charts.length ? [] : [{ id: "ctl", type: "line", range: { startRow: 0, endRow: 0, startCol: 0, endCol: 0 }, title: "ctl" }] };
+    case "setImageLayout": return { ...op, imageLayout: Object.keys(op.imageLayout?.columns || {}).length ? { columns: {}, cells: {} } : { columns: { ctl: { size: "xl" } }, cells: {} } };
     case "setFlags": return { ...op, flags: Object.fromEntries(Object.entries(op.flags).map(([key, value]) => [key, typeof value === "boolean" ? !value : (Number(value) || 0) + 7])) };
     default: return op;
   }
@@ -64,6 +65,7 @@ const scenarios = [
   { name: "setHeaderCols", ops: ["setHeaderCols"], run: (model) => model.toggleHeaderColumn(1) },
   { name: "setFlags", ops: ["setFlags"], run: (model) => { model.showHeaders = false; model.frozenCols = 2; } },
   { name: "setCharts", ops: ["setCharts"], run: (model) => model.charts.push({ id: "chart-1", type: "line", range: { startRow: 0, endRow: 2, startCol: 0, endCol: 1 }, title: "chart" }) },
+  { name: "setImageLayout", ops: ["setImageLayout"], run: (model) => model.setImageLayoutEntry({ columnId: "col1", patch: { size: "l", fit: "cover" } }) },
   { name: "moveRange", ops: ["setRaw"], run: (model) => model.moveRange({ startRow: 0, endRow: 0, startCol: 0, endCol: 1 }, 2, 0) },
 ];
 
@@ -105,7 +107,7 @@ test("every recorded op type round-trips inverse then forward exactly", () => {
 
   assert.deepEqual([...observed].sort(), [
     "insertColAt", "insertRowAt", "orderCols", "orderRows", "removeColById", "removeRowByUid",
-    "setAlignment", "setCharts", "setFlags", "setHeaderCols", "setHeaderRows", "setMerges", "setRaw", "setRowHeight", "setWidth",
+    "setAlignment", "setCharts", "setFlags", "setHeaderCols", "setHeaderRows", "setImageLayout", "setMerges", "setRaw", "setRowHeight", "setWidth",
   ]);
 });
 
@@ -130,6 +132,37 @@ test("a no-op transaction neither pushes an undo entry nor clears redo", () => {
 
   model.transact("real edit", () => model.setRaw(0, 1, "next"));
   assert.equal(model.redoStack.length, 0, "a real transaction still clears redo");
+});
+
+test("setImageLayout undo applies and inverts the whole object", () => {
+  const model = grid();
+  model.transact("Image size", () => {
+    model.setImageLayoutEntry({ columnId: "col1", patch: { size: "xl" } });
+    model.setImageLayoutEntry({ cellUid: "c12", patch: { fit: "cover" } });
+  });
+  assert.deepEqual(model.imageLayout, { columns: { col1: { size: "xl" } }, cells: { c12: { fit: "cover" } } });
+  const entry = model.history.entries.at(-1);
+  assert.deepEqual(entry.inverse, [{ op: "setImageLayout", imageLayout: { columns: {}, cells: {} } }], "the inverse is the whole pre-transaction object");
+  assert.deepEqual(entry.forward, [{ op: "setImageLayout", imageLayout: { columns: { col1: { size: "xl" } }, cells: { c12: { fit: "cover" } } } }]);
+
+  assert.equal(model.undo(), true);
+  assert.deepEqual(model.imageLayout, { columns: {}, cells: {} }, "undo restores the empty shape");
+  assert.equal(model.redo(), true);
+  assert.deepEqual(model.imageLayout, { columns: { col1: { size: "xl" } }, cells: { c12: { fit: "cover" } } }, "redo reapplies both entries");
+});
+
+test("remapUids rewrites imageLayout keys in ops and checkpoints", () => {
+  const model = grid(2, 2);
+  model.transact("image layout", () => {
+    model.setImageLayoutEntry({ columnId: "col1", patch: { size: "l" } });
+    model.setImageLayoutEntry({ cellUid: "c11", patch: { fit: "cover" } });
+  }, { hard: true });
+  const entry = model.history.entries.at(-1);
+  model.history.remapUids(new Map([["col1", "remapped-col"], ["c11", "remapped-cell"]]));
+
+  const forward = entry.forward.find((op) => op.op === "setImageLayout");
+  assert.deepEqual(forward.imageLayout, { columns: { "remapped-col": { size: "l" } }, cells: { "remapped-cell": { fit: "cover" } } }, "op keys follow the uid map");
+  assert.deepEqual(entry.forwardCheckpoint.imageLayout, { columns: { "remapped-col": { size: "l" } }, cells: { "remapped-cell": { fit: "cover" } } }, "checkpoint keys follow it too");
 });
 
 test("a history survives model replacement and keeps addressing cells by uid", () => {

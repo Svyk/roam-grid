@@ -76,6 +76,15 @@ const DEFAULT_NEW_GRID_COLS = 26;
 const DEFAULT_LARGE_OVERSCAN_ROWS = 8;
 const DEFAULT_RANGE_RENDERED_CELLS = 2000;
 const DEFAULT_IMAGE_MAX_HEIGHT = 180;
+// The per-table imageLayout vocabulary (GOAL-IMG-3). Size tokens map to a pixel cap at resolve
+// time except "fill", which keeps the global cap and spans the cell width instead.
+export const IMAGE_SIZE_TOKENS = ["s", "m", "l", "xl", "fill"];
+export const IMAGE_FIT_TOKENS = ["contain", "cover", "original"];
+export const IMAGE_LAYOUT_TOKENS = ["inline", "strip"];
+const IMAGE_SIZE_HEIGHTS = { s: 64, l: 320, xl: 480 }; // "m" and "fill" follow the images-max-height setting
+export const IMAGE_SIZE_MENU = [["Small", "s"], ["Medium", "m"], ["Large", "l"], ["Extra large", "xl"], ["Fill width", "fill"]];
+export const IMAGE_FIT_MENU = [["Contain", "contain"], ["Fill & crop (may enlarge)", "cover"], ["Original size", "original"]];
+export const ROW_HEIGHT_PRESETS = [["Short", 32], ["Medium", 56], ["Tall", 96], ["Extra tall", 160]];
 const DEFAULT_LARGE_CACHE_MB = 256;
 const COMMENT_TRIGGER_HOVER = "Hover";
 const COMMENT_TRIGGER_MODIFIER = "Cmd/Ctrl + hover";
@@ -1558,6 +1567,10 @@ function remapUndoOp(op, uidMap) {
     case "orderCols": return { ...op, columnIds: op.columnIds.map(swap) };
     case "setHeaderRows": return { ...op, rowUids: op.rowUids.map(swap) };
     case "setHeaderCols": return { ...op, columnIds: op.columnIds.map(swap) };
+    case "setImageLayout": return { ...op, imageLayout: {
+      columns: Object.fromEntries(Object.entries(op.imageLayout?.columns || {}).map(([key, value]) => [swap(key), value])),
+      cells: Object.fromEntries(Object.entries(op.imageLayout?.cells || {}).map(([key, value]) => [swap(key), value])),
+    } };
     default: return op;
   }
 }
@@ -1569,6 +1582,7 @@ function remapUndoSnapshot(snapshot, uidMap) {
     ...snapshot, rows: snapshot.rows.map((row) => row.map((cell) => ({ ...cell, uid: swap(cell.uid) }))), columnIds: snapshot.columnIds.map(swap),
     rowHeights: swapKeys(snapshot.rowHeights), alignments: swapKeys(snapshot.alignments), widths: swapKeys(snapshot.widths),
     headerRows: (snapshot.headerRows || []).map(swap), headerColumns: (snapshot.headerColumns || []).map(swap),
+    imageLayout: { columns: swapKeys(snapshot.imageLayout?.columns), cells: swapKeys(snapshot.imageLayout?.cells) },
   };
 }
 
@@ -1648,6 +1662,7 @@ export function applyUndoOp(model, op) {
     case "setHeaderRows": model.headerRows = [...op.rowUids]; return true;
     case "setHeaderCols": model.headerColumns = [...op.columnIds]; return true;
     case "setCharts": model.charts = deepClone(op.charts); return true;
+    case "setImageLayout": model.imageLayout = normalizeImageLayout(op.imageLayout); return true;
     case "setFlags": {
       for (const [key, value] of Object.entries(op.flags || {})) model[key] = value;
       return true;
@@ -1711,6 +1726,10 @@ function undoFieldOps(before, model) {
   if (JSON.stringify(before.charts) !== JSON.stringify(model.charts)) {
     inverse.push({ op: "setCharts", charts: deepClone(before.charts) });
     forward.push({ op: "setCharts", charts: deepClone(model.charts) });
+  }
+  if (JSON.stringify(before.imageLayout) !== JSON.stringify(model.imageLayout)) {
+    inverse.push({ op: "setImageLayout", imageLayout: deepClone(before.imageLayout) });
+    forward.push({ op: "setImageLayout", imageLayout: deepClone(model.imageLayout) });
   }
   const previousFlags = {}; const nextFlags = {};
   for (const key of ["frozenRows", "frozenCols", "showHeaders", "fitToWidth", "colorFormulaCells", "revision"]) {
@@ -1948,7 +1967,7 @@ export function releaseUndoHistory(tableUid, histories = undoHistories) { return
 export function clearUndoHistories(histories = undoHistories) { histories.clear(); }
 
 export class GridModel {
-  constructor({ rows = [[]], tableUid = null, columnIds = [], merges = [], widths = {}, rowHeights = {}, alignments = {}, headerColumns = [], headerRows = [], frozenRows = 1, frozenCols = 0, charts = [], showHeaders = true, fitToWidth = true, colorFormulaCells = true, revision = null, history = null } = {}) {
+  constructor({ rows = [[]], tableUid = null, columnIds = [], merges = [], widths = {}, rowHeights = {}, alignments = {}, headerColumns = [], headerRows = [], frozenRows = 1, frozenCols = 0, charts = [], imageLayout = null, showHeaders = true, fitToWidth = true, colorFormulaCells = true, revision = null, history = null } = {}) {
     const width = Math.max(1, columnIds.length, ...rows.map((row) => row.length));
     this.tableUid = tableUid;
     this.rows = normalizeCells(rows.length ? rows : [[]], width);
@@ -1963,6 +1982,7 @@ export class GridModel {
     this.frozenRows = clamp(Number(frozenRows) || 0, 0, this.rows.length);
     this.frozenCols = clamp(Number(frozenCols) || 0, 0, width);
     this.charts = deepClone(charts);
+    this.imageLayout = normalizeImageLayout(imageLayout);
     this.showHeaders = showHeaders !== false;
     this.fitToWidth = fitToWidth !== false;
     this.colorFormulaCells = colorFormulaCells !== false;
@@ -2029,10 +2049,27 @@ export class GridModel {
     this.headerRows = this.headerRows.includes(id) ? this.headerRows.filter((value) => value !== id) : [...this.headerRows, id];
   }
 
+  /**
+   * Writes one per-table image layout entry, keyed by column id or cell uid. A null patch deletes
+   * the entry (the cell or column falls back to the next layer); a partial patch merges field by
+   * field, an explicitly undefined field clears that key, and a patch that leaves the entry empty
+   * deletes it. Undo comes free: `undoFieldOps` diffs `imageLayout` whole-object like `charts`.
+   */
+  setImageLayoutEntry({ columnId = null, cellUid = null, patch = null } = {}) {
+    const bucket = cellUid != null ? "cells" : "columns";
+    const key = cellUid ?? columnId;
+    if (!key || typeof key !== "string") throw new GridError("IMAGE_LAYOUT", "An image layout entry keys on a column id or a cell uid");
+    this.imageLayout = normalizeImageLayout(this.imageLayout);
+    if (patch == null) { delete this.imageLayout[bucket][key]; return; }
+    const merged = normalizeImageLayout({ [bucket]: { [key]: { ...this.imageLayout[bucket][key], ...patch } } })[bucket][key];
+    if (merged) this.imageLayout[bucket][key] = merged;
+    else delete this.imageLayout[bucket][key];
+  }
+
   snapshot() {
     return {
       rows: deepClone(this.rows), columnIds: [...this.columnIds], merges: deepClone(this.merges), widths: { ...this.widths }, rowHeights: { ...this.rowHeights }, alignments: { ...this.alignments }, headerColumns: [...this.headerColumns], headerRows: [...this.headerRows],
-      frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: deepClone(this.charts), showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, colorFormulaCells: this.colorFormulaCells, revision: this.revision,
+      frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: deepClone(this.charts), imageLayout: deepClone(this.imageLayout), showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, colorFormulaCells: this.colorFormulaCells, revision: this.revision,
     };
   }
 
@@ -2048,6 +2085,7 @@ export class GridModel {
     this.frozenRows = snapshot.frozenRows;
     this.frozenCols = snapshot.frozenCols;
     this.charts = deepClone(snapshot.charts);
+    this.imageLayout = normalizeImageLayout(snapshot.imageLayout);
     this.showHeaders = snapshot.showHeaders !== false;
     this.fitToWidth = snapshot.fitToWidth !== false;
     this.colorFormulaCells = snapshot.colorFormulaCells !== false;
@@ -2403,7 +2441,7 @@ export class GridModel {
   }
 
   toJSON() {
-    return { schema: "roam-grid", version: 1, tableUid: this.tableUid, rows: this.rows, columnIds: this.columnIds, merges: this.merges, widths: this.widths, rowHeights: this.rowHeights, alignments: this.alignments, headerColumns: this.headerColumns, headerRows: this.headerRows, frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: this.charts, showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, colorFormulaCells: this.colorFormulaCells, revision: this.revision };
+    return { schema: "roam-grid", version: 1, tableUid: this.tableUid, rows: this.rows, columnIds: this.columnIds, merges: this.merges, widths: this.widths, rowHeights: this.rowHeights, alignments: this.alignments, headerColumns: this.headerColumns, headerRows: this.headerRows, frozenRows: this.frozenRows, frozenCols: this.frozenCols, charts: this.charts, imageLayout: this.imageLayout, showHeaders: this.showHeaders, fitToWidth: this.fitToWidth, colorFormulaCells: this.colorFormulaCells, revision: this.revision };
   }
 
   static fromJSON(value) {
@@ -2961,13 +2999,13 @@ export class MetadataStore {
   get(tableUid) {
     const value = this.entries.get(tableUid)?.value;
     if (!value) return null;
-    return { columnIds: value.columnIds || [], merges: value.merges || [], widths: value.widths || {}, rowHeights: value.rowHeights || {}, alignments: value.alignments || {}, headerColumns: value.headerColumns || [], headerRows: value.headerRows || [], frozenRows: value.frozenRows ?? 1, frozenCols: value.frozenCols ?? 0, charts: value.charts || [], showHeaders: value.showHeaders !== false, fitToWidth: value.fitToWidth !== false, colorFormulaCells: value.colorFormulaCells !== false };
+    return { columnIds: value.columnIds || [], merges: value.merges || [], widths: value.widths || {}, rowHeights: value.rowHeights || {}, alignments: value.alignments || {}, headerColumns: value.headerColumns || [], headerRows: value.headerRows || [], frozenRows: value.frozenRows ?? 1, frozenCols: value.frozenCols ?? 0, charts: value.charts || [], imageLayout: value.imageLayout || {}, showHeaders: value.showHeaders !== false, fitToWidth: value.fitToWidth !== false, colorFormulaCells: value.colorFormulaCells !== false };
   }
 
   has(tableUid) { return this.entries.has(tableUid); }
 
   async set(tableUid, model, mode = "native") {
-    const value = { schema: 1, mode, tableUid, columnIds: model.columnIds, merges: model.merges, widths: model.widths, rowHeights: model.rowHeights, alignments: model.alignments, headerColumns: model.headerColumns, headerRows: model.headerRows, frozenRows: model.frozenRows, frozenCols: model.frozenCols, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, colorFormulaCells: model.colorFormulaCells !== false, updatedAt: new Date().toISOString() };
+    const value = { schema: 1, mode, tableUid, columnIds: model.columnIds, merges: model.merges, widths: model.widths, rowHeights: model.rowHeights, alignments: model.alignments, headerColumns: model.headerColumns, headerRows: model.headerRows, frozenRows: model.frozenRows, frozenCols: model.frozenCols, charts: model.charts, imageLayout: model.imageLayout, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, colorFormulaCells: model.colorFormulaCells !== false, updatedAt: new Date().toISOString() };
     const string = `${METADATA_PREFIX} ${JSON.stringify(value)}`;
     const entry = this.entries.get(tableUid);
     const pageUid = await this.ensurePage();
@@ -4820,7 +4858,7 @@ export function mergeMetadataMaps(base = {}, ours = {}, theirs = {}) {
 }
 
 const MERGEABLE_MANIFEST_MAPS = ["widths", "rowHeights", "alignments", "rowHeightsByIndex", "alignmentsByIndex"];
-const MERGEABLE_MANIFEST_VALUES = ["columnIds", "charts", "frozenRows", "frozenCols", "showHeaders", "fitToWidth", "colorFormulaCells"];
+const MERGEABLE_MANIFEST_VALUES = ["columnIds", "charts", "imageLayout", "frozenRows", "frozenCols", "showHeaders", "fitToWidth", "colorFormulaCells"];
 
 const refuseMerge = (reason, message, details = {}) => { throw new GridError("CONFLICT", message, { reason, ...details }); };
 
@@ -4971,7 +5009,7 @@ export class LargeGridStore {
       schema: "roam-grid/manifest", version: 2, revision, rowIdRevision: revision, previous: null, lineage: [], createdAt: new Date().toISOString(),
       rowCount: model.rowCount, colCount: model.colCount, chunkRows: chunkSize, columnIds: model.columnIds, widths: model.widths,
       rowHeights: rowHeightsForManifest(model, chunkSize, revision), rowHeightsByIndex: {}, alignments: alignmentsForManifest(model, chunkSize, revision), alignmentsByIndex: {},
-      frozenRows: model.frozenRows, frozenCols: model.frozenCols, merges: model.merges, charts: model.charts, showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, colorFormulaCells: model.colorFormulaCells !== false, chunks, retained: [],
+      frozenRows: model.frozenRows, frozenCols: model.frozenCols, merges: model.merges, charts: model.charts, imageLayout: normalizeImageLayout(model.imageLayout), showHeaders: model.showHeaders !== false, fitToWidth: model.fitToWidth !== false, colorFormulaCells: model.colorFormulaCells !== false, chunks, retained: [],
     };
     const url = await uploadJson(manifest, `roam-grid-${this.anchorUid}-manifest.json`);
     const verified = normalizeManifest(await downloadJson(url));
@@ -5013,6 +5051,7 @@ export class LargeGridStore {
       rowHeights: copiedRowHeights(source, chunkSize, revision, rowCount), rowHeightsByIndex: {}, alignments: copiedAlignments(source, columnIds, chunkSize, revision, rowCount), alignmentsByIndex: {},
       frozenRows: clamp(Number(source.manifest.frozenRows) || 0, 0, rowCount), frozenCols: clamp(Number(source.manifest.frozenCols) || 0, 0, colCount),
       merges: deepClone(source.manifest.merges || []), charts: deepClone(source.manifest.charts || []),
+      imageLayout: normalizeImageLayout(source.manifest.imageLayout),
       showHeaders: source.manifest.showHeaders !== false, fitToWidth: source.manifest.fitToWidth !== false, colorFormulaCells: source.manifest.colorFormulaCells !== false, chunks, retained: [],
     };
     const url = await uploadJson(manifest, `roam-grid-${this.anchorUid}-manifest.json`);
@@ -5450,6 +5489,13 @@ export class LargeGridStore {
     this.recordMetadataMutation("flag", { key, value });
   }
 
+  /** Whole-object image layout write, journaled like the flags so a commit swap replays it. Large
+   *  cells are JSON rows with no block uid, so only the column layer is ever meaningful here. */
+  setImageLayout(imageLayout) {
+    this.manifest.imageLayout = normalizeImageLayout(imageLayout);
+    this.recordMetadataMutation("imageLayout", { value: deepClone(this.manifest.imageLayout) });
+  }
+
   livePointerUrl() {
     const pointer = getTree(this.pointerUid);
     return extractUrl(pointer?.string?.slice(MANIFEST_PREFIX.length));
@@ -5540,6 +5586,7 @@ export class LargeGridStore {
     }
     if (op === "unmerge") { manifest.merges = (manifest.merges || []).filter((item) => item.id !== args.id); return true; }
     if (op === "flag") { manifest[args.key] = args.value; return true; }
+    if (op === "imageLayout") { manifest.imageLayout = normalizeImageLayout(args.value); return true; }
     return false;
   }
 
@@ -5745,7 +5792,7 @@ export class LargeGridStore {
     if (this.manifest.rowCount * this.manifest.colCount > limit) throw new GridError("MUTATION_BUDGET", "Large grid exceeds the safe native-table conversion budget");
     const rows = []; const chunkSize = chunkRowsFor(this.manifest);
     for (let start = 0; start < this.manifest.rowCount; start += chunkSize) rows.push(...await this.getRows(start, Math.min(this.manifest.rowCount, start + chunkSize)));
-    return applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false, colorFormulaCells: this.manifest.colorFormulaCells !== false }), this.rowHeightIndexMap()), this.alignmentIndexMap());
+    return applyManifestAlignments(applyManifestRowHeights(new GridModel({ rows, columnIds: this.manifest.columnIds, widths: this.manifest.widths, frozenRows: this.manifest.frozenRows, frozenCols: this.manifest.frozenCols, merges: this.manifest.merges, charts: this.manifest.charts, imageLayout: this.manifest.imageLayout, showHeaders: this.manifest.showHeaders !== false, fitToWidth: this.manifest.fitToWidth !== false, colorFormulaCells: this.manifest.colorFormulaCells !== false }), this.rowHeightIndexMap()), this.alignmentIndexMap());
   }
 }
 
@@ -7318,16 +7365,61 @@ export function removeImageFromRaw(raw, url, occurrenceIndex = 0) {
 }
 
 /**
- * Cell image layout resolution. IMG-1 reads the two global settings only and always resolves the
- * default fit/layout; IMG-3 layers the per-table `model.imageLayout` (cell → column → default)
- * UNDER this seam, so the signature and return shape are what both generations code against.
+ * Per-table image layout normalization. The shape is `{ columns: { [columnId]: entry },
+ * cells: { [cellUid]: entry } }` where a column entry is `{ size?, fit?, layout? }` and a cell
+ * entry is `{ size?, fit? }`. Anything else — a stripped key, a hand-edited string, an unknown
+ * token — normalizes to the empty shape or a cleaned entry, so a lost metadata value always
+ * degrades to the defaults rather than to a broken cell. Keys are NOT validated against the
+ * model: an entry for a deleted column or cell is inert, and dropping it here would make an
+ * undo that restores the cell unable to restore its layout with it.
+ */
+export function normalizeImageLayout(value) {
+  const out = { columns: {}, cells: {} };
+  if (!value || typeof value !== "object" || Array.isArray(value)) return out;
+  const clean = (entry, allowLayout) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+    const next = {};
+    if (IMAGE_SIZE_TOKENS.includes(entry.size)) next.size = entry.size;
+    if (IMAGE_FIT_TOKENS.includes(entry.fit)) next.fit = entry.fit;
+    if (allowLayout && IMAGE_LAYOUT_TOKENS.includes(entry.layout)) next.layout = entry.layout;
+    return Object.keys(next).length ? next : null;
+  };
+  const columns = value.columns && typeof value.columns === "object" ? value.columns : {};
+  const cells = value.cells && typeof value.cells === "object" ? value.cells : {};
+  for (const [id, entry] of Object.entries(columns)) {
+    const cleaned = clean(entry, true);
+    if (cleaned && id) out.columns[id] = cleaned;
+  }
+  for (const [uid, entry] of Object.entries(cells)) {
+    const cleaned = clean(entry, false);
+    if (cleaned && uid) out.cells[uid] = cleaned;
+  }
+  return out;
+}
+
+/**
+ * Cell image layout resolution, cell → column → default UNDER the two global settings. The
+ * globals always own `enabled` (the kill switch restores exact pre-feature rendering) and the
+ * "m"/"fill" pixel cap (`images-max-height`); the model's `imageLayout` layers size, fit and
+ * layout on top, with a cell entry out-voting its column entry field by field. The return shape
+ * is the seam IMG-1/IMG-2 code against; `size` joined it in IMG-3 so the fill class can be set.
  */
 export function resolveImageLayout(model, row, col) {
+  const globalMax = clamp(Math.floor(Number(getSetting("images-max-height"))) || DEFAULT_IMAGE_MAX_HEIGHT, 48, 480);
+  const layout = model?.imageLayout && typeof model.imageLayout === "object" ? model.imageLayout : null;
+  const columnId = model?.columnIds?.[col];
+  const cellUid = model?.getCell?.(row, col)?.uid;
+  const columnEntry = (layout && columnId ? layout.columns?.[columnId] : null) || null;
+  const cellEntry = (layout && cellUid ? layout.cells?.[cellUid] : null) || null;
+  const size = [cellEntry?.size, columnEntry?.size].find((token) => IMAGE_SIZE_TOKENS.includes(token)) || "m";
+  const fit = [cellEntry?.fit, columnEntry?.fit].find((token) => IMAGE_FIT_TOKENS.includes(token)) || "contain";
+  const strip = IMAGE_LAYOUT_TOKENS.includes(columnEntry?.layout) ? columnEntry.layout : "inline";
   return {
     enabled: getSetting("images-cell-media") !== false,
-    maxHeight: clamp(Math.floor(Number(getSetting("images-max-height"))) || DEFAULT_IMAGE_MAX_HEIGHT, 48, 480),
-    fit: "contain",
-    layout: "inline",
+    size,
+    maxHeight: IMAGE_SIZE_HEIGHTS[size] ?? globalMax,
+    fit,
+    layout: strip,
   };
 }
 
@@ -7337,6 +7429,7 @@ export const imageDimensionCache = new Map();
 
 const IMAGE_FIT_CLASSES = ["rg-cell--img-fit-contain", "rg-cell--img-fit-cover", "rg-cell--img-fit-original"];
 const IMAGE_LAYOUT_CLASSES = ["rg-cell--img-inline", "rg-cell--img-strip"];
+const IMAGE_SIZE_CLASSES = ["rg-cell--img-fill"];
 
 function clearCellImageChips(cell) {
   for (const chip of cell?.querySelectorAll?.(".rg-img-fallback,.rg-img-clip-chip") || []) chip.remove();
@@ -7406,7 +7499,7 @@ export function applyCellImageLayout(cell, model, row, col) {
   const formula = raw.startsWith("=") && !raw.startsWith("==");
   const active = layout.enabled && !formula && cellImageMarkdown(raw).length > 0;
   cell.classList.toggle("rg-cell--media", Boolean(active));
-  cell.classList.remove(...IMAGE_FIT_CLASSES, ...IMAGE_LAYOUT_CLASSES);
+  cell.classList.remove(...IMAGE_FIT_CLASSES, ...IMAGE_LAYOUT_CLASSES, ...IMAGE_SIZE_CLASSES);
   if (!active) {
     cell.style?.removeProperty?.("--rg-img-max-h");
     clearCellImageChips(cell);
@@ -7414,6 +7507,7 @@ export function applyCellImageLayout(cell, model, row, col) {
   }
   cell.style?.setProperty?.("--rg-img-max-h", `${layout.maxHeight}px`);
   cell.classList.add(`rg-cell--img-fit-${layout.fit}`, `rg-cell--img-${layout.layout}`);
+  if (layout.size === "fill") cell.classList.add("rg-cell--img-fill");
   const content = cell.querySelector?.(".rg-cell-content");
   if (content) syncCellImageChips(cell, content);
   return true;
@@ -10796,6 +10890,8 @@ export class GridView {
       this.root.focus?.({ preventScroll: true }); claimKeyboard(this);
     };
     const item = (label, action) => { const element = button(label, label, () => { dismiss(); action(); }); element.className = "bp3-menu-item"; return element; };
+    const section = (label) => { const element = document.createElement("div"); element.className = "rg-menu-section"; element.textContent = label; return element; };
+    const entries = (list) => list.map((entry) => entry.section ? section(entry.section) : item(entry.label, entry.action));
     menu.append(
       ...(this.context === "reference" ? [item("Open source table", () => this.openSource())] : []),
       item("Merge selection", () => this.mergeSelection()), item("Unmerge", () => this.unmergeSelection()),
@@ -10804,13 +10900,14 @@ export class GridView {
       item("Delete selected columns", () => { const range = normalizeRange(this.selection); this.commitMutation("Delete columns", () => this.model.deleteCols(range.startCol, range.endCol - range.startCol + 1), true); }),
       item("Set selected row height…", () => this.setSelectedRowHeight()),
       item("Compact selected rows", () => this.resizeSelectedRows(getSetting("sizing-compact-row-height"))),
-      item("Auto-fit selected rows", () => this.resizeSelectedRows(null)),
+      ...entries(this.rowHeightMenuEntries()),
       item("Set selected column width…", () => this.setSelectedColumnWidth()),
       item("Reset selected column widths", () => this.resizeSelectedColumns(null)),
       item("Align left", () => this.alignSelection("left")),
       item("Align center", () => this.alignSelection("center")),
       item("Align right", () => this.alignSelection("right")),
       item("Reset alignment", () => this.alignSelection(null)),
+      ...entries(this.imageLayoutMenuEntries()),
       item("Copy Roam block reference", () => this.copyRoamReference(false)),
       item("Copy live range reference", () => this.copyRoamReferences()),
       item("Copy cell references as a table", () => this.copyRoamReferenceMatrix()),
@@ -10865,6 +10962,7 @@ export class GridView {
     };
     const divider = () => { const element = document.createElement("li"); element.className = "bp3-menu-divider"; return element; };
     const section = (label) => { const element = document.createElement("li"); element.className = "rg-menu-section"; element.textContent = label; return element; };
+    const entries = (list) => list.map((entry) => entry.section ? section(entry.section) : item(entry.label, entry.action));
     const headerOn = type === "row" ? this.model.isHeaderRow(index) : this.model.isHeaderColumn(index);
     menu.append(section(type === "row" ? `ROW ${index + 1}` : `COLUMN ${columnLabel(index)}`));
     menu.append(item(`Header ${type}`, () => this.toggleAxisHeader(type, index), { checked: headerOn }));
@@ -10889,13 +10987,14 @@ export class GridView {
       item("Insert chart", () => this.insertChart()),
       item("Set selected row height…", () => this.setSelectedRowHeight()),
       item("Compact selected rows", () => this.resizeSelectedRows(getSetting("sizing-compact-row-height"))),
-      item("Auto-fit selected rows", () => this.resizeSelectedRows(null)),
+      ...entries(this.rowHeightMenuEntries()),
       item("Set selected column width…", () => this.setSelectedColumnWidth()),
       item("Reset selected column widths", () => this.resizeSelectedColumns(null)),
       item("Align left", () => this.alignSelection("left")),
       item("Align center", () => this.alignSelection("center")),
       item("Align right", () => this.alignSelection("right")),
       item("Reset alignment", () => this.alignSelection(null)),
+      ...entries(this.imageLayoutMenuEntries()),
       item("Copy Roam block reference", () => this.copyRoamReference(false)),
       item("Copy live range reference", () => this.copyRoamReferences()),
       item("Copy cell references as a table", () => this.copyRoamReferenceMatrix()),
@@ -10925,9 +11024,101 @@ export class GridView {
 
   resizeSelectedRows(height) {
     const range = normalizeRange(this.selection);
-    return this.commitMutation(height == null ? "Auto-fit rows" : "Resize rows", () => {
+    return this.commitMutation(height == null ? "Reset row height" : "Resize rows", () => {
       for (let row = range.startRow; row <= range.endRow; row += 1) this.model.setRowHeight(row, height);
     }, true);
+  }
+
+  /**
+   * One-shot content measurement: the tallest mounted cell in each selected row, content
+   * scrollHeight plus its vertical padding, split across the rows of a merge. Persisted clamped
+   * through `setRowHeight` — which makes it a single undoable transaction — and a measurement
+   * within a pixel of the default deletes the override instead of pinning it. Never reactive:
+   * it reads the DOM once, at click time, and rows with no mounted cell are left alone.
+   */
+  measureSelectedRowHeights() {
+    const range = normalizeRange(this.selection);
+    const measured = [];
+    for (let row = range.startRow; row <= range.endRow; row += 1) {
+      let height = 0;
+      for (let col = 0; col < this.model.colCount; col += 1) {
+        if (this.model.isCovered(row, col)) continue;
+        const cell = this.cells.get(`${row}:${col}`);
+        if (!cell) continue;
+        const content = cell.querySelector?.(".rg-cell-content") || cell;
+        const styles = globalThis.getComputedStyle?.(content);
+        const padding = (Number.parseFloat(styles?.paddingTop) || 0) + (Number.parseFloat(styles?.paddingBottom) || 0);
+        const span = this.model.mergeAt(row, col)?.rowSpan || 1;
+        height = Math.max(height, Math.ceil(((Number(content.scrollHeight) || 0) + padding) / span));
+      }
+      if (height > 0) measured.push([row, height]);
+    }
+    if (!measured.length) return Promise.resolve(null);
+    const defaultHeight = getSetting("sizing-default-row-height");
+    return this.commitMutation("Auto-fit rows", () => {
+      for (const [row, height] of measured) {
+        const clamped = clamp(Math.round(height), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height"));
+        this.model.setRowHeight(row, Math.abs(clamped - defaultHeight) <= 1 ? null : clamped);
+      }
+    }, true);
+  }
+
+  /**
+   * The image layout write behind both context menus. A selection covering every row writes the
+   * COLUMN layer (keyed by columnId, so it survives row edits); a sub-column range writes one
+   * CELL entry per covered uid instead. A null value clears just that field, so resetting the
+   * size never takes a chosen fit down with it.
+   */
+  setSelectionImageLayout(kind, value) {
+    const range = normalizeRange(this.selection);
+    const wholeColumns = range.startRow === 0 && range.endRow >= this.model.rowCount - 1;
+    const menu = kind === "size" ? IMAGE_SIZE_MENU : IMAGE_FIT_MENU;
+    const name = value == null ? "Column default" : menu.find(([, token]) => token === value)?.[0];
+    return this.commitMutation(`Image ${kind}: ${name}`, () => {
+      if (wholeColumns) {
+        for (let col = range.startCol; col <= range.endCol; col += 1) {
+          const columnId = this.model.columnIds[col];
+          if (columnId) this.model.setImageLayoutEntry({ columnId, patch: { [kind]: value ?? undefined } });
+        }
+        return;
+      }
+      const seen = new Set();
+      for (let row = range.startRow; row <= range.endRow; row += 1) for (let col = range.startCol; col <= range.endCol; col += 1) {
+        if (this.model.isCovered(row, col)) continue;
+        const uid = this.model.getCell(row, col)?.uid;
+        if (!uid || seen.has(uid)) continue;
+        seen.add(uid);
+        this.model.setImageLayoutEntry({ cellUid: uid, patch: { [kind]: value ?? undefined } });
+      }
+    }, true);
+  }
+
+  /** Menu descriptors for the image groups: section headers carry the scope so the same item
+   *  labels read honestly for a column write and a these-cells-only write. */
+  imageLayoutMenuEntries() {
+    const range = normalizeRange(this.selection);
+    const wholeColumns = range.startRow === 0 && range.endRow >= this.model.rowCount - 1;
+    const scope = wholeColumns
+      ? (range.startCol === range.endCol ? `column ${columnLabel(range.startCol)}` : `columns ${columnLabel(range.startCol)}–${columnLabel(range.endCol)}`)
+      : "these cells only";
+    const entries = [{ section: `Image size · ${scope}` }];
+    for (const [label, size] of IMAGE_SIZE_MENU) entries.push({ label, action: () => this.setSelectionImageLayout("size", size) });
+    entries.push({ label: "Column default", action: () => this.setSelectionImageLayout("size", null) });
+    entries.push({ section: `Image fit · ${scope}` });
+    for (const [label, fit] of IMAGE_FIT_MENU) entries.push({ label, action: () => this.setSelectionImageLayout("fit", fit) });
+    return entries;
+  }
+
+  /** Menu descriptors for the row-height group: the four presets, the override-clearing reset,
+   *  and the one-shot content measurement. */
+  rowHeightMenuEntries() {
+    const entries = [{ section: "Row height" }];
+    for (const [label, height] of ROW_HEIGHT_PRESETS) entries.push({ label: `${label} (${height} px)`, action: () => this.resizeSelectedRows(height) });
+    entries.push(
+      { label: "Reset row height", action: () => this.resizeSelectedRows(null) },
+      { label: "Auto-fit selected rows (measure)", action: () => this.measureSelectedRowHeights() },
+    );
+    return entries;
   }
 
   setSelectedRowHeight() {
@@ -11492,7 +11683,7 @@ export class LargeGridView {
     const pinnedTheme = pinnedGridThemePalette(); if (pinnedTheme) applyGridThemeValues(this.root, pinnedTheme);
     this.host.appendChild(this.root);
     const toolbar = document.createElement("div"); toolbar.className = "rg-toolbar";
-    toolbar.append(button("↶", "Undo (⌘Z)", () => { void this.undo(); }, "rg-toolbar-primary"), button("↷", "Redo (⌘⇧Z)", () => { void this.redo(); }, "rg-toolbar-primary"), button("Merge", "Safely merge selection", () => this.merge()), button("Unmerge", "Unmerge selection", () => this.unmerge()), button("⇤", "Align selection left", () => this.alignSelection("left")), button("≡", "Center selection", () => this.alignSelection("center")), button("⇥", "Align selection right", () => this.alignSelection("right")), button("fx", "Show or hide formula-cell coloring", () => this.toggleFormulaColors()), button("Labels", "Show or hide row and column labels", () => this.toggleHeaders()), button("Save", "Commit dirty chunks", () => this.flush()), button("Export", "Export visible selection", () => this.exportSelection()), button("Native copy", "Copy to a native table when within the write budget", () => copyLargeToNative(this.store)));
+    toolbar.append(button("↶", "Undo (⌘Z)", () => { void this.undo(); }, "rg-toolbar-primary"), button("↷", "Redo (⌘⇧Z)", () => { void this.redo(); }, "rg-toolbar-primary"), button("Merge", "Safely merge selection", () => this.merge()), button("Unmerge", "Unmerge selection", () => this.unmerge()), button("⇤", "Align selection left", () => this.alignSelection("left")), button("≡", "Center selection", () => this.alignSelection("center")), button("⇥", "Align selection right", () => this.alignSelection("right")), button("fx", "Show or hide formula-cell coloring", () => this.toggleFormulaColors()), button("Labels", "Show or hide row and column labels", () => this.toggleHeaders()), button("Rows", "Row height presets for the selected rows", (event) => this.openRowHeightMenu(event.currentTarget)), button("Save", "Commit dirty chunks", () => this.flush()), button("Export", "Export visible selection", () => this.exportSelection()), button("Native copy", "Copy to a native table when within the write budget", () => copyLargeToNative(this.store)));
     this.status = document.createElement("span"); this.status.className = "rg-status";
     // Large-grid cells are JSON rows in a chunk file, not Roam blocks, so there is nothing for a
     // native comment thread to anchor to.  There is deliberately no alternate comment store.
@@ -11653,11 +11844,16 @@ export class LargeGridView {
     return band;
   }
 
+  /** The image resolver seam over manifest state: large cells are JSON rows with no block uid, so
+   *  only the column layer of `imageLayout` can ever apply. Deliberately no `getRaw` — the render
+   *  already peeked the raw into `dataset.rgRaw`, and the store's async read would poison it. */
+  imageLayoutModel() { return { imageLayout: this.store.manifest.imageLayout, columnIds: this.store.manifest.columnIds }; }
+
   async renderLargeCellValue(cell, raw, row, col, engine = this.formulaEngine) {
     const key = `${row}:${col}`; const token = (this.cellValueTokens.get(cell) || 0) + 1; this.cellValueTokens.set(cell, token);
     const formula = raw.startsWith("=") && !raw.startsWith("=="); const content = ensureCellContent(cell);
     cell.dataset.rgRaw = raw; cell.classList.toggle("rg-cell--formula", formula && formulaTintEnabled(this.store.manifest.colorFormulaCells));
-    applyCellImageLayout(cell, null, row, col);
+    applyCellImageLayout(cell, this.imageLayoutModel(), row, col);
     if (formula) {
       const value = await engine.evaluateCell(row, col);
       if (this.cellValueTokens.get(cell) !== token || this.cells.get(key) !== cell) return;
@@ -11702,6 +11898,39 @@ export class LargeGridView {
     this.anchor = { row: targetRow, col: targetCol };
     this.selection = { startRow: targetRow, endRow: targetRow, startCol: targetCol, endCol: targetCol };
     this.ensureVisible(targetRow, targetCol); this.updateLargeSelection();
+  }
+
+  /** Row-height presets for the selection's rows — the large-grid counterpart of the native
+   *  context-menu group. Writes go through the store, so each one is journaled metadata; null
+   *  deletes the override, the exact gesture the row-header double-click already makes. */
+  setSelectedRowHeights(height) {
+    const range = normalizeRange(this.selection);
+    for (let row = range.startRow; row <= range.endRow; row += 1) this.store.setRowHeight(row, height);
+    this.scheduleSave(true); this.scheduleRender();
+  }
+
+  openRowHeightMenu(anchor) {
+    const existing = document.querySelector(".rg-context-menu"); existing?.__rgDismiss?.(); existing?.remove();
+    const menu = document.createElement("div"); menu.className = "bp3-menu rg-context-menu";
+    let theme = null; let closed = false; let closeTimer = null;
+    const dismiss = () => {
+      if (closed) return; closed = true; clearTimeout(closeTimer);
+      theme?.dispose(); menu.remove(); document.removeEventListener("pointerdown", close, true);
+      if (this.disposed) return;
+      this.root.focus?.({ preventScroll: true }); claimKeyboard(this);
+    };
+    const item = (label, action) => { const element = button(label, label, () => { dismiss(); action(); }); element.className = "bp3-menu-item"; return element; };
+    const section = document.createElement("div"); section.className = "rg-menu-section"; section.textContent = "Row height";
+    menu.append(section);
+    for (const [label, height] of ROW_HEIGHT_PRESETS) menu.append(item(`${label} (${height} px)`, () => this.setSelectedRowHeights(height)));
+    menu.append(item("Reset row height", () => this.setSelectedRowHeights(null)));
+    menu.__rgDismiss = dismiss;
+    tagPortalOwner(menu, gridViewUid(this));
+    document.body.appendChild(menu);
+    theme = createPortalThemeBridge(this.root, menu);
+    const rect = anchor.getBoundingClientRect(); menu.style.left = `${rect.left}px`; menu.style.top = `${rect.bottom}px`;
+    const close = (event) => { if (!menu.contains(event.target)) dismiss(); };
+    closeTimer = setTimeout(() => document.addEventListener("pointerdown", close, true));
   }
 
   startRowResize(row, event) {
@@ -11888,7 +12117,7 @@ async function createNativeTableFromModel(model, afterUid = null, { parentUid = 
   }
   const adapter = new NativeTableAdapter(tableUid);
   const loaded = adapter.load();
-  loaded.columnIds = [...model.columnIds]; loaded.merges = deepClone(model.merges); loaded.widths = { ...model.widths }; loaded.headerColumns = [...model.headerColumns]; loaded.frozenRows = model.frozenRows; loaded.frozenCols = model.frozenCols; loaded.charts = deepClone(model.charts); loaded.showHeaders = model.showHeaders !== false; loaded.fitToWidth = model.fitToWidth !== false; loaded.colorFormulaCells = model.colorFormulaCells !== false;
+  loaded.columnIds = [...model.columnIds]; loaded.merges = deepClone(model.merges); loaded.widths = { ...model.widths }; loaded.headerColumns = [...model.headerColumns]; loaded.frozenRows = model.frozenRows; loaded.frozenCols = model.frozenCols; loaded.charts = deepClone(model.charts); loaded.imageLayout = deepClone(model.imageLayout); loaded.showHeaders = model.showHeaders !== false; loaded.fitToWidth = model.fitToWidth !== false; loaded.colorFormulaCells = model.colorFormulaCells !== false;
   for (let row = 0; row < Math.min(model.rowCount, loaded.rowCount); row += 1) {
     loaded.setRowHeight(row, model.getRowHeight(row));
     if (model.isHeaderRow(row)) loaded.toggleHeaderRow(row);

@@ -1,7 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  GridModel,
   GridView,
+  LargeGridView,
   applyCellImageLayout,
   cellImageMarkdown,
   claimKeyboard,
@@ -140,7 +142,7 @@ test("cellImageMarkdown rejects malformed and non-image markdown", () => {
 test("resolveImageLayout reads only the two global settings", (t) => {
   t.after(() => settingsCache.clear());
   settingsCache.clear();
-  assert.deepEqual(resolveImageLayout(null, 0, 0), { enabled: true, maxHeight: 180, fit: "contain", layout: "inline" });
+  assert.deepEqual(resolveImageLayout(null, 0, 0), { enabled: true, size: "m", maxHeight: 180, fit: "contain", layout: "inline" });
   settingsCache.set("images-cell-media", false);
   assert.equal(resolveImageLayout(null, 0, 0).enabled, false);
   settingsCache.set("images-cell-media", true);
@@ -341,6 +343,180 @@ test("repaintMediaDecor re-resolves every mounted cell from the live settings", 
   assert.equal(first.classList.contains("rg-cell--media"), false, "switch off strips decor in place");
   assert.equal(first.style.getPropertyValue("--rg-img-max-h"), "");
 });
+
+// GOAL-IMG-3 — the per-table model layer under the resolver, the menus, and the measurement.
+
+test("resolveImageLayout layers cell over column over the global defaults", (t) => {
+  t.after(() => settingsCache.clear());
+  settingsCache.clear();
+  const model = {
+    columnIds: ["c0", "c1"],
+    imageLayout: { columns: { c1: { size: "l", fit: "cover", layout: "strip" } }, cells: { u9: { fit: "original", size: "s" } } },
+    getCell: (row, col) => ({ uid: row === 3 && col === 1 ? "u9" : `u${row}${col}` }),
+  };
+  assert.deepEqual(resolveImageLayout(model, 0, 0), { enabled: true, size: "m", maxHeight: 180, fit: "contain", layout: "inline" }, "an unconfigured column resolves the defaults");
+  assert.deepEqual(resolveImageLayout(model, 0, 1), { enabled: true, size: "l", maxHeight: 320, fit: "cover", layout: "strip" }, "the column entry applies whole");
+  assert.deepEqual(resolveImageLayout(model, 3, 1), { enabled: true, size: "s", maxHeight: 64, fit: "original", layout: "strip" }, "a cell entry out-votes its column field by field, and layout stays the column's");
+
+  settingsCache.set("images-max-height", 240);
+  assert.equal(resolveImageLayout(model, 0, 0).maxHeight, 240, "Medium follows the global cap live");
+  assert.equal(resolveImageLayout({ ...model, imageLayout: { columns: { c1: { size: "xl" } }, cells: {} } }, 0, 1).maxHeight, 480);
+  assert.equal(resolveImageLayout({ ...model, imageLayout: { columns: { c1: { size: "fill" } }, cells: {} } }, 0, 1).maxHeight, 240, "Fill width keeps the global cap — it widens, never heightens");
+  assert.equal(resolveImageLayout(model, 0, 1).maxHeight, 320, "an explicit size ignores the global");
+
+  const junk = { columnIds: ["c0"], imageLayout: { columns: { c0: { size: "huge", fit: "weird", layout: "spiral" } }, cells: {} }, getCell: () => ({ uid: "u" }) };
+  assert.deepEqual(resolveImageLayout(junk, 0, 0), { enabled: true, size: "m", maxHeight: 240, fit: "contain", layout: "inline" }, "hand-edited garbage tokens degrade to defaults");
+  assert.equal(resolveImageLayout({ columnIds: ["c0"] }, 0, 0).maxHeight, 240, "a stripped imageLayout key (or the large-grid facade without one) resolves defaults");
+});
+
+test("applyCellImageLayout reads the model imageLayout: column entry, cell override, fill class", (t) => {
+  t.after(() => settingsCache.clear());
+  installMiniDom();
+  settingsCache.clear();
+  const { cell } = makeCell("![cat](u)");
+  const model = {
+    columnIds: ["c0"],
+    imageLayout: { columns: { c0: { size: "l", fit: "cover", layout: "strip" } }, cells: {} },
+    getRaw: () => "![cat](u)",
+    getCell: () => ({ uid: "u1" }),
+  };
+  assert.equal(applyCellImageLayout(cell, model, 0, 0), true);
+  assert.equal(cell.style.getPropertyValue("--rg-img-max-h"), "320px", "the Large preset caps at 320");
+  assert.equal(cell.classList.contains("rg-cell--img-fit-cover"), true);
+  assert.equal(cell.classList.contains("rg-cell--img-strip"), true);
+  assert.equal(cell.classList.contains("rg-cell--img-fill"), false);
+
+  model.imageLayout.cells.u1 = { size: "fill", fit: "contain" };
+  applyCellImageLayout(cell, model, 0, 0);
+  assert.equal(cell.classList.contains("rg-cell--img-fill"), true, "the cell's Fill width wins the size");
+  assert.equal(cell.classList.contains("rg-cell--img-fit-contain"), true, "and its fit out-votes the column's");
+  assert.equal(cell.style.getPropertyValue("--rg-img-max-h"), "180px", "fill keeps the global height cap");
+
+  delete model.imageLayout.cells.u1;
+  applyCellImageLayout(cell, model, 0, 0);
+  assert.equal(cell.classList.contains("rg-cell--img-fill"), false, "removing the override drops the class with it");
+});
+
+test("setSelectionImageLayout writes the column layer for whole columns and cell entries otherwise", async (t) => {
+  t.after(() => settingsCache.clear());
+  settingsCache.clear();
+  installMiniDom();
+  const grid = new GridModel({ rows: [["a", "b"], ["c", "d"]] });
+  const commits = [];
+  const view = {
+    model: grid,
+    selection: { startRow: 0, endRow: 1, startCol: 1, endCol: 1 }, // every row of column B
+    commitMutation: (label, mutation, structural) => { commits.push({ label, structural }); grid.transact(label, mutation); return Promise.resolve(grid); },
+  };
+
+  await GridView.prototype.setSelectionImageLayout.call(view, "size", "l");
+  const columnId = grid.columnIds[1];
+  assert.deepEqual(grid.imageLayout.columns[columnId], { size: "l" }, "a full-height selection writes the column entry");
+  assert.deepEqual(grid.imageLayout.cells, {});
+  assert.deepEqual(commits[0], { label: "Image size: Large", structural: true });
+
+  view.selection = { startRow: 0, endRow: 0, startCol: 0, endCol: 1 }; // a sub-column range
+  await GridView.prototype.setSelectionImageLayout.call(view, "fit", "cover");
+  const uidA = grid.getCell(0, 0).uid; const uidB = grid.getCell(0, 1).uid;
+  assert.deepEqual(grid.imageLayout.cells, { [uidA]: { fit: "cover" }, [uidB]: { fit: "cover" } }, "a sub-column range writes one entry per cell");
+  assert.equal(commits[1].label, "Image fit: Fill & crop (may enlarge)");
+
+  // Column default clears just the size field; with no fit beside it the entry disappears.
+  view.selection = { startRow: 0, endRow: 1, startCol: 1, endCol: 1 };
+  await GridView.prototype.setSelectionImageLayout.call(view, "size", null);
+  assert.equal(grid.imageLayout.columns[columnId], undefined, "Column default clears the field — and the emptied entry with it");
+  assert.equal(commits[2].label, "Image size: Column default");
+  assert.deepEqual(grid.imageLayout.cells[uidB], { fit: "cover" }, "the cell layer is untouched by a column write");
+
+  // Undo through the model history reverses the whole gesture.
+  grid.undo();
+  assert.deepEqual(grid.imageLayout.columns[columnId], { size: "l" }, "undo restores the column entry");
+});
+
+test("the menu descriptors scope image groups and list the row-height presets", () => {
+  const grid = new GridModel({ rows: [["a"], ["b"]] });
+  const columnView = { model: grid, selection: { startRow: 0, endRow: 1, startCol: 0, endCol: 0 } };
+  const entries = GridView.prototype.imageLayoutMenuEntries.call(columnView);
+  assert.equal(entries[0].section, "Image size · column A");
+  assert.deepEqual(
+    entries.filter((entry) => !entry.section).map((entry) => entry.label),
+    ["Small", "Medium", "Large", "Extra large", "Fill width", "Column default", "Contain", "Fill & crop (may enlarge)", "Original size"],
+  );
+
+  const cellsView = { model: grid, selection: { startRow: 1, endRow: 1, startCol: 0, endCol: 0 } };
+  const scoped = GridView.prototype.imageLayoutMenuEntries.call(cellsView);
+  assert.equal(scoped[0].section, "Image size · these cells only", "a sub-column range says so");
+  assert.equal(scoped[7].section, "Image fit · these cells only");
+
+  const rows = GridView.prototype.rowHeightMenuEntries.call(columnView);
+  assert.equal(rows[0].section, "Row height");
+  assert.deepEqual(
+    rows.filter((entry) => !entry.section).map((entry) => entry.label),
+    ["Short (32 px)", "Medium (56 px)", "Tall (96 px)", "Extra tall (160 px)", "Reset row height", "Auto-fit selected rows (measure)"],
+  );
+});
+
+test("measureSelectedRowHeights persists the tallest mounted content, deletes near-defaults, and undoes", async (t) => {
+  t.after(() => settingsCache.clear());
+  settingsCache.clear();
+  installMiniDom();
+  const grid = new GridModel({ rows: [["a", "b"], ["c", "d"], ["e", "f"]] });
+  const stubCell = (scrollHeight) => {
+    const cell = new MiniNode("div"); cell.className = "rg-cell";
+    const content = new MiniNode("div"); content.className = "rg-cell-content";
+    content.scrollHeight = scrollHeight;
+    cell.appendChild(content);
+    return cell;
+  };
+  const cells = new Map([
+    ["0:0", stubCell(140)], ["0:1", stubCell(90)],
+    ["1:0", stubCell(32)], // exactly the default → no override pinned
+    // row 2 mounts nothing → left alone
+  ]);
+  const view = {
+    model: grid, cells,
+    selection: { startRow: 0, endRow: 2, startCol: 0, endCol: 1 },
+    commitMutation: (label, mutation) => { grid.transact(label, mutation); return Promise.resolve(grid); },
+  };
+
+  await GridView.prototype.measureSelectedRowHeights.call(view);
+  assert.equal(grid.getRowHeight(0), 140, "the tallest mounted cell in the row wins");
+  assert.equal(grid.getRowHeight(1), null, "a measurement at the default deletes the override instead of pinning it");
+  assert.equal(grid.getRowHeight(2), null, "a row with nothing mounted is left alone");
+  assert.equal(grid.history.entries.at(-1).label, "Auto-fit rows");
+
+  grid.undo();
+  assert.equal(grid.getRowHeight(0), null, "one undo restores the auto rows");
+  grid.redo();
+  assert.equal(grid.getRowHeight(0), 140, "and redo restores the measurement");
+});
+
+test("the large-grid facade resolves manifest imageLayout columns and the row preset writes through the store", (t) => {
+  t.after(() => settingsCache.clear());
+  settingsCache.clear();
+  const facade = LargeGridView.prototype.imageLayoutModel.call({
+    store: { manifest: { imageLayout: { columns: { cA: { size: "xl" } }, cells: { ghost: { size: "s" } } }, columnIds: ["cA", "cB"] } },
+  });
+  assert.equal(resolveImageLayout(facade, 0, 0).maxHeight, 480, "the column entry applies");
+  assert.equal(resolveImageLayout(facade, 0, 1).maxHeight, 180, "an unlisted column defaults");
+  assert.equal(facade.getRaw, undefined, "no getRaw — the render path owns the raw, a store read is async");
+  assert.equal(facade.getCell, undefined, "large cells are JSON rows: no uid, so the cell layer is inert");
+
+  const calls = [];
+  const view = {
+    selection: { startRow: 2, endRow: 4, startCol: 0, endCol: 0 },
+    store: { setRowHeight: (row, height) => calls.push([row, height]) },
+    scheduleSave: () => { view.saved = true; },
+    scheduleRender: () => { view.rendered = true; },
+  };
+  LargeGridView.prototype.setSelectedRowHeights.call(view, 96);
+  assert.deepEqual(calls, [[2, 96], [3, 96], [4, 96]], "every selected row is written through the store");
+  assert.equal(view.saved, true);
+  assert.equal(view.rendered, true);
+  LargeGridView.prototype.setSelectedRowHeights.call(view, null);
+  assert.deepEqual(calls.at(-1), [4, null], "reset deletes the override");
+});
+
 
 // GOAL-IMG-2 — the lightbox, its delete rewrite, and the keyboard gestures that open it.
 

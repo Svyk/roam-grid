@@ -696,6 +696,11 @@ body.roam-body.dark .rg-portal {
   display: block;
 }
 
+/* Fill width: the image always spans the cell; the --rg-img-max-h cap still bounds its height. */
+.rg-cell--img-fill img.rm-inline-img {
+  width: 100%;
+}
+
 .rg-img-fallback {
   display: inline-flex;
   align-items: center;

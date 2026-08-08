@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { FormulaEngine, GridError, GridModel, columnLabel, fittedTrackResize, formulaReferences, parseCellReference, queryBlockReferenceCounts, rewriteFormula, rewriteFormulaForStructure, selectionBlockReferenceMatrix, selectionBlockReferenceText, serializeTemplateModel, templateModelFromValue } from "../src/extension.js";
+import { FormulaEngine, GridError, GridModel, MetadataStore, columnLabel, fittedTrackResize, formulaReferences, normalizeImageLayout, parseCellReference, queryBlockReferenceCounts, rewriteFormula, rewriteFormulaForStructure, selectionBlockReferenceMatrix, selectionBlockReferenceText, serializeTemplateModel, templateModelFromValue } from "../src/extension.js";
 
 const model = (rows, options = {}) => new GridModel({ rows, ...options });
 
@@ -365,3 +365,110 @@ test("saved templates remap UID-backed layout by position", () => {
   assert.equal(restored.colorFormulaCells, false);
   assert.equal(new FormulaEngine(restored).evaluateCell(1, 1), 6);
 });
+
+/* ------------------------------------------------------------------ GOAL-IMG-3 ---- */
+
+test("normalizeImageLayout reduces junk to the empty shape and cleans valid entries", () => {
+  const empty = { columns: {}, cells: {} };
+  assert.deepEqual(normalizeImageLayout(undefined), empty);
+  assert.deepEqual(normalizeImageLayout(null), empty);
+  assert.deepEqual(normalizeImageLayout("junk"), empty);
+  assert.deepEqual(normalizeImageLayout([["c1", { size: "s" }]]), empty);
+  assert.deepEqual(normalizeImageLayout({ columns: "no", cells: 7 }), empty, "non-object buckets are dropped");
+
+  assert.deepEqual(
+    normalizeImageLayout({
+      columns: { c1: { size: "huge", fit: "cover", layout: "strip", extra: 1 }, c2: { size: "s" }, c3: "junk", c4: {}, "": { size: "s" } },
+      cells: { u1: { size: "xl", layout: "strip" }, u2: {} },
+    }),
+    { columns: { c1: { fit: "cover", layout: "strip" }, c2: { size: "s" } }, cells: { u1: { size: "xl" } } },
+    "unknown tokens, foreign keys, empty entries, and blank ids drop; a cell entry never carries layout",
+  );
+});
+
+test("imageLayout threads the model: ctor default, snapshot/restore, and the JSON round trip", () => {
+  const blank = model([["a"]]);
+  assert.deepEqual(blank.imageLayout, { columns: {}, cells: {} }, "a grid without the key defaults to the empty shape");
+
+  const grid = model([[{ uid: "row-one", raw: "x" }]], {
+    columnIds: ["c1"],
+    imageLayout: { columns: { c1: { size: "l", fit: "cover", junk: true } }, cells: { "row-one": { fit: "original" } }, junk: [1] },
+  });
+  assert.deepEqual(grid.imageLayout, { columns: { c1: { size: "l", fit: "cover" } }, cells: { "row-one": { fit: "original" } } }, "the ctor normalizes exactly once");
+
+  const snapshot = grid.snapshot();
+  snapshot.imageLayout.columns.c1.size = "xl";
+  assert.equal(grid.imageLayout.columns.c1.size, "l", "the snapshot is a deep clone, not a shared reference");
+  snapshot.imageLayout.columns.c1.size = "l"; // rewind the probe
+  grid.setImageLayoutEntry({ columnId: "c1", patch: null });
+  assert.deepEqual(grid.imageLayout.columns, {}, "a null patch deletes the entry");
+  grid.restore(snapshot);
+  assert.deepEqual(grid.imageLayout, { columns: { c1: { size: "l", fit: "cover" } }, cells: { "row-one": { fit: "original" } } }, "restore brings the snapshotted layout back");
+
+  const roundTrip = GridModel.fromJSON(JSON.parse(JSON.stringify(grid.toJSON())));
+  assert.deepEqual(roundTrip.imageLayout, grid.imageLayout, "toJSON/fromJSON carry the layout verbatim");
+
+  const legacy = grid.toJSON();
+  delete legacy.imageLayout;
+  assert.deepEqual(GridModel.fromJSON(JSON.parse(JSON.stringify(legacy))).imageLayout, { columns: {}, cells: {} }, "a document written before image layout existed still loads");
+});
+
+test("setImageLayoutEntry merges patches, clears fields, and deletes emptied entries", () => {
+  const grid = model([[{ uid: "r1c1", raw: "" }, { uid: "r1c2", raw: "" }]], { columnIds: ["c1", "c2"] });
+  grid.setImageLayoutEntry({ columnId: "c1", patch: { size: "l" } });
+  grid.setImageLayoutEntry({ columnId: "c1", patch: { fit: "cover" } });
+  assert.deepEqual(grid.imageLayout.columns.c1, { size: "l", fit: "cover" }, "patches merge field by field");
+  grid.setImageLayoutEntry({ columnId: "c1", patch: { size: undefined } });
+  assert.deepEqual(grid.imageLayout.columns.c1, { fit: "cover" }, "an undefined field clears just that key");
+  grid.setImageLayoutEntry({ columnId: "c1", patch: { size: "huge" } });
+  assert.deepEqual(grid.imageLayout.columns.c1, { fit: "cover" }, "an unknown token never lands");
+  grid.setImageLayoutEntry({ columnId: "c1", patch: null });
+  assert.deepEqual(grid.imageLayout.columns, {}, "a null patch deletes the entry");
+
+  grid.setImageLayoutEntry({ cellUid: "r1c2", patch: { size: "s", fit: "original", layout: "strip" } });
+  assert.deepEqual(grid.imageLayout.cells.r1c2, { size: "s", fit: "original" }, "a cell entry never carries layout — columns own it");
+  grid.setImageLayoutEntry({ cellUid: "r1c2", patch: { size: undefined, fit: undefined } });
+  assert.equal(grid.imageLayout.cells.r1c2, undefined, "a patch that empties the entry deletes it");
+  assert.throws(() => grid.setImageLayoutEntry({}), /column id or a cell uid/);
+});
+
+function installMetadataRoamMock() {
+  let uidCounter = 0;
+  const pages = new Map();
+  const blocks = new Map();
+  const clone = (block) => ({ uid: block.uid, string: block.string, order: block.order, children: (block.children || []).map(clone) });
+  globalThis.window = { roamAlphaAPI: {
+    util: { generateUID: () => `uid${String(++uidCounter).padStart(6, "0")}` },
+    q: (_query, uid) => (uid && blocks.has(uid) ? [[clone(blocks.get(uid))]] : []),
+    data: {
+      pull: (_pattern, [, title]) => (pages.has(title) ? { ":block/uid": pages.get(title) } : null),
+      page: { create: async ({ page }) => { pages.set(page.title, page.uid); blocks.set(page.uid, { uid: page.uid, string: page.title, order: 0, children: [] }); } },
+      block: {
+        create: async ({ location, block }) => { const node = { ...block, order: 0, children: [] }; blocks.set(block.uid, node); blocks.get(location["parent-uid"])?.children.push(node); },
+        update: async ({ block }) => { blocks.get(block.uid).string = block.string; },
+      },
+    },
+  } };
+  return { pages, blocks, dispose: () => delete globalThis.window };
+}
+
+test("metadata carries imageLayout, and a stripped key reads back as the empty shape", async (t) => {
+  const mock = installMetadataRoamMock();
+  t.after(mock.dispose);
+  const store = new MetadataStore();
+  await store.initialize();
+
+  const grid = model([[{ uid: "r1c1", raw: "" }]], { columnIds: ["c1"] });
+  grid.setImageLayoutEntry({ columnId: "c1", patch: { size: "xl", fit: "cover" } });
+  await store.set("table-img", grid);
+  const blockUid = store.entries.get("table-img").blockUid;
+  const written = JSON.parse(mock.blocks.get(blockUid).string.slice(mock.blocks.get(blockUid).string.indexOf("{")));
+  assert.deepEqual(written.imageLayout, { columns: { c1: { size: "xl", fit: "cover" } }, cells: {} }, "the writer persists the layout");
+  assert.deepEqual(store.get("table-img").imageLayout, written.imageLayout, "the reader hands it back");
+
+  // A metadata block written before image layout existed, or with the key stripped by hand.
+  store.entries.set("table-old", { blockUid: "b-old", value: { schema: 1, tableUid: "table-old", columnIds: ["c1"] } });
+  assert.deepEqual(store.get("table-old").imageLayout, {}, "absent degrades to defaults, never a throw");
+  assert.deepEqual(store.get("missing"), null, "and a missing entry is still null");
+});
+

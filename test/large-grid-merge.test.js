@@ -1,8 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  GridError, LargeGridStore, changedChunkIndexes, descendsFrom, extendLineage, manifestLineage,
-  mergeMetadataMaps, normalizeManifest, planManifestMerge, refreshSettingsCache, resetChunkCache,
+  GridError, GridModel, LargeGridStore, changedChunkIndexes, descendsFrom, extendLineage, manifestLineage,
+  mergeMetadataMaps, normalizeImageLayout, normalizeManifest, planManifestMerge, refreshSettingsCache, resetChunkCache,
   settingsCache, sha256Hex,
 } from "../src/extension.js";
 
@@ -435,3 +435,61 @@ test("planManifestMerge refuses a base it cannot place at all", () => {
   assert.throws(() => planManifestMerge(null, {}, live, []), (error) => (assert.equal(reasonOf(error), "fork", "no base snapshot means no provable descent"), true));
   assert.equal(planManifestMerge(base, { ...base }, live, []).manifest.revision, "r2", "and a base the lineage names is placed");
 });
+
+/* ---------------------------------------------------------------- GOAL-IMG-3 ---- */
+
+test("imageLayout is journaled by the store, merges from one side, and refuses from both", async (t) => {
+  const mock = await baseGrid("mergeImg", 4);
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); });
+  withSettings();
+
+  const store = await new LargeGridStore("mergeImg").initialize();
+  assert.equal(store.manifest.imageLayout, undefined, "a manifest written before image layout carries no key");
+
+  // The setter normalizes the write and journals it for replay across a commit's manifest swap.
+  store.setImageLayout({ columns: { cA: { size: "l", fit: "cover", bogus: 1 } }, cells: { ghost: { size: "s" } }, junk: [1] });
+  assert.deepEqual(store.manifest.imageLayout, { columns: { cA: { size: "l", fit: "cover" } }, cells: { ghost: { size: "s" } } }, "the stored value is the normalized shape");
+  const journaled = store.metadataJournal.at(-1);
+  assert.equal(journaled.op, "imageLayout");
+  assert.deepEqual(journaled.args.value, store.manifest.imageLayout, "the journal captures the value, not a reference to it");
+  assert.equal(store.metadataDirty, true, "a metadata write marks the store for commit");
+
+  // Both sides moving it to different values refuses, naming the exact key.
+  await publishRival(mock, (next) => { next.imageLayout = { columns: { cB: { size: "s" } }, cells: {} }; });
+  await assert.rejects(store.commit(), (error) => {
+    assert.equal(reasonOf(error), "metadata");
+    assert.deepEqual(error.details.keys, ["imageLayout"]);
+    return true;
+  });
+
+  // Only our side moving it merges, and the replay op applies idempotently onto the swapped manifest.
+  await publishRival(mock, (next) => rewriteChunk(mock, next, 1, "theirs-"));
+  const merged = await store.commit();
+  assert.deepEqual(merged.imageLayout, { columns: { cA: { size: "l", fit: "cover" } }, cells: { ghost: { size: "s" } } }, "our layout rides the merge");
+  assert.deepEqual(store.manifest.imageLayout, merged.imageLayout);
+
+  assert.equal(store.applyMetadataOp({ op: "imageLayout", args: { value: { columns: { cB: { size: "s" } } } } }), true, "the replay op applies onto the swapped manifest");
+  assert.deepEqual(store.manifest.imageLayout, { columns: { cB: { size: "s" } }, cells: {} }, "and it normalizes on the way in");
+});
+
+test("a seeded manifest carries the model's imageLayout, and a stripped key degrades to defaults", async (t) => {
+  const mock = installRoamMock({ blocks: { seedImg: { string: "{{[[roam/grid]]}}", children: [] } } });
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); });
+  withSettings();
+
+  const seeded = await new LargeGridStore("seedImg").initialize(new GridModel({
+    rows: [["![a](u)", "x"]],
+    imageLayout: { columns: { cA: { size: "fill", fit: "cover" } } },
+  }));
+  assert.deepEqual(seeded.manifest.imageLayout, { columns: { cA: { size: "fill", fit: "cover" } }, cells: {} }, "the seed manifest carries the layout verbatim");
+  seeded.setImageLayout({ columns: { cA: { size: "s" } } });
+  assert.deepEqual(seeded.manifest.imageLayout, { columns: { cA: { size: "s" } }, cells: {} });
+
+  // The live-CDP degradation case: a hand-stripped key on an uploaded manifest reads as defaults.
+  const bare = await baseGrid("bareImg", 1);
+  const stripped = await new LargeGridStore("bareImg").initialize();
+  assert.equal(stripped.manifest.imageLayout, undefined);
+  assert.deepEqual(normalizeImageLayout(stripped.manifest.imageLayout), { columns: {}, cells: {} }, "absent normalizes to the empty shape");
+  bare.dispose();
+});
+
