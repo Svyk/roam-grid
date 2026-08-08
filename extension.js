@@ -8219,10 +8219,11 @@ export function nativeOverlayStrayRepair(baseTree, currentTree, uid) {
  * disposal must not clobber whatever Roam last saved.
  */
 export class NativeCellEditorOverlay {
-  constructor(view, { onFinish = null, mountIsolation = false } = {}) {
+  constructor(view, { onFinish = null, mountIsolation = false, seedThroughTextarea = false } = {}) {
     this.view = view;
     this.onFinish = onFinish;
     this.mountIsolation = mountIsolation;
+    this.seedThroughTextarea = seedThroughTextarea;
     this.state = null;
     this.overlay = null;
     this.textarea = null;
@@ -8348,7 +8349,7 @@ export class NativeCellEditorOverlay {
     this.beforeRaw = String(raw ?? "");
     // FIX-E4: a new edit episode starts with no Escape outstanding.
     this.lastEscapeLentAt = 0;
-    if (initial != null) {
+    if (initial != null && !this.seedThroughTextarea) {
       const seed = String(initial);
       try {
         this.view.adapter?.recordSelfWrite?.(uid, this.beforeRaw, seed);
@@ -8394,13 +8395,25 @@ export class NativeCellEditorOverlay {
     const textarea = await this.pollFrames(() => this.hostTextarea(), 3);
     if (!textarea || !this.state) return this.failStart();
     this.textarea = textarea;
-    const value = String(textarea.value ?? "");
-    const caret = initial == null ? value.length : Math.min(value.length, String(initial).length);
-    try { textarea.setSelectionRange?.(caret, caret); } catch (error) { noteNativeEditorError(error); }
-    this.state.lastValue = value;
-    // The trigger context the cell ALREADY reads as (e.g. `… #done`) is text, not a menu; the
-    // popup-probe fallback only trusts a context that appears or moves after this baseline.
-    this.mountTriggerContext = roamEditorTriggerContext(value, caret, { formula: false });
+    if (this.seedThroughTextarea) {
+      const target = initial != null ? String(initial) : this.beforeRaw;
+      if (String(textarea.value ?? "") !== target) {
+        setNativeTextareaValue(textarea, target);
+        const Constructor = globalThis.InputEvent || globalThis.Event;
+        if (typeof Constructor === "function") textarea.dispatchEvent?.(new Constructor("input", { bubbles: true }));
+      }
+      const caret = target.length;
+      try { textarea.setSelectionRange?.(caret, caret); } catch (error) { noteNativeEditorError(error); }
+      const value = target;
+      this.state.lastValue = value;
+      this.mountTriggerContext = roamEditorTriggerContext(value, caret, { formula: false });
+    } else {
+      const value = String(textarea.value ?? "");
+      const caret = initial == null ? value.length : Math.min(value.length, String(initial).length);
+      try { textarea.setSelectionRange?.(caret, caret); } catch (error) { noteNativeEditorError(error); }
+      this.state.lastValue = value;
+      this.mountTriggerContext = roamEditorTriggerContext(value, caret, { formula: false });
+    }
     this.pendingSeed = null;
     this.listen(overlay, "keydown", (event) => this.interceptKeydown(event), true);
     this.listen(overlay, "paste", (event) => this.interceptPaste(event), true);
@@ -11956,6 +11969,7 @@ export class LargeGridView {
         await blankLargeScratch();
       },
       mountIsolation: true,
+      seedThroughTextarea: true,
     });
     this.viewport.addEventListener("scroll", () => this.scheduleRender()); document.addEventListener("pointerup", this.boundUp, true); this.scheduleRender();
   }
@@ -12242,7 +12256,6 @@ export class LargeGridView {
       if (nativeEditorEnabled() && !floating && !(raw.startsWith("=") && !raw.startsWith("=="))) {
         const scratch = await acquireLargeScratch();
         if (!scratch) return this.editorController?.start({ row, col, cell, raw, initial, floating });
-        await updateBlock(scratch.uid, nativePersistedRaw(raw));
         const started = await this.nativeOverlay?.start({ row, col, cell, uid: scratch.uid, raw, initial });
         if (started) return started;
       }

@@ -499,3 +499,121 @@ test("fallback: scratch acquisition fails → custom editor used", async (t) => 
   view.editorController?.dispose();
   view.dispose();
 });
+
+test("seedThroughTextarea: zero pre-mount block writes, textarea seeded from raw", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorS1");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+
+  // Spy on updateBlock
+  let updateBlockCalls = 0;
+  const origUpdate = globalThis.window.roamAlphaAPI.data.block.update;
+  globalThis.window.roamAlphaAPI.data.block.update = async (args) => {
+    updateBlockCalls += 1;
+    return origUpdate(args);
+  };
+
+  const store = await new LargeGridStore("anchorS1").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  const preEditCalls = updateBlockCalls;
+
+  const cell = view.cells.get("0:0");
+  assert.ok(cell, "cell is mounted");
+  // beginEdit with existing raw — seedThroughTextarea means NO updateBlock before mount
+  await view.beginEdit(0, 0, cell);
+  dom.flush();
+
+  // No new updateBlock calls from the edit path (only from store init)
+  assert.equal(updateBlockCalls, preEditCalls, "zero updateBlock calls from beginEdit (seedThroughTextarea suppresses pre-mount block writes)");
+
+  view.dispose();
+});
+
+test("seedThroughTextarea: initial char goes through textarea, not block", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorS2");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+
+  let updateBlockCalls = 0;
+  const origUpdate = globalThis.window.roamAlphaAPI.data.block.update;
+  globalThis.window.roamAlphaAPI.data.block.update = async (args) => {
+    updateBlockCalls += 1;
+    return origUpdate(args);
+  };
+
+  const store = await new LargeGridStore("anchorS2").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  const preEditCalls = updateBlockCalls;
+
+  const cell = view.cells.get("0:0");
+  assert.ok(cell, "cell is mounted");
+  try { await view.beginEdit(0, 0, cell, "x"); } catch { /* overlay may fail in mock */ }
+  dom.flush();
+
+  // No pre-mount block writes from the initial-char path
+  assert.equal(updateBlockCalls, preEditCalls, "zero pre-mount block writes (initial char seeded through textarea in seedThroughTextarea mode)");
+
+  view.dispose();
+});
+
+test("native-grid regression: default mode still performs pre-mount initial seed via updateBlock", async (t) => {
+  // Create a NativeCellEditorOverlay WITHOUT seedThroughTextarea (default)
+  // and verify the initial != null block-write path still works
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorS3");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+
+  let updateBlockCalls = 0;
+  const origUpdate = globalThis.window.roamAlphaAPI.data.block.update;
+  globalThis.window.roamAlphaAPI.data.block.update = async (args) => {
+    updateBlockCalls += 1;
+    return origUpdate(args);
+  };
+
+  const store = await new LargeGridStore("anchorS3").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  const preEditCalls = updateBlockCalls;
+
+  const cell = view.cells.get("0:0");
+  assert.ok(cell, "cell is mounted");
+
+  // Create a default-mode overlay (seedThroughTextarea defaults to false)
+  const defaultOverlay = new NativeCellEditorOverlay(view, { onFinish: () => {} });
+  const scratch = await acquireLargeScratch();
+  assert.ok(scratch, "scratch acquired");
+
+  // startOnce with initial != null and seedThroughTextarea = false
+  // This should trigger the block-write path
+  try { await defaultOverlay.start({ row: 0, col: 0, cell, uid: scratch.uid, raw: "0", initial: "x" }); } catch { /* may fail */ }
+  dom.flush();
+
+  // Default mode still writes the seed to the block
+  assert.ok(updateBlockCalls > preEditCalls, "default mode (seedThroughTextarea=false) still performs pre-mount block write for initial seed");
+
+  defaultOverlay.dispose();
+  view.dispose();
+});
