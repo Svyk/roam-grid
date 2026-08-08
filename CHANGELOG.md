@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.15.0
+
+Large-grid native editor.
+
+- **Large grids now use Roam's real block editor.** Typing `[[` / `((` (and `#`,
+  `{{`, `/`) in a `{{roam/grid}}` large-grid cell opens Roam's own native menus
+  — the same "Search for a Page" popover native grids get, with full page/block
+  search, autocomplete, and component insertion. A scratch host block on the
+  metadata page provides a uid for `renderBlock` for the duration of the edit.
+  Formula cells, the F2 floating editor, and registered custom editors keep using
+  the grid editor (the v0.14 custom popover remains the fallback).
+- **Mouse isolation for large-grid native edits.** While the native editor
+  overlay is active over a large cell, mouse and pointer events from inside the
+  overlay do not reach the large grid's selection/drag handlers, so typing and
+  clicking inside the menu cannot trigger grid selection changes.
+- **Setting description updated.** `Edit cells with Roam's own block editor` no
+  longer says large grids are excluded.
+
 ## 0.14.0
 
 Large-grid polish.

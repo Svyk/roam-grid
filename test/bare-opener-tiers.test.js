@@ -242,6 +242,7 @@ async function mountNative(t, dom) {
 
 /** Tier-2: a real LargeGridView over a real seeded store, chunk-integrity's harness idiom. */
 async function mountLarge(t, dom, anchorUid) {
+  settingsCache.set("editing-native-editor", false);
   const blocks = new Map(); const files = new Map();
   blocks.set(anchorUid, { uid: anchorUid, string: "{{[[roam/grid]]}}", order: 0, children: [] });
   let uidCounter = 0; let fileCounter = 0;

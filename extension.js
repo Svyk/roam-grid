@@ -1,5 +1,5 @@
-/* Roam Grid v0.14.0 | MIT | generated from src/extension.js */
-const VERSION = "0.14.0";
+/* Roam Grid v0.15.0 | MIT | generated from src/extension.js */
+const VERSION = "0.15.0";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const RANGE_COMPONENT_NAME = "roam-grid-range";
@@ -139,7 +139,7 @@ const SETTING_DESCRIPTORS = [
   { key: "writes-content-debounce-ms", group: "Writes", name: "Content save delay (ms)", description: "How long typing settles before edited cells are written back to Roam.", control: "input", type: "int", default: DEFAULT_CONTENT_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "writes-large-debounce-ms", group: "Writes", name: "Large-grid save delay (ms)", description: "How long a large grid settles before its chunks are uploaded.", control: "input", type: "int", default: DEFAULT_LARGE_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "session-idle-ms", group: "Writes", name: "Session idle timeout (ms)", description: "How long an unmounted grid session stays warm before it is released.", control: "input", type: "int", default: SESSION_IDLE_MS, min: 200, max: 60000, scope: "graph", apply: "immediate", stage: "live", onSession: (session) => session.rescheduleIdle() },
-  { key: "editing-native-editor", group: "Editing", name: "Edit cells with Roam's own block editor", description: "Open Roam's real block editor over the cell instead of the grid's text box, so [[, ((, #, {{ and / open Roam's OWN menus with everything they carry. Formula cells, the F2 floating editor, large grids and registered custom editors always use the grid editor. If the editor cannot be mounted twice in a row the grid editor takes over for the rest of the session.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
+  { key: "editing-native-editor", group: "Editing", name: "Edit cells with Roam's own block editor", description: "Open Roam's real block editor over the cell instead of the grid's text box, so [[, ((, #, {{ and / open Roam's OWN menus with everything they carry. Formula cells, the F2 floating editor, and registered custom editors always use the grid editor. If the editor cannot be mounted twice in a row the grid editor takes over for the rest of the session.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-autocomplete", group: "Editing", name: "Suggest functions and pages while typing", description: "Offer formula-function and [[page]] / ((block)) suggestions inside the cell editor. With this off nothing pops up while you type and the two delay/results rows below do nothing.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-autocomplete-debounce-ms", group: "Editing", name: "Autocomplete delay (ms)", description: "How long a reference query settles before Roam is searched.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_MS, min: 0, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
   { key: "editing-autocomplete-limit", group: "Editing", name: "Autocomplete results", description: "How many suggestions the formula and reference pickers offer.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_LIMIT, min: 1, max: 25, scope: "graph", apply: "next-op", stage: "live" },
@@ -254,6 +254,7 @@ export const runtime = {
   recentlyAcceptedPages: [],
   suggestionRenderDisabled: false,
   slowSuggestionBatches: 0,
+  largeScratch: null,
 };
 
 /** Recently-edited pages and blocks, keyed `<graph>:<page|block>`, 60 s TTL. The second and every
@@ -2791,14 +2792,14 @@ function normalizeTree(block) {
   };
 }
 
-function getTree(uid) {
+export function getTree(uid) {
   const result = roam().q(`[:find (pull ?block [:block/uid :block/string :block/order :edit/time {:block/children ...}])
     :in $ ?uid
     :where [?block :block/uid ?uid]]`, String(uid));
   return normalizeTree(result?.[0]?.[0]);
 }
 
-function getPageUid(title) {
+export function getPageUid(title) {
   const result = roam().data?.pull?.("[:block/uid]", [":node/title", title]) || roam().pull?.("[:block/uid]", [":node/title", title]);
   return result?.[":block/uid"] || result?.uid || null;
 }
@@ -2833,6 +2834,66 @@ async function moveBlock(uid, parentUid, order = "last") {
 async function deleteBlock(uid) {
   const remove = roam().data?.block?.delete || roam().deleteBlock;
   return remove.call(roam().data?.block || roam(), { block: { uid } });
+}
+
+export async function acquireLargeScratch() {
+  if (runtime.largeScratch) return runtime.largeScratch;
+  try {
+    const pageUid = getPageUid(METADATA_PAGE) || await createPage(METADATA_PAGE);
+    const tree = getTree(pageUid);
+    const marker = (tree?.children || []).find((child) => child.string === "rg:scratch");
+    let parentUid;
+    if (marker) {
+      parentUid = marker.uid;
+      for (const child of marker.children || []) {
+        await deleteBlock(child.uid).catch(() => {});
+      }
+    } else {
+      parentUid = await createBlock(pageUid, "rg:scratch");
+    }
+    const childUid = roam().util.generateUID();
+    await createBlock(parentUid, " ", "last", childUid);
+    runtime.largeScratch = { parentUid, uid: childUid };
+    return runtime.largeScratch;
+  } catch (error) {
+    if (globalThis.window) globalThis.window.__RG_U15_LAST_ERROR = String(error.stack || error);
+    return null;
+  }
+}
+
+export async function releaseLargeScratch() {
+  const scratch = runtime.largeScratch;
+  if (!scratch) return;
+  runtime.largeScratch = null;
+  try {
+    await deleteBlock(scratch.uid).catch(() => {});
+  } catch (error) {
+    if (globalThis.window) globalThis.window.__RG_U15_LAST_ERROR = String(error.stack || error);
+  }
+}
+
+export async function blankLargeScratch() {
+  const scratch = runtime.largeScratch;
+  if (!scratch) return;
+  try {
+    const tree = getTree(scratch.uid);
+    const children = tree?.children || [];
+    for (const child of children) {
+      await deleteBlock(child.uid).catch(() => {});
+    }
+    await updateBlock(scratch.uid, " ").catch(() => {});
+  } catch (error) {
+    if (globalThis.window) globalThis.window.__RG_U15_LAST_ERROR = String(error.stack || error);
+  }
+}
+
+export function scratchStrayConcat() {
+  const scratch = runtime.largeScratch;
+  if (!scratch) return null;
+  const tree = getTree(scratch.uid);
+  const strays = (tree?.children || []).filter((child) => !(child.children || []).length);
+  if (!strays.length) return null;
+  return strays.map((child) => nativeStoredRaw(child.string)).join("\n");
 }
 
 function treeFingerprint(tree) {
@@ -8158,9 +8219,10 @@ export function nativeOverlayStrayRepair(baseTree, currentTree, uid) {
  * disposal must not clobber whatever Roam last saved.
  */
 export class NativeCellEditorOverlay {
-  constructor(view, { onFinish = null } = {}) {
+  constructor(view, { onFinish = null, mountIsolation = false } = {}) {
     this.view = view;
     this.onFinish = onFinish;
+    this.mountIsolation = mountIsolation;
     this.state = null;
     this.overlay = null;
     this.textarea = null;
@@ -8332,6 +8394,14 @@ export class NativeCellEditorOverlay {
     // popup-probe fallback only trusts a context that appears or moves after this baseline.
     this.mountTriggerContext = roamEditorTriggerContext(value, caret, { formula: false });
     this.pendingSeed = null;
+    if (this.mountIsolation) {
+      this.listen(overlay, "mousedown", (event) => event.stopPropagation());
+      this.listen(overlay, "mouseup", (event) => event.stopPropagation());
+      this.listen(overlay, "click", (event) => event.stopPropagation());
+      this.listen(overlay, "dblclick", (event) => event.stopPropagation());
+      this.listen(overlay, "pointerdown", (event) => event.stopPropagation());
+      this.listen(overlay, "pointerup", (event) => event.stopPropagation());
+    }
     this.listen(overlay, "keydown", (event) => this.interceptKeydown(event), true);
     this.listen(overlay, "paste", (event) => this.interceptPaste(event), true);
     // Typing starts a new menu episode, so the one Escape lent to Roam is lent again.
@@ -8994,7 +9064,7 @@ export class GridEditorController {
     editor.setAttribute("aria-autocomplete", "list");
     editor.setAttribute("aria-controls", this.suggestionList.id);
     editor.setAttribute("aria-expanded", "false");
-    this.portalTheme.sync();
+    this.portalTheme?.sync();
     if (!floating) {
       editor.addEventListener("keydown", (event) => this.onKeydown(event));
       editor.addEventListener("keyup", (event) => this.onKeyup(event));
@@ -11816,7 +11886,7 @@ export class LargeGridView {
     this.host = host; this.store = store; this.markerElement = markerElement; this.model = null;
     this.selection = { startRow: 0, endRow: 0, startCol: 0, endCol: 0 }; this.anchor = { row: 0, col: 0 };
     this.root = document.createElement("section"); this.root.className = "rg-root rg-large-root"; this.root.tabIndex = 0;
-    this.cells = new Map(); this.cellValueTokens = new WeakMap(); this.editorController = null; this.editingPending = false;
+    this.cells = new Map(); this.cellValueTokens = new WeakMap(); this.editorController = null; this.nativeOverlay = null; this.editingPending = false;
     this.formulaEngine = new AsyncFormulaEngine(this.store, runtime.registries.formulaFunctions, runtime.registries.formulaFunctionMetadata);
     this.saveTimer = null; this.renderToken = 0; this.dragSelecting = false; this.boundUp = () => { this.dragSelecting = false; };
     this.metricsRows = []; this.metricsExtra = new Float64Array(1); this.metricsDefaultHeight = 0;
@@ -11869,20 +11939,33 @@ export class LargeGridView {
         this.ensureVisible(row, col);
         this.scheduleRender();
       },
-      onFinish: async ({ row, col, value, commit, movement }) => {
-        const previous = await this.store.getRaw(row, col);
-        let affected = new Set([`${row}:${col}`]);
-        if (commit && value !== previous) {
-          this.recordLargeEdit("Edit cell", await this.store.setCell(row, col, value));
-          affected = this.formulaEngine.invalidateCell(row, col);
-          this.scheduleSave();
+      onFinish: (result) => this.largeEditorOnFinish(result),
+    });
+    this.nativeOverlay = new NativeCellEditorOverlay(this, {
+      onFinish: async (result) => {
+        let { value, commit } = result;
+        if (commit && (value == null || value === " " || value === "")) {
+          const concat = scratchStrayConcat();
+          if (concat != null) value = concat;
         }
-        await this.repaintLargeCells(affected);
-        if (movement) this.moveLargeSelection(...movement);
-        this.root.focus({ preventScroll: true }); claimKeyboard(this);
+        await this.largeEditorOnFinish({ ...result, value });
+        await blankLargeScratch();
       },
+      mountIsolation: true,
     });
     this.viewport.addEventListener("scroll", () => this.scheduleRender()); document.addEventListener("pointerup", this.boundUp, true); this.scheduleRender();
+  }
+  async largeEditorOnFinish({ row, col, value, commit, movement }) {
+    const previous = await this.store.getRaw(row, col);
+    let affected = new Set([`${row}:${col}`]);
+    if (commit && value !== previous) {
+      this.recordLargeEdit("Edit cell", await this.store.setCell(row, col, value));
+      affected = this.formulaEngine.invalidateCell(row, col);
+      this.scheduleSave();
+    }
+    await this.repaintLargeCells(affected);
+    if (movement) this.moveLargeSelection(...movement);
+    this.root.focus({ preventScroll: true }); claimKeyboard(this);
   }
   /** Same live global mask as a native grid: the manifest flag is never rewritten, so the per-table
    *  “Labels” button keeps its meaning and the global is instantly reversible. */
@@ -11937,7 +12020,7 @@ export class LargeGridView {
     });
   }
   async renderVisible(token = this.renderToken) {
-    if (this.disposed || this.editingPending || (this.editorController?.state && !this.editorController.state.floating)) return;
+    if (this.disposed || this.editingPending || (this.editorController?.state && !this.editorController.state.floating) || this.nativeOverlay?.active) return;
     const { rowCount, colCount } = this.store.manifest; this.status.textContent = `${rowCount.toLocaleString()} × ${colCount}`;
     const headerHeight = this.headerHeight(); const headerWidth = this.headerWidth();
     this.rebuildRowMetrics(); this.canvas.style.width = `${this.totalWidth()}px`; this.canvas.style.height = `${headerHeight + this.rowOffset(rowCount)}px`;
@@ -12152,6 +12235,13 @@ export class LargeGridView {
     if (cached) this.editingPending = true;
     try {
       const raw = cached ? this.store.peekRaw(row, col) : await this.store.getRaw(row, col);
+      if (nativeEditorEnabled() && !floating && !(raw.startsWith("=") && !raw.startsWith("=="))) {
+        const scratch = await acquireLargeScratch();
+        if (!scratch) return this.editorController?.start({ row, col, cell, raw, initial, floating });
+        await updateBlock(scratch.uid, nativePersistedRaw(raw));
+        const started = await this.nativeOverlay?.start({ row, col, cell, uid: scratch.uid, raw, initial });
+        if (started) return started;
+      }
       return this.editorController?.start({ row, col, cell, raw, initial, floating });
     } finally {
       if (cached) this.editingPending = false;
@@ -12315,7 +12405,7 @@ export class LargeGridView {
     this.invalidateLargeCells(coordinates); await this.store.commit(); this.scheduleRender();
     return { manifest: deepClone(this.store.manifest) };
   }
-  dispose({ keepStore = false } = {}) { this.disposed = true; ++this.renderToken; clearTimeout(this.saveTimer); if (!keepStore) this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; releaseKeyboard(this); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden");
+  dispose({ keepStore = false } = {}) { this.disposed = true; ++this.renderToken; clearTimeout(this.saveTimer); if (this.nativeOverlay?.active) { void this.nativeOverlay.commit(null).catch(() => {}); } else { this.nativeOverlay?.dispose(); } this.nativeOverlay = null; if (!keepStore) this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; releaseKeyboard(this); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden");
     this.markerElement?.querySelector?.(".rm-xparser-default-grid")?.classList.remove("rg-large-marker-hidden");
     this.markerElement?.querySelector?.("[data-tag='roam/grid']")?.classList.remove("rg-large-marker-hidden"); }
 }
@@ -13170,6 +13260,7 @@ async function onunload() {
   for (const mount of runtime.largeMounts.values()) mount.dispose(); runtime.largeMounts.clear(); mounting.clear();
   for (const { store, idleTimer } of runtime.largeStores.values()) { clearTimeout(idleTimer); store.dispose(); }
   runtime.largeStores.clear();
+  releaseLargeScratch();
   resetChunkCache();
   resetOrphanCollection();
   clearUndoHistories();

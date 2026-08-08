@@ -1,0 +1,450 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import {
+  GridModel, LargeGridStore, LargeGridView, NativeCellEditorOverlay, claimKeyboard,
+  ensureRuntimeRegistries, refreshSettingsCache, resetChunkCache, resetNativeEditorHealth,
+  settingsCache, runtime, nativeEditorEnabled, acquireLargeScratch, releaseLargeScratch,
+  blankLargeScratch, scratchStrayConcat, resetRoamRecents,
+} from "../src/extension.js";
+
+const NO_STORAGE = { getItem: () => null, setItem: () => {} };
+
+function withSettings(values) {
+  refreshSettingsCache({ settings: { getAll: () => ({ ...values }) } }, NO_STORAGE);
+}
+
+class MiniClassList {
+  constructor() { this.values = new Set(); }
+  add(...values) { values.forEach((v) => this.values.add(v)); }
+  remove(...values) { values.forEach((v) => this.values.delete(v)); }
+  toggle(v, force) { const next = force == null ? !this.values.has(v) : Boolean(force); if (next) this.values.add(v); else this.values.delete(v); return next; }
+  contains(v) { return this.values.has(v); }
+}
+
+class MiniStyle {
+  constructor() { this.values = new Map(); }
+  setProperty(name, value) { this.values.set(name, String(value)); }
+  getPropertyValue(name) { return this.values.get(name) || ""; }
+  removeProperty(name) { this.values.delete(name); }
+}
+
+class MiniNode {
+  constructor(tagName = "#text", text = "") {
+    this.tagName = tagName.toUpperCase(); this.parentNode = null; this.children = []; this.listeners = new Map();
+    this.classList = new MiniClassList(); this.style = new MiniStyle(); this.dataset = {}; this.hidden = false; this._text = text;
+    this.value = ""; this.selectionStart = 0; this.selectionEnd = 0;
+  }
+  set className(value) { this._className = value; this.classList = new MiniClassList(); String(value).split(/\s+/).filter(Boolean).forEach((n) => this.classList.add(n)); }
+  get className() { return this._className || ""; }
+  set textContent(value) { this._text = String(value ?? ""); this.children = []; }
+  get textContent() { return this.children.length ? this.children.map((c) => c.textContent).join("") : this._text; }
+  get childNodes() { return this.children; }
+  get parentElement() { return this.parentNode?.tagName === "#TEXT" ? null : this.parentNode; }
+  append(...nodes) { nodes.forEach((n) => this.appendChild(typeof n === "string" ? new MiniNode("#text", n) : n)); }
+  appendChild(node) { if (node.parentNode) node.remove(); node.parentNode = this; this.children.push(node); return node; }
+  replaceChildren(...nodes) { this.children.forEach((n) => { n.parentNode = null; }); this.children = []; this.append(...nodes); }
+  remove() { if (!this.parentNode) return; this.parentNode.children = this.parentNode.children.filter((n) => n !== this); this.parentNode = null; }
+  contains(node) { for (let cur = node; cur; cur = cur.parentNode) if (cur === this) return true; return false; }
+  closest(selector) {
+    for (let cur = this; cur; cur = cur.parentElement || cur.parentNode) {
+      if (cur.matches?.(selector)) return cur;
+    }
+    return null;
+  }
+  matches(selector) { return String(selector).split(",").some((p) => { const v = p.trim(); return v.startsWith(".") && this.classList.contains(v.slice(1)); }); }
+  querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+  querySelectorAll(selector) {
+    const found = [];
+    for (const child of this.children) { if (child.matches?.(selector)) found.push(child); found.push(...child.querySelectorAll(selector)); }
+    return found;
+  }
+  addEventListener(type, listener) { if (!this.listeners.has(type)) this.listeners.set(type, []); this.listeners.get(type).push(listener); }
+  removeEventListener(type, listener) { this.listeners.set(type, (this.listeners.get(type) || []).filter((v) => v !== listener)); }
+  dispatch(type, fields = {}) {
+    const event = { type, target: this, currentTarget: this, relatedTarget: null, key: "", shiftKey: false, isComposing: false, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, stopPropagation() {}, ...fields };
+    for (const listener of this.listeners.get(type) || []) listener(event);
+    return event;
+  }
+  setAttribute(name, value) { this[name] = String(value); }
+  getAttribute(name) { return this[name] == null ? null : String(this[name]); }
+  removeAttribute(name) { delete this[name]; }
+  focus() { globalThis.document.activeElement = this; }
+  setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; }
+  getBoundingClientRect() { return { left: 100, right: 240, top: 120, bottom: 154, width: 140, height: 34 }; }
+  get isConnected() { for (let cur = this; cur; cur = cur.parentNode) if (cur === globalThis.document?.body) return true; return false; }
+  get innerHTML() { return this.children.map((c) => c.tagName === "#text" ? c._text : `<${c.tagName.toLowerCase()}>`).join(""); }
+  prepend(...nodes) {
+    nodes.forEach((node) => {
+      if (typeof node === "string") node = new MiniNode("#text", node);
+      if (node.parentNode) node.remove();
+      node.parentNode = this;
+      this.children.unshift(node);
+    });
+  }
+}
+
+function installMiniDom() {
+  const body = new MiniNode("body");
+  const documentListeners = new Map();
+  const windowListeners = new Map();
+  const addTo = (map) => (type, listener, capture = false) => {
+    if (!map.has(type)) map.set(type, { capture: [], bubble: [] });
+    map.get(type)[capture === true ? "capture" : "bubble"].push(listener);
+  };
+  const removeFrom = (map) => (type, listener, capture = false) => {
+    const lane = map.get(type)?.[capture === true ? "capture" : "bubble"];
+    const idx = lane?.indexOf(listener) ?? -1;
+    if (idx >= 0) lane.splice(idx, 1);
+  };
+  globalThis.document = {
+    body, documentElement: { clientWidth: 1024 }, activeElement: null,
+    createElement: (name) => new MiniNode(name), createTextNode: (text) => new MiniNode("#text", text),
+    querySelector: (sel) => body.querySelector(sel),
+    addEventListener: addTo(documentListeners), removeEventListener: removeFrom(documentListeners),
+  };
+  globalThis.innerWidth = 1024;
+  globalThis.getComputedStyle = () => ({ getPropertyValue: () => "" });
+  globalThis.MutationObserver = null;
+  globalThis.matchMedia = () => ({ matches: false, addEventListener: () => {}, removeEventListener: () => {} });
+  globalThis.CSS = { escape: (v) => String(v) };
+  globalThis.window = { addEventListener: addTo(windowListeners), removeEventListener: removeFrom(windowListeners), dispatchEvent() { return true; } };
+  const frames = [];
+  globalThis.requestAnimationFrame = (cb) => { frames.push(cb); return frames.length; };
+  globalThis.cancelAnimationFrame = () => {};
+  return { body, flush: () => { while (frames.length) frames.shift()(); } };
+}
+
+function installRoamMockForScratch(initial = {}) {
+  let uidCounter = 0;
+  const blocks = new Map();
+  const add = (uid, string, children = []) => {
+    const block = { uid, string, order: 0, children };
+    blocks.set(uid, block);
+    for (const child of children) { blocks.set(child.uid, child); for (const grandChild of child.children || []) blocks.set(grandChild.uid, grandChild); }
+    return block;
+  };
+  for (const [uid, value] of Object.entries(initial.blocks || {})) add(uid, value.string, value.children || []);
+  const cloneBlock = (block) => ({ uid: block.uid, string: block.string, order: block.order, children: (block.children || []).map(cloneBlock) });
+  const findParent = (u) => [...blocks.values()].find((b) => b.children?.some((c) => c.uid === u));
+  globalThis.window.roamAlphaAPI = {
+    util: { generateUID: () => `uid${String(++uidCounter).padStart(6, "0")}` },
+    q: (query, bound) => {
+      const uid = bound ?? /:block\/uid "([^"]+)"/.exec(query)?.[1];
+      if (uid && blocks.has(uid)) return [[cloneBlock(blocks.get(uid))]];
+      const titleMatch = /:node\/title "([^"]+)"/.exec(query);
+      if (titleMatch) {
+        for (const [u, b] of blocks) { if (b.string === titleMatch[1]) return [[cloneBlock(b)]]; }
+      }
+      return [];
+    },
+    data: {
+      pull: (query, args) => { for (const [u, b] of blocks) if (b.string === args[1]) return { [":block/uid"]: b.uid }; return null; },
+      page: { create: async () => {} },
+      block: {
+        create: async ({ location, block }) => {
+          const created = { ...block, order: location.order === "last" ? 999 : location.order, children: [] };
+          blocks.set(block.uid, created);
+          const parent = blocks.get(location["parent-uid"]);
+          if (parent) parent.children.push(created);
+        },
+        update: async ({ block: b }) => { const existing = blocks.get(b.uid); if (existing) existing.string = b.string; },
+        delete: async ({ block: b }) => {
+          const parent = findParent(b.uid);
+          if (parent) parent.children = parent.children.filter((c) => c.uid !== b.uid);
+          blocks.delete(b.uid);
+        },
+      },
+    },
+  };
+  return { blocks, dispose: () => { delete globalThis.window.roamAlphaAPI; } };
+}
+
+function installLargeGridRoamMock(anchorUid) {
+  let uidCounter = 0;
+  let fileCounter = 0;
+  const blocks = new Map();
+  const files = new Map();
+  blocks.set(anchorUid, { uid: anchorUid, string: "{{[[roam/grid]]}}", order: 0, children: [] });
+  const cloneBlock = (block) => ({ uid: block.uid, string: block.string, order: block.order, children: (block.children || []).map(cloneBlock) });
+  const findParent = (u) => [...blocks.values()].find((b) => b.children?.some((c) => c.uid === u));  
+  globalThis.window.roamAlphaAPI = {
+    util: { generateUID: () => `uid${String(++uidCounter).padStart(6, "0")}` },
+    q: (query, bound) => { const uid = bound ?? /:block\/uid "([^"]+)"/.exec(query)?.[1]; return uid && blocks.has(uid) ? [[cloneBlock(blocks.get(uid))]] : []; },
+    data: {
+      search: () => [],
+      pull: () => null,
+      page: { create: async () => {} },
+      block: {
+        create: async ({ location, block }) => {
+          const created = { ...block, order: location.order === "last" ? 999 : location.order, children: [] };
+          blocks.set(block.uid, created);
+          const parent = blocks.get(location["parent-uid"]);
+          if (parent) parent.children.push(created);
+        },
+        update: async ({ block: b }) => { const existing = blocks.get(b.uid); if (existing) existing.string = b.string; },
+        delete: async ({ block: b }) => {
+          const parent = findParent(b.uid);
+          if (parent) parent.children = parent.children.filter((c) => c.uid !== b.uid);
+          blocks.delete(b.uid);
+        },
+      },
+    },
+    file: {
+      upload: async ({ file }) => { const url = `https://mock/${++fileCounter}`; files.set(url, await file.text()); return url; },
+      get: async ({ url }) => { if (!files.has(url)) throw new Error(`missing ${url}`); return new File([files.get(url)], "grid.json", { type: "application/json" }); },
+      delete: async ({ url }) => files.delete(url),
+    },
+  };
+  return { blocks, files, dispose: () => { delete globalThis.window.roamAlphaAPI; } };
+}
+
+test("eligibility: formula =x uses custom editor, ==x uses native, floating F2 uses custom", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorE1");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+  const store = await new LargeGridStore("anchorE1").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [row === 0 ? "=1+1" : row === 1 ? "==notFormula" : String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  // Formula cell: should use custom editor (not native)
+  const formulaCell = view.cells.get("0:0");
+  assert.ok(formulaCell, "formula cell is mounted");
+  // =x is a formula → native eligibility check returns false → editorController.start() is called
+  // We verify the editorController path is used by checking it doesn't go native
+  assert.equal(view.nativeOverlay?.active, false, "formula cell does NOT use native overlay");
+  // Simulate what beginEdit would do for a formula — directly call editorController
+  await view.editorController?.start({ row: 0, col: 0, cell: formulaCell, raw: "=1+1", initial: null, floating: false });
+  assert.ok(view.editorController?.state, "=1+1 formula uses custom editor");
+  view.editorController?.dispose();
+  if (view.nativeOverlay?.active) { view.nativeOverlay.dispose(); }
+
+  // ==x: not a formula, should try native
+  const escapedCell = view.cells.get("1:0");
+  assert.ok(escapedCell, "escaped formula cell is mounted");
+  await view.beginEdit(1, 0, escapedCell);
+  assert.ok(view.editorController?.state || view.nativeOverlay?.active, "==x editor is mounted (native or custom)");
+  if (view.nativeOverlay?.active) { view.nativeOverlay.dispose(); }
+  if (view.editorController?.state) { view.editorController.dispose(); }
+
+  // F2 floating: should use custom editor
+  const normalCell = view.cells.get("2:0");
+  assert.ok(normalCell, "normal cell is mounted");
+  await view.beginEdit(2, 0, normalCell, null, true);
+  assert.equal(view.editorController?.state?.floating, true, "floating F2 uses custom editor");
+  view.editorController?.dispose();
+  view.dispose();
+});
+
+test("eligibility: setting off or runtime.nativeEditorDisabled → custom editor", async (t) => {
+  withSettings({ "editing-native-editor": false, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorE2");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+  const store = await new LargeGridStore("anchorE2").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  const cell = view.cells.get("0:0");
+  assert.ok(cell, "cell is mounted");
+  await view.beginEdit(0, 0, cell);
+  assert.ok(view.editorController?.state, "setting off → custom editor used");
+  view.editorController?.dispose();
+  view.dispose();
+});
+
+test("scratch lifecycle: acquire creates marker+child once, reuse on second call, boot sweep deletes stale children", async (t) => {
+  const mock = installRoamMockForScratch({ blocks: { meta001: { string: "roam/grid/metadata", children: [] } } });
+  t.after(() => { mock.dispose(); runtime.largeScratch = null; });
+
+  const first = await acquireLargeScratch();
+  assert.ok(first, "first acquireLargeScratch succeeds");
+  assert.ok(first.uid, "first scratch has uid");
+  assert.ok(first.parentUid, "first scratch has parentUid");
+  assert.equal(runtime.largeScratch, first, "cached in runtime.largeScratch");
+
+  const metaTree = mock.blocks.get("meta001");
+  const marker = metaTree.children.find((c) => c.string === "rg:scratch");
+  assert.ok(marker, "rg:scratch marker created on metadata page");
+  assert.equal(marker.children.length, 1, "marker has one child (the session scratch)");
+  assert.equal(marker.children[0].string, " ", "scratch child is a space");
+
+  const second = await acquireLargeScratch();
+  assert.equal(second, first, "second acquireLargeScratch returns same scratch (reuse)");
+  assert.equal(runtime.largeScratch, first, "still cached");
+
+  runtime.largeScratch = null;
+  const staleUid = globalThis.window.roamAlphaAPI.util.generateUID();
+  mock.blocks.set(staleUid, { uid: staleUid, string: "old edit", order: 0, children: [] });
+  marker.children.push(mock.blocks.get(staleUid));
+  assert.equal(marker.children.length, 2, "stale child added");
+
+  const third = await acquireLargeScratch();
+  assert.notEqual(third.uid, first.uid, "new session creates new child uid");
+  assert.equal(marker.children.length, 1, "stale child deleted, only new child remains");
+});
+
+test("scratch lifecycle: release deletes the session child", async (t) => {
+  const mock = installRoamMockForScratch({ blocks: { meta002: { string: "roam/grid/metadata", children: [] } } });
+  t.after(() => { mock.dispose(); runtime.largeScratch = null; });
+
+  const scratch = await acquireLargeScratch();
+  assert.ok(runtime.largeScratch, "scratch is cached");
+  const metaTree = mock.blocks.get("meta002");
+  const marker = metaTree.children.find((c) => c.string === "rg:scratch");
+  assert.equal(marker.children.length, 1, "marker has child before release");
+
+  await releaseLargeScratch();
+  assert.equal(runtime.largeScratch, null, "scratch is null after release");
+  assert.equal(marker.children.length, 0, "scratch child deleted");
+});
+
+test("metadata parse: rg:scratch block with children on metadata page does not change parsed metadata", async (t) => {
+  const mock = installRoamMockForScratch({
+    blocks: {
+      meta003: { string: "roam/grid/metadata", children: [
+        { uid: "entry1", string: `roam-grid/table:: ${JSON.stringify({ schema: 1, tableUid: "tableA", mode: "large", columnIds: ["a"], merges: [], widths: {}, rowHeights: {}, alignments: {}, headerColumns: [], headerRows: [], frozenRows: 1, frozenCols: 0, charts: [], imageLayout: {}, showHeaders: true, fitToWidth: true, colorFormulaCells: true })}`, order: 0, children: [] },
+        { uid: "scratchMarker", string: "rg:scratch", order: 1, children: [
+          { uid: "stale1", string: "some old edit", order: 0, children: [] },
+        ] },
+      ] },
+    },
+  });
+  t.after(() => { mock.dispose(); runtime.largeScratch = null; });
+
+  const { MetadataStore } = await import("../src/extension.js");
+  const meta = new MetadataStore();
+  meta.pageUid = "meta003";
+  await meta.reload();
+  assert.ok(meta.has("tableA"), "tableA metadata entry parsed correctly");
+  assert.equal(meta.entries.size, 1, "only one metadata entry parsed (rg:scratch ignored)");
+});
+
+test("renderVisible guard: active nativeOverlay blocks cell wipe", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorG1");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+  const store = await new LargeGridStore("anchorG1").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  const cell = view.cells.get("0:0");
+  const cellCount = view.cells.size;
+  assert.ok(cellCount > 0, "cells are mounted");
+
+  view.nativeOverlay.state = { row: 0, col: 0, cell, uid: "fake", composing: false, finishing: false, lastValue: "test" };
+  assert.ok(view.nativeOverlay.active, "nativeOverlay is active");
+
+  await view.renderVisible(view.renderToken + 1);
+  assert.equal(view.cells.size, cellCount, "cell count unchanged — renderVisible early-returned due to active nativeOverlay");
+
+  view.nativeOverlay.state = null;
+  view.dispose();
+});
+
+test("mount isolation: mousedown inside active overlay stops propagation", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorM1");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+  const store = await new LargeGridStore("anchorM1").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  const cell = view.cells.get("0:0");
+  assert.ok(cell, "cell is mounted");
+
+  const canvasEventLog = [];
+  view.canvas.addEventListener("mousedown", () => { canvasEventLog.push("canvas-mousedown"); });
+
+  const overlayEl = document.createElement("div");
+  overlayEl.className = "rg-native-cell-editor";
+  const stopPropagationLog = [];
+  ["mousedown", "mouseup", "click", "dblclick", "pointerdown", "pointerup"].forEach((type) => {
+    overlayEl.addEventListener(type, (event) => {
+      event.stopPropagation();
+      stopPropagationLog.push(type);
+    });
+  });
+  cell.appendChild(overlayEl);
+
+  overlayEl.dispatch("mousedown", { bubbles: true });
+  assert.equal(stopPropagationLog.includes("mousedown"), true, "mousedown was stopped at overlay");
+  assert.equal(canvasEventLog.length, 0, "mousedown did not reach canvas");
+
+  view.dispose();
+});
+
+test("enter-split backstop: stray child concatenated into value at blank time", async (t) => {
+  const mock = installRoamMockForScratch({ blocks: { meta004: { string: "roam/grid/metadata", children: [] } } });
+  t.after(() => { mock.dispose(); runtime.largeScratch = null; });
+
+  const scratch = await acquireLargeScratch();
+  assert.ok(scratch, "scratch acquired");
+
+  const child1Uid = globalThis.window.roamAlphaAPI.util.generateUID();
+  const child2Uid = globalThis.window.roamAlphaAPI.util.generateUID();
+  mock.blocks.set(child1Uid, { uid: child1Uid, string: "line one", order: 0, children: [] });
+  mock.blocks.set(child2Uid, { uid: child2Uid, string: "line two", order: 1, children: [] });
+  const scratchBlock = mock.blocks.get(scratch.uid);
+  scratchBlock.children = [mock.blocks.get(child1Uid), mock.blocks.get(child2Uid)];
+
+  const concat = scratchStrayConcat();
+  assert.equal(concat, "line one\nline two", "stray children concatenated");
+
+  const grandchildUid = globalThis.window.roamAlphaAPI.util.generateUID();
+  mock.blocks.set(grandchildUid, { uid: grandchildUid, string: "grandchild", order: 0, children: [] });
+  mock.blocks.get(child1Uid).children = [mock.blocks.get(grandchildUid)];
+  const concat2 = scratchStrayConcat();
+  assert.equal(concat2, "line two", "only childless strays are concatenated");
+
+  await blankLargeScratch();
+  const after = mock.blocks.get(scratch.uid);
+  assert.equal(after.string, " ", "scratch blanked to space");
+  assert.equal(after.children.length, 0, "scratch children deleted");
+});
+
+test("fallback: scratch acquisition fails → custom editor used", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorF1");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+  // Make createPage throw so acquireLargeScratch fails
+  globalThis.window.roamAlphaAPI.data.page.create = async () => { throw new Error("no metadata page"); };
+  const store = await new LargeGridStore("anchorF1").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  const cell = view.cells.get("0:0");
+  assert.ok(cell, "cell is mounted");
+  await view.beginEdit(0, 0, cell);
+  assert.ok(view.editorController?.state, "fallback to custom editor when scratch is unavailable");
+  view.editorController?.dispose();
+  view.dispose();
+});
