@@ -2837,22 +2837,28 @@ async function deleteBlock(uid) {
 }
 
 export async function acquireLargeScratch() {
-  if (runtime.largeScratch) return runtime.largeScratch;
   try {
-    const pageUid = getPageUid(METADATA_PAGE) || await createPage(METADATA_PAGE);
-    const tree = getTree(pageUid);
-    const marker = (tree?.children || []).find((child) => child.string === "rg:scratch");
-    let parentUid;
-    if (marker) {
-      parentUid = marker.uid;
-      for (const child of marker.children || []) {
-        await deleteBlock(child.uid).catch(() => {});
+    // Rotation: every acquire hands out a FRESH child uid. The previous edit's post-commit writes
+    // (commit value, blank) then echo against a uid nothing is mounted on, instead of re-rendering
+    // the next edit's renderBlock mount ~200ms in. The marker parent alone is memoized.
+    let parentUid = runtime.largeScratch?.parentUid || null;
+    const previousUid = runtime.largeScratch?.uid || null;
+    if (!parentUid) {
+      const pageUid = getPageUid(METADATA_PAGE) || await createPage(METADATA_PAGE);
+      const tree = getTree(pageUid);
+      const marker = (tree?.children || []).find((child) => child.string === "rg:scratch");
+      if (marker) {
+        parentUid = marker.uid;
+        for (const child of marker.children || []) {
+          await deleteBlock(child.uid).catch(() => {});
+        }
+      } else {
+        parentUid = await createBlock(pageUid, "rg:scratch");
       }
-    } else {
-      parentUid = await createBlock(pageUid, "rg:scratch");
     }
     const childUid = roam().util.generateUID();
     await createBlock(parentUid, " ", "last", childUid);
+    if (previousUid) void deleteBlock(previousUid).catch(() => {});
     runtime.largeScratch = { parentUid, uid: childUid };
     return runtime.largeScratch;
   } catch (error) {
@@ -8428,12 +8434,20 @@ export class NativeCellEditorOverlay {
       observer.observe(overlay, { childList: true, subtree: true, attributes: true, characterData: true });
       const start = this.now();
       const cap = 900;
+      // Two mutation-free frames are only "settled" once hydration has actually STARTED — a
+      // foreign-page renderBlock can sit inert for the first frames, and exiting on that
+      // pre-hydration quiet guards nothing. No mutation at all within the grace window means the
+      // mount was already hydrated (same-page block) and the click is safe.
+      const preHydrationGrace = 250;
       let quiet = 0;
-      while (this.state && this.overlay && observer && quiet < 2) {
+      let sawMutation = false;
+      while (this.state && this.overlay && observer) {
         if (this.now() - start >= cap) break;
+        if (!sawMutation && this.now() - start >= preHydrationGrace) break;
         await this.nextFrame();
-        quiet = mutations === 0 ? quiet + 1 : 0;
+        if (mutations > 0) { sawMutation = true; quiet = 0; } else if (sawMutation) { quiet += 1; }
         mutations = 0;
+        if (sawMutation && quiet >= 2) break;
       }
       this.settleObserver = null;
       observer.disconnect();
@@ -8717,8 +8731,8 @@ export class NativeCellEditorOverlay {
 
     if (this.seedThroughTextarea && state.startedAt != null && this.overlay?.isConnected) {
       const elapsed = this.now() - state.startedAt;
-      if (elapsed < 1200 && !state.refocusAttempted) {
-        state.refocusAttempted = true;
+      if (elapsed < 1200 && (state.refocusAttempts || 0) < 2) {
+        state.refocusAttempts = (state.refocusAttempts || 0) + 1;
         const host = this.blockInput();
         if (host) {
           try { synthesizeBlockClick(host); } catch (error) { noteNativeEditorError(error); }
@@ -8759,8 +8773,37 @@ export class NativeCellEditorOverlay {
       void this.cancel();
       return true;
     }
+    // Post-grace stale-blank floor: a late hydration swap can leave the (possibly detached)
+    // textarea holding the blanked scratch while the user's typed value lives in lastValue —
+    // committing that blank silently erases the cell. A user who deliberately cleared the cell has
+    // lastValue === "" (the input listener tracks the live textarea) and still commits.
+    if (this.seedThroughTextarea && state) {
+      const current = this.textarea ? String(this.textarea.value ?? "") : "";
+      const persisted = nativeStoredRaw(current);
+      if ((persisted === "" || persisted === " ") && state.lastValue !== "" && state.lastValue !== " ") {
+        void this.cancel();
+        return true;
+      }
+    }
     void this.commit(null);
     return true;
+  }
+
+  /** Dispose-time finish: same stale-blank floor as finishIfFocusLeft. An ancestor re-render can
+   *  dispose the view mid-hydration, and a bare commit(null) would persist the blanked scratch
+   *  over the user's cell. Blank-over-data cancels; anything else commits as before. */
+  finishForDispose() {
+    const state = this.state;
+    if (!state) { this.dispose(); return; }
+    if (this.seedThroughTextarea) {
+      const current = this.textarea ? String(this.textarea.value ?? "") : "";
+      const persisted = nativeStoredRaw(current);
+      if ((persisted === "" || persisted === " ") && state.lastValue !== "" && state.lastValue !== " ") {
+        void this.cancel().catch(() => {});
+        return;
+      }
+    }
+    void this.commit(null).catch(() => {});
   }
 
   scheduleStructureRepair({ commitWhenClean = false } = {}) {
@@ -12048,12 +12091,17 @@ export class LargeGridView {
           }
         }
         await this.largeEditorOnFinish({ ...result, value });
-        await blankLargeScratch();
+        // Fire-and-forget: the blank targets the finished edit's uid; the next acquire rotates to a
+        // fresh uid, so this write must never be able to delay or echo into the next mount.
+        void blankLargeScratch();
       },
       mountIsolation: true,
       seedThroughTextarea: true,
     });
     this.viewport.addEventListener("scroll", () => this.scheduleRender()); document.addEventListener("pointerup", this.boundUp, true); this.scheduleRender();
+    // A warm-adopted store can arrive with dirty chunks whose save timer died with the previous
+    // view (dispose clears it) — without this, that data sits unsaved until the next edit.
+    if (this.store?.dirty?.size) this.scheduleSave();
   }
   async largeEditorOnFinish({ row, col, value, commit, movement }) {
     const previous = await this.store.getRaw(row, col);
@@ -12335,10 +12383,28 @@ export class LargeGridView {
     const merge = this.store.mergeAt(row, col); row = merge?.row ?? row; col = merge?.col ?? col;
     const chunkIndex = this.store.chunkIndexForRow(row);
     if (this.store.unreadableChunks.has(chunkIndex)) return toast(`Chunk ${chunkIndex} is unreadable — reload it before editing these rows`, "warning");
+    // Commit any live native edit BEFORE the scratch acquire below: startOnce's internal commit
+    // would otherwise run after acquire has rotated to the next uid, letting a rapid cell→cell
+    // edit mount the pre-rotation block. Running it before the async read also frees
+    // renderVisible's editor guard so the detach recovery below can repaint.
+    if (this.nativeOverlay?.active) await this.nativeOverlay.commit(null).catch(() => {});
     const cached = this.store.cache.has(chunkIndex);
     if (cached) this.editingPending = true;
     try {
-      const raw = cached ? this.store.peekRaw(row, col) : await this.store.getRaw(row, col);
+      let raw;
+      if (cached) raw = this.store.peekRaw(row, col);
+      else {
+        raw = await this.store.getRaw(row, col);
+        if (!cell.isConnected) {
+          // A virtualization re-render ran during the fetch and recycled the canvas — the captured
+          // node may be detached. Swap in the remounted cell when one exists (one direct
+          // renderVisible pass covers a band the drop hasn't repainted); otherwise keep the caller's
+          // node and fall through — explicit callers may pass detached hosts on purpose.
+          const remounted = this.cells.get(`${row}:${col}`)
+            || (await this.renderVisible(), this.cells.get(`${row}:${col}`));
+          if (remounted) cell = remounted;
+        }
+      }
       if (nativeEditorEnabled() && !floating && !(raw.startsWith("=") && !raw.startsWith("=="))) {
         const scratch = await acquireLargeScratch();
         if (!scratch) return this.editorController?.start({ row, col, cell, raw, initial, floating });
@@ -12493,7 +12559,18 @@ export class LargeGridView {
   toggleFormulaColors() { this.store.setDisplayFlag("colorFormulaCells", this.store.manifest.colorFormulaCells === false); this.scheduleSave(true); this.scheduleRender(); }
   toggleHeaders() { this.store.setDisplayFlag("showHeaders", this.store.manifest.showHeaders === false); this.scheduleSave(true); this.scheduleRender(); }
   scheduleSave(immediate = false) { clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.flush(), immediate ? 0 : getSetting("writes-large-debounce-ms")); }
-  async flush() { clearTimeout(this.saveTimer); this.root.classList.add("rg-root--saving"); try { await this.store.commit(); toast("Large grid saved", "success", 1800); } catch (error) { toast(error.message, "danger", 8000); } finally { this.root.classList.remove("rg-root--saving"); } }
+  async flush() {
+    clearTimeout(this.saveTimer);
+    // Never commit under a live edit: the manifest pointer write re-renders the anchor block,
+    // which disconnects .rg-root and force-remounts this view mid-typing. Dirty chunks stay dirty;
+    // the edit's own onFinish reschedules, and this re-arm covers editor lanes that don't.
+    if (this.nativeOverlay?.active || this.editorController?.state || this.editingPending) {
+      this.saveTimer = setTimeout(() => this.flush(), 500);
+      return;
+    }
+    this.root.classList.add("rg-root--saving");
+    try { await this.store.commit(); toast("Large grid saved", "success", 1800); } catch (error) { toast(error.message, "danger", 8000); } finally { this.root.classList.remove("rg-root--saving"); }
+  }
   async exportSelection() { const range = normalizeRange(this.selection); const rows = await this.store.getRows(range.startRow, range.endRow + 1); downloadText(rows.map((row) => row.slice(range.startCol, range.endCol + 1).map((value) => quoteDelimited(value, ",")).join(",")).join("\n"), "roam-grid-selection.csv", "text/csv"); }
   /**
    * Deliberately records no undo entry, matching `applyPatchToModel(model, patch, false)` on the
@@ -12508,7 +12585,7 @@ export class LargeGridView {
     this.invalidateLargeCells(coordinates); await this.store.commit(); this.scheduleRender();
     return { manifest: deepClone(this.store.manifest) };
   }
-  dispose({ keepStore = false } = {}) { this.disposed = true; this.dragSelecting = false; this.dragOrigin = null; ++this.renderToken; clearTimeout(this.saveTimer); if (this.nativeOverlay?.active) { void this.nativeOverlay.commit(null).catch(() => {}); } else { this.nativeOverlay?.dispose(); } this.nativeOverlay = null; if (!keepStore) this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; releaseKeyboard(this); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden");
+  dispose({ keepStore = false } = {}) { this.disposed = true; this.dragSelecting = false; this.dragOrigin = null; ++this.renderToken; clearTimeout(this.saveTimer); if (this.nativeOverlay?.active) { this.nativeOverlay.finishForDispose(); } else { this.nativeOverlay?.dispose(); } this.nativeOverlay = null; if (!keepStore) this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; releaseKeyboard(this); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden");
     this.markerElement?.querySelector?.(".rm-xparser-default-grid")?.classList.remove("rg-large-marker-hidden");
     this.markerElement?.querySelector?.("[data-tag='roam/grid']")?.classList.remove("rg-large-marker-hidden"); }
 }

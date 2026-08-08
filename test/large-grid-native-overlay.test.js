@@ -263,7 +263,7 @@ test("eligibility: setting off or runtime.nativeEditorDisabledUntil cooldown →
   view.dispose();
 });
 
-test("scratch lifecycle: acquire creates marker+child once, reuse on second call, boot sweep deletes stale children", async (t) => {
+test("scratch lifecycle: first acquire boot-sweeps marker, rotation returns a fresh child per call, boot sweep deletes stale children", async (t) => {
   const mock = installRoamMockForScratch({ blocks: { meta001: { string: "roam/grid/metadata", children: [] } } });
   t.after(() => { mock.dispose(); runtime.largeScratch = null; });
 
@@ -279,9 +279,13 @@ test("scratch lifecycle: acquire creates marker+child once, reuse on second call
   assert.equal(marker.children.length, 1, "marker has one child (the session scratch)");
   assert.equal(marker.children[0].string, " ", "scratch child is a space");
 
+  const firstUid = first.uid;
   const second = await acquireLargeScratch();
-  assert.equal(second, first, "second acquireLargeScratch returns same scratch (reuse)");
-  assert.equal(runtime.largeScratch, first, "still cached");
+  assert.notEqual(second.uid, firstUid, "F2c rotation: second acquire returns a fresh child uid");
+  assert.equal(runtime.largeScratch, second, "runtime.largeScratch updated to the fresh scratch");
+  assert.equal(marker.children.length, 1, "marker holds only the fresh child after rotation");
+  assert.equal(marker.children[0].uid, second.uid, "remaining child is the fresh scratch");
+  assert.ok(!mock.blocks.has(firstUid), "previous scratch child was fire-and-forget deleted");
 
   runtime.largeScratch = null;
   const staleUid = globalThis.window.roamAlphaAPI.util.generateUID();
@@ -691,7 +695,7 @@ test("grace refocus: hydration swap within grace window does not commit", async 
   const result = overlay.finishIfFocusLeft();
   // Within grace window (1001 - 1000 = 1ms < 1200), should NOT commit
   assert.equal(result, false, "finishIfFocusLeft did NOT commit within grace window");
-  assert.equal(overlay.state.refocusAttempted, true, "refocus was attempted");
+  assert.equal(overlay.state.refocusAttempts, 1, "refocus was attempted");
   assert.equal(overlay.state.finishing, false, "state is not finishing");
 
   // Verify store.setCell was NOT called
@@ -727,7 +731,7 @@ test("stale-blank protection: textarea holds ' ' while lastValue non-empty → c
 
   overlay.overlay = document.createElement("div");
   cell.appendChild(overlay.overlay);
-  overlay.state = { row: 0, col: 0, cell, uid: "test", composing: false, finishing: false, lastValue: "hello", startedAt: 1000, refocusAttempted: true };
+  overlay.state = { row: 0, col: 0, cell, uid: "test", composing: false, finishing: false, lastValue: "hello", startedAt: 1000, refocusAttempts: 2 };
   overlay.textarea = document.createElement("textarea");
   overlay.textarea.value = " ";
   globalThis.document.activeElement = globalThis.document.body;
@@ -742,4 +746,283 @@ test("stale-blank protection: textarea holds ' ' while lastValue non-empty → c
 
   overlay.dispose();
   view.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// UNIT 3 — native editor races: scratch rotation, settle floor, save deferral,
+// grace hardening, dirty-store remount, dispose stale-blank guard.
+// ---------------------------------------------------------------------------
+
+test("F2c rotation: two consecutive edits produce different scratch uids; old child is fire-and-forget deleted", async (t) => {
+  const mock = installRoamMockForScratch({ blocks: { metaR1: { string: "roam/grid/metadata", children: [] } } });
+  t.after(() => { mock.dispose(); runtime.largeScratch = null; });
+
+  const first = await acquireLargeScratch();
+  assert.ok(first?.uid, "first scratch acquired");
+  const firstUid = first.uid;
+
+  const second = await acquireLargeScratch();
+  assert.ok(second?.uid, "second scratch acquired");
+  assert.notEqual(second.uid, firstUid, "rotation: second scratch has a fresh child uid");
+  assert.equal(runtime.largeScratch, second, "runtime.largeScratch updated to the fresh scratch");
+  assert.equal(second.parentUid, first.parentUid, "marker parent reused across rotations");
+  const metaTree = mock.blocks.get("metaR1");
+  const marker = metaTree.children.find((c) => c.string === "rg:scratch");
+  assert.equal(marker.children.length, 1, "marker holds only the fresh child after rotation");
+  assert.equal(marker.children[0].uid, second.uid, "remaining child is the fresh scratch");
+  assert.ok(!mock.blocks.has(firstUid), "previous scratch child was deleted (fire-and-forget)");
+});
+
+test("F2c ordering trap: beginEdit B while A's overlay is active commits A BEFORE B's scratch is acquired", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorR2");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+  const store = await new LargeGridStore("anchorR2").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  const cellA = view.cells.get("0:0");
+  const cellB = view.cells.get("1:0");
+  assert.ok(cellA && cellB, "both cells mounted");
+
+  const scratchA = await acquireLargeScratch();
+  assert.ok(scratchA, "A's scratch acquired");
+  view.nativeOverlay.state = { row: 0, col: 0, cell: cellA, uid: scratchA.uid, composing: false, finishing: false, lastValue: "A", startedAt: 100, refocusAttempts: 0 };
+
+  const order = [];
+  let startCalled = false;
+  let commitBeforeStart = false;
+  view.nativeOverlay.commit = async () => {
+    if (!startCalled) commitBeforeStart = true;
+    order.push({ event: "commitA", scratchUidAtCommit: runtime.largeScratch?.uid });
+    view.nativeOverlay.state = null;
+    view.nativeOverlay.overlay = null;
+    view.nativeOverlay.textarea = null;
+    return null;
+  };
+  const realStart = view.nativeOverlay.start.bind(view.nativeOverlay);
+  view.nativeOverlay.start = function (args) { startCalled = true; return realStart(args); };
+
+  await view.beginEdit(1, 0, cellB);
+  dom.flush();
+
+  assert.ok(order.some((e) => e.event === "commitA"), "A's overlay was committed when B's edit began");
+  assert.equal(commitBeforeStart, true, "commit(A) fired BEFORE nativeOverlay.start(B) — the ordering trap");
+  const commitEntry = order.find((e) => e.event === "commitA");
+  assert.equal(commitEntry.scratchUidAtCommit, scratchA.uid, "at commit time the scratch was still A's uid (commit ran before rotation)");
+  assert.notEqual(runtime.largeScratch?.uid, scratchA.uid, "B's edit rotated to a fresh scratch uid");
+
+  if (view.editorController?.state) view.editorController.dispose();
+  view.dispose();
+});
+
+test("F2d settle floor: 2 quiet frames AFTER a mutation, OR ~250ms no-mutation exit (not 2 quiet frames unconditionally)", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorQ4");
+  let OrigMORef;
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; if (OrigMORef !== undefined) globalThis.MutationObserver = OrigMORef; });
+  const store = await new LargeGridStore("anchorQ4").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+  const cell = view.cells.get("0:0");
+  assert.ok(cell, "cell mounted");
+
+  OrigMORef = globalThis.MutationObserver;
+  globalThis.MutationObserver = class MiniMO {
+    constructor(cb) { this.cb = cb; this.disc = false; }
+    observe() {}
+    disconnect() { this.disc = true; }
+  };
+
+  const blockHost = document.createElement("div");
+  const fakeTextarea = document.createElement("textarea");
+
+  async function runSettle(triggerMutationAtMs) {
+    const overlay = new NativeCellEditorOverlay(view, { onFinish: () => {}, seedThroughTextarea: true });
+    let t = 0; let frames = 0; let mutFired = false;
+    overlay.now = () => t;
+    overlay.nextFrame = () => new Promise((r) => {
+      frames += 1; t += 50;
+      if (triggerMutationAtMs != null && t >= triggerMutationAtMs && !mutFired) {
+        mutFired = true;
+        overlay.settleObserver?.cb?.([]);
+      }
+      queueMicrotask(r);
+    });
+    overlay.mountBlock = () => true;
+    overlay.blockInput = () => blockHost;
+    overlay.hostTextarea = () => fakeTextarea;
+    try { await overlay.start({ row: 0, col: 0, cell, uid: "settleUid", raw: "0", initial: null }); } catch { /* mock may bail late */ }
+    const exitT = t;
+    overlay.dispose();
+    return { exitT, frames };
+  }
+
+  const noMut = await runSettle(null);
+  assert.ok(noMut.exitT >= 250, `no-mutation floor exits at ~250ms, not 2 quiet frames (exitT=${noMut.exitT}, frames=${noMut.frames})`);
+
+  const withMut = await runSettle(200);
+  assert.ok(withMut.exitT >= 250, `mutation at t=200: floor waits for the mutation + 2 quiet after (exitT=${withMut.exitT}, frames=${withMut.frames})`);
+
+  view.dispose();
+});
+
+test("F2f save deferral: flush() during an active overlay defers (no store.commit, no saving class), then flushes after finish", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorD1");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+  const store = await new LargeGridStore("anchorD1").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+  const cell = view.cells.get("0:0");
+
+  view.nativeOverlay.state = { row: 0, col: 0, cell, uid: "edit", composing: false, finishing: false, lastValue: "x", startedAt: 1, refocusAttempts: 0 };
+  assert.ok(view.nativeOverlay.active, "overlay is active");
+
+  let commitCalls = 0;
+  view.store.commit = async () => { commitCalls += 1; };
+
+  await view.flush();
+  assert.equal(commitCalls, 0, "store.commit NOT called while the overlay is active (deferred)");
+  assert.ok(!view.root.classList.contains("rg-root--saving"), "no rg-root--saving class while deferred");
+  assert.ok(view.saveTimer, "a saveTimer was armed to retry after the edit finishes");
+
+  clearTimeout(view.saveTimer);
+  view.nativeOverlay.state = null;
+  await view.flush();
+  assert.equal(commitCalls, 1, "store.commit called once the overlay is no longer active");
+
+  view.dispose();
+});
+
+test("F2g post-window stale-blank: focus left at >1200ms with blank textarea + non-empty lastValue -> cancel, not commit", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorQ5");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+  const store = await new LargeGridStore("anchorQ5").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+  const cell = view.cells.get("0:0");
+
+  let baseTime = 6000;
+  const overlay = new NativeCellEditorOverlay(view, { onFinish: () => {}, seedThroughTextarea: true });
+  overlay.now = () => baseTime++;
+  overlay.overlay = document.createElement("div");
+  cell.appendChild(overlay.overlay);
+  overlay.state = { row: 0, col: 0, cell, uid: "x", composing: false, finishing: false, lastValue: "had typed", startedAt: 1000, refocusAttempts: 2 };
+  overlay.textarea = document.createElement("textarea");
+  overlay.textarea.value = " ";
+  globalThis.document.activeElement = globalThis.document.body;
+
+  let cancelCalled = false; let commitCalled = false;
+  overlay.cancel = async () => { cancelCalled = true; overlay.state = null; return null; };
+  overlay.commit = async () => { commitCalled = true; return null; };
+
+  const result = overlay.finishIfFocusLeft();
+  assert.equal(result, true, "finishIfFocusLeft handled the post-window stale-blank case");
+  assert.equal(cancelCalled, true, "cancel path was taken (stale blank + non-empty lastValue)");
+  assert.equal(commitCalled, false, "commit was NOT called — the blank was not persisted");
+
+  const stored = await store.getRaw(0, 0);
+  assert.equal(stored, "0", "store cell unchanged — the mid-hydration blank was not written");
+
+  overlay.dispose();
+  view.dispose();
+});
+
+test("Must-fix A dirty-store remount: a view constructed with a dirty adopted store schedules a save in mount()", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorA1");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+  const model = new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false });
+  const store = await new LargeGridStore("anchorA1").initialize(model);
+  store.retryDelay = () => 0;
+  const hostA = new MiniNode("div"); dom.body.appendChild(hostA);
+  const viewA = new LargeGridView({ host: hostA, store });
+  claimKeyboard(viewA);
+  viewA.viewport.scrollTop = 0; viewA.viewport.scrollLeft = 0; viewA.viewport.clientHeight = 600; viewA.viewport.clientWidth = 800;
+  await viewA.renderVisible(); dom.flush();
+
+  store.markChunkDirty(0);
+  assert.ok(store.dirty.size > 0, "store has a dirty chunk before remount");
+  viewA.dispose({ keepStore: true });
+
+  const hostB = new MiniNode("div"); dom.body.appendChild(hostB);
+  const viewB = new LargeGridView({ host: hostB, store });
+  assert.ok(viewB.saveTimer, "dirty adopted store triggered scheduleSave() in mount()");
+
+  const storeClean = await new LargeGridStore("anchorA2").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  storeClean.retryDelay = () => 0;
+  const hostC = new MiniNode("div"); dom.body.appendChild(hostC);
+  const viewC = new LargeGridView({ host: hostC, store: storeClean });
+  assert.equal(viewC.saveTimer, null, "clean store does not schedule a save on mount");
+
+  clearTimeout(viewB.saveTimer);
+  viewB.dispose();
+  viewC.dispose();
+  storeClean.dispose();
+});
+
+test("Must-fix B dispose guard: dispose during a mid-hydration blank -> cancel path taken, cell value preserved", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorB1");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+  const store = await new LargeGridStore("anchorB1").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+  const cell = view.cells.get("0:0");
+  const scratch = await acquireLargeScratch();
+  assert.ok(scratch, "scratch acquired for the active edit");
+
+  view.nativeOverlay.state = { row: 0, col: 0, cell, uid: scratch.uid, composing: false, finishing: false, lastValue: "had typed", startedAt: 100, refocusAttempts: 0 };
+  view.nativeOverlay.overlay = document.createElement("div");
+  cell.appendChild(view.nativeOverlay.overlay);
+  view.nativeOverlay.textarea = document.createElement("textarea");
+  view.nativeOverlay.textarea.value = " ";
+
+  let cancelCalled = false; let commitCalled = false;
+  view.nativeOverlay.cancel = async () => { cancelCalled = true; view.nativeOverlay.state = null; return null; };
+  view.nativeOverlay.commit = async () => { commitCalled = true; return null; };
+
+  view.dispose({ keepStore: true });
+  assert.equal(cancelCalled, true, "dispose took the cancel path (mid-hydration blank + non-empty lastValue)");
+  assert.equal(commitCalled, false, "dispose did NOT blank-commit the mid-hydration cell");
+
+  const stored = await store.getRaw(0, 0);
+  assert.equal(stored, "0", "store cell value preserved across the guarded dispose");
+
+  store.dispose();
+  runtime.largeScratch = null;
 });
