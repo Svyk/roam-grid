@@ -227,6 +227,7 @@ export const runtime = {
   templates: null,
   sessions: gridSessions,
   largeMounts: largeGridMounts,
+  largeStores: new Map(),
   views: gridViews,
   viewsByNative: new WeakMap(),
   guardStyle: null,
@@ -12310,7 +12311,7 @@ export class LargeGridView {
     this.invalidateLargeCells(coordinates); await this.store.commit(); this.scheduleRender();
     return { manifest: deepClone(this.store.manifest) };
   }
-  dispose() { this.disposed = true; clearTimeout(this.saveTimer); this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; releaseKeyboard(this); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden"); }
+  dispose({ keepStore = false } = {}) { this.disposed = true; clearTimeout(this.saveTimer); if (!keepStore) this.store?.dispose(); this.resizeCleanup?.(); this.editorController?.dispose(); this.editorController = null; releaseKeyboard(this); document.removeEventListener("pointerup", this.boundUp, true); releaseRichCellHosts(this.root); this.root.remove(); this.markerElement?.classList.remove("rg-large-marker-hidden"); }
 }
 
 function downloadText(text, filename, type = "text/plain") {
@@ -12841,8 +12842,14 @@ function cleanupDisconnectedViews() {
     runtime.views.delete(view); runtime.viewsByNative.delete?.(view.nativeElement); view.dispose({ releaseNative: false });
   }
   for (const [uid, session] of [...runtime.sessions]) if (!runtime.metadata?.has(uid)) disposeNativeSession(uid, true);
-  for (const [uid, mount] of [...runtime.largeMounts]) if (!mount.root?.isConnected || !runtime.metadata?.has(uid)) {
-    mount.dispose(); runtime.largeMounts.delete(uid);
+  for (const [uid, mount] of [...runtime.largeMounts]) {
+    if (mount.root?.isConnected && runtime.metadata?.has(uid)) continue;
+    if (!runtime.metadata?.has(uid)) { mount.dispose(); runtime.largeMounts.delete(uid); runtime.largeStores.delete(uid); }
+    else {
+      mount.dispose({ keepStore: true }); runtime.largeMounts.delete(uid);
+      const prior = runtime.largeStores.get(uid); if (prior) clearTimeout(prior.idleTimer);
+      runtime.largeStores.set(uid, { store: mount.store, idleTimer: setTimeout(() => { runtime.largeStores.delete(uid); mount.store.dispose(); }, getSetting("session-idle-ms")) });
+    }
   }
 }
 
@@ -12950,7 +12957,10 @@ async function scanMounts() {
     try {
       const block = findBlockElement(uid); if (!block) continue;
       const marker = block.querySelector(".rm-block__input") || block.firstElementChild;
-      const store = await new LargeGridStore(uid).initialize();
+      let store;
+      const warm = runtime.largeStores.get(uid);
+      if (warm?.store && !warm.store.disposed) { clearTimeout(warm.idleTimer); runtime.largeStores.delete(uid); store = warm.store; }
+      else store = await new LargeGridStore(uid).initialize();
       // An unload can land during the initialize await; mounting a live view (+listeners +timers)
       // into a torn-down runtime would leak it. The metadata re-check is the liveness probe.
       if (!runtime.metadata || !runtime.extensionAPI) continue;
@@ -13142,6 +13152,8 @@ async function onunload() {
   runtime.observer?.disconnect(); runtime.observer = null; disposePortalObservers(); runtime.pendingScanRoots.clear(); runtime.rangeSpecs.clear(); runtime.scanQueued = false;
   for (const uid of [...runtime.sessions.keys()]) disposeNativeSession(uid, true);
   for (const mount of runtime.largeMounts.values()) mount.dispose(); runtime.largeMounts.clear(); mounting.clear();
+  for (const { store, idleTimer } of runtime.largeStores.values()) { clearTimeout(idleTimer); store.dispose(); }
+  runtime.largeStores.clear();
   resetChunkCache();
   resetOrphanCollection();
   clearUndoHistories();

@@ -2,8 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   GridModel, LargeGridStore, LargeGridView, alignmentKey, chunkRowsFor, deriveRowId, getSetting,
-  migrateManifestToV2, normalizeManifest, parseRowId, refreshSettingsCache, rowIdRevisionFor,
-  settingsCache, splitAlignmentKey, synthesizeChunkRowIds,
+  migrateManifestToV2, mounting, normalizeManifest, parseRowId, refreshSettingsCache, rowIdRevisionFor,
+  runtime, settingsCache, splitAlignmentKey, synthesizeChunkRowIds,
 } from "../src/extension.js";
 
 const NO_STORAGE = { getItem: () => null, setItem: () => {} };
@@ -455,4 +455,78 @@ test("ensureRows loads exactly the chunks a band needs and peekRaw reads them sy
   assert.deepEqual(mock.downloads, [], "a band entirely past the last row loads nothing");
   await store.ensureRows(50010, 50011);
   assert.deepEqual(mock.downloads, [], "a resident band re-downloads nothing");
+});
+
+function installMinimalDom() {
+  const prev = globalThis.document;
+  globalThis.document = { removeEventListener: () => {} };
+  return () => { globalThis.document = prev; };
+}
+
+test("warm-store reuse skips cold rebuild and disposes on idle timeout", async (t) => {
+  const mock = installRoamMock({ blocks: { warm001: { string: "{{[[roam/grid]]}}", children: [] } } });
+  const removeDom = installMinimalDom();
+  t.after(() => { removeDom(); mock.dispose(); settingsCache.clear(); runtime.largeStores.clear(); runtime.largeMounts.clear(); mounting.clear(); runtime.metadata = null; runtime.extensionAPI = null; });
+  withSettings({ "session-idle-ms": 1500, "new-grid-rows": 10, "new-grid-cols": 3 });
+  runtime.extensionAPI = { settings: { getAll: () => ({}) } };
+  runtime.metadata = { entries: new Map([["warm001", { value: { mode: "large" } }]]) };
+
+  const store = await new LargeGridStore("warm001").initialize(new GridModel({ rows: [["a", "b", "c"]], showHeaders: false }));
+  const downloadsAfterInit = mock.downloads.length;
+  assert.ok(downloadsAfterInit > 0, "initialization downloads chunks");
+
+  const view = Object.assign(Object.create(LargeGridView.prototype), {
+    store, markerElement: null, root: { remove: () => {} }, saveTimer: null,
+    resizeCleanup: null, editorController: null, boundUp: null, disposed: false,
+  });
+  runtime.largeMounts.set("warm001", view);
+
+  assert.equal(store.disposed, false);
+
+  view.dispose({ keepStore: true });
+  runtime.largeMounts.delete("warm001");
+  const prior = runtime.largeStores.get("warm001");
+  if (prior) clearTimeout(prior.idleTimer);
+  runtime.largeStores.set("warm001", { store, idleTimer: setTimeout(() => { runtime.largeStores.delete("warm001"); store.dispose(); }, getSetting("session-idle-ms")) });
+
+  assert.equal(store.disposed, false, "store survived a keepStore disposal");
+  assert.ok(runtime.largeStores.has("warm001"), "store is stashed");
+  assert.equal(view.disposed, true, "view is marked disposed");
+
+  assert.equal(mock.downloads.length, downloadsAfterInit, "no extra downloads while stashed");
+
+  const warm = runtime.largeStores.get("warm001");
+  clearTimeout(warm.idleTimer);
+  runtime.largeStores.delete("warm001");
+  const reused = warm.store;
+  assert.strictEqual(reused, store, "same store instance reused");
+  assert.equal(reused.disposed, false);
+  assert.equal(mock.downloads.length, downloadsAfterInit, "reuse path does not re-download");
+
+  reused.dispose();
+  assert.equal(reused.disposed, true);
+  assert.equal(runtime.largeStores.has("warm001"), false, "dropped from warm stores after disposal");
+});
+
+test("warm-store idle timer disposes and drops the store", async (t) => {
+  const mock = installRoamMock({ blocks: { warm002: { string: "{{[[roam/grid]]}}", children: [] } } });
+  t.after(() => { mock.dispose(); settingsCache.clear(); runtime.largeStores.clear(); runtime.largeMounts.clear(); mounting.clear(); runtime.metadata = null; runtime.extensionAPI = null; });
+  withSettings({ "session-idle-ms": 50, "new-grid-rows": 5, "new-grid-cols": 2 });
+  runtime.extensionAPI = { settings: { getAll: () => ({}) } };
+
+  const store = await new LargeGridStore("warm002").initialize(new GridModel({ rows: [["x", "y"]], showHeaders: false }));
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("idle timer never fired")), 5000);
+    runtime.largeStores.set("warm002", { store, idleTimer: setTimeout(() => {
+      clearTimeout(timer);
+      runtime.largeStores.delete("warm002");
+      store.dispose();
+      try {
+        assert.equal(store.disposed, true);
+        assert.equal(runtime.largeStores.has("warm002"), false);
+        resolve();
+      } catch (error) { reject(error); }
+    }, getSetting("session-idle-ms")) });
+  });
 });
