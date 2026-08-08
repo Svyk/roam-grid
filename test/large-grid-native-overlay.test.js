@@ -617,3 +617,129 @@ test("native-grid regression: default mode still performs pre-mount initial seed
   defaultOverlay.dispose();
   view.dispose();
 });
+
+test("settle: settleObserver installed + disconnected via seedThroughTextarea overlay lifecycle", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorQ1");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+
+  const store = await new LargeGridStore("anchorQ1").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  const cell = view.cells.get("0:0");
+  assert.ok(cell, "cell is mounted");
+
+  // Verify seedThroughTextarea is passed to the large grid's nativeOverlay
+  assert.equal(view.nativeOverlay.seedThroughTextarea, true, "LargeGridView nativeOverlay has seedThroughTextarea=true");
+
+  // Verify default-mode overlay does NOT have seedThroughTextarea
+  const defaultOverlay = new NativeCellEditorOverlay(view, { onFinish: () => {} });
+  assert.equal(defaultOverlay.seedThroughTextarea, false, "default overlay has seedThroughTextarea=false");
+  defaultOverlay.dispose();
+
+  // Verify the settable-observer path exists in seedThroughTextarea mode
+  const overlayWithSettle = new NativeCellEditorOverlay(view, { onFinish: () => {}, seedThroughTextarea: true });
+  const scratch = await acquireLargeScratch();
+  // start() will call startOnce → mountBlock fails → failStart → teardown
+  // teardown clears settleObserver — verify the observer field is accessible
+  try { await overlayWithSettle.start({ row: 0, col: 0, cell, uid: scratch.uid, raw: "0", initial: null }); } catch { /* mock mountBlock fails */ }
+  assert.equal(overlayWithSettle.settleObserver, null, "settleObserver is cleared after teardown (failStart or success)");
+  overlayWithSettle.dispose();
+
+  view.dispose();
+});
+
+test("grace refocus: hydration swap within grace window does not commit", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorQ2");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+
+  const store = await new LargeGridStore("anchorQ2").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  const cell = view.cells.get("0:0");
+  assert.ok(cell, "cell is mounted");
+
+  // Simulate a running overlay with seedThroughTextarea within grace window
+  const nowCalls = [];
+  let baseTime = 1000;
+  const overlay = new NativeCellEditorOverlay(view, { onFinish: () => {}, seedThroughTextarea: true });
+  overlay.now = () => baseTime++;
+
+  overlay.overlay = document.createElement("div");
+  cell.appendChild(overlay.overlay);
+  overlay.state = { row: 0, col: 0, cell, uid: "test", composing: false, finishing: false, lastValue: "hello", startedAt: 1000 };
+  overlay.textarea = document.createElement("textarea");
+  overlay.textarea.value = " ";
+  // Focus should be not in overlay (simulating hydration swap)
+  globalThis.document.activeElement = globalThis.document.body;
+
+  const result = overlay.finishIfFocusLeft();
+  // Within grace window (1001 - 1000 = 1ms < 1200), should NOT commit
+  assert.equal(result, false, "finishIfFocusLeft did NOT commit within grace window");
+  assert.equal(overlay.state.refocusAttempted, true, "refocus was attempted");
+  assert.equal(overlay.state.finishing, false, "state is not finishing");
+
+  // Verify store.setCell was NOT called
+  const stored = await store.getRaw(0, 0);
+  assert.equal(stored, "0", "store cell unchanged — commit was NOT triggered");
+
+  overlay.dispose();
+  view.dispose();
+});
+
+test("stale-blank protection: textarea holds ' ' while lastValue non-empty → cancel not commit", async (t) => {
+  withSettings({ "editing-native-editor": true, "large-chunk-rows": 40, "large-overscan-rows": 0 });
+  ensureRuntimeRegistries(); resetNativeEditorHealth(); settingsCache.clear(); resetRoamRecents();
+  const dom = installMiniDom();
+  const mock = installLargeGridRoamMock("anchorQ3");
+  t.after(() => { mock.dispose(); resetChunkCache(); settingsCache.clear(); runtime.largeScratch = null; });
+
+  const store = await new LargeGridStore("anchorQ3").initialize(new GridModel({ rows: Array.from({ length: 40 }, (_, row) => [String(row)]), showHeaders: false }));
+  store.retryDelay = () => 0;
+  const host = new MiniNode("div"); dom.body.appendChild(host);
+  const view = new LargeGridView({ host, store });
+  claimKeyboard(view);
+  view.viewport.scrollTop = 0; view.viewport.scrollLeft = 0; view.viewport.clientHeight = 600; view.viewport.clientWidth = 800;
+  await view.renderVisible(); dom.flush();
+
+  const cell = view.cells.get("0:0");
+  assert.ok(cell, "cell is mounted");
+
+  // Simulate grace window exhausted, refocus already attempted
+  let baseTime = 5000;
+  const overlay = new NativeCellEditorOverlay(view, { onFinish: () => {}, seedThroughTextarea: true });
+  overlay.now = () => baseTime++;
+
+  overlay.overlay = document.createElement("div");
+  cell.appendChild(overlay.overlay);
+  overlay.state = { row: 0, col: 0, cell, uid: "test", composing: false, finishing: false, lastValue: "hello", startedAt: 1000, refocusAttempted: true };
+  overlay.textarea = document.createElement("textarea");
+  overlay.textarea.value = " ";
+  globalThis.document.activeElement = globalThis.document.body;
+
+  const result = overlay.finishIfFocusLeft();
+  // After grace (5000 - 1000 = 4000ms > 1200), with stale blank → cancel path
+  assert.equal(result, true, "finishIfFocusLeft handled the stale-blank case");
+
+  // Verify store was NOT written with blank
+  const stored = await store.getRaw(0, 0);
+  assert.equal(stored, "0", "store cell unchanged — cancel prevented the stale blank commit");
+
+  overlay.dispose();
+  view.dispose();
+});

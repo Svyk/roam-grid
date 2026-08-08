@@ -8259,6 +8259,7 @@ export class NativeCellEditorOverlay {
     this.pendingSeed = null;
     this.claimedUid = null;
     this.mountTriggerContext = null;
+    this.settleObserver = null;
   }
 
   get active() { return Boolean(this.state); }
@@ -8390,6 +8391,24 @@ export class NativeCellEditorOverlay {
     overlay.classList.add("rg-native-cell-editor--ready");
     session?.beginNativeOverlayEdit?.(uid);
     this.claimedUid = uid;
+    if (this.seedThroughTextarea && typeof globalThis.MutationObserver === "function") {
+      let mutations = 0;
+      const observer = new globalThis.MutationObserver(() => { mutations += 1; });
+      this.settleObserver = observer;
+      observer.observe(overlay, { childList: true, subtree: true, attributes: true, characterData: true });
+      const start = this.now();
+      const cap = 900;
+      let quiet = 0;
+      while (this.state && this.overlay && observer && quiet < 2) {
+        if (this.now() - start >= cap) break;
+        await this.nextFrame();
+        quiet = mutations === 0 ? quiet + 1 : 0;
+        mutations = 0;
+      }
+      this.settleObserver = null;
+      observer.disconnect();
+      if (!this.state || !this.overlay) return this.failStart();
+    }
     try { synthesizeBlockClick(host); } catch (error) { noteNativeEditorError(error); }
     const textarea = await this.pollFrames(() => this.hostTextarea(), 3);
     if (!textarea || !this.state) return this.failStart();
@@ -8431,6 +8450,7 @@ export class NativeCellEditorOverlay {
     this.listen(globalThis.document, "keydown", (event) => this.onDocumentKeydown(event), true);
     this.listen(globalThis.document, "keyup", (event) => this.onDocumentKeyup(event), true);
     noteNativeEditorSuccess();
+    if (this.state) this.state.startedAt = this.now();
     return this.state;
   }
 
@@ -8664,6 +8684,38 @@ export class NativeCellEditorOverlay {
     if (active?.closest?.(".rm-autocomplete__results")) return false;
     if (this.nativeAutocompletePortal()) return false;
     if (active && this.view?.root?.contains?.(active)) return false;
+
+    if (this.seedThroughTextarea && state.startedAt != null && this.overlay?.isConnected) {
+      const elapsed = this.now() - state.startedAt;
+      if (elapsed < 1200 && !state.refocusAttempted) {
+        state.refocusAttempted = true;
+        const host = this.blockInput();
+        if (host) {
+          try { synthesizeBlockClick(host); } catch (error) { noteNativeEditorError(error); }
+        }
+        const textarea = this.hostTextarea();
+        if (textarea) {
+          this.textarea = textarea;
+          const expected = state.lastValue;
+          if (String(textarea.value ?? "") !== expected) {
+            setNativeTextareaValue(textarea, expected);
+            const Constructor = globalThis.InputEvent || globalThis.Event;
+            if (typeof Constructor === "function") textarea.dispatchEvent?.(new Constructor("input", { bubbles: true }));
+          }
+        }
+        return false;
+      }
+      if (elapsed < 1200) {
+        const ta = this.textarea;
+        const current = ta ? String(ta.value ?? "") : "";
+        const persisted = nativeStoredRaw(current);
+        if ((persisted === "" || persisted === " ") && state.lastValue !== "" && state.lastValue !== " ") {
+          void this.cancel();
+          return true;
+        }
+      }
+    }
+
     // FIX-E4: an Escape was lent to Roam to close its `[[` menu, so this focus-leave is Roam blurring
     // its textarea as it dismisses that menu — the user is backing out, not committing. Committing
     // here persists the auto-paired text (e.g. `test [[]]`) before the pending second Escape can
@@ -8790,6 +8842,7 @@ export class NativeCellEditorOverlay {
       try { resolve(); } catch (error) { noteNativeEditorError(error); }
     }
     this.frames.clear();
+    if (this.settleObserver) { try { this.settleObserver.disconnect(); } catch { /* already gone */ } this.settleObserver = null; }
     this.repairScheduled = false; this.repairCommitWhenClean = false; this.popupJustClosed = false;
     this.escapeDeferred = false; this.escapeKeydownSeen = false; this.focusCheckScheduled = false;
     this.lastEscapeLentAt = 0; // FIX-E4: commit/cancel/dispose all end any outstanding Escape loan.
