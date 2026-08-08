@@ -1,5 +1,5 @@
-/* Roam Grid v0.13.0 | MIT | generated from src/extension.js */
-const VERSION = "0.13.0";
+/* Roam Grid v0.14.0 | MIT | generated from src/extension.js */
+const VERSION = "0.14.0";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const RANGE_COMPONENT_NAME = "roam-grid-range";

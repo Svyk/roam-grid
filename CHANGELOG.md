@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.14.0
+
+Large-grid polish.
+
+- **`[[` / `((` autocomplete now works reliably in large grids.** The in-cell
+  editor opened by typing in a `{{roam/grid}}` large grid raced the grid's own
+  virtualization: it read the cell's bytes asynchronously before mounting the
+  editor, and a re-render in that window could detach the cell so the reference
+  popover never positioned. The editor now reads the (always-resident) visible
+  cell synchronously and holds a lock that blocks the re-render until the editor
+  is mounted. (Large-grid cells are chunk-file rows with no Roam block id, so
+  they get the same custom `[[`/`((`/`#`/`{{`/`/` popover a native grid shows
+  with Roam's own editor off — not the renderBlock native menu, which needs a
+  block id.)
+- **No more flash when you navigate back to a large grid.** Large grids now get
+  a pre-paint guard (like native tables already had) that hides the raw
+  `{{roam/grid}}` marker for grids you've enhanced, and the parsed store is kept
+  warm for a short idle window so a quick away-and-back reuses it instead of
+  re-downloading the manifest and rebuilding from scratch.
+- Suite: 682 tests.
+
 ## 0.13.0
 
 Images in cells.
