@@ -38,7 +38,7 @@ All in the command palette:
 - **Roam Grid: Restore native table**
 - **Roam Grid: Save current grid as template**
 - **Roam Grid: New from saved template**
-- **Roam Grid: New large grid** — works only after **Experimental — Large grids** is on; otherwise it toasts "Large grids are experimental and off."
+- **Roam Grid: New large grid** — available when **Experimental — Large grids** is on
 - **Roam Grid: Copy/convert table**
 - **Roam Grid: Import**
 - **Roam Grid: Export**
@@ -109,29 +109,13 @@ Plus five maintenance actions:
 
 ## Experimental: large grids
 
-Large grids are for datasets too big to keep as blocks: rows and columns are virtualized, and cells are stored as JSON chunk files in Roam's file storage. They are **off until you turn Experimental — Large grids on**.
-
-Large-grid cells are not Roam blocks. Turning the switch off does not delete anything: the views unmount, and the meta and chunk files stay in the graph.
-
-**Roam Grid: New large grid** is gated by the same switch.
+Large grids are for datasets too big to keep as blocks. They are **off until you turn Experimental — Large grids on**. Turning the switch off unmounts the views and leaves the files in the graph.
 
 With the switch on, three more rows appear in the panel:
 
 - **Large grids — Cache large-grid chunks on this device**
-- **Large grids — Permanently delete superseded large-grid files (irreversible)** — off by default, and it cannot be undone.
-- **Large grids — Mirror large-grid references into Roam** — off by default. It writes each grid's distinct references into collapsed blocks so Roam indexes them, at the cost of a write on every save.
-
-## Known limitations
-
-- Large-grid cells are JSON rows, not Roam blocks: no block uid, no comments, no block refs, no reference counts. Use **Roam Grid: Copy/convert table** for a native copy.
-- The `/` menu is a deliberate subset of Roam's own and is not on the settings panel.
-- Ranking of `[[` / `((` suggestions can differ from Roam's own menu.
-- Large-grid references, when mirroring is on, are grid-precision, not cell-precision: click-through lands on the grid, not the cell.
-- Roam does not retract a page it auto-created: committing `[[New Page]]` makes the page, and deleting the text afterwards leaves the empty page behind.
-- Grids in hover previews are read-only.
-- Formula coverage is broad but not exhaustive; unknown functions evaluate to an error value.
-- Rich cell content (page links, block references, images, embeds) is painted by Roam's own renderer and inherits its behaviour.
-- A workspace dark-theme `roam/css` rule with `!important` can still override suggestion colours.
+- **Large grids — Permanently delete superseded large-grid files (irreversible)**
+- **Large grids — Mirror large-grid references into Roam**
 
 ## License
 

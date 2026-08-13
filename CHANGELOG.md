@@ -25,6 +25,8 @@ unload.
   0.17.0 (it was still 0.15.0).
 - **License line is a plain MIT pointer.** The README no longer names other
   projects.
+- **No Known limitations section.** Caveat copy was also taken out of the
+  settings panel descriptions.
 
 ## 0.16.0
 
