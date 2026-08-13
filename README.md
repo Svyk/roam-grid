@@ -135,6 +135,6 @@ With the switch on, three more rows appear in the panel:
 
 ## License
 
-MIT. Roam Grid is an independent MIT implementation; the GPL-licensed [`yibie/grid-table`](https://github.com/yibie/grid-table) project is a behavioral reference only — no source code is copied from it.
+MIT. See [LICENSE](LICENSE).
 
 Developers: [docs/](docs/) covers architecture, development, testing, and the Live AI adapter. `window.roamGrid.v1` is the extension API.

@@ -23,6 +23,8 @@ unload.
   treated as discovery events.
 - **The README is now the Depot product page**, and its version line reads
   0.17.0 (it was still 0.15.0).
+- **License line is a plain MIT pointer.** The README no longer names other
+  projects.
 
 ## 0.16.0
 
