@@ -89,8 +89,9 @@ Steps 1–9 are done in this repository. Step 10 is an external action and has
 **not** been taken.
 
 1. **Version agreement** — `package.json`, the `const VERSION` on line 1 of
-   `src/extension.js`, and the README all read the same version. `node build.mjs`
-   enforces the first two.
+   `src/extension.js`, and the README all read the same version: the README's
+   first body line is `Version 0.17.0`, matching `package.json`.
+   `node build.mjs` enforces the first two.
 2. **Gate green** — `npm run check` passes: syntax check, full `node:test` suite,
    secret scan, generated-artifact verify.
 3. **Artifacts rebuilt** — `node build.mjs` has run since the last source edit,

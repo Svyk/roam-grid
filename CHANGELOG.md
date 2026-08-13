@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.17.0
+
+Simpler settings panel, an experimental gate on large grids, and a harder
+unload.
+
+- **The settings panel is simpler.** Only live rows render. The pending tuning
+  rows — write budgets, debounce timings, sizing in pixels, autocomplete delay,
+  the `/` commands toggle, and the like — stay in the schema but no longer
+  appear in the panel.
+- **Large grids are experimental and off by default.** The gate is
+  **Experimental — Large grids**. Turning the switch off does not delete
+  existing large-grid files: the views unmount, and the meta and chunk files
+  stay in the graph. The three large-grid tuning rows — **Large grids — Cache
+  large-grid chunks on this device**, **Large grids — Permanently delete
+  superseded large-grid files (irreversible)**, and **Large grids — Mirror
+  large-grid references into Roam** — appear only after you turn the gate on.
+- **Unload and disable are harder.** Dirty cells flush before teardown, and
+  listeners and scans come down cleanly.
+- **Graph-wide scans were cut.** The pre-paint guard no longer uses
+  document-global suffix attribute selectors, and settings changes are no longer
+  treated as discovery events.
+- **The README is now the Depot product page**, and its version line reads
+  0.17.0 (it was still 0.15.0).
+
 ## 0.16.0
 
 Large-grid selection + native-editor reliability.
