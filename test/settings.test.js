@@ -6,7 +6,7 @@ import {
   SETTINGS_MAINTENANCE,
   applyDisplayDefaults,
   applyDisplayDefaultsToOpenGrids,
-  displayDefaults,
+  applyLargeGridGateChange,
   applyGridMaxWidth,
   applySettingsChange,
   applyToolbarPreset,
@@ -14,7 +14,9 @@ import {
   buildSettingsPanelConfig,
   clipPasteMatrix,
   coerceSetting,
+  copyNativeToLarge,
   deviceSettingsKey,
+  displayDefaults,
   displayRestampValues,
   enterMovement,
   formulaTintEnabled,
@@ -25,11 +27,17 @@ import {
   GridView,
   gridViews,
   headersVisible,
-  LargeGridView,
+  importCommand,
   initializeSettings,
+  largeGridEnabled,
   largeGridMounts,
+  LargeGridStore,
+  LargeGridView,
+  newLargeGrid,
   notificationAllowed,
+  pendingTimers,
   pinnedGridThemePalette,
+  runtime,
   planDeviceSettingsMigration,
   planSettingsMigration,
   readDeviceSettings,
@@ -38,6 +46,7 @@ import {
   repaintFormulaTint,
   resolveSettingValue,
   runMaintenanceAction,
+  scanLargeMounts,
   setSetting,
   settingDefaults,
   settingsCache,
@@ -97,6 +106,7 @@ const TODAYS_CONSTANTS = {
   "ranges-max-rendered-cells": 2000,
   "images-cell-media": true,
   "images-max-height": 180,
+  "experimental-large-grid": false,
   "large-cache-enabled": true,
   "large-cache-max-mb": 256,
   "large-verify-checksums": true,
@@ -110,15 +120,51 @@ const TODAYS_CONSTANTS = {
  * arithmetic below is written in terms of it, and because the schema sweep asserts that nothing may
  * become `stage: "pending"` without being listed here.
  */
-const PENDING_KEYS = [];
+const PENDING_KEYS = [
+  "writes-native-budget",
+  "writes-content-debounce-ms",
+  "writes-large-debounce-ms",
+  "session-idle-ms",
+  "editing-autocomplete-debounce-ms",
+  "editing-autocomplete-limit",
+  "editing-autocomplete-empty-opener",
+  "editing-autocomplete-render-rows",
+  "editing-autocomplete-components",
+  "editing-autocomplete-commands",
+  "editing-capture-undo",
+  "conflict-restore-prompt",
+  "appearance-reference-badges",
+  "appearance-max-width",
+  "appearance-notifications",
+  "sizing-default-row-height",
+  "sizing-compact-row-height",
+  "sizing-default-col-width",
+  "sizing-min-row-height",
+  "sizing-max-row-height",
+  "sizing-min-col-width",
+  "sizing-max-col-width",
+  "new-grid-rows",
+  "new-grid-cols",
+  "large-overscan-rows",
+  "large-chunk-rows",
+  "large-cache-max-mb",
+  "large-verify-checksums",
+  "large-refs-max",
+  "comments-badges",
+  "ranges-max-rendered-cells",
+];
 
-const COMMENT_KEYS = ["comments-enabled", "comments-affordance-trigger", "comments-badges", "comments-compose-mode"];
+// `stage: "experimental"` rows are user-facing only when the experimental-large-grid gate is on;
+// they render in the panel conditional on `largeGridEnabled()` and are seeded exactly like `live`.
+const EXPERIMENTAL_KEYS = ["large-cache-enabled", "large-gc-orphans", "large-refs-sync"];
 
-const RANGE_KEYS = ["ranges-live-references", "ranges-max-rendered-cells"];
+const COMMENT_KEYS = ["comments-enabled", "comments-affordance-trigger", "comments-compose-mode"];
+
+const RANGE_KEYS = ["ranges-live-references"];
 
 const IMAGE_KEYS = ["images-cell-media", "images-max-height"];
 
-const LARGE_STORAGE_KEYS = ["large-cache-enabled", "large-cache-max-mb", "large-verify-checksums", "large-gc-orphans"];
+const LARGE_STORAGE_KEYS = ["large-cache-enabled", "large-gc-orphans", "large-refs-sync"];
 
 const MAINTENANCE_KEYS = ["maintenance-apply-display", "maintenance-forget-device", "maintenance-clear-caches", "maintenance-migrate-templates", "maintenance-reset"];
 
@@ -183,7 +229,7 @@ test("every descriptor is well-formed", () => {
     assert.ok(types.has(descriptor.type), `${key}: unknown type ${descriptor.type}`);
     assert.ok(["graph", "device"].includes(descriptor.scope), `${key}: unknown scope ${descriptor.scope}`);
     assert.ok(["immediate", "next-op"].includes(descriptor.apply), `${key}: unknown apply ${descriptor.apply}`);
-    assert.ok(["live", "pending"].includes(descriptor.stage), `${key}: unknown stage ${descriptor.stage}`);
+    assert.ok(["live", "pending", "experimental"].includes(descriptor.stage), `${key}: unknown stage ${descriptor.stage}`);
     if (descriptor.control === "switch") assert.equal(descriptor.type, "bool", `${key}: switch rows must be bool`);
     if (descriptor.control === "select") assert.equal(descriptor.type, "enum", `${key}: select rows must be enum`);
     if (descriptor.type === "bool") assert.equal(typeof descriptor.default, "boolean", `${key}: bool default must be a boolean`);
@@ -207,11 +253,15 @@ test("every descriptor is well-formed", () => {
 });
 
 test("schema keys are unique across the panel and the map", () => {
+  refreshSettingsCache(makeApi().api, makeStorage());
   const ids = buildSettingsPanelConfig().settings.map((row) => row.id);
   assert.equal(new Set(ids).size, ids.length, "panel row ids must be unique");
-  assert.equal(Object.keys(SETTINGS).length, ids.length + PENDING_KEYS.length - MAINTENANCE_KEYS.length);
+  // With the experimental gate OFF by default, the EXPERIMENTAL_KEYS hide alongside the pending ones.
+  assert.equal(Object.keys(SETTINGS).length, ids.length + PENDING_KEYS.length + EXPERIMENTAL_KEYS.length - MAINTENANCE_KEYS.length);
   for (const key of PENDING_KEYS) assert.ok(SETTINGS[key], `${key} must exist in the schema`);
+  for (const key of EXPERIMENTAL_KEYS) assert.ok(SETTINGS[key], `${key} must exist in the schema`);
   for (const key of MAINTENANCE_KEYS) assert.ok(!SETTINGS[key], `${key} is an action, not a stored setting`);
+  settingsCache.clear();
 });
 
 test("settingDefaults equals today's constant values exactly", () => {
@@ -527,6 +577,8 @@ test("setSetting ignores unknown keys and survives a read-only graph", async () 
 });
 
 test("the panel omits pending rows but the schema still resolves them", async () => {
+  refreshSettingsCache(makeApi().api, makeStorage());
+  assert.equal(largeGridEnabled(), false, "the default panel sees the experimental-large-grid gate closed");
   const config = buildSettingsPanelConfig();
   const ids = config.settings.map((row) => row.id);
   assert.equal(config.tabTitle, "Roam Grid");
@@ -534,10 +586,14 @@ test("the panel omits pending rows but the schema still resolves them", async ()
     assert.ok(!ids.includes(key), `${key} must not be rendered while it is pending`);
     assert.equal(SETTINGS[key].stage, "pending");
   }
-  // PENDING_KEYS is empty today, so the loop above proves nothing on its own. This is the assertion
-  // that keeps it honest: a row may only be invisible if it is listed as pending.
+  for (const key of EXPERIMENTAL_KEYS) {
+    assert.ok(!ids.includes(key), `${key} must not be rendered while the gate is off`);
+    assert.equal(SETTINGS[key].stage, "experimental");
+  }
+  // The schema sweep keeps the inventory honest: a row may only be invisible if it is listed here.
   for (const [key, descriptor] of Object.entries(SETTINGS)) {
     if (descriptor.stage === "pending") assert.ok(PENDING_KEYS.includes(key), `${key} is pending but is not listed in PENDING_KEYS`);
+    else if (descriptor.stage === "experimental") assert.ok(EXPERIMENTAL_KEYS.includes(key), `${key} is experimental but is not listed in EXPERIMENTAL_KEYS`);
     else assert.ok(ids.includes(key), `${key} is live and must be rendered`);
   }
   // GOAL-3H wired these and deleted `ranges-read-only`: RangeGridView has no commitMutation and no
@@ -557,31 +613,52 @@ test("the panel omits pending rows but the schema still resolves them", async ()
   }
   assert.deepEqual([...SETTINGS["comments-affordance-trigger"].items], ["Hover", "Cmd/Ctrl + hover"]);
   assert.equal(SETTINGS["comments-affordance-trigger"].default, "Hover", "GOAL-2H: plain hover is what the user asked for");
-  // Their features landed in the 3B/3C/3F storage chain. A setting whose feature ships but whose
-  // control stays hidden is the mirror image of the defect this schema replaced, so the visibility
-  // of these four is asserted directly rather than only implied by their absence from PENDING_KEYS.
+  // comments-badges left COMMENT_KEYS: it is now pending. rewrap that fact so a future MOVE-to-live
+  // regression flips both this and the PENDING_KEYS list together.
+  assert.equal(SETTINGS["comments-badges"].stage, "pending");
+  assert.ok(PENDING_KEYS.includes("comments-badges"));
+  // EXPERIMENTAL large-storage rows stay hidden until the gate opens. The v0.17.0 campaign collapses
+  // one-step tuning for large grids behind the experimental-large-grid switch: a default-off panel
+  // cannot surface tuning for a feature that itself stays off by default.
   for (const key of LARGE_STORAGE_KEYS) {
-    assert.ok(ids.includes(key), `${key} backs a shipped feature and must be rendered`);
-    assert.equal(SETTINGS[key].stage, "live");
+    assert.ok(!ids.includes(key), `${key} is an experimental row; it must NOT render while the gate is off`);
+    assert.equal(SETTINGS[key].stage, "experimental");
   }
   assert.equal(SETTINGS["large-gc-orphans"].default, false, "irreversible deletion is opt-in");
   assert.match(SETTINGS["large-gc-orphans"].name, /irreversible/i, "the row must say so where the user reads it");
   refreshSettingsCache(makeApi().api, makeStorage());
   assert.equal(getSetting("comments-compose-mode"), "In place");
   assert.equal(getSetting("large-cache-max-mb"), 256);
-  assert.ok(ids.includes("writes-native-budget"));
+  // writes-native-budget was visible on the panel before; the v0.17.0 campaign collapses deep tuning
+  // rows behind stage=pending, so this assertion is the regression that keeps the old contract retired.
+  assert.ok(!ids.includes("writes-native-budget"));
   for (const key of MAINTENANCE_KEYS) assert.ok(ids.includes(key), `${key} must be rendered as a maintenance button`);
-  assert.equal(ids.length, Object.keys(SETTINGS).length - PENDING_KEYS.length + MAINTENANCE_KEYS.length);
+  // Panel arithmetic with the gate OFF hides both pending and experimental rows.
+  assert.equal(ids.length, Object.keys(SETTINGS).length - PENDING_KEYS.length - EXPERIMENTAL_KEYS.length + MAINTENANCE_KEYS.length);
+
+  // Turn the gate ON: experimental rows appear, pending rows stay hidden, and live rows stay live.
+  refreshSettingsCache(makeApi({ values: { "experimental-large-grid": true } }).api, makeStorage());
+  assert.equal(largeGridEnabled(), true);
+  const configOn = buildSettingsPanelConfig();
+  const idsOn = configOn.settings.map((row) => row.id);
+  for (const key of EXPERIMENTAL_KEYS) assert.ok(idsOn.includes(key), `${key} ships when the experimental gate is on`);
+  for (const key of PENDING_KEYS) assert.ok(!idsOn.includes(key), `${key} stays hidden even with the gate on`);
+  for (const key of ["editing-enter-direction", "appearance-theme", "comments-compose-mode"]) {
+    assert.ok(idsOn.includes(key), `${key} is a live row and must render regardless of the gate`);
+  }
+  assert.ok(!idsOn.includes("writes-native-budget"));
+  assert.equal(idsOn.length, Object.keys(SETTINGS).length - PENDING_KEYS.length + MAINTENANCE_KEYS.length);
+  settingsCache.clear();
 });
 
 test("panel rows carry the group naming convention, a className, and a supported action", () => {
   const rows = buildSettingsPanelConfig().settings;
   const byId = new Map(rows.map((row) => [row.id, row]));
-  const budget = byId.get("writes-native-budget");
-  assert.equal(budget.name, "Writes — Native write budget");
-  assert.equal(budget.className, "rg-settings-writes");
-  assert.equal(budget.action.type, "input");
-  assert.equal(budget.action.placeholder, "1200");
+  const direction = byId.get("editing-enter-direction");
+  assert.equal(direction.name, "Editing — Enter moves");
+  assert.equal(direction.className, "rg-settings-editing");
+  assert.equal(direction.action.type, "select");
+  assert.deepEqual(direction.action.items, ["Down", "Right", "Stay"]);
   const theme = byId.get("appearance-theme");
   assert.equal(theme.name, "Appearance — Theme");
   assert.equal(theme.action.type, "select");
@@ -589,7 +666,9 @@ test("panel rows carry the group naming convention, a className, and a supported
   assert.notEqual(theme.action.items, SETTINGS["appearance-theme"].items, "the panel must not hand out the frozen schema array");
   const headers = byId.get("appearance-show-headers");
   assert.equal(headers.action.type, "switch");
-  assert.equal(byId.get("new-grid-rows").className, "rg-settings-new-grids");
+  const compose = byId.get("comments-compose-mode");
+  assert.equal(compose.className, "rg-settings-comments");
+  assert.equal(compose.action.type, "select");
   for (const row of rows) {
     assert.ok(row.className.startsWith("rg-settings-"), `${row.id}: className must be rg-prefixed`);
     assert.equal(typeof row.action.onChange === "function" || typeof row.action.onClick === "function", true);
@@ -602,12 +681,12 @@ test("panel handlers receive the control-appropriate raw value", () => {
   const byId = new Map(rows.map((row) => [row.id, row]));
   byId.get("appearance-show-headers").action.onChange({ target: { checked: false, value: "on" } });
   byId.get("appearance-theme").action.onChange({ target: { value: "Dark" } });
-  byId.get("writes-native-budget").action.onChange({ target: { value: "640" } });
+  byId.get("images-max-height").action.onChange({ target: { value: "240" } });
   byId.get("editing-tab-direction").action.onChange("Down");
   assert.deepEqual(seen, [
     ["appearance-show-headers", false],
     ["appearance-theme", "Dark"],
-    ["writes-native-budget", "640"],
+    ["images-max-height", "240"],
     ["editing-tab-direction", "Down"],
   ]);
 });
@@ -631,9 +710,16 @@ test("initializeSettings seeds only unset live keys and creates one panel", asyn
   const written = new Map(fake.writes);
   assert.equal(written.get("writes-native-budget"), 900, "the migrated value must not be overwritten by the default");
   assert.ok(!written.has("editing-tab-direction"), "an already-set key is not reseeded");
-  for (const key of PENDING_KEYS) assert.ok(!written.has(key), `${key} must not be seeded while it is pending`);
-  assert.equal(fake.writes.length, Object.keys(SETTINGS).length - PENDING_KEYS.length - 1 + 1, "one write per unseeded live key plus the version row");
+  // Pending keys are NOT seeded with their default; the one exception is the legacy migration
+  // destination itself (`writes-native-budget`), which writes the user's already-existing value,
+  // not a default — that's conversion of stored data, not seeding. The seeding loop skips every
+  // pending descriptor on its own (writes-native-budget is one of those), so `seeded` is simply
+  // SETTINGS minus PENDING minus editing-tab-direction (already in the graph).
+  for (const key of PENDING_KEYS) if (key !== "writes-native-budget") assert.ok(!written.has(key), `${key} must not be seeded while it is pending`);
+  const seeded = Object.keys(SETTINGS).length - PENDING_KEYS.length - 1 /* editing-tab-direction already set */;
+  assert.equal(fake.writes.length, 2 + seeded, "one write per unseeded live/experimental key plus the two migration rows (budget + version)");
   assert.equal(getSetting("writes-native-budget"), 900);
+  assert.equal(getSetting("experimental-large-grid"), false, "the new live key is seeded with its default");
   assert.equal(getSetting("editing-tab-direction"), "Down");
 });
 
@@ -645,7 +731,11 @@ test("initializeSettings performs zero writes when the graph forbids them and st
   assert.equal(fake.counters.set, 0);
   assert.equal(fake.counters.panel, 1);
   assert.equal(fake.panels[0].tabTitle, "Roam Grid");
-  assert.equal(fake.panels[0].settings.length, Object.keys(SETTINGS).length - PENDING_KEYS.length + MAINTENANCE_KEYS.length);
+  // With the experimental-large-grid gate OFF by default, the panel hides both pending and experimental rows.
+  assert.equal(fake.panels[0].settings.length, Object.keys(SETTINGS).length - PENDING_KEYS.length - EXPERIMENTAL_KEYS.length + MAINTENANCE_KEYS.length);
+  assert.ok(fake.panels[0].settings.some((row) => row.id === "experimental-large-grid"), "the new live experimental-large-grid switch ships in the default panel");
+  assert.ok(!fake.panels[0].settings.some((row) => row.id === "writes-native-budget"), "writes-native-budget is no longer a panel row");
+  assert.ok(!fake.panels[0].settings.some((row) => row.id === "large-cache-enabled"), "experimental LARGE_STORAGE rows are hidden while the gate is off");
   assert.equal(getSetting("writes-native-budget"), 1200, "an unwritable graph still resolves defaults");
 });
 
@@ -658,44 +748,51 @@ test("initializeSettings is a no-op on a second run and routes panel changes thr
   assert.equal(fake.writes.length, writesAfterFirstRun, "a second initialization writes nothing");
   assert.equal(fake.counters.panel, 2);
 
-  const row = fake.panels[1].settings.find((entry) => entry.id === "appearance-max-width");
-  row.action.onChange({ target: { value: "2000" } });
+  // The experimental-large-grid row is live in the panel: appearance-max-width went pending in
+  // v0.17.0, so drive a remaining live device-scoped row that the test previously used for this.
+  const firstPanel = fake.panels[1].settings.find((entry) => entry.id === "appearance-toolbar-preset");
+  assert.ok(firstPanel, "appearance-toolbar-preset is a live device-scoped row that ships in the panel");
+  firstPanel.action.onChange({ target: { value: "Compact" } });
   await Promise.resolve();
   await Promise.resolve();
-  assert.equal(getSetting("appearance-max-width"), 2000);
-  assert.deepEqual(readDeviceSettings(storage), { "appearance-max-width": 2000 });
+  assert.equal(getSetting("appearance-toolbar-preset"), "Compact");
+  assert.deepEqual(readDeviceSettings(storage), { "appearance-toolbar-preset": "Compact" });
+  settingsCache.clear();
 });
 
-test("applySettingsChange reaches every registered view, large mount, and session", (t) => {
+test("applySettingsChange reaches every registered view and large mount", (t) => {
   t.after(() => { clearRegistries(); settingsCache.clear(); });
   clearRegistries();
   refreshSettingsCache(makeApi().api, makeStorage());
 
-  const badgeCalls = [];
+  const tintCalls = [];
   for (let index = 0; index < 5; index += 1) {
-    gridViews.add({ id: index, updateReferenceCountBadges() { badgeCalls.push(index); } });
+    gridViews.add({ id: index, refreshFormulaTint() { tintCalls.push(index); } });
   }
-  const badges = applySettingsChange(SETTINGS["appearance-reference-badges"], false);
+  const tinted = applySettingsChange(SETTINGS["appearance-formula-tinting"], false);
   assert.equal(gridViews.size, 5);
-  assert.equal(badges.views, 5, "every registered view must be visited");
-  assert.deepEqual(badgeCalls, [0, 1, 2, 3, 4]);
-  assert.equal(badges.value, false);
-  assert.equal(badges.failed, 0);
+  assert.equal(tinted.views, 5, "every registered view must be visited");
+  assert.deepEqual(tintCalls, [0, 1, 2, 3, 4]);
+  assert.equal(tinted.value, false);
+  assert.equal(tinted.failed, 0);
 
   const renders = [];
   largeGridMounts.set("large-a", { scheduleRender: () => renders.push("a") });
   largeGridMounts.set("large-b", { scheduleRender: () => renders.push("b") });
-  const overscan = applySettingsChange(SETTINGS["large-overscan-rows"], 20);
-  assert.equal(overscan.largeMounts, 2);
+  const images = applySettingsChange(SETTINGS["images-max-height"], 240);
+  assert.equal(images.largeMounts, 2, "every large mount is visited by the onLarge hook");
   assert.deepEqual(renders, ["a", "b"]);
-  assert.equal(overscan.views, 0, "a large-only setting must not walk the view registry");
+  assert.equal(images.failed, 0);
 
+  // session-idle-ms was the only onSession hook; it went pending and dropped the hook in v0.17.0.
+  // Asserting the hook is gone: applying the descriptor no longer reaches any session.
   const rearmed = [];
   gridSessions.set("t1", { rescheduleIdle: () => rearmed.push("t1") });
   gridSessions.set("t2", { rescheduleIdle: () => rearmed.push("t2") });
   const idle = applySettingsChange(SETTINGS["session-idle-ms"], 4000);
-  assert.equal(idle.sessions, 2);
-  assert.deepEqual(rearmed, ["t1", "t2"]);
+  assert.equal(idle.sessions, 0, "session-idle-ms lost its onSession hook when it went pending");
+  assert.deepEqual(rearmed, []);
+  assert.equal(SETTINGS["session-idle-ms"].onSession, undefined, "the hook stays dropped while the row is pending");
 });
 
 test("a view that throws is counted, isolated, and does not truncate the walk", (t) => {
@@ -703,13 +800,13 @@ test("a view that throws is counted, isolated, and does not truncate the walk", 
   clearRegistries();
   refreshSettingsCache(makeApi().api, makeStorage());
   const reached = [];
-  gridViews.add({ updateReferenceCountBadges() { reached.push("first"); } });
-  gridViews.add({ updateReferenceCountBadges() { reached.push("boom"); throw new Error("detached node"); } });
-  gridViews.add({ updateReferenceCountBadges() { reached.push("last"); } });
+  gridViews.add({ refreshFormulaTint() { reached.push("first"); } });
+  gridViews.add({ refreshFormulaTint() { reached.push("boom"); throw new Error("detached node"); } });
+  gridViews.add({ refreshFormulaTint() { reached.push("last"); } });
   const warn = console.warn;
   console.warn = () => {};
   try {
-    const result = applySettingsChange("appearance-reference-badges", true);
+    const result = applySettingsChange("appearance-formula-tinting", true);
     assert.deepEqual(reached, ["first", "boom", "last"], "the walk must continue past a failing surface");
     assert.equal(result.views, 3);
     assert.equal(result.failed, 1);
@@ -719,14 +816,14 @@ test("a view that throws is counted, isolated, and does not truncate the walk", 
 test("applySettingsChange resolves a key string, an unknown key, and an omitted value", (t) => {
   t.after(() => { clearRegistries(); settingsCache.clear(); });
   clearRegistries();
-  refreshSettingsCache(makeApi({ values: { "appearance-max-width": 1800 } }).api, makeStorage());
-  const seen = [];
+  // appearance-theme is still live in v0.17.0; appearance-max-width went pending, so its onView walk
+  // no longer fires. appearance-theme carries onView (`resyncGridTheme(view)`) applied to each view.
+  refreshSettingsCache(makeApi({ values: { "appearance-theme": "Dark" } }).api, makeStorage());
   gridViews.add({ root: makeElement() });
-  const resolved = applySettingsChange("appearance-max-width");
-  assert.equal(resolved.value, 1800, "an omitted value is read from the cache");
-  assert.equal(resolved.views, 1);
+  const resolved = applySettingsChange("appearance-theme");
+  assert.equal(resolved.value, "Dark", "an omitted value is read from the cache");
+  assert.equal(resolved.views, 1, "the live onView hook walked the views registry once");
   assert.deepEqual(applySettingsChange("not-a-setting", 1), { key: null, value: 1, views: 0, largeMounts: 0, sessions: 0, failed: 0 });
-  assert.deepEqual(seen, []);
 });
 
 test("applySettingsChange never reaches for the mount scanner", async (t) => {
@@ -1046,18 +1143,19 @@ test("forgetting device overrides drops the shadow and rebuilds the panel", asyn
   t.after(() => { clearRegistries(); settingsCache.clear(); });
   clearRegistries();
   const fake = makeApi({ values: { "appearance-theme": "Light" } });
-  const storage = makeStorage({ [deviceSettingsKey()]: '{"appearance-theme":"Dark","appearance-max-width":2400}' });
+  const storage = makeStorage({ [deviceSettingsKey()]: '{"appearance-theme":"Dark","appearance-toolbar-preset":"Compact"}' });
   refreshSettingsCache(fake.api, storage);
   assert.equal(getSetting("appearance-theme"), "Dark");
+  assert.equal(getSetting("appearance-toolbar-preset"), "Compact");
   const root = makeElement();
   gridViews.add({ root });
   let rebuilt = 0;
   assert.equal(await runMaintenanceAction("maintenance-forget-device", { extensionAPI: fake.api, storage, rebuildPanel: () => { rebuilt += 1; } }), true);
   assert.deepEqual(readDeviceSettings(storage), {});
   assert.equal(getSetting("appearance-theme"), "Light", "the graph seed takes over");
-  assert.equal(getSetting("appearance-max-width"), 1200);
+  assert.equal(getSetting("appearance-toolbar-preset"), "Full");
   assert.equal(rebuilt, 1, "Roam renders row values once, so the panel must be rebuilt");
-  assert.equal(root.style.properties.get("--rg-max-width"), "1200px", "device-scoped changes are pushed to live grids");
+  assert.deepEqual([...root.classList.names], ["rg-root--toolbar-full"], "device-scoped changes are pushed to live grids through the live onView hook");
   assert.deepEqual(fake.writes, [], "forgetting a device override must not write to the graph");
 });
 
@@ -1087,9 +1185,15 @@ test("resetting restores every default, clears the device shadow, and rebuilds t
   assert.deepEqual(readDeviceSettings(storage), {});
   const written = new Map(fake.writes);
   for (const [key, descriptor] of Object.entries(SETTINGS)) {
-    assert.equal(getSetting(key), descriptor.default, `${key} must resolve to its default`);
-    if (PENDING_KEYS.includes(key)) assert.ok(!written.has(key), `${key} must not be written while it is pending`);
-    else assert.equal(written.get(key), descriptor.default, `${key} must be written back to its default`);
+    // Pending rows are not user-visible and not reset by maintenance-reset; their graph value stays
+    // at whatever the user seeded before they went pending. Live and experimental rows are reset to
+    // their defaults and written back to the graph.
+    if (PENDING_KEYS.includes(key)) {
+      assert.ok(!written.has(key), `${key} must not be written while it is pending`);
+    } else {
+      assert.equal(getSetting(key), descriptor.default, `${key} must resolve to its default`);
+      assert.equal(written.get(key), descriptor.default, `${key} must be written back to its default`);
+    }
   }
   assert.equal(await runMaintenanceAction("not-an-action", { extensionAPI: fake.api, storage }), false);
 });
@@ -1178,4 +1282,198 @@ test("the theme setting pins a palette or defers to the host", () => {
   refreshSettingsCache(makeApi({ values: { "appearance-theme": "Dark" } }).api, makeStorage());
   assert.equal(pinnedGridThemePalette()["--rg-color"], "#f6f7f9");
   settingsCache.clear();
+});
+
+// ---------------------------------------------------------------------------
+// v0.17.0 — experimental-large-grid gate
+// ---------------------------------------------------------------------------
+
+/** Minimal `document`/`window` stand-in that lets `toast` paint without a real host. Restored in
+ *  each test's `t.after` because `toast` reads globalThis.document directly. */
+function installToastDom() {
+  const appendedToBody = [];
+  const childrenOf = (self) => { const children = []; self.appendChild = (child) => { child.isConnected = true; children.push(child); return child; }; self.children = children; return self; };
+  const makeElement = () => installToastDom.shallowElement();
+  installToastDom.shallowElement = () => {
+    const element = { className: "", textContent: "", id: "", isConnected: false, style: { setProperty() {} }, dataset: {}, classList: { add() {}, remove() {}, contains() { return false; } }, appendChild(child) { this.children?.push(child); return child; }, remove() {}, addEventListener() {} };
+    element.children = [];
+    return element;
+  };
+  const body = makeElement();
+  body.appendChild = (child) => { child.isConnected = true; appendedToBody.push(child); return child; };
+  const document = {
+    body,
+    head: { appendChild() {}, contains() { return false; } },
+    querySelector: (selector) => selector === ".rg-toasts" ? appendedToBody.find((node) => node.className === "rg-toasts") || null : null,
+    querySelectorAll: () => [],
+    createElement: makeElement,
+    getElementById: () => null,
+    addEventListener() {},
+    removeEventListener() {},
+  };
+  const previousDocument = globalThis.document;
+  const previousObserver = globalThis.MutationObserver;
+  globalThis.document = document;
+  globalThis.MutationObserver = class { observe() {} disconnect() {} };
+  return {
+    document,
+    appendedToBody,
+    restore() {
+      for (const id of pendingTimers) clearTimeout(id);
+      pendingTimers.clear();
+      if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
+      if (previousObserver === undefined) delete globalThis.MutationObserver; else globalThis.MutationObserver = previousObserver;
+    },
+  };
+}
+
+test("largeGridEnabled is false by default and surfaces what the gate reads", () => {
+  settingsCache.clear();
+  assert.equal(largeGridEnabled(), false, "with no cache populated, the gate closes at the schema default");
+  refreshSettingsCache(makeApi().api, makeStorage());
+  assert.equal(largeGridEnabled(), false, "the manufactured default panel also sees the gate closed");
+  refreshSettingsCache(makeApi({ values: { "experimental-large-grid": true } }).api, makeStorage());
+  assert.equal(largeGridEnabled(), true);
+  settingsCache.clear();
+});
+
+test("the experimental-large-grid toast refuses newLargeGrid, copyNativeToLarge, and import overflow while the gate is off", async (t) => {
+  const dom = installToastDom();
+  t.after(() => { dom.restore(); clearRegistries(); settingsCache.clear(); runtime.metadata = null; runtime.extensionAPI = null; });
+  clearRegistries();
+  const writes = [];
+  const metadata = { has: () => false, entries: new Map(), set: async (uid) => { writes.push(["set", uid]); }, remove: async (uid) => { writes.push(["remove", uid]); } };
+  runtime.metadata = metadata;
+  runtime.extensionAPI = { settings: { get: () => null, set: async () => {}, panel: { create: async () => {} } } };
+
+  // The toast path is what the user-facing commands SHOULD all converge on while the gate is off.
+  refreshSettingsCache(makeApi().api, makeStorage());
+  assert.equal(largeGridEnabled(), false);
+
+  // newLargeGrid has to refuse without inserting a block or materialising a store.
+  await newLargeGrid();
+  assert.deepEqual(writes, [], "newLargeGrid did NOT seed metadata while the gate is off");
+
+  // copyNativeToLarge refuses with the same wording — no LargeGridStore, no metadata.write.
+  const model = new GridModel({ rows: [["a", "b"], ["c", "d"]] });
+  await copyNativeToLarge(model);
+  assert.deepEqual(writes, [], "copyNativeToLarge did NOT touch metadata while the gate is off");
+
+  // importCommand's overflow decision is testable separately: at a rowCount * colCount above the
+  // native write budget, an OFF gate must refuse with the shared toast instead of creating a large
+  // grid. We exercise the decision through the same entry point (copyNativeToLarge) that importCommand
+  // routes overflow into; with the gate OFF it toast-refuses without writing metadata.
+  const largeSized = new GridModel({ rows: Array.from({ length: 50 }, () => Array.from({ length: 50 }, () => "")) });
+  // rowCount * colCount = 50 * 50 = 2500 > writes-native-budget (1200) → overflowing the budget.
+  assert.ok(largeSized.rowCount * largeSized.colCount > 1200, "the import model exceeds the native write budget");
+  await copyNativeToLarge(largeSized);
+  assert.deepEqual(writes, [], "an oversized import still does not write when the gate is closed");
+
+  // Three refusals landed in the toast container — one per call.
+  const toastContainer = dom.appendedToBody.find((node) => node.className === "rg-toasts");
+  assert.ok(toastContainer, "toast produced a .rg-toasts container to host the gate refusals");
+  assert.equal(toastContainer.children.length, 3, "newLargeGrid, copyNativeToLarge, and the oversized import each refused once");
+  for (const item of toastContainer.children) assert.equal(item.className, "rg-toast rg-toast--warning", "every refusal carries the warning intent");
+  assert.equal(toastContainer.children[0].textContent, "Large grids are experimental and off.");
+});
+
+test("scanLargeMounts leaves the large-mount registry untouched while the experimental-large-grid gate is off", async (t) => {
+  t.after(() => { clearRegistries(); settingsCache.clear(); runtime.metadata = null; runtime.extensionAPI = null; });
+  clearRegistries();
+  refreshSettingsCache(makeApi().api, makeStorage());
+  assert.equal(largeGridEnabled(), false);
+  runtime.metadata = { entries: new Map([["anchorL1", { value: { mode: "large" } }]]), has: () => true };
+  runtime.extensionAPI = { settings: { get: () => null } };
+  const constructs = [];
+  const originalInitialize = LargeGridStore.prototype.initialize;
+  LargeGridStore.prototype.initialize = function (...args) { constructs.push(args); throw new Error("LargeGridStore must NOT initialize while the gate is off"); };
+  try {
+    await scanLargeMounts();
+    assert.equal(runtime.largeMounts.size, 0, "the large-mount loop did not mount a LargeGridView");
+    assert.deepEqual(constructs, [], "the off gate short-circuits before instantiating a LargeGridStore");
+  } finally {
+    LargeGridStore.prototype.initialize = originalInitialize;
+  }
+});
+
+test("the panel hides experimental rows while the gate is off and shows them once the cache goes true", () => {
+  // Boundary condition: just the cache rebuild (no full panel.onChange flow). buildSettingsPanelConfig
+  // reads `largeGridEnabled()` directly off the settings cache, so flipping the cache and rebuilding
+  // is enough to surface or hide the experimental LARGE_STORAGE rows.
+  refreshSettingsCache(makeApi().api, makeStorage());
+  const offIds = buildSettingsPanelConfig().settings.map((row) => row.id);
+  for (const key of EXPERIMENTAL_KEYS) assert.ok(!offIds.includes(key), `${key} hides while the gate is off`);
+  refreshSettingsCache(makeApi({ values: { "experimental-large-grid": true } }).api, makeStorage());
+  const onIds = buildSettingsPanelConfig().settings.map((row) => row.id);
+  for (const key of EXPERIMENTAL_KEYS) assert.ok(onIds.includes(key), `${key} renders once the gate opens`);
+  settingsCache.clear();
+});
+
+test("turning the experimental-large-grid switch off disposes registered large mounts and leaves metadata untouched", (t) => {
+  const dom = installToastDom();
+  t.after(() => { dom.restore(); clearRegistries(); settingsCache.clear(); runtime.metadata = null; runtime.extensionAPI = null; runtime.rebuildPanel = null; });
+  clearRegistries();
+  const writes = [];
+  const metadataOps = [];
+  runtime.metadata = { has: () => true, entries: new Map([["anchorL1", { value: { mode: "large" } }]]), remove: async (uid) => { metadataOps.push(["remove", uid]); } };
+  runtime.extensionAPI = { settings: { get: () => null, set: async (key, value) => writes.push([key, value]), panel: { create: async () => {} } } };
+
+  // Simulate a previously registered large mount that the gate-turnoff must tear down without touching files.
+  const disposals = [];
+  runtime.largeMounts.set("anchorL1", { dispose: ({ keepStore = false } = {}) => { disposals.push({ uid: "anchorL1", keepStore }); }, root: { isConnected: true }, store: { disposed: false } });
+  // panel.create is called once at panel rebuild by applyLargeGridGateChange.
+  let panelCreates = 0;
+  runtime.rebuildPanel = () => { panelCreates += 1; };
+
+  // Start with the gate ON, then flip to OFF through the panel-application path.
+  refreshSettingsCache(makeApi({ values: { "experimental-large-grid": true } }).api, makeStorage());
+  assert.equal(largeGridEnabled(), true);
+  settingsCache.set("experimental-large-grid", false);
+  applySettingsChange(SETTINGS["experimental-large-grid"], false);
+
+  assert.equal(largeGridEnabled(), false, "the gate is now OFF after applying the false value");
+  assert.equal(panelCreates, 1, "rebuildPanel ran once during the toggle");
+  assert.equal(runtime.largeMounts.size, 0, "the large-mount registry is cleared");
+  assert.deepEqual(disposals, [{ uid: "anchorL1", keepStore: true }], "every registered large mount was disposed with keepStore");
+  assert.deepEqual(metadataOps, [], "metadata.remove must NOT run while the gate is off — files, manifests, and metadata entries are preserved");
+});
+
+test("flipping the experimental-large-grid switch via the panel onChange rebuilds the panel and shows or hides experimental rows", async (t) => {
+  const dom = installToastDom();
+  t.after(() => { dom.restore(); clearRegistries(); settingsCache.clear(); runtime.rebuildPanel = null; runtime.metadata = null; runtime.extensionAPI = null; });
+  clearRegistries();
+  const fake = makeApi({ values: {} });
+  const storage = makeStorage();
+  runtime.metadata = { entries: new Map(), has: () => false };
+
+  // initializeSettings seeds the live rows (including experimental-large-grid default false), builds
+  // the panel, and stores the rebuild function on runtime.rebuildPanel.
+  await initializeSettings(fake.api, { storage });
+  assert.equal(fake.counters.panel, 1, "the initial panel was built");
+  // Sanity check: the experimental-large-grid row shipped and the experimental LARGE_STORAGE rows did not.
+  const firstIds = fake.panels[0].settings.map((row) => row.id);
+  assert.ok(firstIds.includes("experimental-large-grid"), "the experimental-large-grid switch ships on the default panel");
+  for (const key of EXPERIMENTAL_KEYS) assert.ok(!firstIds.includes(key), `${key} stays hidden while the gate is off`);
+
+  // Flip the switch ON via the panel row's onChange — the rebuildPanel routine must fire and the
+  // experimental LARGE_STORAGE rows must surface in the rebuilt panel.
+  const row = fake.panels[0].settings.find((entry) => entry.id === "experimental-large-grid");
+  assert.ok(row, "the experimental-large-grid row is rendered");
+  row.action.onChange({ target: { checked: true } });
+  for (let tick = 0; tick < 6; tick += 1) await Promise.resolve();
+  assert.equal(largeGridEnabled(), true);
+  assert.equal(fake.counters.panel, 2, "the panel was rebuilt during the toggle");
+  const idsAfterOn = fake.panels[1].settings.map((row) => row.id);
+  for (const key of EXPERIMENTAL_KEYS) assert.ok(idsAfterOn.includes(key), `${key} ships as an experimental row while the gate is on`);
+  // Pending rows remain off the rebuilt panel.
+  for (const key of PENDING_KEYS) assert.ok(!idsAfterOn.includes(key), `${key} stays hidden while the gate is on`);
+
+  // Flip the switch OFF — experimental rows vanish again.
+  const offRow = fake.panels[1].settings.find((entry) => entry.id === "experimental-large-grid");
+  offRow.action.onChange({ target: { checked: false } });
+  for (let tick = 0; tick < 6; tick += 1) await Promise.resolve();
+  assert.equal(largeGridEnabled(), false);
+  assert.equal(fake.counters.panel, 3, "the panel was rebuilt a second time");
+  const idsAfterOff = fake.panels[2].settings.map((row) => row.id);
+  for (const key of EXPERIMENTAL_KEYS) assert.ok(!idsAfterOff.includes(key), `${key} is hidden again once the gate closes`);
 });

@@ -149,12 +149,14 @@ test("settings initialization performs zero writes when the graph forbids them",
   assert.deepEqual(writes, []);
   assert.equal(panels.length, 1);
   assert.equal(panels[0].tabTitle, "Roam Grid");
-  assert.ok(panels[0].settings.some((row) => row.id === "writes-native-budget"));
+  assert.ok(panels[0].settings.some((row) => row.id === "experimental-large-grid"), "the experimental-large-grid switch ships on the default panel");
+  assert.ok(!panels[0].settings.some((row) => row.id === "writes-native-budget"), "writes-native-budget is no longer a panel row (it went pending)");
 
   const writable = { settings: { get: () => null, set: async (key, value) => writes.push([key, value]), panel: { create: async () => {} } } };
   await initializeSettings(writable, { storage: null });
   assert.deepEqual(writes[0], ["settingsVersion", 2]);
-  assert.ok(writes.some(([key, value]) => key === "writes-native-budget" && value === 1200));
+  assert.ok(writes.some(([key, value]) => key === "experimental-large-grid" && value === false), "the new live experimental-large-grid switch is seeded with its default");
+  assert.ok(!writes.some(([key]) => key === "writes-native-budget"), "writes-native-budget is pending and must not be seeded");
   const seeded = writes.length;
 
   const alreadySet = { settings: { canSet: true, get: () => 500, set: async (key, value) => writes.push([key, value]), panel: { create: async () => {} } } };

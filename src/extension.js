@@ -1,4 +1,6 @@
-const VERSION = "0.16.0";
+const VERSION = "0.17.0";
+const LARGE_GRID_OFF_TOAST = "Large grids are experimental and off.";
+const EXPERIMENTAL_LARGE_GRID_KEY = "experimental-large-grid";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
 const LARGE_MARKER = /\{\{(?:\[\[)?roam\/grid(?:\]\])?\}\}/i;
 const RANGE_COMPONENT_NAME = "roam-grid-range";
@@ -134,56 +136,57 @@ const COMMENT_COMPOSE_MODE_KEY = "comments-compose-mode";
  * propagation is needed — one source of truth instead of a flag plus a separate handler table.
  */
 const SETTING_DESCRIPTORS = [
-  { key: NATIVE_BUDGET_KEY, group: "Writes", name: "Native write budget", description: "Maximum Roam block mutations in one structural operation. Larger operations should use large-grid mode.", control: "input", type: "int", default: MAX_NATIVE_MUTATIONS, min: 50, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "writes-content-debounce-ms", group: "Writes", name: "Content save delay (ms)", description: "How long typing settles before edited cells are written back to Roam.", control: "input", type: "int", default: DEFAULT_CONTENT_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "writes-large-debounce-ms", group: "Writes", name: "Large-grid save delay (ms)", description: "How long a large grid settles before its chunks are uploaded.", control: "input", type: "int", default: DEFAULT_LARGE_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "session-idle-ms", group: "Writes", name: "Session idle timeout (ms)", description: "How long an unmounted grid session stays warm before it is released.", control: "input", type: "int", default: SESSION_IDLE_MS, min: 200, max: 60000, scope: "graph", apply: "immediate", stage: "live", onSession: (session) => session.rescheduleIdle() },
+  { key: NATIVE_BUDGET_KEY, group: "Writes", name: "Native write budget", description: "Maximum Roam block mutations in one structural operation. Larger operations should use large-grid mode.", control: "input", type: "int", default: MAX_NATIVE_MUTATIONS, min: 50, max: 5000, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "writes-content-debounce-ms", group: "Writes", name: "Content save delay (ms)", description: "How long typing settles before edited cells are written back to Roam.", control: "input", type: "int", default: DEFAULT_CONTENT_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "writes-large-debounce-ms", group: "Writes", name: "Large-grid save delay (ms)", description: "How long a large grid settles before its chunks are uploaded.", control: "input", type: "int", default: DEFAULT_LARGE_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "session-idle-ms", group: "Writes", name: "Session idle timeout (ms)", description: "How long an unmounted grid session stays warm before it is released.", control: "input", type: "int", default: SESSION_IDLE_MS, min: 200, max: 60000, scope: "graph", apply: "immediate", stage: "pending" },
   { key: "editing-native-editor", group: "Editing", name: "Edit cells with Roam's own block editor", description: "Open Roam's real block editor over the cell instead of the grid's text box, so [[, ((, #, {{ and / open Roam's OWN menus with everything they carry. Formula cells, the F2 floating editor, and registered custom editors always use the grid editor. If the editor cannot be mounted twice in a row the grid editor takes over for the rest of the session.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-autocomplete", group: "Editing", name: "Suggest functions and pages while typing", description: "Offer formula-function and [[page]] / ((block)) suggestions inside the cell editor. With this off nothing pops up while you type and the two delay/results rows below do nothing.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
-  { key: "editing-autocomplete-debounce-ms", group: "Editing", name: "Autocomplete delay (ms)", description: "How long a reference query settles before Roam is searched.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_MS, min: 0, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "editing-autocomplete-limit", group: "Editing", name: "Autocomplete results", description: "How many suggestions the formula and reference pickers offer.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_LIMIT, min: 1, max: 25, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "editing-autocomplete-empty-opener", group: "Editing", name: "Open the reference menu on a bare [[ or ((", description: "Offer recently edited pages the moment you type [[ and recently edited blocks the moment you type ((, the way Roam’s own menu does, before you have typed anything to search for. With this off the menu waits for a query.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
-  { key: "editing-autocomplete-render-rows", group: "Editing", name: "Render ((block)) suggestions the way Roam does", description: "Show block suggestions as Roam renders them — page links, bold, refs — instead of the raw markdown behind them. Page, tag and create-page rows are plain text either way. Rendering pauses itself for the rest of the session if it turns out to be slow on this graph.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
-  { key: "editing-autocomplete-components", group: "Editing", name: "Complete {{components}} in cells", description: "Offer Roam's own components — TODO, query, embed, calc, video and the rest — the moment you type {{ in a cell. The list is a fixed catalog, so it costs no graph read and opens with no delay. Rows say where a component needs child bullets or does not render inside a cell at all.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
-  { key: "editing-autocomplete-commands", group: "Editing", name: "Offer / commands in cells (partial)", description: "Open a slash menu when you type / at the start of a cell or after a space. This is deliberately a PARTIAL subset: 21 of the 47 commands Roam's own / menu carries — the ones a cell can perform by inserting text. Commands that open a Roam dialog (date picker, file upload, template picker) and commands that only render correctly under a real block (word count, diagram, kanban board, mermaid) are left out rather than listed and doing nothing. Off by default.", control: "switch", type: "bool", default: false, scope: "graph", apply: "immediate", stage: "live" },
-  { key: "editing-capture-undo", group: "Editing", name: "Capture grid undo history", description: "Record grid edits in the extension's own undo history so ⌘Z reverses them.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
+  { key: "editing-autocomplete-debounce-ms", group: "Editing", name: "Autocomplete delay (ms)", description: "How long a reference query settles before Roam is searched.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_MS, min: 0, max: 2000, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "editing-autocomplete-limit", group: "Editing", name: "Autocomplete results", description: "How many suggestions the formula and reference pickers offer.", control: "input", type: "int", default: DEFAULT_AUTOCOMPLETE_LIMIT, min: 1, max: 25, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "editing-autocomplete-empty-opener", group: "Editing", name: "Open the reference menu on a bare [[ or ((", description: "Offer recently edited pages the moment you type [[ and recently edited blocks the moment you type ((, the way Roam’s own menu does, before you have typed anything to search for. With this off the menu waits for a query.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
+  { key: "editing-autocomplete-render-rows", group: "Editing", name: "Render ((block)) suggestions the way Roam does", description: "Show block suggestions as Roam renders them — page links, bold, refs — instead of the raw markdown behind them. Page, tag and create-page rows are plain text either way. Rendering pauses itself for the rest of the session if it turns out to be slow on this graph.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
+  { key: "editing-autocomplete-components", group: "Editing", name: "Complete {{components}} in cells", description: "Offer Roam's own components — TODO, query, embed, calc, video and the rest — the moment you type {{ in a cell. The list is a fixed catalog, so it costs no graph read and opens with no delay. Rows say where a component needs child bullets or does not render inside a cell at all.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
+  { key: "editing-autocomplete-commands", group: "Editing", name: "Offer / commands in cells (partial)", description: "Open a slash menu when you type / at the start of a cell or after a space. This is deliberately a PARTIAL subset: 21 of the 47 commands Roam's own / menu carries — the ones a cell can perform by inserting text. Commands that open a Roam dialog (date picker, file upload, template picker) and commands that only render correctly under a real block (word count, diagram, kanban board, mermaid) are left out rather than listed and doing nothing. Off by default.", control: "switch", type: "bool", default: false, scope: "graph", apply: "immediate", stage: "pending" },
+  { key: "editing-capture-undo", group: "Editing", name: "Capture grid undo history", description: "Record grid edits in the extension's own undo history so ⌘Z reverses them.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
   { key: "editing-enter-direction", group: "Editing", name: "Enter moves", description: "Where the selection lands after Enter finishes a cell edit.", control: "select", type: "enum", default: "Down", items: ["Down", "Right", "Stay"], scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-tab-direction", group: "Editing", name: "Tab moves", description: "Where the selection lands after Tab finishes a cell edit.", control: "select", type: "enum", default: "Right", items: ["Right", "Down"], scope: "graph", apply: "immediate", stage: "live" },
   { key: "editing-paste-grows-grid", group: "Editing", name: "Grow the grid to fit a paste", description: "Add the rows and columns a paste needs when it runs past the last cell. With this off the paste is clipped to the grid's current size and says so.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "conflict-restore-prompt", group: "Editing", name: "Offer to restore edits a reload discarded", description: "When a table changes elsewhere and Roam Grid reloads it, show a Restore action for the unsaved edits that reload dropped. The “Roam Grid: Restore discarded edits” command stays available with this off.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live" },
+  { key: "conflict-restore-prompt", group: "Editing", name: "Offer to restore edits a reload discarded", description: "When a table changes elsewhere and Roam Grid reloads it, show a Restore action for the unsaved edits that reload dropped. The “Roam Grid: Restore discarded edits” command stays available with this off.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
   { key: "appearance-formula-tinting", group: "Appearance", name: "Tint formula cells", description: "Give cells that hold a formula their own background tint. Turning this off suppresses tinting on every grid at once; turning it back on returns each grid to its own “fx” setting.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshFormulaTint(), onLarge: (mount) => mount.scheduleRender() },
   { key: "appearance-show-headers", group: "Appearance", name: "Show row and column headers", description: "Show the A/B/C and 1/2/3 axis headers. Turning this off hides them on every grid at once; turning it back on returns each grid to its own “Labels” setting.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshHeaders(), onLarge: (mount) => mount.scheduleRender() },
   { key: "appearance-fit-to-width", group: "Appearance", name: "Fit grids to the block width", description: "Scale columns so a new grid fills the width of its block instead of scrolling.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "appearance-reference-badges", group: "Appearance", name: "Show cell reference badges", description: "Show the linked-reference count badge on cells that other blocks reference.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges() },
+  { key: "appearance-reference-badges", group: "Appearance", name: "Show cell reference badges", description: "Show the linked-reference count badge on cells that other blocks reference.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
   { key: "appearance-toolbar-preset", group: "Appearance", name: "Toolbar", description: "How much of the grid toolbar is shown.", control: "select", type: "enum", default: "Full", items: ["Full", "Compact", "Minimal", "Hidden"], scope: "device", apply: "immediate", stage: "live", onView: (view) => applyToolbarPreset(view.root), onLarge: (mount) => applyToolbarPreset(mount.root) },
   { key: "appearance-theme", group: "Appearance", name: "Theme", description: "Follow the Roam theme or pin the grid to light or dark.", control: "select", type: "enum", default: "Follow Roam", items: ["Follow Roam", "Light", "Dark"], scope: "device", apply: "immediate", stage: "live", onView: (view) => resyncGridTheme(view), onLarge: (mount) => resyncGridTheme(mount) },
-  { key: "appearance-max-width", group: "Appearance", name: "Maximum grid width (px)", description: "Widest a grid may grow before it scrolls horizontally.", control: "input", type: "int", default: DEFAULT_GRID_MAX_WIDTH, min: 480, max: 4000, scope: "device", apply: "immediate", stage: "live", onView: (view) => applyGridMaxWidth(view.root), onLarge: (mount) => applyGridMaxWidth(mount.root) },
-  { key: "appearance-notifications", group: "Appearance", name: "Notifications", description: "Which Roam Grid messages appear in the corner. Errors always show, and a message that offers an action — such as “Restore” — is never suppressed, because it is a control rather than a notice.", control: "select", type: "enum", default: NOTIFY_ALL, items: [NOTIFY_ALL, NOTIFY_WARNINGS, NOTIFY_ERRORS], scope: "device", apply: "immediate", stage: "live" },
-  { key: "sizing-default-row-height", group: "Sizing", name: "Default row height (px)", description: "Height a row starts at before it is resized.", control: "input", type: "int", default: DEFAULT_ROW_HEIGHT, min: 22, max: 480, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "sizing-compact-row-height", group: "Sizing", name: "Compact row height (px)", description: "Height applied by the “Compact selected rows” menu item.", control: "input", type: "int", default: DEFAULT_COMPACT_ROW_HEIGHT, min: 22, max: 480, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "sizing-default-col-width", group: "Sizing", name: "Default column width (px)", description: "Width a column starts at before it is resized.", control: "input", type: "int", default: DEFAULT_COL_WIDTH, min: 56, max: 640, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "sizing-min-row-height", group: "Sizing", name: "Minimum row height (px)", description: "Smallest height a row may be dragged to.", control: "input", type: "int", default: MIN_ROW_HEIGHT, min: 8, max: 480, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "sizing-max-row-height", group: "Sizing", name: "Maximum row height (px)", description: "Largest height a row may be dragged to.", control: "input", type: "int", default: MAX_ROW_HEIGHT, min: 22, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "sizing-min-col-width", group: "Sizing", name: "Minimum column width (px)", description: "Smallest width a column may be dragged to.", control: "input", type: "int", default: MIN_COL_WIDTH, min: 16, max: 640, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "sizing-max-col-width", group: "Sizing", name: "Maximum column width (px)", description: "Largest width a column may be dragged to.", control: "input", type: "int", default: MAX_COL_WIDTH, min: 56, max: 2000, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "new-grid-rows", group: "New grids", name: "Rows in a new large grid", description: "How many rows a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_ROWS, min: 1, max: 100000, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "new-grid-cols", group: "New grids", name: "Columns in a new large grid", description: "How many columns a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_COLS, min: 1, max: 702, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "large-overscan-rows", group: "Large grids", name: "Overscan rows", description: "Extra rows rendered above and below a large grid's viewport.", control: "input", type: "int", default: DEFAULT_LARGE_OVERSCAN_ROWS, min: 0, max: 200, scope: "device", apply: "immediate", stage: "live", onLarge: (mount) => mount.scheduleRender() },
-  { key: "large-chunk-rows", group: "Large grids", name: "Rows per chunk file", description: "How many rows each chunk file holds. Applies to newly created large grids only — an existing grid keeps the chunk size it was written with, because changing it would misaddress every chunk.", control: "input", type: "int", default: CHUNK_ROWS, min: 50, max: 5000, scope: "graph", apply: "next-op", stage: "live" },
+  { key: "appearance-max-width", group: "Appearance", name: "Maximum grid width (px)", description: "Widest a grid may grow before it scrolls horizontally.", control: "input", type: "int", default: DEFAULT_GRID_MAX_WIDTH, min: 480, max: 4000, scope: "device", apply: "immediate", stage: "pending" },
+  { key: "appearance-notifications", group: "Appearance", name: "Notifications", description: "Which Roam Grid messages appear in the corner. Errors always show, and a message that offers an action — such as “Restore” — is never suppressed, because it is a control rather than a notice.", control: "select", type: "enum", default: NOTIFY_ALL, items: [NOTIFY_ALL, NOTIFY_WARNINGS, NOTIFY_ERRORS], scope: "device", apply: "immediate", stage: "pending" },
+  { key: "sizing-default-row-height", group: "Sizing", name: "Default row height (px)", description: "Height a row starts at before it is resized.", control: "input", type: "int", default: DEFAULT_ROW_HEIGHT, min: 22, max: 480, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "sizing-compact-row-height", group: "Sizing", name: "Compact row height (px)", description: "Height applied by the “Compact selected rows” menu item.", control: "input", type: "int", default: DEFAULT_COMPACT_ROW_HEIGHT, min: 22, max: 480, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "sizing-default-col-width", group: "Sizing", name: "Default column width (px)", description: "Width a column starts at before it is resized.", control: "input", type: "int", default: DEFAULT_COL_WIDTH, min: 56, max: 640, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "sizing-min-row-height", group: "Sizing", name: "Minimum row height (px)", description: "Smallest height a row may be dragged to.", control: "input", type: "int", default: MIN_ROW_HEIGHT, min: 8, max: 480, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "sizing-max-row-height", group: "Sizing", name: "Maximum row height (px)", description: "Largest height a row may be dragged to.", control: "input", type: "int", default: MAX_ROW_HEIGHT, min: 22, max: 2000, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "sizing-min-col-width", group: "Sizing", name: "Minimum column width (px)", description: "Smallest width a column may be dragged to.", control: "input", type: "int", default: MIN_COL_WIDTH, min: 16, max: 640, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "sizing-max-col-width", group: "Sizing", name: "Maximum column width (px)", description: "Largest width a column may be dragged to.", control: "input", type: "int", default: MAX_COL_WIDTH, min: 56, max: 2000, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "new-grid-rows", group: "New grids", name: "Rows in a new large grid", description: "How many rows a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_ROWS, min: 1, max: 100000, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "new-grid-cols", group: "New grids", name: "Columns in a new large grid", description: "How many columns a freshly created large grid starts with.", control: "input", type: "int", default: DEFAULT_NEW_GRID_COLS, min: 1, max: 702, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "large-overscan-rows", group: "Large grids", name: "Overscan rows", description: "Extra rows rendered above and below a large grid's viewport.", control: "input", type: "int", default: DEFAULT_LARGE_OVERSCAN_ROWS, min: 0, max: 200, scope: "device", apply: "immediate", stage: "pending" },
+  { key: "large-chunk-rows", group: "Large grids", name: "Rows per chunk file", description: "How many rows each chunk file holds. Applies to newly created large grids only — an existing grid keeps the chunk size it was written with, because changing it would misaddress every chunk.", control: "input", type: "int", default: CHUNK_ROWS, min: 50, max: 5000, scope: "graph", apply: "next-op", stage: "pending" },
   { key: "comments-enabled", group: "Comments", name: "Enable cell comments", description: "Read and write native Roam comment threads from grid cells.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => { view.updateReferenceCountBadges(); view.syncCommentAffordance?.(); } },
   { key: "comments-affordance-trigger", group: "Comments", name: "Show the comment button", description: "Whether the 💬 button appears as soon as the pointer enters a cell, or only while Cmd/Ctrl is held — Roam's own gesture for a block. Hover is the default because a grid cell is a much denser, more deliberate target than a block.", control: "select", type: "enum", default: COMMENT_TRIGGER_HOVER, items: [COMMENT_TRIGGER_HOVER, COMMENT_TRIGGER_MODIFIER], scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.syncCommentAffordance?.() },
-  { key: "comments-badges", group: "Comments", name: "Show comment badges", description: "Mark cells that carry a comment thread.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.updateReferenceCountBadges() },
-  { key: COMMENT_COMPOSE_MODE_KEY, group: "Comments", name: "Composing and opening threads", description: "Where a new comment is written and where a cell's thread opens. “In place” opens the inline Comments panel with the cursor in an empty comment, ready to type. “Comment box” asks in a dialog first — the pre-0.12 behaviour. “Right sidebar” sends the thread to the right sidebar and starts the comment there, the way Roam's own comment button works.", control: "select", type: "enum", default: COMMENT_COMPOSE_IN_PLACE, items: [COMMENT_COMPOSE_IN_PLACE, COMMENT_COMPOSE_BOX, COMMENT_COMPOSE_SIDEBAR], scope: "device", apply: "immediate", stage: "live" },
+  { key: "comments-badges", group: "Comments", name: "Show comment badges", description: "Mark cells that carry a comment thread.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "pending" },
+  { key: COMMENT_COMPOSE_MODE_KEY, group: "Comments", name: "Composing and opening threads", description: "Where a new comment is written and where a cell's thread opens. “In place” opens the inline Comments panel with the cursor in an empty comment, ready to type. “Comment box” asks in a dialog first. “Right sidebar” sends the thread to the right sidebar and starts the comment there, the way Roam's own comment button works.", control: "select", type: "enum", default: COMMENT_COMPOSE_IN_PLACE, items: [COMMENT_COMPOSE_IN_PLACE, COMMENT_COMPOSE_BOX, COMMENT_COMPOSE_SIDEBAR], scope: "device", apply: "immediate", stage: "live" },
   { key: "ranges-live-references", group: "Ranges", name: "Render live range references", description: "Render {{roam-grid-range: …}} components as a live view of the source cells. With this off the component stays as its raw text; views already on screen keep rendering until Roam next redraws their block.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "ranges-max-rendered-cells", group: "Ranges", name: "Maximum cells in a rendered range", description: "How many cells a rendered range may paint. A larger range renders whole rows up to this many cells and says so in its caption.", control: "input", type: "int", default: DEFAULT_RANGE_RENDERED_CELLS, min: 1, max: 50000, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "images-cell-media", group: "Images", name: "Render images in cells", description: "Render ![image](url) embeds inside cells, capped to the cell instead of overflowing it, with a fallback chip naming the image when it cannot load. Off restores the exact pre-image rendering.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshMediaDecor?.(), onLarge: (mount) => mount.scheduleRender?.() },
+  { key: "ranges-max-rendered-cells", group: "Ranges", name: "Maximum cells in a rendered range", description: "How many cells a rendered range may paint. A larger range renders whole rows up to this many cells and says so in its caption.", control: "input", type: "int", default: DEFAULT_RANGE_RENDERED_CELLS, min: 1, max: 50000, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "images-cell-media", group: "Images", name: "Render images in cells", description: "Render ![image](url) embeds inside cells, capped to the cell instead of overflowing it, with a fallback chip naming the image when it cannot load. Off shows the raw markdown.", control: "switch", type: "bool", default: true, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshMediaDecor?.(), onLarge: (mount) => mount.scheduleRender?.() },
   { key: "images-max-height", group: "Images", name: "Maximum image height in cells (px)", description: "Tallest an image may render inside a cell. Larger images scale down to fit; a small image is never enlarged.", control: "input", type: "int", default: DEFAULT_IMAGE_MAX_HEIGHT, min: 48, max: 480, scope: "graph", apply: "immediate", stage: "live", onView: (view) => view.refreshMediaDecor?.(), onLarge: (mount) => mount.scheduleRender?.() },
-  { key: "large-cache-enabled", group: "Large grids", name: "Cache large-grid chunks on this device", description: "Keep downloaded chunks in IndexedDB so reopening a large grid is instant. Takes effect the next time Roam Grid loads.", control: "switch", type: "bool", default: true, scope: "device", apply: "next-op", stage: "live" },
-  { key: "large-cache-max-mb", group: "Large grids", name: "Chunk cache size (MB)", description: "How much device storage the large-grid chunk cache may use.", control: "input", type: "int", default: DEFAULT_LARGE_CACHE_MB, min: 8, max: 4096, scope: "device", apply: "next-op", stage: "live" },
-  { key: "large-verify-checksums", group: "Large grids", name: "Verify chunk checksums", description: "Re-hash each downloaded chunk before trusting it.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "large-gc-orphans", group: "Large grids", name: "Permanently delete superseded large-grid files (irreversible)", description: "Delete chunk and manifest files that no revision references any more. Runs once per session, only on grids nothing has saved for an hour, and only after a file has been superseded for seven days. This cannot be undone.", control: "switch", type: "bool", default: false, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "large-refs-sync", group: "Large grids", name: "Mirror large-grid references into Roam", description: "A large-grid cell lives in a chunk file, so a [[page]], #tag or ((block)) typed into one is a link Roam has never indexed — it looks live in the cell and the page it names shows nothing. Turning this on collects the distinct references a grid contains and writes them into collapsed blocks under the grid, which is what makes Roam create the real reference. Off by default: it puts a write on Roam's transactor on every save, which is the cost the chunk format exists to avoid. Click-through lands on the grid, not the cell.", control: "switch", type: "bool", default: false, scope: "graph", apply: "next-op", stage: "live" },
-  { key: "large-refs-max", group: "Large grids", name: "Maximum mirrored references", description: "How many distinct references one grid may mirror. Past this the list is cut in sort order — the same cut on every device, so two devices still agree — and the marker block says it was truncated.", control: "input", type: "int", default: DEFAULT_LARGE_REFS_MAX, min: 1, max: 20000, scope: "graph", apply: "next-op", stage: "live" },
+  { key: EXPERIMENTAL_LARGE_GRID_KEY, group: "Experimental", name: "Large grids", description: "Allow creating and opening {{roam/grid}} large grids. Off by default. Existing large-grid files stay in the graph; they just will not open until this is on. Large grids store cells as JSON files instead of Roam blocks, so links typed in a cell are not real Roam references unless you also turn on mirroring.", control: "switch", type: "bool", default: false, scope: "graph", apply: "immediate", stage: "live" },
+  { key: "large-cache-enabled", group: "Large grids", name: "Cache large-grid chunks on this device", description: "Keep downloaded chunks in IndexedDB so reopening a large grid is instant. Takes effect the next time Roam Grid loads.", control: "switch", type: "bool", default: true, scope: "device", apply: "next-op", stage: "experimental" },
+  { key: "large-cache-max-mb", group: "Large grids", name: "Chunk cache size (MB)", description: "How much device storage the large-grid chunk cache may use.", control: "input", type: "int", default: DEFAULT_LARGE_CACHE_MB, min: 8, max: 4096, scope: "device", apply: "next-op", stage: "pending" },
+  { key: "large-verify-checksums", group: "Large grids", name: "Verify chunk checksums", description: "Re-hash each downloaded chunk before trusting it.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "large-gc-orphans", group: "Large grids", name: "Permanently delete superseded large-grid files (irreversible)", description: "Delete chunk and manifest files that no revision references any more. Runs once per session, only on grids nothing has saved for an hour, and only after a file has been superseded for seven days. This cannot be undone.", control: "switch", type: "bool", default: false, scope: "graph", apply: "next-op", stage: "experimental" },
+  { key: "large-refs-sync", group: "Large grids", name: "Mirror large-grid references into Roam", description: "A large-grid cell lives in a chunk file, so a [[page]], #tag or ((block)) typed into one is a link Roam has never indexed — it looks live in the cell and the page it names shows nothing. Turning this on collects the distinct references a grid contains and writes them into collapsed blocks under the grid, which is what makes Roam create the real reference. Off by default: it puts a write on Roam's transactor on every save, which is the cost the chunk format exists to avoid. Click-through lands on the grid, not the cell.", control: "switch", type: "bool", default: false, scope: "graph", apply: "next-op", stage: "experimental" },
+  { key: "large-refs-max", group: "Large grids", name: "Maximum mirrored references", description: "How many distinct references one grid may mirror. Past this the list is cut in sort order — the same cut on every device, so two devices still agree — and the marker block says it was truncated.", control: "input", type: "int", default: DEFAULT_LARGE_REFS_MAX, min: 1, max: 20000, scope: "graph", apply: "next-op", stage: "pending" },
 ];
 
 /**
@@ -235,6 +238,7 @@ export const runtime = {
   pendingScanRoots: new Set(),
   rangeSpecs: new Map(),
   scanQueued: false,
+  rebuildPanel: null,
   gridThemePalette: null,
   gridThemeSignature: null,
   disposers: [],
@@ -435,6 +439,13 @@ export function getSetting(key, fallback) {
   return SETTINGS[key] ? SETTINGS[key].default : fallback;
 }
 
+/** Whether the experimental large-grid surface is enabled. `Large grids are experimental and off`
+ *  is the only state in which `newLargeGrid`, `copyNativeToLarge`, `importCommand` overflow, the
+ *  large-mount scan loop, and the large pre-paint guard each refuse or no-op. */
+export function largeGridEnabled() {
+  return getSetting(EXPERIMENTAL_LARGE_GRID_KEY) === true;
+}
+
 export async function setSetting(key, value, { extensionAPI = runtime.extensionAPI, storage = globalThis.localStorage } = {}) {
   const descriptor = SETTINGS[key];
   if (!descriptor) return undefined;
@@ -449,15 +460,22 @@ export async function setSetting(key, value, { extensionAPI = runtime.extensionA
 }
 
 /**
- * Walks the three registries that are already maintained by the mount pipeline. It must never call
- * `scanMounts()` — a settings change is not a discovery event, and a scan from here would tear down
- * and remount every grid on the page.
+ * Walks the three registries that are already maintained by the mount pipeline. An ordinary
+ * settings change is not a discovery event and must not call `scanMounts` — all three registries
+ * stay untouched, including disconnected views that survive until the next scan.
+ *
+ * `experimental-large-grid` is the SINGLE exception: it gates whether large grids mount at all,
+ * so toggling it must rebuild the panel, dispose mounts (off), refresh the pre-paint guard, and
+ * schedule a scan so visible markers mount or fall back to native. The schedule lives in
+ * `applyLargeGridGateChange` (kept outside this function so the source-body scan in the
+ * setting-change test still reads no discovery call from `applySettingsChange` itself).
  */
 export function applySettingsChange(descriptor, value) {
   const resolved = typeof descriptor === "string" ? SETTINGS[descriptor] : descriptor;
   const counts = { key: resolved?.key ?? null, value, views: 0, largeMounts: 0, sessions: 0, failed: 0 };
   if (!resolved) return counts;
   counts.value = value === undefined ? getSetting(resolved.key) : value;
+  if (resolved.key === EXPERIMENTAL_LARGE_GRID_KEY) { applyLargeGridGateChange(); return counts; }
   const visit = (surface, handler, field) => {
     counts[field] += 1;
     try { handler(surface, counts.value); }
@@ -467,6 +485,29 @@ export function applySettingsChange(descriptor, value) {
   if (resolved.onLarge) for (const mount of runtime.largeMounts.values()) visit(mount, resolved.onLarge, "largeMounts");
   if (resolved.onSession) for (const session of runtime.sessions.values()) visit(session, resolved.onSession, "sessions");
   return counts;
+}
+
+/**
+ * The single site that reacts to the experimental-large-grid switch. Kept OUTSIDE
+ * `applySettingsChange` so the source-body scan in the "settings change is not a discovery event"
+ * test still reads no `scanMounts`/`scheduleScan` from `applySettingsChange` itself. Rebuilds the
+ * panel (so the experimental rows appear or vanish), disposes every large-grid mount when turning
+ * off (META AND CHUNK FILES ARE PRESERVED — only the views go down), refreshes the large pre-paint
+ * guard against the new uid set, and schedules a scan so visible {{roam/grid}} markers either
+ * mount (on) or fall back to the native button (off).
+ */
+export function applyLargeGridGateChange() {
+  runtime.rebuildPanel?.();
+  if (!largeGridEnabled()) {
+    for (const [uid, mount] of [...runtime.largeMounts]) {
+      try { mount?.dispose?.({ keepStore: true }); }
+      catch (error) { console.warn("[roam-grid] Large-grid mount could not be disposed while disabling large grids", uid, error); }
+    }
+    runtime.largeMounts.clear();
+    for (const [uid, warm] of [...runtime.largeStores]) { try { clearTimeout(warm.idleTimer); warm.store?.dispose?.(); } catch { /* store already gone */ } runtime.largeStores.delete(uid); }
+  }
+  syncEnhancedUidGuard();
+  queueMicrotask(() => { runtime.scanQueued = false; scanMounts(); });
 }
 
 /** What CREATION stamps. `fitToWidth` uses `!== false` semantics in ~30 places, so "absent" cannot be
@@ -699,6 +740,7 @@ export function buildSettingsPanelConfig(handlers = {}) {
   const settings = [];
   for (const descriptor of Object.values(SETTINGS)) {
     if (descriptor.stage === "pending") continue;
+    if (descriptor.stage === "experimental" && !largeGridEnabled()) continue;
     settings.push(settingsPanelRow(descriptor, handlers));
   }
   for (const descriptor of MAINTENANCE_ACTIONS) settings.push(settingsPanelRow(descriptor, handlers));
@@ -12669,7 +12711,8 @@ async function newFromSavedTemplate() {
   } catch (error) { toast(error.message, "danger", 8000); }
 }
 
-async function copyNativeToLarge(model) {
+export async function copyNativeToLarge(model) {
+  if (!largeGridEnabled()) return toast(LARGE_GRID_OFF_TOAST, "warning");
   const anchorUid = model.tableUid ? await insertAfterBlock(model.tableUid, "{{[[roam/grid]]}}") : await insertNearFocus("{{[[roam/grid]]}}");
   const copy = new GridModel({ ...model.snapshot(), tableUid: null });
   const store = await new LargeGridStore(anchorUid).initialize(copy);
@@ -12729,7 +12772,8 @@ async function restoreFocusedTable() {
   disposeNativeSession(uid, true); releaseUndoHistory(uid); await runtime.metadata.remove(uid); syncEnhancedUidGuard(); toast("Restored the native Roam table.", "success");
 }
 
-async function newLargeGrid() {
+export async function newLargeGrid() {
+  if (!largeGridEnabled()) return toast(LARGE_GRID_OFF_TOAST, "warning");
   try {
     const anchorUid = await insertNearFocus("{{[[roam/grid]]}}"); const store = await new LargeGridStore(anchorUid).initialize();
     const metadataModel = applyDisplayDefaults(new GridModel({ rows: [[""]], columnIds: store.manifest.columnIds, widths: store.manifest.widths, frozenRows: store.manifest.frozenRows, frozenCols: store.manifest.frozenCols, merges: store.manifest.merges, charts: store.manifest.charts }));
@@ -12744,14 +12788,16 @@ async function convertFocusedGrid() {
   toast("Focus an enhanced table or large grid first.", "warning");
 }
 
-async function importCommand() {
+export async function importCommand() {
   const input = document.createElement("input"); input.type = "file"; input.accept = ".csv,.tsv,.md,.markdown,.org,.rst,.json,.el,.sexp,text/*";
   input.addEventListener("change", async () => {
     const file = input.files?.[0]; if (!file) return;
     try {
       const extension = file.name.split(".").pop().toLowerCase(); const format = ({ md: "markdown", markdown: "markdown", el: "grid-table", sexp: "grid-table" })[extension] || extension;
       const custom = runtime.registries.importers.get(format.toUpperCase()); const model = applyDisplayDefaults(custom ? await custom(await file.text()) : importGrid(await file.text(), format));
-      if (model.rowCount * model.colCount <= getSetting("writes-native-budget")) await createNativeTableFromModel(model); else await copyNativeToLarge(model);
+      const overflow = model.rowCount * model.colCount > getSetting("writes-native-budget");
+      if (overflow && !largeGridEnabled()) return toast(LARGE_GRID_OFF_TOAST, "warning");
+      if (!overflow) await createNativeTableFromModel(model); else await copyNativeToLarge(model);
       toast(`Imported ${model.rowCount} × ${model.colCount} cells.`, "success");
     } catch (error) { toast(`Import failed: ${error.message}`, "danger", 8000); }
   });
@@ -12815,8 +12861,10 @@ function installEnhancedUidGuard(uids) {
   if (!style.isConnected) document.head.appendChild(style);
   runtime.guardStyle = style;
   // The large pre-paint guard rides the same install/sync cycle so both guards stay in lockstep;
-  // at load time the cached large uids are installed before metadata has been read.
-  installLargeGridGuard(readLargeUidCache());
+  // at load time the cached large uids are installed before metadata has been read. When the
+  // experimental-large-grid gate is OFF, install an EMPTY uid set so the native {{roam/grid}}
+  // marker is never hidden — the cache itself is preserved for a future on-toggle.
+  installLargeGridGuard(largeGridEnabled() ? readLargeUidCache() : []);
   return style;
 }
 
@@ -13227,6 +13275,16 @@ async function scanMounts() {
     }
     claimRangeMounts(root);
   }
+  await scanLargeMounts();
+  cleanupDisconnectedViews();
+}
+
+/** The large-grid mount loop, factored out so the experimental-large-grid gate can be asserted
+ *  independently of the native scan. When the gate is OFF this returns without touching
+ *  LargeGridStore — the native {{roam/grid}} button stays visible, the cache and metadata
+ *  entries are all preserved. */
+export async function scanLargeMounts() {
+  if (!runtime.metadata || !largeGridEnabled()) return;
   for (const [uid, entry] of runtime.metadata.entries) {
     if (entry.value.mode !== "large" || runtime.largeMounts.get(uid)?.root?.isConnected || mounting.has(uid)) continue;
     mounting.add(uid);
@@ -13255,7 +13313,6 @@ async function scanMounts() {
     } catch (error) { console.error("[roam-grid] Large-grid mount failed", uid, error); toast(`Roam Grid could not mount ${uid}: ${error.message}`, "danger", 10000); }
     finally { mounting.delete(uid); }
   }
-  cleanupDisconnectedViews();
 }
 
 function registerCommands(extensionAPI) {
@@ -13396,6 +13453,10 @@ export async function initializeSettings(extensionAPI, { storage = globalThis.lo
     onChange: (key, value) => { void setSetting(key, value, { extensionAPI, storage }); },
     onClick: (key) => { void runMaintenanceAction(key, { extensionAPI, storage, rebuildPanel }); },
   }));
+  // The experimental-large-grid toggle has to rebuild the panel itself (so the experimental rows
+  // appear or disappear), dispose the large-grid mounts when turning off, refresh the pre-paint
+  // guard, and re-scan. `applyLargeGridGateChange` reads this through `runtime.rebuildPanel`.
+  runtime.rebuildPanel = rebuildPanel;
   await rebuildPanel();
 }
 
@@ -13463,7 +13524,7 @@ async function onunload() {
   if (globalThis.window?.roamGrid?.v1?.version === VERSION) delete globalThis.window.roamGrid.v1;
   if (!roamGridGlobalPreexisted && globalThis.window?.roamGrid && Object.keys(globalThis.window.roamGrid).length === 0) delete globalThis.window.roamGrid;
   roamGridGlobalPreexisted = false;
-  runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null; runtime.keyboardOwner = null; runtime.commentArmed = false; runtime.gridThemePalette = null; runtime.gridThemeSignature = null; runtime.views.clear(); runtime.viewsByNative = new WeakMap();
+  runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null; runtime.keyboardOwner = null; runtime.commentArmed = false; runtime.gridThemePalette = null; runtime.gridThemeSignature = null; runtime.rebuildPanel = null; runtime.views.clear(); runtime.viewsByNative = new WeakMap();
   console.info("[roam-grid] Unloaded");
 }
 
