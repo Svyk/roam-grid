@@ -118,7 +118,7 @@ Steps 1–9 are done in this repository. Step 10 is an external action and has
    to stay documented in `docs/ARCHITECTURE.md`.
 10. **Open the PR against `Roam-Research/roam-depot`** — opened
     https://github.com/Roam-Research/roam-depot/pull/1414 on 2026-08-13,
-    pinning `source_commit` to `f36cb28af188b053625553b88aa1815a115a3d7c`.
+    pinning `source_commit` to `9f9c27e8d017a46a31369cacc5968d39db0b2844`.
 
 ## Repository facts worth knowing before submitting
 
