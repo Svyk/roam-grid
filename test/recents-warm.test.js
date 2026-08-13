@@ -58,7 +58,7 @@ function restoreGlobals(saved) {
   }
 }
 
-test("onload schedules an idle warm that fills both recents caches, and unload disposes every handle", async (t) => {
+test("onload schedules no recents warm; the warm arms on the first grid mount and unload disposes every handle", async (t) => {
   const saved = saveGlobals();
   t.after(() => { resetRoamRecents(); restoreGlobals(saved); });
   t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -70,16 +70,22 @@ test("onload schedules an idle warm that fills both recents caches, and unload d
     ui: { commandPalette: { addCommand() {} }, slashCommand: { addCommand() {} } },
   };
   await extension.onload({ extensionAPI });
-  assert.deepEqual(counts, { page: 0, block: 0 }, "the warm is scheduled, not run inline during load");
-  assert.ok(pendingTimers.size >= 1, "the fallback warm timer is lifecycle-tracked");
+  // FIX-5: onload no longer arms the recents warm — an idle graph with the extension installed pays
+  // zero Datascript scans. No fallback timer is lifecycle-tracked from load.
+  assert.deepEqual(counts, { page: 0, block: 0 }, "onload does not run or schedule any recents query");
+  assert.equal(pendingTimers.size, 0, "no warm timer is tracked from onload");
 
+  // The warm arms from the first grid mount (see mountNativeInstance / scanLargeMounts), not onload.
+  gridSessions.set("fake-native-uid", {});
+  scheduleRecentsWarm();
   t.mock.timers.tick(2500);
-  assert.deepEqual(counts, { page: 1, block: 1 }, "the warm ran both recents queries off the critical path");
+  assert.deepEqual(counts, { page: 1, block: 1 }, "the warm ran both recents queries once a grid is mounted");
   assert.equal(recentsCacheReady("page"), true);
   assert.equal(recentsCacheReady("block"), true);
   assert.equal(pendingTimers.size, 1, "the re-warm chain is armed after a successful warm");
 
-  // No grid is mounted in this test, so the re-warm must fire once and stop the chain.
+  // No grid stays mounted for the whole tick. The next re-warm fires, sees no mount, and stops.
+  gridSessions.clear();
   t.mock.timers.tick(55_000);
   assert.deepEqual(counts, { page: 1, block: 1 }, "an idle graph with no grids runs no perpetual background queries");
   assert.equal(pendingTimers.size, 0, "the chain stopped instead of rescheduling");
@@ -111,13 +117,15 @@ test("an idle-callback warm runs on the callback and registers no timer", async 
   assert.deepEqual(cancelled, [9], "a pending idle handle is cancelled on dispose");
 });
 
-test("a background warm never sets recentsDisabled and records its outcome in __rgDiag", (t) => {
+test("a background warm never disarms but an over-budget warm stops the re-warm chain (FIX-5c)", (t) => {
   const saved = saveGlobals();
   t.after(() => { resetRoamRecents(); restoreGlobals(saved); });
   installRecentsApi();
   let clock = 0;
-  globalThis.performance = { now: () => (clock += 500) };
-  assert.equal(warmRecentsCache({ api: globalThis.window.roamAlphaAPI }), true);
+  globalThis.performance = { now: () => (clock += 500) }; // SLOW: 1000ms per fetch, over the 250ms budget
+  // FIX-5c: an over-budget background warm still never disarms (off the critical path), but it now
+  // returns false so the re-warm chain does not keep re-running the slow query every TTL-lead ms.
+  assert.equal(warmRecentsCache({ api: globalThis.window.roamAlphaAPI }), false, "an over-budget warm stops the re-warm chain");
   assert.equal(recentsDisabled(), false, "a slow warm is off the critical path, so it never disarms");
   const diag = globalThis.window.__rgDiag?.recentsWarm;
   assert.ok(diag, "the warm recorded forensics");

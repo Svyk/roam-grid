@@ -644,3 +644,43 @@ test("a merge-covered overlay commit keeps the model at the written value", asyn
   clearTimeout(session.saveTimer);
   assert.equal(model.getRaw(0, 1), "typed", "the model matches the graph and base after the failed undo entry");
 });
+
+/* --------------------------------------------------------------------------------------------
+ * FIX-3 — a pull-watch firing mid-saveContent must be deferred for the whole queue turn, so it
+ * cannot replaceModel / clear the dirty cells the save is settling, or let the in-flight write
+ * clobber a freshly adopted tree. The deferred watch replays through the same handler once the
+ * save settles, reconciling to whatever the graph holds.
+ * ------------------------------------------------------------------------------------------ */
+test("a pull-watch firing mid-saveContent is deferred so it cannot clobber the adopted tree (FIX-3)", async (t) => {
+  const tree = makeTree();
+  const { calls, emit } = installApi(t, tree);
+  const adapter = new NativeTableAdapter(tree.uid, { get: () => null, set: async () => {} });
+  const model = adapter.load();
+  const uid = model.getCell(1, 1).uid;
+  const events = [];
+  adapter.watchExternal((_m, event) => events.push(event));
+  calls.q = 0;
+
+  // Start the save; let the queued task run to its first `await updateBlock` so contentSaving is true.
+  const save = adapter.saveContent([{ uid, baseRaw: "1:1", raw: "fast", revision: 1 }]);
+  await Promise.resolve();
+
+  // A concurrent external edit lands on the SAME cell while the save is in flight.
+  const before = structuredClone(tree);
+  const after = structuredClone(tree);
+  flatten(after).get(uid).node.string = "someone else";
+  emit(before, after);
+  assert.equal(events.length, 0, "the mid-save pull-watch was deferred — the session callback did not replaceModel or clear dirty mid-flight");
+
+  await save;
+  assert.equal(adapter.baseCells.get(uid).raw, "fast", "the save's patchBaseContent settled the base to the saved value");
+  assert.deepEqual(calls.updates, [{ uid, string: "fast" }], "the save wrote its own value to the graph, not the concurrent external one");
+
+  // The deferred watch replays AFTER the queue turn ends (setTimeout 0), reconciling to the external
+  // tree instead of being lost or clobbering the save mid-flight.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(events.length, 1, "the deferred watch replayed once the save settled");
+  assert.equal(events[0].type, "content");
+  assert.equal(events[0].structural, false);
+  assert.ok(events[0].changes.some((change) => change.uid === uid && change.raw === "someone else"), "the replay carries the concurrent external edit");
+});

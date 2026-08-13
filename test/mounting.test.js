@@ -36,40 +36,43 @@ test("graph-scoped enhanced UID cache is sorted, validated, and corruption-safe"
 
 test("pre-paint guard covers canonical and referenced instances without collapsing layout", () => {
   const css = enhancedUidGuardCss(new Set(["NgPxePzgl", "abc"]));
-  assert.match(css, /\[id\$="NgPxePzgl"\] \.rm-table/);
   assert.match(css, /\.rm-block-ref\[data-uid="NgPxePzgl"\] \.rm-table/);
+  assert.match(css, /\[data-uid="NgPxePzgl"\] \.rm-table/);
   assert.match(css, /visibility: hidden !important/);
   assert.doesNotMatch(css, /display:\s*none/);
+  // FIX-6: the [id$] suffix-match family is gone (rule 15 shape — exact [data-uid] only).
+  assert.doesNotMatch(css, /\[id\$/);
 });
 
-test("pre-paint guard emits exactly three selector families per uid, including bare data-uid surfaces", () => {
+test("pre-paint guard emits exactly two selector families per uid, narrowed to exact data-uid shapes", () => {
   const css = enhancedUidGuardCss(new Set(["NgPxePzgl", "abc"]));
   const selectors = css.slice(0, css.indexOf("{")).split(",").map((selector) => selector.trim()).filter(Boolean);
-  assert.equal(selectors.length, 6);
+  assert.equal(selectors.length, 4);
   for (const uid of ["NgPxePzgl", "abc"]) {
-    assert.ok(selectors.includes(`[id$="${uid}"] .rm-table:not(.rg-native-hidden)`));
     assert.ok(selectors.includes(`.rm-block-ref[data-uid="${uid}"] .rm-table:not(.rg-native-hidden)`));
     assert.ok(selectors.includes(`[data-uid="${uid}"] .rm-table:not(.rg-native-hidden)`));
+    assert.equal(selectors.some((selector) => selector.includes(`[id$="${uid}"]`)), false, "no suffix-match selector survives FIX-6");
   }
   assert.doesNotMatch(css, /display:\s*none/);
 });
 
 test("large-grid pre-paint guard targets the raw grid marker with a non-collapsing hide and the mount handoff", () => {
   const css = largeGridGuardCss(new Set(["uidLarge"]));
-  assert.match(css, /\[id\$="uidLarge"\] \.rm-xparser-default-grid:not\(\.rg-large-marker-hidden\)/);
   assert.match(css, /\.rm-block-ref\[data-uid="uidLarge"\] \.rm-xparser-default-grid:not\(\.rg-large-marker-hidden\)/);
+  assert.match(css, /\[data-uid="uidLarge"\] \.rm-xparser-default-grid:not\(\.rg-large-marker-hidden\)/);
   assert.match(css, /visibility: hidden !important/);
   assert.doesNotMatch(css, /display:\s*none/);
+  assert.doesNotMatch(css, /\[id\$/);
 });
 
-test("large-grid pre-paint guard emits three selector families per uid and caps over-budget sets", () => {
+test("large-grid pre-paint guard emits two selector families per uid and caps over-budget sets", () => {
   const css = largeGridGuardCss(new Set(["uidLarge", "otherLarge"]));
   const selectors = css.slice(0, css.indexOf("{")).split(",").map((selector) => selector.trim()).filter(Boolean);
-  assert.equal(selectors.length, 6);
+  assert.equal(selectors.length, 4);
   for (const uid of ["uidLarge", "otherLarge"]) {
-    assert.ok(selectors.includes(`[id$="${uid}"] .rm-xparser-default-grid:not(.rg-large-marker-hidden)`));
     assert.ok(selectors.includes(`.rm-block-ref[data-uid="${uid}"] .rm-xparser-default-grid:not(.rg-large-marker-hidden)`));
     assert.ok(selectors.includes(`[data-uid="${uid}"] .rm-xparser-default-grid:not(.rg-large-marker-hidden)`));
+    assert.equal(selectors.some((selector) => selector.includes(`[id$="${uid}"]`)), false, "no suffix-match selector survives FIX-6");
   }
   assert.doesNotMatch(css, /display:\s*none/);
 });

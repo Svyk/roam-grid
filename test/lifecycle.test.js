@@ -391,3 +391,50 @@ test("unload removes the window.roamGrid husk it created but keeps a pre-existin
     if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
   }
 });
+
+// FIX-1: onunload must isolate a throwing session/mount/store and still sweep later disposers and
+// open dialogs from a finally block — a disable/reload cannot strand pull-watches, command captures,
+// or an inert ::backdrop behind a .rg-lightbox when one view's dispose throws.
+test("onunload isolates throwing teardown steps and still sweeps later disposers and dialogs", async () => {
+  const previousDocument = globalThis.document;
+  const previousWindow = globalThis.window;
+  const swept = [];
+  const toasts = { remove: () => swept.push("toasts") };
+  const lightbox = { __rgDismiss: () => swept.push("lightbox"), remove() {} };
+  globalThis.document = { querySelectorAll: () => [toasts, lightbox] };
+  globalThis.window = { roamGrid: {} };
+  runtime.sessions.clear();
+  runtime.largeMounts.clear();
+  runtime.largeStores.clear();
+  runtime.disposers.length = 0;
+  const flushed = [];
+  const disposed = [];
+  runtime.sessions.set("throw-uid", { views: new Set(), flushBeforeUnload: async () => { flushed.push("throw"); throw new Error("flush boom"); }, dispose() { disposed.push("throw"); throw new Error("dispose boom"); } });
+  runtime.sessions.set("clean-uid", { views: new Set(), flushBeforeUnload: async () => { flushed.push("clean"); }, dispose() { disposed.push("clean"); } });
+  runtime.largeMounts.set("throw-mount", { dispose() { throw new Error("mount boom"); } });
+  runtime.largeStores.set("throw-store", { store: { dispose() { throw new Error("store boom"); } }, idleTimer: 1234567 });
+  const disposerOrder = [];
+  runtime.disposers.push(() => { disposerOrder.push("registered-before-throw"); });
+  try {
+    await extension.onunload();
+    // The throwing session's flush and dispose both ran (or attempted); the clean session's did too,
+    // and neither aborts the sweep.
+    assert.deepEqual(flushed.sort(), ["clean", "throw"], "every session's flushBeforeUnload was awaited, throwing or not");
+    assert.deepEqual(disposed.sort(), ["clean", "throw"], "every session's dispose was attempted, throwing or not");
+    assert.equal(runtime.sessions.size, 0, "every session entry is cleared even when its dispose threw");
+    assert.equal(runtime.largeMounts.size, 0, "large mounts are cleared despite a throwing mount");
+    assert.equal(runtime.largeStores.size, 0, "large stores are cleared despite a throwing store");
+    // A disposer registered BEFORE the run still fires from the finally sweep.
+    assert.deepEqual(disposerOrder, ["registered-before-throw"], "the disposer sweep ran in finally regardless of earlier throws");
+    // The dialog/backdrop sweep ran too — nothing is orphaned behind an inert ::backdrop.
+    assert.deepEqual(swept, ["toasts", "lightbox"], "toasts and an open lightbox are swept on unload");
+    assert.equal(runtime.disposers.length, 0, "the disposer list is drained");
+  } finally {
+    runtime.sessions.clear();
+    runtime.largeMounts.clear();
+    runtime.largeStores.clear();
+    runtime.disposers.length = 0;
+    if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
+    if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
+  }
+});

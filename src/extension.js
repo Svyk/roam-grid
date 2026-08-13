@@ -55,6 +55,13 @@ const RECENTS_BUDGET_MS = 250;
 // toward the streak — they run off the critical path, so they can only re-arm, never disarm.
 const RECENTS_DISARM_OVERRUNS = 2;
 const RECENT_BLOCK_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+// FIX-5: the page query used to return EVERY page in the graph (`[:where [?p :node/title ?title]`).
+// On a large graph that is a graph-wide Datascript scan paid at every warm and every bare `[[`
+// inside a grid. Bounding it by the same edit/time machinery the blocks query uses, with a wider
+// 90d window (pages are coarser-grained than blocks), keeps the returned set proportional to
+// recency instead of graph size. Accepted pages are still promoted from the accepted-page LRU ahead
+// of any graph rows, so a freshly created page never falls off the menu.
+const RECENT_PAGE_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
 const RECENT_ACCEPTED_PAGES = 25;
 // The idle warm pays the recents queries before the first bare opener does. 2.5 s is the fallback
 // when requestIdleCallback is missing; the re-warm fires 5 s ahead of TTL expiry so the cache never
@@ -756,8 +763,13 @@ export function enhancedUidGuardCss(uids) {
   }
   for (const uid of unique) {
     const escaped = cssAttributeValue(uid);
+    // FIX-6 (rule 15): drop the `[id$="<uid>"]` suffix-match family. A substring attribute match is
+    // the expensive selector SHAPE rule 15 calls out, and it sat in a document-global <style> for
+    // every keystroke restyle. The two exact `[data-uid]` families cover the surfaces the claim path
+    // matches against (`nativeTableInstanceInfo` resolves via `node.dataset.uid === uid`, falling
+    // back to `id.endsWith(uid)` only when no ancestor carries data-uid — the MutationObserver still
+    // claims such a surface on the next paint, so the worst case is one native frame, not data loss).
     selectors.push(
-      `[id$="${escaped}"] .rm-table:not(.rg-native-hidden)`,
       `.rm-block-ref[data-uid="${escaped}"] .rm-table:not(.rg-native-hidden)`,
       `[data-uid="${escaped}"] .rm-table:not(.rg-native-hidden)`,
     );
@@ -778,8 +790,10 @@ export function largeGridGuardCss(uids) {
   }
   for (const uid of unique) {
     const escaped = cssAttributeValue(uid);
+    // FIX-6: shares the enhanced guard's selector-shape fix — exact `[data-uid]` only, no `[id$]`
+    // suffix family. The large guard is already empty while experimental-large-grid is off; the
+    // shape change applies the same rule-15 narrowing when the gate opens.
     selectors.push(
-      `[id$="${escaped}"] .rm-xparser-default-grid:not(.rg-large-marker-hidden)`,
       `.rm-block-ref[data-uid="${escaped}"] .rm-xparser-default-grid:not(.rg-large-marker-hidden)`,
       `[data-uid="${escaped}"] .rm-xparser-default-grid:not(.rg-large-marker-hidden)`,
     );
@@ -3400,9 +3414,11 @@ export class NativeTableAdapter {
     this.lastWatchTree = null;
     this.selfWrites = new Map();
     this.structuralSaving = false;
+    this.contentSaving = false;
     this.deferredStructuralWatches = [];
     this.expectedStructuralTransitions = [];
     this.watchCallback = null;
+    this.watchHandler = null;
   }
 
   /** `defaults` is only ever supplied on a first enhancement, where there is no stored layout yet;
@@ -3509,7 +3525,12 @@ export class NativeTableAdapter {
     const handler = (before, after) => {
       const nextTree = normalizeTree(after);
       if (!nextTree) return;
-      if (this.structuralSaving) { this.deferredStructuralWatches.push(nextTree); return; }
+      // FIX-3: a content save holds the pull-watch off for the whole queue turn, exactly like a
+      // structural save. A watch firing mid-`updateBlock` used to replaceModel / clear the dirty
+      // cells the save is about to settle, which let the in-flight `patchBaseContent` overwrite a
+      // freshly adopted tree (including someone else's concurrent edit) and silently drop pending
+      // cells from the dirty queue. The replay is `saveContent`/`save`'s responsibility.
+      if (this.structuralSaving || this.contentSaving) { this.deferredStructuralWatches.push(nextTree); return; }
       const previousTree = normalizeTree(before) || this.lastWatchTree || this.baseTree;
       const structural = !previousTree || nativeStructureSignature(previousTree) !== nativeStructureSignature(nextTree);
       const previous = previousTree ? nativeCellIndex(previousTree) : new Map();
@@ -3532,6 +3553,7 @@ export class NativeTableAdapter {
       callback(model, { type: structural ? "structural" : "content", structural, changes: externalChanges, tree: nextTree });
     };
     roam().data.addPullWatch(pattern, entity, handler);
+    this.watchHandler = handler;
     this.watch = () => roam().data.removePullWatch(pattern, entity, handler);
     return this.watch;
   }
@@ -3583,6 +3605,11 @@ export class NativeTableAdapter {
         validation.push({ change, current });
       }
       const written = [];
+      // FIX-3: hold the pull-watch off for the whole write loop so a watch firing mid-`updateBlock`
+      // cannot replaceModel / clear the dirty cells the save is settling. Deferred watches replay
+      // through the same handler once the queue turn ends, reconciling to whatever the graph holds.
+      this.contentSaving = true;
+      this.deferredStructuralWatches = [];
       try {
         for (const item of validation) {
           this.recordSelfWrite(item.change.uid, item.current.raw, item.change.raw);
@@ -3606,6 +3633,16 @@ export class NativeTableAdapter {
           if (tree) this.adoptBaseTree(tree);
         } catch { /* preserve the last verified base when repull is unavailable */ }
         throw error;
+      } finally {
+        this.contentSaving = false;
+        const deferred = this.deferredStructuralWatches.splice(0);
+        if (deferred.length && this.watchHandler) {
+          const handler = this.watchHandler;
+          // Replay off the queue turn so a throw in the session callback cannot abort saveContent's
+          // return value. `before=null` makes the handler fall back to `lastWatchTree` (frozen while
+          // the watch was deferred) — our own echo is still absorbed via `recordSelfWrite`.
+          setTimeout(() => { for (const tree of deferred) handler(null, tree); }, 0);
+        }
       }
     });
   }
@@ -3779,7 +3816,7 @@ export class NativeTableAdapter {
     }
   }
 
-  dispose() { this.watchCallback = null; this.deferredStructuralWatches.length = 0; this.expectedStructuralTransitions.length = 0; this.selfWrites.clear(); return this.watch?.(); }
+  dispose() { this.watchCallback = null; this.watchHandler = null; this.contentSaving = false; this.deferredStructuralWatches.length = 0; this.expectedStructuralTransitions.length = 0; this.selfWrites.clear(); return this.watch?.(); }
 }
 
 /**
@@ -4339,6 +4376,22 @@ export class NativeGridSession {
     const patches = Array.isArray(patch) ? patch : [patch];
     const rowDeletion = patches.length > 0 && patches.every((item) => item?.op === "deleteRows");
     return this.commitMutation(sourceView, "External patch", () => applyPatchToModel(this.model, patch, false), patchChangesLayout(patch), { rowDeletion }).then(() => this.model.toJSON());
+  }
+
+  /**
+   * The unload path's only flush hook. The save debounce (DEFAULT_CONTENT_SAVE_MS) and any in-flight
+   * `contentSavePromise` would be torn down unreconciled by `dispose` — the last ~220ms of typing
+   * and a save still round-tripping would vanish on a Depot disable/reload. This awaits the
+   * in-flight save, then runs one final content/structural flush for whatever is still dirty; the
+   * session's own discard lane (`captureDiscardedEdits` → `rememberDiscardedEdits`) records
+   * anything that still cannot land — a gone table, a CONFLICT — so the value is restorable, never
+   * silently dropped. `dispose` clears `dirtyCells` as a backstop; this runs first (FIX-2). */
+  async flushBeforeUnload() {
+    if (this.disposed) return;
+    try { if (this.contentSavePromise) await this.contentSavePromise; } catch { /* the flush lane recorded the discard */ }
+    if (this.disposed) return;
+    if (this.structuralPending) { try { await this.flushSave(); } catch { /* discard recorded */ } }
+    else if (this.dirtyCells.size) { try { await this.flushContentSave(); } catch { /* discard recorded */ } }
   }
 
   dispose() {
@@ -6033,6 +6086,29 @@ export function isRoamBlockInput(target) { return Boolean(roamBlockInputFor(targ
 
 function isGridEditorInput(target) { return Boolean(target?.closest?.(".rg-editor,.rg-floating-editor-input,.rg-dialog-input")); }
 
+/** Any field the browser can edit text in — Roam's command palette, search, find, and settings rows
+ *  are ordinary `<input>/<textarea>`s, as are third-party popups. */
+function isEditableField(target) {
+  if (!target) return false;
+  const tag = target.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+  return Boolean(target.isContentEditable);
+}
+
+/** A focused field the grid does NOT own takes the keyboard back from a grid whose claim survived a
+ *  canvas click — Roam's palette/search/find/settings are ordinary `<input>`s, so without this ⌘Z
+ *  would still undo the grid the user can no longer see or focus. Grid-owned editors (in-cell
+ *  editor, dialog input) and Roam block inputs keep the grid; fields inside the owning root or one
+ *  of its `[data-rg-owner]` portals keep it too (FIX-4). */
+function focusedFieldOutsideOwner(target, owner) {
+  if (!isEditableField(target) || isGridEditorInput(target) || isRoamBlockInput(target)) return false;
+  const ownerRoot = owner?.view?.root;
+  if (ownerRoot?.contains?.(target)) return false;
+  const ownerUid = owner?.uid;
+  if (ownerUid && target.closest?.(`[data-rg-owner="${ownerUid}"]`)) return false;
+  return true;
+}
+
 export function onGlobalPointerDown(event) {
   const target = event?.target;
   const root = target?.closest?.(".rg-root");
@@ -6045,7 +6121,12 @@ export function onGlobalPointerDown(event) {
 }
 
 export function onGlobalFocusIn(event) {
-  if (isRoamBlockInput(event?.target)) releaseKeyboard();
+  if (isRoamBlockInput(event?.target)) return releaseKeyboard();
+  // FIX-4: a grid claim left over from a canvas click must not keep steering ⌘Z while the user
+  // focuses Roam's palette/search/find/settings (ordinary inputs the grid does not own). The grid's
+  // own editors and Roam block inputs are handled above and intentionally keep the grid.
+  const owner = runtime.keyboardOwner;
+  if (owner?.view && !owner.view.disposed && focusedFieldOutsideOwner(event?.target, owner)) return releaseKeyboard();
 }
 
 /**
@@ -6064,6 +6145,9 @@ export function onGlobalKeydown(event) {
   if (!undoCombo) return owner.view.onKeydown(event);
   if (isRoamBlockInput(event.target)) return;
   if (isGridEditorInput(event.target)) return;
+  // FIX-4: a stray claim (a focusin race, or a field that never fired focusin) must not let ⌘Z
+  // undo the grid while the user is typing into Roam's palette/search/settings or a third-party input.
+  if (focusedFieldOutsideOwner(event.target, owner)) return;
   const method = event.shiftKey ? "redo" : "undo";
   if (typeof owner.view[method] !== "function") return owner.view.onKeydown(event);
   event.preventDefault();
@@ -7918,7 +8002,7 @@ export function withCreatePageSuggestion(context, suggestions) {
   return rows;
 }
 
-const RECENT_PAGES_QUERY = '[:find ?title ?uid ?time :where [?p :node/title ?title] [?p :block/uid ?uid] [(get-else $ ?p :edit/time 0) ?time]]';
+const RECENT_PAGES_QUERY = '[:find ?title ?uid ?time :in $ ?since :where [?p :node/title ?title] [?p :block/uid ?uid] [(get-else $ ?p :edit/time 0) ?time] [(> ?time ?since)]]';
 const RECENT_BLOCKS_QUERY = '[:find ?uid ?string ?time :in $ ?since :where [?b :edit/time ?time] [(> ?time ?since)] [?b :block/string ?string] [(!= ?string "")] [?b :block/uid ?uid]]';
 
 /** The one recency signal this extension owns: pages it inserted itself. Promoted ahead of the
@@ -7945,7 +8029,7 @@ function readRecentRows(type, api, now, { background = false, force = false } = 
   if (!force && cached && now - cached.at < RECENTS_TTL_MS) return cached.rows;
   const clock = () => globalThis.performance?.now?.() ?? Date.now();
   const started = clock();
-  const rows = type === "page" ? api.q(RECENT_PAGES_QUERY) : api.q(RECENT_BLOCKS_QUERY, now - RECENT_BLOCK_WINDOW_MS);
+  const rows = type === "page" ? api.q(RECENT_PAGES_QUERY, now - RECENT_PAGE_WINDOW_MS) : api.q(RECENT_BLOCKS_QUERY, now - RECENT_BLOCK_WINDOW_MS);
   const elapsed = clock() - started;
   const value = [...(rows || [])];
   roamRecentsCache.set(key, { at: now, rows: value });
@@ -7980,15 +8064,21 @@ function noteRecentsFetch(type, elapsed, background) {
       console.info(`[roam-grid] Recent ${label} took ${Math.round(elapsed)}ms, over the ${RECENTS_BUDGET_MS}ms budget ${RECENTS_DISARM_OVERRUNS} fetches in a row. Bare [[ and (( open on cached recents only until a fetch comes back under budget; typing a query still searches.`);
     }
   }
+  runtime.recentsLastOverBudget = elapsed > RECENTS_BUDGET_MS;
   const target = globalThis.window;
   if (target) (target.__rgDiag ||= {}).recentsBudget = { disarmed: runtime.recentsDisabled, overruns: runtime.recentsOverruns, lastMs: Math.round(elapsed), rearmedAt: runtime.recentsRearmedAt };
 }
 
 /** Warms both recents caches off the critical path. Returns false when nothing could run, which is
- *  how the scheduler knows not to keep a re-warm chain alive against a dead API. */
+ *  how the scheduler knows not to keep a re-warm chain alive against a dead API — and, since FIX-5,
+ *  against a graph whose last background fetch was over budget, so a slow recents query cannot keep
+ *  re-running every TTL-lead ms while a grid is mounted. The accepted-page LRU stays promoted
+ *  regardless; the cache still settles so a future bare opener inside the TTL hits the rows already
+ *  paid for. */
 export function warmRecentsCache({ api = globalThis.window?.roamAlphaAPI, now = Date.now(), force = false } = {}) {
   if (typeof api?.q !== "function") return false;
   let warmed = true;
+  let anyOverBudget = false;
   for (const type of ["page", "block"]) {
     try { readRecentRows(type, api, now, { background: true, force }); }
     catch (error) {
@@ -7996,8 +8086,9 @@ export function warmRecentsCache({ api = globalThis.window?.roamAlphaAPI, now = 
       const target = globalThis.window;
       if (target) (target.__rgDiag ||= {}).lastError = String(error?.stack || error);
     }
+    anyOverBudget ||= runtime.recentsLastOverBudget === true;
   }
-  return warmed;
+  return warmed && !anyOverBudget;
 }
 
 const recentsWarmHandles = { idleId: null, cancelIdle: null, timerId: null };
@@ -12962,6 +13053,9 @@ function mountNativeInstance(nativeElement, info, surface = instanceSurface(nati
   view.root.dataset.roamGridUid = info.uid; view.root.dataset.roamGridInstance = cryptoId(); view.root.__rgView = view;
   runtime.views.add(view); runtime.viewsByNative.set(nativeElement, view);
   nativeElement.classList.remove("rg-native-pending");
+  // FIX-5: arming the recents warm on the first grid mount keeps an idle graph off the full-page
+  // Datascript scan; idempotent, so a second mount only reschedules the idle callback.
+  scheduleRecentsWarm();
   return view;
 }
 
@@ -13310,6 +13404,8 @@ export async function scanLargeMounts() {
       const view = new LargeGridView({ host: block, store, markerElement: marker });
       if (!runtime.metadata) { try { view.dispose(); } catch { /* mid-unload */ } continue; }
       view.root.dataset.roamGridUid = uid; view.root.__rgView = view; runtime.largeMounts.set(uid, view);
+      // FIX-5: the recents warm is armed on first mount (native or large), not at onload.
+      scheduleRecentsWarm();
     } catch (error) { console.error("[roam-grid] Large-grid mount failed", uid, error); toast(`Roam Grid could not mount ${uid}: ${error.message}`, "danger", 10000); }
     finally { mounting.delete(uid); }
   }
@@ -13481,7 +13577,10 @@ async function onload({ extensionAPI }) {
     throw error;
   }
   console.info(`[roam-grid] Loaded v${VERSION}`);
-  scheduleRecentsWarm();
+  // FIX-5: the recents warm no longer fires from onload — an idle graph with the extension installed
+  // must not pay a full-page Datascript scan. The warm is armed from the first native/large grid
+  // mount (`mountNativeInstance`, `scanLargeMounts`) and self-stops the re-warm chain once no grid
+  // is mounted; `scheduleRecentsWarm` is idempotent so repeated mounts only reschedule.
   // Legacy-template migration is idle work: scheduled only when the load-time reload actually
   // found legacy JSON (steady state costs no timer and no writes), tracked so onunload cancels it.
   if ([...runtime.templates.entries.values()].some((entry) => entry.legacyValue)) {
@@ -13496,35 +13595,49 @@ async function onload({ extensionAPI }) {
 
 async function onunload() {
   runtime.observer?.disconnect(); runtime.observer = null; disposePortalObservers(); runtime.pendingScanRoots.clear(); runtime.rangeSpecs.clear(); runtime.scanQueued = false;
-  for (const uid of [...runtime.sessions.keys()]) disposeNativeSession(uid, true);
-  for (const mount of runtime.largeMounts.values()) mount.dispose(); runtime.largeMounts.clear(); mounting.clear();
-  for (const { store, idleTimer } of runtime.largeStores.values()) { clearTimeout(idleTimer); store.dispose(); }
-  runtime.largeStores.clear();
-  releaseLargeScratch();
-  resetChunkCache();
-  resetOrphanCollection();
-  clearUndoHistories();
-  settingsCache.clear();
-  imageDimensionCache.clear();
-  runtime.guardStyle?.remove(); runtime.guardStyle = null;
-  runtime.guardLargeStyle?.remove(); runtime.guardLargeStyle = null;
-  for (const dispose of runtime.disposers.splice(0)) try { dispose(); } catch { /* no-op */ }
-  cancelRecentsWarm();
-  // Session health is per load, never persisted: a reload must start from a clean slate instead of
-  // carrying a graph's mount-failure or budget flags across the unload boundary.
-  resetNativeEditorHealth();
-  resetRoamRecents();
-  resetSuggestionRendering();
-  clearTrackedTimers();
-  // `.rg-lightbox` joins the sweep so an open modal dialog is dismissed via its `__rgDismiss` (which
-  // unmounts the renderString host), not merely orphaned behind its inert backdrop on unload (FIX-2).
-  document.querySelectorAll(".rg-toasts,.rg-dialog-overlay,.rg-context-menu,.rg-lightbox").forEach((element) => {
-    if (element.__rgDismiss) element.__rgDismiss(); else element.remove();
-  });
-  if (globalThis.window?.roamGrid?.v1?.version === VERSION) delete globalThis.window.roamGrid.v1;
-  if (!roamGridGlobalPreexisted && globalThis.window?.roamGrid && Object.keys(globalThis.window.roamGrid).length === 0) delete globalThis.window.roamGrid;
-  roamGridGlobalPreexisted = false;
-  runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null; runtime.keyboardOwner = null; runtime.commentArmed = false; runtime.gridThemePalette = null; runtime.gridThemeSignature = null; runtime.rebuildPanel = null; runtime.views.clear(); runtime.viewsByNative = new WeakMap();
+  await Promise.allSettled([...runtime.sessions.values()].map((session) => session.flushBeforeUnload?.()));
+  // FIX-1: a single throwing view/adapter/store must not abort teardown and strand the rest of the
+  // runtime. Each session, large mount, and large store disposes under its own try/catch; the
+  // command/keyboard/dialog sweep, the recents + tracked-timer reset, and the public-API delete live
+  // in a `finally` so a reload never stacks a second pull-watch, command capture, window keydown, or
+  // an inert `::backdrop` behind a `.rg-lightbox`. `onunload` stays idempotent and never throws out
+  // of the sweep.
+  try {
+    for (const uid of [...runtime.sessions.keys()]) { try { disposeNativeSession(uid, true); } catch (error) { console.warn("[roam-grid] Native session could not be disposed during unload", uid, error); } finally { runtime.sessions.delete(uid); } }
+    for (const [uid, mount] of [...runtime.largeMounts]) { try { mount.dispose(); } catch (error) { console.warn("[roam-grid] Large mount could not be disposed during unload", uid, error); } }
+    runtime.largeMounts.clear(); mounting.clear();
+    for (const [uid, { store, idleTimer }] of [...runtime.largeStores]) {
+      try { clearTimeout(idleTimer); store.dispose(); }
+      catch (error) { console.warn("[roam-grid] Large store could not be disposed during unload", uid, error); }
+    }
+    runtime.largeStores.clear();
+    try { releaseLargeScratch(); } catch (error) { console.warn("[roam-grid] Large scratch could not be released during unload", error); }
+    try { resetChunkCache(); } catch (error) { console.warn("[roam-grid] Chunk cache reset failed during unload", error); }
+    try { resetOrphanCollection(); } catch (error) { console.warn("[roam-grid] Orphan collection reset failed during unload", error); }
+    try { clearUndoHistories(); } catch (error) { console.warn("[roam-grid] Undo histories could not be cleared during unload", error); }
+    settingsCache.clear();
+    imageDimensionCache.clear();
+    runtime.guardStyle?.remove(); runtime.guardStyle = null;
+    runtime.guardLargeStyle?.remove(); runtime.guardLargeStyle = null;
+  } finally {
+    for (const dispose of runtime.disposers.splice(0)) { try { dispose(); } catch (error) { console.warn("[roam-grid] Disposer failed during unload", error); } }
+    cancelRecentsWarm();
+    // Session health is per load, never persisted: a reload must start from a clean slate instead of
+    // carrying a graph's mount-failure or budget flags across the unload boundary.
+    resetNativeEditorHealth();
+    resetRoamRecents();
+    resetSuggestionRendering();
+    clearTrackedTimers();
+    // `.rg-lightbox` joins the sweep so an open modal dialog is dismissed via its `__rgDismiss` (which
+    // unmounts the renderString host), not merely orphaned behind its inert backdrop on unload (FIX-2).
+    document.querySelectorAll(".rg-toasts,.rg-dialog-overlay,.rg-context-menu,.rg-lightbox").forEach((element) => {
+      if (element.__rgDismiss) element.__rgDismiss(); else element.remove();
+    });
+    if (globalThis.window?.roamGrid?.v1?.version === VERSION) delete globalThis.window.roamGrid.v1;
+    if (!roamGridGlobalPreexisted && globalThis.window?.roamGrid && Object.keys(globalThis.window.roamGrid).length === 0) delete globalThis.window.roamGrid;
+    roamGridGlobalPreexisted = false;
+    runtime.extensionAPI = null; runtime.metadata = null; runtime.templates = null; runtime.registries = null; runtime.lastFocusedUid = null; runtime.keyboardOwner = null; runtime.commentArmed = false; runtime.gridThemePalette = null; runtime.gridThemeSignature = null; runtime.rebuildPanel = null; runtime.views.clear(); runtime.viewsByNative = new WeakMap();
+  }
   console.info("[roam-grid] Unloaded");
 }
 

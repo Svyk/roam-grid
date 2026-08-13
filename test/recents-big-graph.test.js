@@ -118,15 +118,19 @@ test("budget semantics are pinned in source: consecutive disarm, re-arm, cache-h
     ["250ms budget constant", /const RECENTS_BUDGET_MS = 250;/],
     ["60s cache TTL constant", /const RECENTS_TTL_MS = 60000;/],
     ["7d recent-block window constant", /const RECENT_BLOCK_WINDOW_MS = 7 \* 24 \* 60 \* 60 \* 1000;/],
+    ["90d recent-page window constant (FIX-5: pages query is bounded by edit time)", /const RECENT_PAGE_WINDOW_MS = 90 \* 24 \* 60 \* 60 \* 1000;/],
+    ["recent pages query is bounded by a :in $ ?since window, not every page", /const RECENT_PAGES_QUERY = '\[:find \?title \?uid \?time :in \$ \?since :where \[\?p :node\/title \?title\] \[\?p :block\/uid \?uid\] \[\(get-else \$ \?p :edit\/time 0\) \?time\] \[\(> \?time \?since\)\]\]';/],
     ["disarm threshold of 2 consecutive overruns", /const RECENTS_DISARM_OVERRUNS = 2;/],
     ["disarm requires the consecutive-overrun threshold", /runtime\.recentsOverruns >= RECENTS_DISARM_OVERRUNS/],
     ["background warms never count toward the streak", /\} else if \(!background\) \{/],
     ["an under-budget fetch resets the streak", /runtime\.recentsOverruns = 0;/],
     ["a re-arm path exists", /runtime\.recentsDisabled = false;/],
     ["the re-arm is timestamped for the diag ledger", /runtime\.recentsRearmedAt = Date\.now\(\);/],
+    ["over-budget fetch records the last-over-budget flag (FIX-5c stops the re-warm chain)", /runtime\.recentsLastOverBudget = elapsed > RECENTS_BUDGET_MS;/],
     ["the disarm decision is mirrored to __rgDiag", /recentsBudget = \{ disarmed: runtime\.recentsDisabled/],
     ["the gate lets a fresh cache open armed or not", /if \(recentsDisabled\(\) && !recentsCacheReady\(context\.type, now\)\) return \[\];/],
     ["readRecentRows bypasses the query on a fresh cache", /if \(!force && cached && now - cached\.at < RECENTS_TTL_MS\) return cached\.rows;/],
+    ["readRecentRows bounds the pages query by the page window", /api\.q\(RECENT_PAGES_QUERY, now - RECENT_PAGE_WINDOW_MS\)/],
   ];
   for (const [name, pattern] of pins) assert.match(source, pattern, `missing budget semantic: ${name}`);
 });

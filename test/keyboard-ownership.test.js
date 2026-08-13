@@ -940,3 +940,56 @@ test("beginEdit on another view finishes a live native overlay before mounting a
     assert.deepEqual(commits, [], "re-entering the same view does not tear down its own overlay");
   } finally { session.dispose(); }
 });
+
+// FIX-4 — Roam's command palette, search, find, and settings rows are ordinary <input>/<textarea>s
+// the grid does not own. A grid claim left over from a canvas click must release the keyboard when
+// one of them takes focus, and ⌘Z must reach the field's native undo instead of undoing the grid the
+// user can no longer see. Grid-owned editors (in-cell editor, dialog input) and Roam block inputs
+// keep the grid.
+test("FIX-4: an outside editable field releases the grid keyboard so ⌘Z is not stolen from Roam's palette/search/settings", () => {
+  const dom = installDom();
+  releaseKeyboard();
+  const uninstall = installKeyboardOwnership();
+  const { view, cell, session } = makeGrid(dom);
+  try {
+    dom.firePointerDown(cell);
+    assert.equal(keyboardOwner()?.view, view, "the grid owns the keyboard after a canvas click");
+
+    for (const tagName of ["input", "textarea"]) {
+      const field = new Node(tagName);
+      dom.body.appendChild(field);
+      dom.fireFocusIn(field);
+      assert.equal(keyboardOwner(), null, `focus into an outside ${tagName} releases the grid claim`);
+
+      const undo = dom.fireKeydown(field, { metaKey: true, key: "z" });
+      assert.equal(undo.defaultPrevented, false, `⌘Z reaches the ${tagName}'s native undo, not the grid`);
+      assert.equal(view.undoCalls, 0, "the grid's undo never fires for the outside field");
+
+      // A stray re-claim must not steal undo either: the keydown guard is belt to the focusin release.
+      claimKeyboard(view);
+      const stray = dom.fireKeydown(field, { metaKey: true, key: "z" });
+      assert.equal(stray.defaultPrevented, false, "even a stale claim cannot steal undo from the focused outside field");
+      assert.equal(view.undoCalls, 0);
+      releaseKeyboard();
+      field.remove();
+    }
+  } finally { uninstall(); session.dispose(); }
+});
+
+test("FIX-4: a grid-owned editor input keeps the grid, so ⌘Z stays with the grid", () => {
+  const dom = installDom();
+  releaseKeyboard();
+  const uninstall = installKeyboardOwnership();
+  const { view, cell, root, session } = makeGrid(dom);
+  try {
+    dom.firePointerDown(cell);
+    assert.equal(keyboardOwner()?.view, view);
+    // A grid dialog input is grid-owned (isGridEditorInput), so focusing it must NOT release.
+    const dialog = new Node("input"); dialog.className = "rg-dialog-input"; root.appendChild(dialog);
+    dom.fireFocusIn(dialog);
+    assert.equal(keyboardOwner()?.view, view, "a grid-owned dialog input keeps the keyboard");
+    const undo = dom.fireKeydown(dialog, { metaKey: true, key: "z" });
+    assert.equal(undo.defaultPrevented, false, "the dialog input keeps ⌘Z for its own native undo (isGridEditorInput early-return)");
+    assert.equal(view.undoCalls, 0, "the grid's undo does not fire while the dialog input owns the keystroke");
+  } finally { uninstall(); session.dispose(); }
+});

@@ -162,7 +162,10 @@ test("FIX-3: large guard CSS targets button with :not() release", function() {
   var uid = "fix3guard";
   var css = largeGridGuardCss([uid]);
   assert.ok(css.indexOf(".rm-xparser-default-grid:not(.rg-large-marker-hidden)") >= 0, "guard targets button with :not() release");
-  assert.ok(css.indexOf("[id$=\"fix3guard\"]") >= 0, "guard is scoped to uid");
+  // FIX-6: the [id$] suffix-match family was dropped (rule 15 shape); the guard scopes to uid via
+  // the exact [data-uid] families instead.
+  assert.ok(css.indexOf('[data-uid="fix3guard"]') >= 0, "guard is scoped to uid via exact data-uid");
+  assert.equal(css.indexOf("[id$="), -1, "the suffix-match family is gone from the large guard");
 });
 
 test("FIX-3: mount adds rg-large-marker-hidden to button, dispose removes it", async function() {

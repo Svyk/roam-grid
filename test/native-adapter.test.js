@@ -193,3 +193,71 @@ test("the split-remainder repair plan recognises exactly the damage pinned fact 
   assert.equal(nativeOverlayStrayRepair(base, rawTree(), "row000002"), null, "an intact table needs no repair");
   assert.equal(nativeOverlayStrayRepair(null, split, "row000002"), null, "with no verified base there is nothing to diff against");
 });
+
+/* --------------------------------------------------------------------------------------------
+ * FIX-2 — a dirty native cell whose debounce has not fired must survive a Depot disable/reload.
+ * `dispose` alone clears `dirtyCells` without flushing; the unload path now calls the async
+ * `flushBeforeUnload` first, which awaits any in-flight save and runs one final content flush.
+ * ------------------------------------------------------------------------------------------ */
+function flushBeforeUnloadHarness({ saveContentImpl } = {}) {
+  const tableUid = "table0001";
+  const model = new GridModel({ tableUid, columnIds: ["col0", "col1"], rows: [[{ uid: "cell00001", raw: "Alpha" }, { uid: "cell00002", raw: "Beta" }]] });
+  model.baseSnapshot = model.snapshot();
+  const history = new UndoHistory();
+  model.history = history;
+  const base = new Map([["cell00001", "Alpha"], ["cell00002", "Beta"]]);
+  const saveCalls = [];
+  const adapter = {
+    model,
+    getBaseRaw: (uid) => base.get(uid) ?? null,
+    acceptExternalTree() {},
+    load: () => model,
+    async saveContent(batch) { saveCalls.push([...batch.keys()]); return (saveContentImpl || (async (b) => ({ saved: [...b.values()], skipped: [] })))(batch); },
+  };
+  const session = Object.assign(Object.create(NativeGridSession.prototype), {
+    tableUid, model, history, views: new Set(), nativeOverlayUids: new Set(), adapter,
+    dirtyCells: new Map(), editRevisions: new Map(), metadataDirty: false, structuralPending: false,
+    contentSavePromise: null, disposed: false, changeVersion: 1, savedVersion: 0, saveTimer: null,
+    referenceCounts: new Map(), referenceCountFrame: null, referenceCountTimer: null,
+    commentThreads: new Map(), commentPageUid: null, discardedEdits: null,
+    renderStructural() {}, refreshValues() {}, scheduleReferenceCountRefresh() {}, setSaving() {},
+  });
+  return { model, session, saveCalls };
+}
+
+test("dispose alone never flushes — the dirty value would be lost on reload without flushBeforeUnload (FIX-2)", () => {
+  const { session, saveCalls } = flushBeforeUnloadHarness();
+  session.dirtyCells.set("cell00001", { uid: "cell00001", baseRaw: "Alpha", raw: "Typed", revision: 1 });
+  session.dispose();
+  assert.equal(session.disposed, true);
+  assert.equal(saveCalls.length, 0, "dispose on its own drops a dirty cell — the reload would lose the last ~220ms of typing");
+  assert.equal(session.dirtyCells.size, 0, "dispose clears the dirty queue without flushing");
+});
+
+test("flushBeforeUnload flushes still-dirty cells before dispose (FIX-2)", async () => {
+  const { session, model, saveCalls } = flushBeforeUnloadHarness();
+  // The model holds the typed value, so the flush settles the dirty entry instead of rescheduling.
+  model.getCell(0, 0).raw = "Typed";
+  session.dirtyCells.set("cell00001", { uid: "cell00001", baseRaw: "Alpha", raw: "Typed", revision: 1 });
+  await session.flushBeforeUnload();
+  assert.ok(saveCalls.length >= 1, "flushBeforeUnload ran a final content flush for the still-dirty cell");
+  assert.equal(session.dirtyCells.size, 0, "the dirty cell was settled by the final flush, not silently dropped");
+  assert.equal(session.disposed, false, "flush does not dispose — the unload path disposes after");
+  session.dispose();
+});
+
+test("flushBeforeUnload awaits an in-flight save and survives its rejection without throwing (FIX-2)", async () => {
+  const { session, saveCalls } = flushBeforeUnloadHarness();
+  // An in-flight content save is mid-roundtrip; it settles BEFORE the unload's final flush runs.
+  // A rejection there must not abort the unload — its own flush lane already recorded any discard.
+  let settleInflight;
+  session.contentSavePromise = new Promise((_, reject) => { settleInflight = reject; });
+  const flush = session.flushBeforeUnload();
+  settleInflight(new Error("in-flight save failed"));
+  await flush;
+  assert.equal(session.disposed, false, "an in-flight rejection must not abort the unload flush path");
+  // No dirty cell remained, so the final flush is a no-op; the in-flight promise was merely awaited.
+  assert.equal(saveCalls.length, 0, "nothing dirty remained to re-flush after the in-flight save settled");
+  session.contentSavePromise = null;
+  session.dispose();
+});
