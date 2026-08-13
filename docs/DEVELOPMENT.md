@@ -116,11 +116,9 @@ Steps 1–9 are done in this repository. Step 10 is an external action and has
    `roam-grid-range` component. The lint test at the end of
    `test/range-reference.test.js` enforces that count and requires the exception
    to stay documented in `docs/ARCHITECTURE.md`.
-10. **Open the PR against `Roam-Research/roam-depot`** — **NOT DONE.** Requires
-    forking the Depot repository, copying the draft metadata to
-    `extensions/Svyk/roam-grid.json`, replacing `source_commit` with the real
-    commit SHA, and opening a pull request. This is an external, public action
-    and needs an explicit decision before it is taken.
+10. **Open the PR against `Roam-Research/roam-depot`** — opened
+    https://github.com/Roam-Research/roam-depot/pull/1414 on 2026-08-13,
+    pinning `source_commit` to `f36cb28af188b053625553b88aa1815a115a3d7c`.
 
 ## Repository facts worth knowing before submitting
 
