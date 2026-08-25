@@ -116,9 +116,11 @@ Steps 1–9 are done in this repository. Step 10 is an external action and has
    `roam-grid-range` component. The lint test at the end of
    `test/range-reference.test.js` enforces that count and requires the exception
    to stay documented in `docs/ARCHITECTURE.md`.
-10. **Open the PR against `Roam-Research/roam-depot`** — opened
-    https://github.com/Roam-Research/roam-depot/pull/1414 on 2026-08-13,
-    pinning `source_commit` to `9f9c27e8d017a46a31369cacc5968d39db0b2844`.
+10. **Open the PR against `Roam-Research/roam-depot`** — first listing
+    https://github.com/Roam-Research/roam-depot/pull/1414 merged 2026-08-22,
+    pinning `9f9c27e8d017a46a31369cacc5968d39db0b2844` (v0.17.0). Bug-fix
+    follow-up https://github.com/Roam-Research/roam-depot/pull/1435 pins
+    `d6db6cc3d01ea61bffb44fcc98e406c32c914e6c` (v0.17.1).
 
 ## Repository facts worth knowing before submitting
 
