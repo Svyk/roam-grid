@@ -183,3 +183,19 @@ test("a fresh cache is not re-queried, and full disposal happens on unload", asy
   await extension.onunload();
   assert.equal(pendingTimers.size, 0, "unload cancels a pending warm timer");
 });
+
+test("cancelRecentsWarm can invoke a window host cancelIdleCallback without Illegal invocation", (t) => {
+  const saved = saveGlobals();
+  t.after(() => { resetRoamRecents(); restoreGlobals(saved); });
+  installRecentsApi();
+  const cancelled = [];
+  function cancelIdle(id) {
+    if (this !== globalThis) throw new TypeError("Illegal invocation");
+    cancelled.push(id);
+  }
+  scheduleRecentsWarm({ requestIdle: () => 7, cancelIdle });
+  scheduleRecentsWarm({ requestIdle: () => 9, cancelIdle }); // live path: second mount cancels the first
+  assert.deepEqual(cancelled, [7]);
+  cancelRecentsWarm();
+  assert.deepEqual(cancelled, [7, 9]);
+});

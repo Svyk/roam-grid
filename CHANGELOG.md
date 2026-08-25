@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.17.1
+
+- **Enhancing a table no longer toasts `Illegal invocation`.** Recents-cache
+  warm stored `cancelIdleCallback` on a plain handle object and invoked it
+  as a method, so Chromium threw and the mount catch tore down a grid that
+  had already painted. Cancel now uses `this = globalThis`, clears the
+  handle first, and a recents-warm failure cannot fail the mount.
+
 ## 0.17.0
 
 Simpler settings panel, an experimental gate on large grids, and a harder

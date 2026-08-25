@@ -1,5 +1,5 @@
-/* Roam Grid v0.17.0 | MIT | generated from src/extension.js */
-const VERSION = "0.17.0";
+/* Roam Grid v0.17.1 | MIT | generated from src/extension.js */
+const VERSION = "0.17.1";
 const LARGE_GRID_OFF_TOAST = "Large grids are experimental and off.";
 const EXPERIMENTAL_LARGE_GRID_KEY = "experimental-large-grid";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
@@ -8124,9 +8124,20 @@ export function scheduleRecentsWarm({ requestIdle = globalThis.requestIdleCallba
 }
 
 export function cancelRecentsWarm() {
-  if (recentsWarmHandles.idleId != null && recentsWarmHandles.cancelIdle) recentsWarmHandles.cancelIdle(recentsWarmHandles.idleId);
-  if (recentsWarmHandles.timerId != null) { clearTimeout(recentsWarmHandles.timerId); pendingTimers.delete(recentsWarmHandles.timerId); }
-  recentsWarmHandles.idleId = null; recentsWarmHandles.cancelIdle = null; recentsWarmHandles.timerId = null;
+  const idleId = recentsWarmHandles.idleId;
+  const cancelIdle = recentsWarmHandles.cancelIdle;
+  recentsWarmHandles.idleId = null;
+  recentsWarmHandles.cancelIdle = null;
+  if (idleId != null && typeof cancelIdle === "function") {
+    try { cancelIdle.call(globalThis, idleId); }
+    catch { /* already cancelled, or host rejected a stale handle */ }
+  }
+  if (recentsWarmHandles.timerId != null) { clearTimeout(recentsWarmHandles.timerId); pendingTimers.delete(recentsWarmHandles.timerId); recentsWarmHandles.timerId = null; }
+}
+
+function armRecentsWarm() {
+  try { scheduleRecentsWarm(); }
+  catch (error) { console.warn("[roam-grid] Recents warm failed", error); }
 }
 
 function recentPageSuggestions(rows, limit) {
@@ -13056,7 +13067,7 @@ function mountNativeInstance(nativeElement, info, surface = instanceSurface(nati
   nativeElement.classList.remove("rg-native-pending");
   // FIX-5: arming the recents warm on the first grid mount keeps an idle graph off the full-page
   // Datascript scan; idempotent, so a second mount only reschedules the idle callback.
-  scheduleRecentsWarm();
+  armRecentsWarm();
   return view;
 }
 
@@ -13406,7 +13417,7 @@ export async function scanLargeMounts() {
       if (!runtime.metadata) { try { view.dispose(); } catch { /* mid-unload */ } continue; }
       view.root.dataset.roamGridUid = uid; view.root.__rgView = view; runtime.largeMounts.set(uid, view);
       // FIX-5: the recents warm is armed on first mount (native or large), not at onload.
-      scheduleRecentsWarm();
+      armRecentsWarm();
     } catch (error) { console.error("[roam-grid] Large-grid mount failed", uid, error); toast(`Roam Grid could not mount ${uid}: ${error.message}`, "danger", 10000); }
     finally { mounting.delete(uid); }
   }

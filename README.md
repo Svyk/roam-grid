@@ -1,6 +1,6 @@
 # Roam Grid
 
-Version 0.17.0
+Version 0.17.1
 
 Turn a native Roam `{{table}}` into a spreadsheet — formulas, merges, sorting, resizing, charts, comments — without moving a cell out of your graph.
 
