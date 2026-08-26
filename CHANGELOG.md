@@ -1,5 +1,7 @@
 # Changelog
 
+## 0.18.0
+
 ## 0.17.1
 
 - **Enhancing a table no longer toasts `Illegal invocation`.** Recents-cache

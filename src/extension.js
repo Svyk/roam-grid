@@ -1,4 +1,4 @@
-const VERSION = "0.17.1";
+const VERSION = "0.18.0";
 const LARGE_GRID_OFF_TOAST = "Large grids are experimental and off.";
 const EXPERIMENTAL_LARGE_GRID_KEY = "experimental-large-grid";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
@@ -6279,6 +6279,186 @@ function patchChangesLayout(patch) {
   return (Array.isArray(patch) ? patch : [patch]).some((item) => item.op !== "set");
 }
 
+/** Identity-fenced registry install: overlapping reloads never delete a sibling or a foreign
+ *  replacement. Returns an idempotent disposer that only removes the entry we still own. */
+export function installOwnedWindowRegistryEntry(windowLike, registryName, entryName, entry) {
+  if (!windowLike || (typeof windowLike !== "object" && typeof windowLike !== "function")) throw new TypeError("A window-like object is required");
+  if (windowLike[registryName] != null && typeof windowLike[registryName] !== "object") throw new TypeError(`window.${registryName} is already owned by a non-object`);
+  const createdRegistry = !windowLike[registryName];
+  const registry = createdRegistry ? {} : windowLike[registryName];
+  windowLike[registryName] = registry;
+  registry[entryName] = entry;
+  let disposed = false;
+  return () => {
+    if (disposed) return;
+    disposed = true;
+    if (windowLike[registryName] !== registry) return;
+    if (registry[entryName] !== entry) return;
+    delete registry[entryName];
+    if (createdRegistry && Reflect.ownKeys(registry).length === 0) delete windowLike[registryName];
+  };
+}
+
+/** Caps caller-requested grid dims into the 1..20 native-tool range. */
+function clampTableDims(rows, cols) {
+  const clampDim = (value, fallback) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(1, Math.min(20, Math.trunc(n)));
+  };
+  return { rows: clampDim(rows, 3), cols: clampDim(cols, 3) };
+}
+
+/** An empty GridModel with space-filled cells so native Roam table cells are valid. */
+function emptyTableModel(rows, cols) {
+  const filled = Array.from({ length: rows }, () => Array.from({ length: cols }, () => " "));
+  return new GridModel({ rows: filled, frozenRows: 1 });
+}
+
+/** Summary row for `rg_list_grids` / `v1.listGrids`: live dimensions when the runtime can give
+ *  them, falling back to manifest/adapter/columnIds, never throwing out of the caller. */
+function gridDimensionsFor(uid, entry) {
+  const mode = entry?.value?.mode || "native";
+  const session = runtime.sessions.get(uid);
+  if (session?.model) return { mode, rows: session.model.rowCount, cols: session.model.colCount };
+  const largeMount = runtime.largeMounts.get(uid);
+  if (largeMount?.model) return { mode, rows: largeMount.model.rowCount, cols: largeMount.model.colCount };
+  const largeStore = runtime.largeStores.get(uid)?.store;
+  if (largeStore?.manifest) return { mode, rows: largeStore.manifest.rowCount, cols: largeStore.manifest.colCount };
+  if (mode === "native") {
+    try {
+      const adapter = new NativeTableAdapter(uid);
+      const model = adapter.load();
+      return { mode, rows: model.rowCount, cols: model.colCount };
+    } catch { /* not a table / block gone: fall through to metadata dims */ }
+  }
+  const metadata = runtime.metadata.get(uid);
+  return { mode, rows: null, cols: metadata?.columnIds?.length || 0 };
+}
+
+function listGridMetadataSummaries() {
+  const grids = [];
+  for (const [uid, entry] of runtime.metadata.entries) {
+    let dims;
+    try { dims = gridDimensionsFor(uid, entry); } catch { dims = { mode: entry?.value?.mode || "native", rows: null, cols: 0 }; }
+    grids.push({ uid, mode: dims.mode, rows: dims.rows, cols: dims.cols });
+  }
+  return grids;
+}
+
+/** Wraps a tool `impl` so the returned `execute` never throws; resolves `{ ok, ... }` payloads. */
+function wrapSafeExecute(impl) {
+  return async (args = {}) => {
+    try {
+      const result = await impl(args || {});
+      if (result && typeof result === "object" && "ok" in result) return result;
+      return { ok: true, ...(result && typeof result === "object" ? result : { value: result }) };
+    } catch (error) {
+      return { ok: false, error: error?.message || String(error) };
+    }
+  };
+}
+
+/** Builds the registration object installed under `window.RoamExtensionTools["roam-grid"]`. */
+export function createExtensionToolsRegistration() {
+  const tools = [
+    {
+      name: "rg_list_grids", readOnly: true,
+      description: "List every enhanced grid (native and large) with uid, mode, rows, cols.",
+      parameters: [],
+      execute: wrapSafeExecute(() => ({ grids: listGridMetadataSummaries() })),
+    },
+    {
+      name: "rg_get_grid", readOnly: true,
+      description: "Return the JSON model of an enhanced grid by uid.",
+      parameters: [{ name: "uid", required: true }],
+      execute: wrapSafeExecute(({ uid } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        const model = createPublicApi().getTableModel(uid);
+        if (model == null) return { ok: false, error: `No enhanced grid for uid ${uid}` };
+        return { model };
+      }),
+    },
+    {
+      name: "rg_enhance_table",
+      description: "Enhance a native {{table}} block by uid without focusing it.",
+      parameters: [{ name: "uid", required: true }],
+      execute: wrapSafeExecute(({ uid } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        return createPublicApi().enhanceTable(uid).then(() => ({ ok: true, uid })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_restore_native",
+      description: "Restore an enhanced native grid to a plain Roam table by uid.",
+      parameters: [{ name: "uid", required: true }],
+      execute: wrapSafeExecute(({ uid } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        return createPublicApi().restoreNative(uid).then(() => ({ ok: true, uid })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_create_table",
+      description: "Create a new native grid. Requires parent_uid or after_uid so it never depends on focus.",
+      parameters: [{ name: "parent_uid" }, { name: "after_uid" }, { name: "rows" }, { name: "cols" }],
+      execute: wrapSafeExecute(({ parent_uid, after_uid, rows, cols } = {}) => {
+        if (!parent_uid && !after_uid) return { ok: false, error: "parent_uid or after_uid is required" };
+        return createPublicApi().createTable({ parentUid: parent_uid || null, afterUid: after_uid || null, rows, cols }).then((uid) => ({ ok: true, uid })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_set_cell",
+      description: "Set a cell value via the v1 patch surface (row/col 0-indexed). Formulas begin with `=` but not `==`.",
+      parameters: [{ name: "uid", required: true }, { name: "row", required: true }, { name: "col", required: true }, { name: "value", required: true }],
+      execute: wrapSafeExecute(({ uid, row, col, value } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (!Number.isFinite(Number(row)) || !Number.isFinite(Number(col))) return { ok: false, error: "row and col must be numeric" };
+        return createPublicApi().applyPatch(uid, { op: "set", row: Number(row), col: Number(col), value }).then((model) => ({ ok: true, model })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_add_formula",
+      description: "Set a formula cell. A leading `=` is added if missing; `==` is refused.",
+      parameters: [{ name: "uid", required: true }, { name: "row", required: true }, { name: "col", required: true }, { name: "formula", required: true }],
+      execute: wrapSafeExecute(({ uid, row, col, formula } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (!Number.isFinite(Number(row)) || !Number.isFinite(Number(col))) return { ok: false, error: "row and col must be numeric" };
+        const raw = String(formula ?? "");
+        if (raw.startsWith("==")) return { ok: false, error: "Formula must start with `=` not `==`" };
+        const normalized = raw.startsWith("=") ? raw : `=${raw}`;
+        return createPublicApi().applyPatch(uid, { op: "set", row: Number(row), col: Number(col), value: normalized }).then((model) => ({ ok: true, model })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_apply_patch",
+      description: "Apply one or more v1 grid patches (object or array) by uid.",
+      parameters: [{ name: "uid", required: true }, { name: "patch", required: true }],
+      execute: wrapSafeExecute(({ uid, patch } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (!patch || (typeof patch !== "object" && !Array.isArray(patch))) return { ok: false, error: "patch must be an object or array" };
+        return createPublicApi().applyPatch(uid, patch).then((model) => ({ ok: true, model })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_list_templates", readOnly: true,
+      description: "List saved grid template names (registry and store).",
+      parameters: [],
+      execute: wrapSafeExecute(() => ({ templates: savedTemplateNameList() })),
+    },
+    {
+      name: "rg_create_from_template",
+      description: "Insert a grid from a saved template. parent_uid is required so it never depends on focus.",
+      parameters: [{ name: "name", required: true }, { name: "parent_uid" }],
+      execute: wrapSafeExecute(({ name, parent_uid } = {}) => {
+        if (!name) return { ok: false, error: "name is required" };
+        if (!parent_uid) return { ok: false, error: "parent_uid is required" };
+        return createPublicApi().createFromTemplate(name, parent_uid).then((uid) => ({ ok: true, uid })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+  ];
+  return { name: "Roam Grid", version: VERSION, tools };
+}
+
 /** Case-insensitively deduped template list: registry display name wins the label over a saved
  *  template that differs only by case, and resolution precedence is unchanged (registry first). */
 export function savedTemplateNameList(registry = runtime.registries, store = runtime.templates) {
@@ -6294,7 +6474,7 @@ export function savedTemplateNameList(registry = runtime.registries, store = run
   return [...byKey.values()].sort((a, b) => a.localeCompare(b));
 }
 
-function createPublicApi() {
+export function createPublicApi() {
   const registries = runtime.registries;
   return {
     version: VERSION,
@@ -6311,7 +6491,7 @@ function createPublicApi() {
       if (!model) throw new GridError("TEMPLATE_SOURCE", "Focus an enhanced native grid before saving a template");
       return runtime.templates.save(name, model, { confirmOverwrite: false });
     },
-    createFromTemplate: async (name) => createNativeTableFromModel(await resolveTemplateModel(name)),
+    createFromTemplate: async (name, parentUid = null) => createNativeTableFromModel(await resolveTemplateModel(name), null, { parentUid }),
     getTableModel: (tableUid) => {
       const session = runtime.sessions.get(tableUid);
       if (session?.model) return deepClone(session.model.toJSON());
@@ -6327,6 +6507,29 @@ function createPublicApi() {
       const saved = await adapter.save(model, { saveMetadata: patchChangesLayout(patch) });
       globalThis.window?.dispatchEvent(new CustomEvent("roam-grid:changed", { detail: { tableUid, patch } }));
       return saved.toJSON();
+    },
+    listGrids: () => listGridMetadataSummaries(),
+    enhanceTable: async (tableUid) => {
+      if (!tableUid) throw new GridError("NOT_TABLE", "A table uid is required");
+      if (runtime.metadata.has(tableUid)) throw new GridError("ALREADY_ENHANCED", "This table is already enhanced");
+      const adapter = new NativeTableAdapter(tableUid);
+      const model = adapter.load(displayDefaults());
+      await runtime.metadata.set(tableUid, model, "native");
+      syncEnhancedUidGuard(); scheduleScan(document);
+      return tableUid;
+    },
+    restoreNative: async (tableUid) => {
+      if (!tableUid || !runtime.metadata.has(tableUid)) throw new GridError("NOT_ENHANCED", "No enhanced Roam Grid matches that uid");
+      const entry = runtime.metadata.entries.get(tableUid);
+      if (entry?.value?.mode === "large") throw new GridError("LARGE_GRID", "Large grids cannot become native fallback without creating a native copy");
+      disposeNativeSession(tableUid, true); releaseUndoHistory(tableUid); await runtime.metadata.remove(tableUid); syncEnhancedUidGuard();
+      return tableUid;
+    },
+    createTable: async ({ parentUid = null, rows = 3, cols = 3, afterUid = null } = {}) => {
+      if (!parentUid && !afterUid) throw new GridError("MISSING_PARENT", "createTable requires parentUid or afterUid so it does not depend on focused UI");
+      const dims = clampTableDims(rows, cols);
+      const model = emptyTableModel(dims.rows, dims.cols);
+      return createNativeTableFromModel(model, afterUid, { parentUid });
     },
     importGrid,
     exportGrid,
@@ -13576,6 +13779,7 @@ async function onload({ extensionAPI }) {
     runtime.extensionAPI = extensionAPI; runtime.registries = new RegistrySet(); runtime.metadata = new MetadataStore(); runtime.templates = new GridTemplateStore();
     await runtime.metadata.initialize(); syncEnhancedUidGuard(); await runtime.templates.initialize(); await initializeSettings(extensionAPI); registerCommands(extensionAPI);
     const publicApi = createPublicApi(); globalThis.window.roamGrid = { ...(globalThis.window.roamGrid || {}), v1: publicApi };
+    if (globalThis.window) runtime.disposers.push(installOwnedWindowRegistryEntry(globalThis.window, "RoamExtensionTools", "roam-grid", createExtensionToolsRegistration()));
     document.addEventListener("focusin", rememberFocusedUid, true);
     runtime.disposers.push(() => document.removeEventListener("focusin", rememberFocusedUid, true));
     installKeyboardOwnership();
