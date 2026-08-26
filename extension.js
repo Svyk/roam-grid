@@ -1,5 +1,5 @@
-/* Roam Grid v0.18.0 | MIT | generated from src/extension.js */
-const VERSION = "0.18.0";
+/* Roam Grid v0.18.1 | MIT | generated from src/extension.js */
+const VERSION = "0.18.1";
 const LARGE_GRID_OFF_TOAST = "Large grids are experimental and off.";
 const EXPERIMENTAL_LARGE_GRID_KEY = "experimental-large-grid";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
@@ -6280,6 +6280,23 @@ function patchChangesLayout(patch) {
   return (Array.isArray(patch) ? patch : [patch]).some((item) => item.op !== "set");
 }
 
+/** Composes a structural patch list that resizes `model` to `targetRows` x `targetCols`.
+ *  Grows first (insertCols then insertRows), then shrinks (deleteCols then deleteRows) so the
+ *  final dimensions are exactly the requested size while never emptying the grid (clamping and
+ *  the DELETE_ALL guard enforce at least one row and one col). */
+function buildResizePatch(model, targetRows, targetCols) {
+  const oldRows = model.rowCount;
+  const oldCols = model.colCount;
+  const patch = [];
+  if (targetCols > oldCols) patch.push({ op: "insertCols", index: oldCols, count: targetCols - oldCols });
+  if (targetRows > oldRows) patch.push({ op: "insertRows", index: oldRows, count: targetRows - oldRows });
+  const afterInsertCols = Math.max(oldCols, targetCols);
+  if (targetCols < afterInsertCols) patch.push({ op: "deleteCols", index: targetCols, count: afterInsertCols - targetCols });
+  const afterInsertRows = Math.max(oldRows, targetRows);
+  if (targetRows < afterInsertRows) patch.push({ op: "deleteRows", index: targetRows, count: afterInsertRows - targetRows });
+  return patch;
+}
+
 /** Identity-fenced registry install: overlapping reloads never delete a sibling or a foreign
  *  replacement. Returns an idempotent disposer that only removes the entry we still own. */
 export function installOwnedWindowRegistryEntry(windowLike, registryName, entryName, entry) {
@@ -6464,6 +6481,20 @@ export function createExtensionToolsRegistration() {
       }),
     },
     {
+      name: "rg_resize_table",
+      description: "Resize a native grid by uid. rows/cols clamped to 1-20.",
+      parameters: objectParams({
+        uid: uidProp,
+        rows: { type: "number", description: "Target row count, 1-20." },
+        cols: { type: "number", description: "Target column count, 1-20." },
+      }, ["uid", "rows", "cols"]),
+      execute: wrapSafeExecute(({ uid, rows, cols } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (!Number.isFinite(Number(rows)) || !Number.isFinite(Number(cols))) return { ok: false, error: "rows and cols must be numeric" };
+        return createPublicApi().resizeTable(uid, Number(rows), Number(cols)).then((result) => ({ ok: true, ...result })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
       name: "rg_list_templates", readOnly: true,
       description: "List saved grid template names (registry and store).",
       parameters: objectParams({}),
@@ -6534,6 +6565,27 @@ export function createPublicApi() {
       const saved = await adapter.save(model, { saveMetadata: patchChangesLayout(patch) });
       globalThis.window?.dispatchEvent(new CustomEvent("roam-grid:changed", { detail: { tableUid, patch } }));
       return saved.toJSON();
+    },
+    resizeTable: async (tableUid, rows, cols) => {
+      if (!tableUid) throw new GridError("NOT_TABLE", "A table uid is required");
+      if (!Number.isFinite(Number(rows)) || !Number.isFinite(Number(cols))) throw new GridError("RESIZE_DIMS", "rows and cols must be finite numbers");
+      const targetRows = Math.max(1, Math.min(20, Math.trunc(Number(rows))));
+      const targetCols = Math.max(1, Math.min(20, Math.trunc(Number(cols))));
+      const session = runtime.sessions.get(tableUid);
+      if (session) {
+        await session.applyPatch(buildResizePatch(session.model, targetRows, targetCols));
+        return { ok: true, uid: tableUid, rows: session.model.rowCount, cols: session.model.colCount };
+      }
+      if (!runtime.metadata.has(tableUid)) throw new GridError("NOT_ENHANCED", "No enhanced Roam Grid matches that uid");
+      const adapter = new NativeTableAdapter(tableUid);
+      const model = adapter.load();
+      const patch = buildResizePatch(model, targetRows, targetCols);
+      if (patch.length) {
+        applyPatchToModel(model, patch);
+        await adapter.save(model, { saveMetadata: true });
+      }
+      const reloaded = new NativeTableAdapter(tableUid).load();
+      return { ok: true, uid: tableUid, rows: reloaded.rowCount, cols: reloaded.colCount };
     },
     listGrids: () => listGridMetadataSummaries(),
     enhanceTable: async (tableUid) => {

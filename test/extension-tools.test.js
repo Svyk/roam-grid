@@ -55,7 +55,20 @@ function installTableRoamMock() {
       pull: (_pattern, [, title]) => (pages.has(title) ? { ":block/uid": pages.get(title) } : null),
       page: { create: async ({ page }) => { pages.set(page.title, page.uid); add(page.uid, page.title); } },
       block: {
-        create: async ({ location, block }) => { const node = { ...block, order: 0, children: [] }; blocks.set(block.uid, node); blocks.get(location["parent-uid"])?.children.push(node); },
+        create: async ({ location, block }) => {
+          const order = typeof location.order === "number" ? location.order : "last";
+          const node = { ...block, order, children: [] };
+          blocks.set(block.uid, node);
+          const parent = blocks.get(location["parent-uid"]);
+          if (parent) {
+            if (typeof order === "number") {
+              const insertAt = parent.children.findIndex((child) => (child.order ?? 0) >= order);
+              if (insertAt < 0) parent.children.push(node); else parent.children.splice(insertAt, 0, node);
+            } else {
+              parent.children.push(node);
+            }
+          }
+        },
         update: async ({ block }) => { if (blocks.has(block.uid)) blocks.get(block.uid).string = block.string; },
         delete: async ({ block }) => {
           for (const node of blocks.values()) {
@@ -63,6 +76,24 @@ function installTableRoamMock() {
             if (index >= 0) node.children.splice(index, 1);
           }
           blocks.delete(block.uid);
+        },
+        move: async ({ location, block }) => {
+          const node = blocks.get(block.uid);
+          if (!node) return;
+          for (const parent of blocks.values()) {
+            const index = (parent.children || []).findIndex((child) => child.uid === block.uid);
+            if (index >= 0) parent.children.splice(index, 1);
+          }
+          const target = blocks.get(location["parent-uid"]);
+          if (!target) return;
+          const order = typeof location.order === "number" ? location.order : "last";
+          if (typeof order === "number") {
+            const insertAt = target.children.findIndex((child) => (child.order ?? 0) >= order);
+            if (insertAt < 0) target.children.push(node); else target.children.splice(insertAt, 0, node);
+          } else {
+            target.children.push(node);
+          }
+          node.order = typeof order === "number" ? order : (target.children.length - 1);
         },
       },
     },
@@ -158,12 +189,12 @@ test("sibling keys survive disposer and the pre-existing registry is left in pla
 test("createExtensionToolsRegistration exposes the roam-grid contract", () => {
   const registration = createExtensionToolsRegistration();
   assert.equal(registration.name, "Roam Grid");
-  assert.equal(registration.version, "0.18.0");
+  assert.equal(registration.version, "0.18.1");
   const names = registration.tools.map((tool) => tool.name);
   assert.deepEqual(names.sort(), [
     "rg_add_formula", "rg_apply_patch", "rg_create_from_template", "rg_create_table",
     "rg_enhance_table", "rg_get_grid", "rg_list_grids", "rg_list_templates",
-    "rg_restore_native", "rg_set_cell",
+    "rg_resize_table", "rg_restore_native", "rg_set_cell",
   ]);
   for (const readOnly of ["rg_list_grids", "rg_get_grid", "rg_list_templates"]) {
     assert.equal(toolByName(registration, readOnly).readOnly, true, `${readOnly} is readOnly`);
@@ -461,4 +492,110 @@ test("savedTemplateNameList still works without a runtime (no throw on null stor
     runtime.registries = previousRegistries;
     runtime.templates = previousTemplates;
   }
+});
+
+test("rg_create_table builds a nested table: 4 row roots each holding nested col cells, not 20 flat siblings", async (t) => {
+  const mock = installTableRoamMock();
+  t.after(mock.dispose);
+  const restoreDocument = installDocumentStub();
+  t.after(restoreDocument);
+  runtime.registries = new RegistrySet();
+  runtime.metadata = new MetadataStore();
+  await runtime.metadata.initialize();
+  mock.addPage("Home", "pageHome");
+  const registration = createExtensionToolsRegistration();
+
+  const created = await callTool(registration, "rg_create_table", { parent_uid: "pageHome", rows: 4, cols: 5 });
+  assert.equal(created.ok, true);
+
+  const tableNode = mock.blocks.get(created.uid);
+  assert.equal(tableNode.children.length, 4, "table has 4 row roots, not 20 flat siblings");
+  let chainDepth = 0; let cursor = tableNode.children[0];
+  while (cursor) { chainDepth += 1; cursor = (cursor.children || [])[0] || null; }
+  assert.equal(chainDepth, 5, "first row root holds a 5-deep first-child chain (1 root + 4 nested cols), not flat siblings");
+
+  const model = createPublicApi().getTableModel(created.uid);
+  assert.equal(model.rows.length, 4);
+  assert.equal(model.columnIds.length, 5);
+
+  runtime.metadata = null; runtime.registries = null;
+});
+
+test("a flat 20-sibling {{table}} enhances to 20x1 then resizes to a nested 4x4 tree", async (t) => {
+  const mock = installTableRoamMock();
+  t.after(mock.dispose);
+  const restoreDocument = installDocumentStub();
+  t.after(restoreDocument);
+  runtime.registries = new RegistrySet();
+  runtime.metadata = new MetadataStore();
+  await runtime.metadata.initialize();
+
+  const flatChildren = Array.from({ length: 20 }, (_, index) => ({ uid: `flat${String(index).padStart(2, "0")}`, string: " ", order: index, children: [] }));
+  mock.addBlock("flatTable", "{{[[table]]}}", null, flatChildren);
+
+  const registration = createExtensionToolsRegistration();
+  const enhanced = await callTool(registration, "rg_enhance_table", { uid: "flatTable" });
+  assert.equal(enhanced.ok, true);
+
+  const beforeModel = createPublicApi().getTableModel("flatTable");
+  assert.equal(beforeModel.rows.length, 20, "flat siblings walk as 20 rows");
+  assert.equal(beforeModel.columnIds.length, 1, "each flat sibling has no nested col chain, so 1 col");
+
+  const resized = await callTool(registration, "rg_resize_table", { uid: "flatTable", rows: 4, cols: 4 });
+  assert.equal(resized.ok, true);
+
+  const afterModel = createPublicApi().getTableModel("flatTable");
+  assert.equal(afterModel.rows.length, 4);
+  assert.equal(afterModel.columnIds.length, 4);
+
+  const tableNode = mock.blocks.get("flatTable");
+  assert.equal(tableNode.children.length, 4, "resize nests into 4 row roots");
+  assert.ok(tableNode.children[0].children.length >= 1, "first row now has nested col children (cols > 1)");
+
+  runtime.metadata = null; runtime.registries = null;
+});
+
+test("rg_set_cell + rg_add_formula produce a computed formula value via GridModel.fromJSON", async (t) => {
+  const mock = installTableRoamMock();
+  t.after(mock.dispose);
+  const restoreDocument = installDocumentStub();
+  t.after(restoreDocument);
+  runtime.registries = new RegistrySet();
+  runtime.metadata = new MetadataStore();
+  await runtime.metadata.initialize();
+  mock.addPage("Home", "pageHome");
+  const registration = createExtensionToolsRegistration();
+
+  const created = await callTool(registration, "rg_create_table", { parent_uid: "pageHome", rows: 3, cols: 3 });
+  const uid = created.uid;
+
+  await callTool(registration, "rg_set_cell", { uid, row: 0, col: 0, value: "10" });
+  await callTool(registration, "rg_set_cell", { uid, row: 0, col: 1, value: "20" });
+  await callTool(registration, "rg_add_formula", { uid, row: 0, col: 2, formula: "A1+B1" });
+
+  const model = GridModel.fromJSON(createPublicApi().getTableModel(uid));
+  assert.equal(model.getValue(0, 2), 30, "formula cell evaluates A1+B1 = 10+20");
+
+  runtime.metadata = null; runtime.registries = null;
+});
+
+test("rg_apply_patch merge produces a nonempty merges list (single-cell and nonempty covers are refused)", async (t) => {
+  const mock = installTableRoamMock();
+  t.after(mock.dispose);
+  const restoreDocument = installDocumentStub();
+  t.after(restoreDocument);
+  runtime.registries = new RegistrySet();
+  runtime.metadata = new MetadataStore();
+  await runtime.metadata.initialize();
+  mock.addPage("Home", "pageHome");
+  const registration = createExtensionToolsRegistration();
+
+  const created = await callTool(registration, "rg_create_table", { parent_uid: "pageHome", rows: 3, cols: 3 });
+  const uid = created.uid;
+
+  const merged = await callTool(registration, "rg_apply_patch", { uid, patch: { op: "merge", range: { startRow: 0, startCol: 0, endRow: 0, endCol: 1 } } });
+  assert.equal(merged.ok, true);
+  assert.ok(merged.model.merges.length > 0, "merge produced a nonempty merges list");
+
+  runtime.metadata = null; runtime.registries = null;
 });
