@@ -1,6 +1,6 @@
 # Roam Grid
 
-Version 0.17.1
+Version 0.18.0
 
 Turn a native Roam `{{table}}` into a spreadsheet — formulas, merges, sorting, resizing, charts, comments — without moving a cell out of your graph.
 
@@ -117,8 +117,25 @@ With the switch on, three more rows appear in the panel:
 - **Large grids — Permanently delete superseded large-grid files (irreversible)**
 - **Large grids — Mirror large-grid references into Roam**
 
+## Extension Tools API
+
+Roam Grid registers tools on `window.RoamExtensionTools["roam-grid"]` so Chief of Staff (and other extensions) can list, create, and edit grids by uid when you enable Roam Grid under Extension Tools.
+
+| Tool | Description |
+|------|-------------|
+| `rg_list_grids` | List every enhanced grid (native and large) with uid, mode, rows, cols |
+| `rg_get_grid` | Return the JSON model of an enhanced grid by uid |
+| `rg_enhance_table` | Enhance a native `{{table}}` block by uid without focusing it |
+| `rg_restore_native` | Restore an enhanced native grid to a plain Roam table by uid |
+| `rg_create_table` | Create a new native grid. Requires `parent_uid` or `after_uid` |
+| `rg_set_cell` | Set a cell value (row/col 0-indexed). Formulas begin with `=` but not `==` |
+| `rg_add_formula` | Set a formula cell. A leading `=` is added if missing; `==` is refused |
+| `rg_apply_patch` | Apply one or more v1 grid patches (object or array) by uid |
+| `rg_list_templates` | List saved grid template names |
+| `rg_create_from_template` | Insert a grid from a saved template. Requires `parent_uid` |
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
 
-Developers: [docs/](docs/) covers architecture, development, testing, and the Live AI adapter. `window.roamGrid.v1` is the extension API.
+Developers: [docs/](docs/) covers architecture, development, testing, and the Live AI adapter. `window.roamGrid.v1` is the extension API; the Extension Tools registry is `window.RoamExtensionTools["roam-grid"]`.

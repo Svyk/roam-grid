@@ -21,6 +21,15 @@ serialized block writes inside one owner. When Roam Grid is absent or the table
 is not enhanced, Live AI continues to call `roamAlphaAPI.updateBlock` with the
 cell UID. The integration therefore adds no hard dependency in either direction.
 
+The same writes are also available as Extension Tools on
+`window.RoamExtensionTools["roam-grid"]`: `rg_list_grids`, `rg_get_grid`,
+`rg_enhance_table`, `rg_restore_native`, `rg_create_table`, `rg_set_cell`,
+`rg_add_formula`, `rg_apply_patch`, `rg_list_templates`,
+`rg_create_from_template`. Chief of Staff uses that registry, not a second
+write path. The adapter still asks `v1.getTableModel` / `applyPatch`, so
+formula invalidation, undo, metadata, conflict detection, and serialized
+block writes stay in one owner.
+
 The local Live AI source adapter lives in
 `~/roam-extension-live-ai-assistant/src/utils/roamTable.js` and its streamed
 completion writer in `src/ai/tableCompletion.js`.

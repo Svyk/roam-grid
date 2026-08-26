@@ -2,6 +2,23 @@
 
 ## 0.18.0
 
+Extension Tools for Chief of Staff, and uid-based enhance, create, and cell
+writes that do not need a focused block.
+
+- **Roam Grid registers on `window.RoamExtensionTools["roam-grid"]`.** The
+  entry is `{ name: "Roam Grid", version: "0.18.0", tools }`, installed at
+  onload.
+- **Ten tools, same write owner as `window.roamGrid.v1`.**
+  `rg_list_grids`, `rg_get_grid`, `rg_enhance_table`, `rg_restore_native`,
+  `rg_create_table`, `rg_set_cell`, `rg_add_formula`, `rg_apply_patch`,
+  `rg_list_templates`, `rg_create_from_template`.
+- **Enhance, create, set, and formula take a uid.** They never depend on a
+  focused block. `rg_create_table` needs `parent_uid` or `after_uid`;
+  `rg_create_from_template` needs `parent_uid`.
+- **Chief of Staff discovers them when you enable Roam Grid under Extension
+  Tools.** COS uses that registry; writes go through `createPublicApi` /
+  `applyPatch`.
+
 ## 0.17.1
 
 - **Enhancing a table no longer toasts `Illegal invocation`.** Recents-cache
