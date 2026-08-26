@@ -6360,18 +6360,23 @@ function wrapSafeExecute(impl) {
 }
 
 /** Builds the registration object installed under `window.RoamExtensionTools["roam-grid"]`. */
+function objectParams(properties, required = []) {
+  return { type: "object", properties, ...(required.length ? { required } : {}) };
+}
+
 export function createExtensionToolsRegistration() {
+  const uidProp = { type: "string", description: "Block uid of the native {{table}} or enhanced grid." };
   const tools = [
     {
       name: "rg_list_grids", readOnly: true,
       description: "List every enhanced grid (native and large) with uid, mode, rows, cols.",
-      parameters: [],
+      parameters: objectParams({}),
       execute: wrapSafeExecute(() => ({ grids: listGridMetadataSummaries() })),
     },
     {
       name: "rg_get_grid", readOnly: true,
       description: "Return the JSON model of an enhanced grid by uid.",
-      parameters: [{ name: "uid", required: true }],
+      parameters: objectParams({ uid: uidProp }, ["uid"]),
       execute: wrapSafeExecute(({ uid } = {}) => {
         if (!uid) return { ok: false, error: "uid is required" };
         const model = createPublicApi().getTableModel(uid);
@@ -6382,7 +6387,7 @@ export function createExtensionToolsRegistration() {
     {
       name: "rg_enhance_table",
       description: "Enhance a native {{table}} block by uid without focusing it.",
-      parameters: [{ name: "uid", required: true }],
+      parameters: objectParams({ uid: uidProp }, ["uid"]),
       execute: wrapSafeExecute(({ uid } = {}) => {
         if (!uid) return { ok: false, error: "uid is required" };
         return createPublicApi().enhanceTable(uid).then(() => ({ ok: true, uid })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
@@ -6391,7 +6396,7 @@ export function createExtensionToolsRegistration() {
     {
       name: "rg_restore_native",
       description: "Restore an enhanced native grid to a plain Roam table by uid.",
-      parameters: [{ name: "uid", required: true }],
+      parameters: objectParams({ uid: uidProp }, ["uid"]),
       execute: wrapSafeExecute(({ uid } = {}) => {
         if (!uid) return { ok: false, error: "uid is required" };
         return createPublicApi().restoreNative(uid).then(() => ({ ok: true, uid })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
@@ -6400,7 +6405,12 @@ export function createExtensionToolsRegistration() {
     {
       name: "rg_create_table",
       description: "Create a new native grid. Requires parent_uid or after_uid so it never depends on focus.",
-      parameters: [{ name: "parent_uid" }, { name: "after_uid" }, { name: "rows" }, { name: "cols" }],
+      parameters: objectParams({
+        parent_uid: { type: "string", description: "Parent block uid. Required unless after_uid is set." },
+        after_uid: { type: "string", description: "Insert the new table after this block uid." },
+        rows: { type: "number", description: "Row count, 1-20. Default 3." },
+        cols: { type: "number", description: "Column count, 1-20. Default 3." },
+      }),
       execute: wrapSafeExecute(({ parent_uid, after_uid, rows, cols } = {}) => {
         if (!parent_uid && !after_uid) return { ok: false, error: "parent_uid or after_uid is required" };
         return createPublicApi().createTable({ parentUid: parent_uid || null, afterUid: after_uid || null, rows, cols }).then((uid) => ({ ok: true, uid })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
@@ -6409,7 +6419,12 @@ export function createExtensionToolsRegistration() {
     {
       name: "rg_set_cell",
       description: "Set a cell value via the v1 patch surface (row/col 0-indexed). Formulas begin with `=` but not `==`.",
-      parameters: [{ name: "uid", required: true }, { name: "row", required: true }, { name: "col", required: true }, { name: "value", required: true }],
+      parameters: objectParams({
+        uid: uidProp,
+        row: { type: "number", description: "0-indexed row." },
+        col: { type: "number", description: "0-indexed column." },
+        value: { type: "string", description: "Cell text. Formulas start with a single =." },
+      }, ["uid", "row", "col", "value"]),
       execute: wrapSafeExecute(({ uid, row, col, value } = {}) => {
         if (!uid) return { ok: false, error: "uid is required" };
         if (!Number.isFinite(Number(row)) || !Number.isFinite(Number(col))) return { ok: false, error: "row and col must be numeric" };
@@ -6419,7 +6434,12 @@ export function createExtensionToolsRegistration() {
     {
       name: "rg_add_formula",
       description: "Set a formula cell. A leading `=` is added if missing; `==` is refused.",
-      parameters: [{ name: "uid", required: true }, { name: "row", required: true }, { name: "col", required: true }, { name: "formula", required: true }],
+      parameters: objectParams({
+        uid: uidProp,
+        row: { type: "number", description: "0-indexed row." },
+        col: { type: "number", description: "0-indexed column." },
+        formula: { type: "string", description: "Formula body. A leading = is added if missing." },
+      }, ["uid", "row", "col", "formula"]),
       execute: wrapSafeExecute(({ uid, row, col, formula } = {}) => {
         if (!uid) return { ok: false, error: "uid is required" };
         if (!Number.isFinite(Number(row)) || !Number.isFinite(Number(col))) return { ok: false, error: "row and col must be numeric" };
@@ -6432,7 +6452,10 @@ export function createExtensionToolsRegistration() {
     {
       name: "rg_apply_patch",
       description: "Apply one or more v1 grid patches (object or array) by uid.",
-      parameters: [{ name: "uid", required: true }, { name: "patch", required: true }],
+      parameters: objectParams({
+        uid: uidProp,
+        patch: { description: "One patch object or an array of patches (set/merge/insertRows/…)." },
+      }, ["uid", "patch"]),
       execute: wrapSafeExecute(({ uid, patch } = {}) => {
         if (!uid) return { ok: false, error: "uid is required" };
         if (!patch || (typeof patch !== "object" && !Array.isArray(patch))) return { ok: false, error: "patch must be an object or array" };
@@ -6442,13 +6465,16 @@ export function createExtensionToolsRegistration() {
     {
       name: "rg_list_templates", readOnly: true,
       description: "List saved grid template names (registry and store).",
-      parameters: [],
+      parameters: objectParams({}),
       execute: wrapSafeExecute(() => ({ templates: savedTemplateNameList() })),
     },
     {
       name: "rg_create_from_template",
       description: "Insert a grid from a saved template. parent_uid is required so it never depends on focus.",
-      parameters: [{ name: "name", required: true }, { name: "parent_uid" }],
+      parameters: objectParams({
+        name: { type: "string", description: "Saved template name." },
+        parent_uid: { type: "string", description: "Parent block uid for the new table." },
+      }, ["name", "parent_uid"]),
       execute: wrapSafeExecute(({ name, parent_uid } = {}) => {
         if (!name) return { ok: false, error: "name is required" };
         if (!parent_uid) return { ok: false, error: "parent_uid is required" };

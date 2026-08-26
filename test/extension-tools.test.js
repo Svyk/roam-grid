@@ -171,6 +171,12 @@ test("createExtensionToolsRegistration exposes the roam-grid contract", () => {
   for (const writable of ["rg_enhance_table", "rg_set_cell", "rg_create_table"]) {
     assert.notEqual(toolByName(registration, writable).readOnly, true, `${writable} is not readOnly`);
   }
+  for (const tool of registration.tools) {
+    assert.equal(tool.parameters?.type, "object", `${tool.name} parameters is JSON Schema`);
+    assert.equal(typeof tool.parameters?.properties, "object", `${tool.name} has properties`);
+    assert.equal(Array.isArray(tool.parameters), false, `${tool.name} is not a name-array`);
+  }
+  assert.deepEqual(toolByName(registration, "rg_get_grid").parameters.required, ["uid"]);
 });
 
 test("rg_list_grids lists metadata entries with mode and dimensions", async (t) => {

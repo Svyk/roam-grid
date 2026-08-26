@@ -17,7 +17,8 @@ writes that do not need a focused block.
   `rg_create_from_template` needs `parent_uid`.
 - **Chief of Staff discovers them when you enable Roam Grid under Extension
   Tools.** COS uses that registry; writes go through `createPublicApi` /
-  `applyPatch`.
+  `applyPatch`. Each tool's `parameters` is a JSON Schema object (`type:
+  object`, `properties`, `required`) so COS can pass it as `input_schema`.
 
 ## 0.17.1
 
