@@ -133,6 +133,18 @@ Roam Grid registers tools on `window.RoamExtensionTools["roam-grid"]` so Chief o
 | `rg_apply_patch` | Apply one or more v1 grid patches (object or array) by uid |
 | `rg_list_templates` | List saved grid template names |
 | `rg_create_from_template` | Insert a grid from a saved template. Requires `parent_uid` |
+| `rg_resize_table` | Resize a native grid by uid. rows/cols clamped to 1-20 |
+| `rg_insert_rows` | Insert rows into an enhanced grid by uid. Default count 1 |
+| `rg_insert_cols` | Insert columns into an enhanced grid by uid. Default count 1 |
+| `rg_delete_rows` | Delete rows from an enhanced grid by uid. Refuses the last row |
+| `rg_delete_cols` | Delete columns from an enhanced grid by uid. Refuses the last column |
+| `rg_get_cell` | Return `{ raw, value }` for a cell. value evaluates formulas |
+| `rg_fill` | Fill a rectangular region starting at (start_row, start_col) with values |
+| `rg_merge` | Merge a range of cells. Refuses single cell and nonempty covers |
+| `rg_unmerge` | Unmerge the merge region containing (row, col) |
+| `rg_sort` | Sort rows by a column. direction is \"asc\" or \"desc\". Header rows stay put |
+| `rg_export_grid` | Export an enhanced grid as text (csv, tsv, markdown, json). No download |
+| `rg_insert_chart` | Insert a chart spec (line, column, bar, scatter) onto the model |
 
 ## License
 

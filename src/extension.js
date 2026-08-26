@@ -6512,6 +6512,172 @@ export function createExtensionToolsRegistration() {
         return createPublicApi().createFromTemplate(name, parent_uid).then((uid) => ({ ok: true, uid })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
       }),
     },
+    {
+      name: "rg_insert_rows",
+      description: "Insert rows into an enhanced grid by uid. Default count 1.",
+      parameters: objectParams({
+        uid: uidProp,
+        index: { type: "number", description: "0-indexed row position to insert at." },
+        count: { type: "number", description: "Number of rows to insert. Default 1." },
+      }, ["uid", "index"]),
+      execute: wrapSafeExecute(({ uid, index, count } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (!Number.isFinite(Number(index))) return { ok: false, error: "index must be numeric" };
+        return createPublicApi().insertRows(uid, Number(index), Number(count) || 1).then((model) => ({ ok: true, model })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_insert_cols",
+      description: "Insert columns into an enhanced grid by uid. Default count 1.",
+      parameters: objectParams({
+        uid: uidProp,
+        index: { type: "number", description: "0-indexed column position to insert at." },
+        count: { type: "number", description: "Number of columns to insert. Default 1." },
+      }, ["uid", "index"]),
+      execute: wrapSafeExecute(({ uid, index, count } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (!Number.isFinite(Number(index))) return { ok: false, error: "index must be numeric" };
+        return createPublicApi().insertCols(uid, Number(index), Number(count) || 1).then((model) => ({ ok: true, model })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_delete_rows",
+      description: "Delete rows from an enhanced grid by uid. Default count 1. Refuses to delete the last row.",
+      parameters: objectParams({
+        uid: uidProp,
+        index: { type: "number", description: "0-indexed row position to delete at." },
+        count: { type: "number", description: "Number of rows to delete. Default 1." },
+      }, ["uid", "index"]),
+      execute: wrapSafeExecute(({ uid, index, count } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (!Number.isFinite(Number(index))) return { ok: false, error: "index must be numeric" };
+        const n = Number(count) || 1;
+        const model = createPublicApi().getTableModel(uid);
+        if (model && model.rows.length - n < 1) return { ok: false, error: "A grid must keep at least one row" };
+        return createPublicApi().deleteRows(uid, Number(index), n).then((m) => ({ ok: true, model: m })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_delete_cols",
+      description: "Delete columns from an enhanced grid by uid. Default count 1. Refuses to delete the last column.",
+      parameters: objectParams({
+        uid: uidProp,
+        index: { type: "number", description: "0-indexed column position to delete at." },
+        count: { type: "number", description: "Number of columns to delete. Default 1." },
+      }, ["uid", "index"]),
+      execute: wrapSafeExecute(({ uid, index, count } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (!Number.isFinite(Number(index))) return { ok: false, error: "index must be numeric" };
+        const n = Number(count) || 1;
+        const model = createPublicApi().getTableModel(uid);
+        if (model && model.columnIds.length - n < 1) return { ok: false, error: "A grid must keep at least one column" };
+        return createPublicApi().deleteCols(uid, Number(index), n).then((m) => ({ ok: true, model: m })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_get_cell", readOnly: true,
+      description: "Return { raw, value } for a cell. value evaluates formulas via FormulaEngine.",
+      parameters: objectParams({
+        uid: uidProp,
+        row: { type: "number", description: "0-indexed row." },
+        col: { type: "number", description: "0-indexed column." },
+      }, ["uid", "row", "col"]),
+      execute: wrapSafeExecute(({ uid, row, col } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (!Number.isFinite(Number(row)) || !Number.isFinite(Number(col))) return { ok: false, error: "row and col must be numeric" };
+        const { raw, value } = createPublicApi().getCell(uid, Number(row), Number(col));
+        return { ok: true, raw, value };
+      }),
+    },
+    {
+      name: "rg_fill",
+      description: "Fill a rectangular region starting at (start_row, start_col) with values (array of arrays of strings).",
+      parameters: objectParams({
+        uid: uidProp,
+        start_row: { type: "number", description: "0-indexed start row." },
+        start_col: { type: "number", description: "0-indexed start column." },
+        values: { type: "array", description: "Array of arrays of strings to fill.", items: { type: "array", items: { type: "string" } } },
+      }, ["uid", "start_row", "start_col", "values"]),
+      execute: wrapSafeExecute(({ uid, start_row, start_col, values } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (!Array.isArray(values)) return { ok: false, error: "values must be an array of arrays" };
+        return createPublicApi().fill(uid, Number(start_row), Number(start_col), values).then((model) => ({ ok: true, model })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_merge",
+      description: "Merge a range of cells. Refuses a single cell and nonempty covered cells.",
+      parameters: objectParams({
+        uid: uidProp,
+        start_row: { type: "number", description: "0-indexed start row." },
+        start_col: { type: "number", description: "0-indexed start column." },
+        end_row: { type: "number", description: "0-indexed end row (inclusive)." },
+        end_col: { type: "number", description: "0-indexed end column (inclusive)." },
+      }, ["uid", "start_row", "start_col", "end_row", "end_col"]),
+      execute: wrapSafeExecute(({ uid, start_row, start_col, end_row, end_col } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        return createPublicApi().merge(uid, { startRow: Number(start_row), startCol: Number(start_col), endRow: Number(end_row), endCol: Number(end_col) }).then((model) => ({ ok: true, model })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_unmerge",
+      description: "Unmerge the merge region containing (row, col).",
+      parameters: objectParams({
+        uid: uidProp,
+        row: { type: "number", description: "0-indexed row." },
+        col: { type: "number", description: "0-indexed column." },
+      }, ["uid", "row", "col"]),
+      execute: wrapSafeExecute(({ uid, row, col } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        return createPublicApi().unmerge(uid, Number(row), Number(col)).then((model) => ({ ok: true, model })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_sort",
+      description: "Sort rows by a column. direction must be \"asc\" or \"desc\". Header rows (frozenRows) stay put.",
+      parameters: objectParams({
+        uid: uidProp,
+        col: { type: "number", description: "0-indexed column to sort by." },
+        direction: { type: "string", description: "Sort direction: \"asc\" or \"desc\"." },
+      }, ["uid", "col", "direction"]),
+      execute: wrapSafeExecute(({ uid, col, direction } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (direction !== "asc" && direction !== "desc") return { ok: false, error: "direction must be \"asc\" or \"desc\"" };
+        return createPublicApi().sort(uid, Number(col), direction).then((model) => ({ ok: true, model })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
+    {
+      name: "rg_export_grid", readOnly: true,
+      description: "Export an enhanced grid as text. format one of csv|tsv|markdown|json. No file download.",
+      parameters: objectParams({
+        uid: uidProp,
+        format: { type: "string", description: "Export format: csv, tsv, markdown, or json." },
+      }, ["uid", "format"]),
+      execute: wrapSafeExecute(({ uid, format } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (!["csv", "tsv", "markdown", "json"].includes(String(format).toLowerCase())) return { ok: false, error: "format must be csv, tsv, markdown, or json" };
+        const text = createPublicApi().exportTable(uid, String(format));
+        return { ok: true, text };
+      }),
+    },
+    {
+      name: "rg_insert_chart",
+      description: "Insert a chart spec onto the model. type one of line|column|bar|scatter. No UI picker.",
+      parameters: objectParams({
+        uid: uidProp,
+        type: { type: "string", description: "Chart type: line, column, bar, or scatter." },
+        start_row: { type: "number", description: "0-indexed start row of the chart range." },
+        start_col: { type: "number", description: "0-indexed start column of the chart range." },
+        end_row: { type: "number", description: "0-indexed end row of the chart range (inclusive)." },
+        end_col: { type: "number", description: "0-indexed end column of the chart range (inclusive)." },
+        title: { type: "string", description: "Optional chart title. Defaults to \"<type> · <range>\"." },
+      }, ["uid", "type", "start_row", "start_col", "end_row", "end_col"]),
+      execute: wrapSafeExecute(({ uid, type, start_row, start_col, end_row, end_col, title } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        if (!["line", "column", "bar", "scatter"].includes(String(type))) return { ok: false, error: "type must be line, column, bar, or scatter" };
+        return createPublicApi().insertChart(uid, { type: String(type), startRow: Number(start_row), startCol: Number(start_col), endRow: Number(end_row), endCol: Number(end_col), title }).then((model) => ({ ok: true, uid, charts: model.charts.length })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
+      }),
+    },
   ];
   return { name: "Roam Grid", version: VERSION, tools };
 }
@@ -6612,6 +6778,103 @@ export function createPublicApi() {
     importGrid,
     exportGrid,
     renderChartSvg,
+    insertRows: async (tableUid, index, count = 1) => {
+      const session = runtime.sessions.get(tableUid);
+      if (session) return session.applyPatch({ op: "insertRows", index, count });
+      const adapter = new NativeTableAdapter(tableUid);
+      const model = adapter.load();
+      applyPatchToModel(model, { op: "insertRows", index, count });
+      const saved = await adapter.save(model, { saveMetadata: true });
+      globalThis.window?.dispatchEvent(new CustomEvent("roam-grid:changed", { detail: { tableUid } }));
+      return saved.toJSON();
+    },
+    insertCols: async (tableUid, index, count = 1) => {
+      const session = runtime.sessions.get(tableUid);
+      if (session) return session.applyPatch({ op: "insertCols", index, count });
+      const adapter = new NativeTableAdapter(tableUid);
+      const model = adapter.load();
+      applyPatchToModel(model, { op: "insertCols", index, count });
+      const saved = await adapter.save(model, { saveMetadata: true });
+      globalThis.window?.dispatchEvent(new CustomEvent("roam-grid:changed", { detail: { tableUid } }));
+      return saved.toJSON();
+    },
+    deleteRows: async (tableUid, index, count = 1) => {
+      const session = runtime.sessions.get(tableUid);
+      if (session) return session.applyPatch({ op: "deleteRows", index, count });
+      const adapter = new NativeTableAdapter(tableUid);
+      const model = adapter.load();
+      applyPatchToModel(model, { op: "deleteRows", index, count });
+      const saved = await adapter.save(model, { saveMetadata: true });
+      globalThis.window?.dispatchEvent(new CustomEvent("roam-grid:changed", { detail: { tableUid } }));
+      return saved.toJSON();
+    },
+    deleteCols: async (tableUid, index, count = 1) => {
+      const session = runtime.sessions.get(tableUid);
+      if (session) return session.applyPatch({ op: "deleteCols", index, count });
+      const adapter = new NativeTableAdapter(tableUid);
+      const model = adapter.load();
+      applyPatchToModel(model, { op: "deleteCols", index, count });
+      const saved = await adapter.save(model, { saveMetadata: true });
+      globalThis.window?.dispatchEvent(new CustomEvent("roam-grid:changed", { detail: { tableUid } }));
+      return saved.toJSON();
+    },
+    getCell: (tableUid, row, col) => {
+      const session = runtime.sessions.get(tableUid);
+      const model = session?.model || (runtime.metadata.has(tableUid) ? new NativeTableAdapter(tableUid).load() : null);
+      if (!model) throw new GridError("NOT_ENHANCED", `No enhanced grid for uid ${tableUid}`);
+      const raw = model.getRaw(row, col);
+      const value = model.getValue(row, col);
+      return { raw, value };
+    },
+    fill: async (tableUid, startRow, startCol, values) => {
+      const patch = [];
+      for (let r = 0; r < values.length; r += 1) {
+        const row = values[r] || [];
+        for (let c = 0; c < row.length; c += 1) {
+          patch.push({ op: "set", row: startRow + r, col: startCol + c, value: row[c] });
+        }
+      }
+      return createPublicApi().applyPatch(tableUid, patch);
+    },
+    merge: async (tableUid, range) => {
+      const normalized = range && typeof range === "object" && !("startRow" in range)
+        ? { startRow: range.row ?? range.start ?? 0, startCol: range.col ?? 0, endRow: range.row ?? 0, endCol: range.col ?? 0 }
+        : range;
+      return createPublicApi().applyPatch(tableUid, { op: "merge", range: normalized });
+    },
+    unmerge: async (tableUid, row, col) => createPublicApi().applyPatch(tableUid, { op: "unmerge", row, col }),
+    sort: async (tableUid, col, direction) => {
+      const session = runtime.sessions.get(tableUid);
+      const model = session?.model || (runtime.metadata.has(tableUid) ? new NativeTableAdapter(tableUid).load() : null);
+      if (!model) throw new GridError("NOT_ENHANCED", `No enhanced grid for uid ${tableUid}`);
+      return createPublicApi().applyPatch(tableUid, { op: "sort", col, direction, headerRows: model.frozenRows });
+    },
+    exportTable: (tableUid, format) => {
+      const session = runtime.sessions.get(tableUid);
+      const model = session?.model || (runtime.metadata.has(tableUid) ? new NativeTableAdapter(tableUid).load() : null);
+      if (!model) throw new GridError("NOT_ENHANCED", `No enhanced grid for uid ${tableUid}`);
+      return exportGrid(model, format);
+    },
+    insertChart: async (tableUid, { type, startRow, startCol, endRow, endCol, title }) => {
+      const spec = {
+        id: makeLocalUid(),
+        type,
+        range: { startRow, startCol, endRow, endCol },
+        title: title || `${type} · ${cellLabel(startRow, startCol)}:${cellLabel(endRow, endCol)}`,
+      };
+      const session = runtime.sessions.get(tableUid);
+      if (session) {
+        await session.commitMutation(null, "Insert chart", () => session.model.charts.push(spec), true);
+        return session.model;
+      }
+      if (!runtime.metadata.has(tableUid)) throw new GridError("NOT_ENHANCED", `No enhanced grid for uid ${tableUid}`);
+      const adapter = new NativeTableAdapter(tableUid);
+      const model = adapter.load();
+      model.charts.push(spec);
+      await adapter.save(model, { saveMetadata: true });
+      globalThis.window?.dispatchEvent(new CustomEvent("roam-grid:changed", { detail: { tableUid } }));
+      return model;
+    },
   };
 }
 

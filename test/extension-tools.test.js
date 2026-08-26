@@ -193,10 +193,12 @@ test("createExtensionToolsRegistration exposes the roam-grid contract", () => {
   const names = registration.tools.map((tool) => tool.name);
   assert.deepEqual(names.sort(), [
     "rg_add_formula", "rg_apply_patch", "rg_create_from_template", "rg_create_table",
-    "rg_enhance_table", "rg_get_grid", "rg_list_grids", "rg_list_templates",
-    "rg_resize_table", "rg_restore_native", "rg_set_cell",
+    "rg_delete_cols", "rg_delete_rows", "rg_enhance_table", "rg_export_grid", "rg_fill",
+    "rg_get_cell", "rg_get_grid", "rg_insert_chart", "rg_insert_cols", "rg_insert_rows",
+    "rg_list_grids", "rg_list_templates", "rg_merge", "rg_resize_table", "rg_restore_native",
+    "rg_set_cell", "rg_sort", "rg_unmerge",
   ]);
-  for (const readOnly of ["rg_list_grids", "rg_get_grid", "rg_list_templates"]) {
+  for (const readOnly of ["rg_list_grids", "rg_get_grid", "rg_list_templates", "rg_get_cell", "rg_export_grid"]) {
     assert.equal(toolByName(registration, readOnly).readOnly, true, `${readOnly} is readOnly`);
   }
   for (const writable of ["rg_enhance_table", "rg_set_cell", "rg_create_table"]) {
@@ -576,6 +578,11 @@ test("rg_set_cell + rg_add_formula produce a computed formula value via GridMode
   const model = GridModel.fromJSON(createPublicApi().getTableModel(uid));
   assert.equal(model.getValue(0, 2), 30, "formula cell evaluates A1+B1 = 10+20");
 
+  const cell = await callTool(registration, "rg_get_cell", { uid, row: 0, col: 2 });
+  assert.equal(cell.ok, true);
+  assert.equal(cell.value, 30, "rg_get_cell value evaluates the formula");
+  assert.ok(String(cell.raw).startsWith("="), "rg_get_cell raw is the formula string");
+
   runtime.metadata = null; runtime.registries = null;
 });
 
@@ -596,6 +603,133 @@ test("rg_apply_patch merge produces a nonempty merges list (single-cell and none
   const merged = await callTool(registration, "rg_apply_patch", { uid, patch: { op: "merge", range: { startRow: 0, startCol: 0, endRow: 0, endCol: 1 } } });
   assert.equal(merged.ok, true);
   assert.ok(merged.model.merges.length > 0, "merge produced a nonempty merges list");
+
+  runtime.metadata = null; runtime.registries = null;
+});
+
+test("rg_insert_cols/rg_delete_cols/rg_merge/rg_unmerge/rg_sort/rg_export_grid cover the full toolbar by uid", async (t) => {
+  const mock = installTableRoamMock();
+  t.after(mock.dispose);
+  const restoreDocument = installDocumentStub();
+  t.after(restoreDocument);
+  runtime.registries = new RegistrySet();
+  runtime.metadata = new MetadataStore();
+  await runtime.metadata.initialize();
+  mock.addPage("Home", "pageHome");
+  const registration = createExtensionToolsRegistration();
+
+  const created = await callTool(registration, "rg_create_table", { parent_uid: "pageHome", rows: 4, cols: 3 });
+  const uid = created.uid;
+  assert.equal(created.ok, true);
+
+  // Fill unique strings so sort/export have content. Row 0 is the frozen header.
+  await callTool(registration, "rg_fill", { uid, start_row: 1, start_col: 0, values: [["zebra", "apple", "mango"], ["pear", "banana", "cherry"], ["fig", "date", "kiwi"]] });
+
+  // insert_cols then delete_cols restores colCount to original (3).
+  const inserted = await callTool(registration, "rg_insert_cols", { uid, index: 1, count: 1 });
+  assert.equal(inserted.ok, true);
+  assert.equal(inserted.model.columnIds.length, 4, "insert_cols grows colCount to 4");
+  const deleted = await callTool(registration, "rg_delete_cols", { uid, index: 1, count: 1 });
+  assert.equal(deleted.ok, true);
+  assert.equal(deleted.model.columnIds.length, 3, "delete_cols restores colCount to 3");
+
+  // merge then unmerge leaves merges empty.
+  const merged = await callTool(registration, "rg_merge", { uid, start_row: 0, start_col: 0, end_row: 0, end_col: 1 });
+  assert.equal(merged.ok, true);
+  assert.ok(merged.model.merges.length > 0, "merge produced a merge");
+  const unmerged = await callTool(registration, "rg_unmerge", { uid, row: 0, col: 0 });
+  assert.equal(unmerged.ok, true);
+  assert.equal(unmerged.model.merges.length, 0, "unmerge cleared merges");
+
+  // Sort by col 0 desc — data rows reorder, header row 0 stays put (headerRows = frozenRows = 1).
+  const headerBefore = createPublicApi().getTableModel(uid).rows[0].map((cell) => cell.raw);
+  const sorted = await callTool(registration, "rg_sort", { uid, col: 0, direction: "desc" });
+  assert.equal(sorted.ok, true);
+  const sortedModel = createPublicApi().getTableModel(uid);
+  const headerAfter = sortedModel.rows[0].map((cell) => cell.raw);
+  assert.deepEqual(headerAfter, headerBefore, "header row is unchanged by sort");
+  const dataCol = sortedModel.rows.slice(1).map((row) => row[0].raw);
+  assert.deepEqual(dataCol, ["zebra", "pear", "fig"], "data rows sorted desc by col 0");
+
+  // Export to CSV: contains a comma (delimiter) and a newline (row break). No download.
+  const exported = await callTool(registration, "rg_export_grid", { uid, format: "csv" });
+  assert.equal(exported.ok, true);
+  assert.ok(exported.text.includes(","), "csv contains a comma delimiter");
+  assert.ok(exported.text.includes("\n"), "csv contains a newline row break");
+
+  // tsv contains a tab.
+  const tsv = await callTool(registration, "rg_export_grid", { uid, format: "tsv" });
+  assert.equal(tsv.ok, true);
+  assert.ok(tsv.text.includes("\t"), "tsv contains a tab delimiter");
+
+  runtime.metadata = null; runtime.registries = null;
+});
+
+test("rg_insert_chart pushes a chart spec onto the model", async (t) => {
+  const mock = installTableRoamMock();
+  t.after(mock.dispose);
+  const restoreDocument = installDocumentStub();
+  t.after(restoreDocument);
+  runtime.registries = new RegistrySet();
+  runtime.metadata = new MetadataStore();
+  await runtime.metadata.initialize();
+  mock.addPage("Home", "pageHome");
+  const registration = createExtensionToolsRegistration();
+
+  const created = await callTool(registration, "rg_create_table", { parent_uid: "pageHome", rows: 3, cols: 3 });
+  const uid = created.uid;
+
+  const before = createPublicApi().getTableModel(uid).charts.length;
+  const chart = await callTool(registration, "rg_insert_chart", { uid, type: "line", start_row: 0, start_col: 0, end_row: 2, end_col: 2 });
+  assert.equal(chart.ok, true);
+  assert.equal(chart.charts, before + 1, "model.charts grew by 1");
+  const after = createPublicApi().getTableModel(uid).charts.length;
+  assert.equal(after, before + 1, "chart persisted in the stored model");
+
+  const bad = await callTool(registration, "rg_insert_chart", { uid, type: "pie", start_row: 0, start_col: 0, end_row: 1, end_col: 1 });
+  assert.equal(bad.ok, false);
+  assert.match(bad.error, /type must be/);
+
+  runtime.metadata = null; runtime.registries = null;
+});
+
+test("rg_delete_rows refuses the last row and rg_delete_cols refuses the last column", async (t) => {
+  const mock = installTableRoamMock();
+  t.after(mock.dispose);
+  const restoreDocument = installDocumentStub();
+  t.after(restoreDocument);
+  runtime.registries = new RegistrySet();
+  runtime.metadata = new MetadataStore();
+  await runtime.metadata.initialize();
+  mock.addPage("Home", "pageHome");
+  const registration = createExtensionToolsRegistration();
+
+  const created = await callTool(registration, "rg_create_table", { parent_uid: "pageHome", rows: 2, cols: 2 });
+  const uid = created.uid;
+
+  // Delete all rows (2) -> refuses.
+  const allRows = await callTool(registration, "rg_delete_rows", { uid, index: 0, count: 2 });
+  assert.equal(allRows.ok, false);
+  assert.match(allRows.error, /at least one row/);
+
+  // Delete all cols (2) -> refuses.
+  const allCols = await callTool(registration, "rg_delete_cols", { uid, index: 0, count: 2 });
+  assert.equal(allCols.ok, false);
+  assert.match(allCols.error, /at least one column/);
+
+  // A 1-row table: delete the single row -> refuses.
+  const single = await callTool(registration, "rg_create_table", { parent_uid: "pageHome", rows: 1, cols: 2 });
+  const singleUid = single.uid;
+  const lastRow = await callTool(registration, "rg_delete_rows", { uid: singleUid, index: 0, count: 1 });
+  assert.equal(lastRow.ok, false);
+  assert.match(lastRow.error, /at least one row/);
+
+  // A 1-col table: delete the single col -> refuses.
+  const singleCol = await callTool(registration, "rg_create_table", { parent_uid: "pageHome", rows: 2, cols: 1 });
+  const singleColUid = singleCol.uid;
+  const lastCol = await callTool(registration, "rg_delete_cols", { uid: singleColUid, index: 0, count: 1 });
+  assert.equal(lastCol.ok, false);
+  assert.match(lastCol.error, /at least one column/);
 
   runtime.metadata = null; runtime.registries = null;
 });

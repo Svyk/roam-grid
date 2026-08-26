@@ -2,6 +2,14 @@
 
 ## 0.18.1
 
+- **Full toolbar Extension Tools.** Adds `rg_resize_table`,
+  `rg_insert_rows`, `rg_insert_cols`, `rg_delete_rows`,
+  `rg_delete_cols`, `rg_get_cell`, `rg_fill`, `rg_merge`,
+  `rg_unmerge`, `rg_sort`, `rg_export_grid`, `rg_insert_chart`.
+  Each routes through `createPublicApi()` so NativeTableAdapter
+  stays the single write owner. `rg_get_cell` and `rg_export_grid`
+  are readOnly.
+
 ## 0.18.0
 
 Extension Tools for Chief of Staff, and uid-based enhance, create, and cell
