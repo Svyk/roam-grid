@@ -2866,12 +2866,45 @@ async function createPage(title) {
   return uid;
 }
 
+const ROAM_RATE_LIMIT = /rate limit exceeded/i;
+const DEFAULT_ROAM_WRITE_RETRY_DELAYS = Object.freeze([1000, 2000, 4000, 8000, 15000, 30000]);
+let roamWriteRetryDelays = [...DEFAULT_ROAM_WRITE_RETRY_DELAYS];
+
+/** Tests set `[0, 0, …]`; calling with no argument restores the production schedule (~60 s, Roam's window). */
+export function setRoamWriteRetryDelays(delays = null) {
+  roamWriteRetryDelays = Array.isArray(delays) ? [...delays] : [...DEFAULT_ROAM_WRITE_RETRY_DELAYS];
+}
+
+/** Waits out Roam's 1,500-writes/60 s limit instead of failing mid-transaction. Any other error
+ *  rethrows at once. `landed` (creates only) runs after each wait: a create whose rejection arrived
+ *  after the block was written must not be repeated. */
+async function withRoamWriteRetry(write, landed = null) {
+  for (let attempt = 0; ; attempt += 1) {
+    try { return await write(); }
+    catch (error) {
+      if (!ROAM_RATE_LIMIT.test(String(error?.message ?? error)) || attempt >= roamWriteRetryDelays.length) throw error;
+      await new Promise((resolve) => setTimeout(resolve, roamWriteRetryDelays[attempt]));
+      if (landed) {
+        let exists = false;
+        try { exists = Boolean(await landed()); } catch { exists = false; }
+        if (exists) return undefined;
+      }
+    }
+  }
+}
+
+function blockExists(uid) {
+  const api = roam();
+  const result = api.data?.pull?.("[:block/uid]", [":block/uid", uid]) || api.pull?.("[:block/uid]", [":block/uid", uid]);
+  return Boolean(result?.[":block/uid"] || result?.uid);
+}
+
 async function createBlock(parentUid, string, order = "last", uid = null, open = null) {
   const blockUid = uid || roam().util.generateUID();
   const create = roam().data?.block?.create || roam().createBlock;
   const block = { uid: blockUid, string: String(string ?? "") };
   if (typeof open === "boolean") block.open = open;
-  await create.call(roam().data?.block || roam(), { location: { "parent-uid": parentUid, order }, block });
+  await withRoamWriteRetry(() => create.call(roam().data?.block || roam(), { location: { "parent-uid": parentUid, order }, block }), () => blockExists(blockUid));
   return blockUid;
 }
 
@@ -2879,17 +2912,17 @@ async function updateBlock(uid, string, { open = null } = {}) {
   const update = roam().data?.block?.update || roam().updateBlock;
   const block = { uid, string: String(string ?? "") };
   if (typeof open === "boolean") block.open = open;
-  return update.call(roam().data?.block || roam(), { block });
+  return withRoamWriteRetry(() => update.call(roam().data?.block || roam(), { block }));
 }
 
 async function moveBlock(uid, parentUid, order = "last") {
   const move = roam().data?.block?.move || roam().moveBlock;
-  return move.call(roam().data?.block || roam(), { location: { "parent-uid": parentUid, order }, block: { uid } });
+  return withRoamWriteRetry(() => move.call(roam().data?.block || roam(), { location: { "parent-uid": parentUid, order }, block: { uid } }));
 }
 
 async function deleteBlock(uid) {
   const remove = roam().data?.block?.delete || roam().deleteBlock;
-  return remove.call(roam().data?.block || roam(), { block: { uid } });
+  return withRoamWriteRetry(() => remove.call(roam().data?.block || roam(), { block: { uid } }));
 }
 
 export async function acquireLargeScratch() {
@@ -3714,7 +3747,7 @@ export class NativeTableAdapter {
       }
       return;
     }
-    return this.persistDeletionOnly(model, currentTree) || this.reconcile(model, currentTree);
+    return this.persistDeletionOnly(model, currentTree) || this.persistInsertionOnly(model, currentTree) || this.reconcile(model, currentTree);
   }
 
   persistDeletionOnly(model, currentTree) {
@@ -3777,44 +3810,228 @@ export class NativeTableAdapter {
     }
   }
 
+  /** A pure insertion of whole new rows OR whole new columns writes only what changed: new cells are
+   *  created in place and, for a column insert, the existing cell that now follows one is moved under
+   *  it. Anything else (mixed growth, reorder, removal) returns null and falls through to `reconcile`. */
+  persistInsertionOnly(model, currentTree) {
+    const currentRows = tableCells(currentTree);
+    const rowsBefore = currentRows.length;
+    if (!rowsBefore) return null;
+    const colsBefore = currentRows[0].length;
+    if (!colsBefore || currentRows.some((row) => row.length !== colsBefore)) return null;
+    if (model.rows.some((row) => row.length !== model.colCount)) return null;
+    const currentByUid = new Map();
+    currentRows.forEach((row, rowIndex) => row.forEach((cell, colIndex) => currentByUid.set(cell.uid, { cell, rowIndex, colIndex })));
+    const isNew = (cell) => cell.uid.startsWith("rg_") || !currentByUid.has(cell.uid);
+    const existing = model.rows.flat().filter((cell) => !isNew(cell));
+    if (existing.length !== currentByUid.size || new Set(existing.map((cell) => cell.uid)).size !== currentByUid.size) return null;
+    let kind = null; let newCount = 0;
+    if (model.rowCount === rowsBefore && model.colCount > colsBefore) {
+      kind = "cols";
+      let newIndexes = null;
+      for (let row = 0; row < rowsBefore; row += 1) {
+        const indexes = model.rows[row].flatMap((cell, col) => (isNew(cell) ? [col] : []));
+        const kept = model.rows[row].filter((cell) => !isNew(cell));
+        if (kept.length !== colsBefore || kept.some((cell, col) => cell.uid !== currentRows[row][col].uid)) return null;
+        if (newIndexes === null) newIndexes = indexes;
+        else if (indexes.length !== newIndexes.length || indexes.some((value, index) => value !== newIndexes[index])) return null;
+      }
+      newCount = newIndexes.length;
+    } else if (model.colCount === colsBefore && model.rowCount > rowsBefore) {
+      kind = "rows";
+      const kept = [];
+      for (const row of model.rows) {
+        const flags = row.map(isNew);
+        if (flags.every(Boolean)) { newCount += 1; continue; }
+        if (flags.some(Boolean)) return null;
+        kept.push(row);
+      }
+      if (kept.length !== rowsBefore || kept.some((row, index) => row.some((cell, col) => cell.uid !== currentRows[index][col].uid))) return null;
+    } else return null;
+    const updates = [];
+    model.rows.forEach((row, rowIndex) => row.forEach((cell, colIndex) => {
+      if (isNew(cell)) return;
+      const current = nativeStoredRaw(currentByUid.get(cell.uid).cell.string);
+      const desired = model.getRaw(rowIndex, colIndex);
+      if (desired !== current) updates.push({ uid: cell.uid, from: current, raw: desired });
+    }));
+    const mutationEstimate = kind === "cols" ? rowsBefore * newCount * 2 + updates.length : newCount * colsBefore + updates.length;
+    if (mutationEstimate > getSetting("writes-native-budget")) throw new GridError("MUTATION_BUDGET", `${kind === "cols" ? "Column" : "Row"} insertion requires about ${mutationEstimate} Roam writes; copy to a large grid instead`);
+    const parents = new Map();
+    currentRows.forEach((row, rowIndex) => row.forEach((cell, colIndex) => parents.set(cell.uid, colIndex === 0 ? { parent: this.tableUid, order: rowIndex } : { parent: row[colIndex - 1].uid, order: 0 })));
+    return this.createInsertionTransaction({ model, kind, parents, updates, newCells: new Set(model.rows.flat().filter(isNew)) });
+  }
+
+  async createInsertionTransaction({ model, kind, parents, updates, newCells }) {
+    const created = []; const moved = []; const appliedUpdates = [];
+    const finalUids = model.rows.map((row) => row.map(() => null));
+    let rollbackResult = null; let committed = false; let mintUndo = null;
+    const revertMint = () => {
+      if (!mintUndo) return;
+      for (const item of mintUndo.cells) {
+        item.cell.uid = item.oldUid;
+        if (item.rowHeight !== undefined) { model.rowHeights[item.oldUid] = item.rowHeight; delete model.rowHeights[item.newUid]; }
+        if (item.alignment !== undefined) { model.alignments[item.oldUid] = item.alignment; delete model.alignments[item.newUid]; }
+      }
+      this.model?.history?.remapUids(new Map([...mintUndo.minted].map(([oldUid, newUid]) => [newUid, oldUid])));
+      mintUndo = null;
+    };
+    const rollback = async () => {
+      if (rollbackResult) return rollbackResult;
+      const errors = []; let moveFailed = false; let updateFailed = false; let deleteFailed = false;
+      for (const item of [...moved].reverse()) {
+        try { await moveBlock(item.uid, item.fromParent, item.fromOrder); }
+        catch (error) { moveFailed = true; errors.push(error); }
+      }
+      for (const item of [...appliedUpdates].reverse()) {
+        try { await updateBlock(item.uid, nativePersistedRaw(item.from)); }
+        catch (error) { updateFailed = true; errors.push(error); }
+      }
+      // A created block can still be the parent of an existing cell until every move-back landed.
+      if (!moveFailed) {
+        for (const uid of [...created].reverse()) {
+          try { await deleteBlock(uid); }
+          catch (error) { deleteFailed = true; errors.push(error); }
+        }
+      }
+      if (!moveFailed) revertMint();
+      rollbackResult = { complete: errors.length === 0 && !moveFailed, graphRestored: !moveFailed && !updateFailed && !deleteFailed, errors };
+      return rollbackResult;
+    };
+    try {
+      for (let row = 0; row < model.rowCount; row += 1) {
+        const cells = model.rows[row];
+        const rowIsNew = kind === "rows" && newCells.has(cells[0]);
+        for (let col = 0; col < cells.length; col += 1) {
+          const cell = cells[col];
+          const parent = col === 0 ? this.tableUid : finalUids[row][col - 1];
+          const order = col === 0 ? row : 0;
+          if (newCells.has(cell)) {
+            const uid = roam().util.generateUID();
+            created.push(uid);
+            await createBlock(parent, nativePersistedRaw(cell.raw), order, uid);
+            finalUids[row][col] = uid;
+          } else {
+            finalUids[row][col] = cell.uid;
+            if (!rowIsNew && kind === "cols") {
+              const was = parents.get(cell.uid);
+              if (was.parent !== parent) {
+                moved.push({ uid: cell.uid, fromParent: was.parent, fromOrder: was.order });
+                await moveBlock(cell.uid, parent, order);
+              }
+            }
+          }
+        }
+      }
+      for (const item of updates) { appliedUpdates.push(item); await updateBlock(item.uid, nativePersistedRaw(item.raw)); }
+    } catch (error) {
+      const result = await rollback();
+      error.rgRollbackAttempted = true;
+      error.rgRollbackComplete = result.complete;
+      error.rgRollbackGraphRestored = result.graphRestored;
+      if (result.errors.length) console.error("[roam-grid] Structural insert rollback incomplete", result.errors);
+      throw error;
+    }
+    const minted = new Map(); const cellsMinted = [];
+    model.rows.forEach((row, rowIndex) => row.forEach((cell, colIndex) => {
+      if (!newCells.has(cell)) return;
+      const oldUid = cell.uid; const newUid = finalUids[rowIndex][colIndex];
+      const item = { cell, oldUid, newUid };
+      cell.uid = newUid;
+      minted.set(oldUid, newUid);
+      if (colIndex === 0 && Object.hasOwn(model.rowHeights, oldUid)) {
+        item.rowHeight = model.rowHeights[oldUid];
+        model.rowHeights[newUid] = item.rowHeight;
+        delete model.rowHeights[oldUid];
+      }
+      if (Object.hasOwn(model.alignments, oldUid)) { item.alignment = model.alignments[oldUid]; model.alignments[newUid] = item.alignment; delete model.alignments[oldUid]; }
+      cellsMinted.push(item);
+    }));
+    mintUndo = { cells: cellsMinted, minted };
+    if (minted.size) this.model?.history?.remapUids(minted);
+    return {
+      commit: async () => { committed = true; },
+      rollback: () => (committed ? Promise.resolve({ complete: false, errors: [new Error("Insertion was already committed")] }) : rollback()),
+    };
+  }
+
   async reconcile(model, currentTree, force = false) {
     const currentRows = tableCells(currentTree);
     const current = currentRows.flat();
     const mutationEstimate = current.length * 2 + model.rowCount * model.colCount;
     if (!force && mutationEstimate > getSetting("writes-native-budget")) throw new GridError("MUTATION_BUDGET", `Structural edit requires about ${mutationEstimate} Roam writes; copy to a large grid instead`);
     const stagingUid = await this.metadataStore.createStaging(this.tableUid);
+    const createdUids = []; const updated = []; const mintedCells = [];
     try {
       for (const row of currentRows) for (const cell of [...row].reverse()) await moveBlock(cell.uid, stagingUid, "last");
-      const desiredUids = new Set(); const minted = new Map();
+      const minted = new Map();
       for (let rowIndex = 0; rowIndex < model.rowCount; rowIndex += 1) for (let colIndex = 0; colIndex < model.colCount; colIndex += 1) {
         const cell = model.rows[rowIndex][colIndex];
         const desired = cell.raw === "" ? " " : cell.raw;
         if (cell.uid.startsWith("rg_") || !current.some((old) => old.uid === cell.uid)) {
           const oldUid = cell.uid;
-          cell.uid = await createBlock(stagingUid, desired);
+          const uid = roam().util.generateUID();
+          createdUids.push(uid);
+          await createBlock(stagingUid, desired, "last", uid);
+          const item = { cell, oldUid, newUid: uid };
+          cell.uid = uid;
           minted.set(oldUid, cell.uid);
           if (colIndex === 0 && Object.hasOwn(model.rowHeights, oldUid)) {
+            item.rowHeight = model.rowHeights[oldUid];
             model.rowHeights[cell.uid] = model.rowHeights[oldUid];
             delete model.rowHeights[oldUid];
           }
-          if (Object.hasOwn(model.alignments, oldUid)) { model.alignments[cell.uid] = model.alignments[oldUid]; delete model.alignments[oldUid]; }
+          if (Object.hasOwn(model.alignments, oldUid)) { item.alignment = model.alignments[oldUid]; model.alignments[cell.uid] = model.alignments[oldUid]; delete model.alignments[oldUid]; }
+          mintedCells.push(item);
         }
-        else if (current.find((old) => old.uid === cell.uid)?.string !== desired) await updateBlock(cell.uid, desired);
-        desiredUids.add(cell.uid);
+        else {
+          const before = current.find((old) => old.uid === cell.uid)?.string;
+          if (before !== desired) { updated.push({ uid: cell.uid, from: before ?? "" }); await updateBlock(cell.uid, desired); }
+        }
       }
-      // Undo entries address cells by uid; a checkpoint restored under the
-      // pre-mint uids would make the model disagree with the graph and force a
-      // full reconcile, destroying every inbound block reference to those cells.
-      if (minted.size) this.model?.history?.remapUids(minted);
-      for (const cell of current) if (!desiredUids.has(cell.uid)) await deleteBlock(cell.uid);
+      // Removed cells stay in staging until the very end: deleting them here would make a later
+      // failure unrecoverable. The staging delete below takes them out on success.
       for (let rowIndex = 0; rowIndex < model.rowCount; rowIndex += 1) {
         const row = model.rows[rowIndex];
         await moveBlock(row[0].uid, this.tableUid, rowIndex);
         for (let col = 1; col < row.length; col += 1) await moveBlock(row[col].uid, row[col - 1].uid, 0);
       }
-    } finally {
-      try { await deleteBlock(stagingUid); } catch { /* best effort cleanup */ }
+      // Undo entries address cells by uid; a checkpoint restored under the
+      // pre-mint uids would make the model disagree with the graph and force a
+      // full reconcile, destroying every inbound block reference to those cells.
+      if (minted.size) this.model?.history?.remapUids(minted);
+    } catch (error) {
+      const errors = []; let moveFailed = false; let updateFailed = false;
+      for (let rowIndex = 0; rowIndex < currentRows.length; rowIndex += 1) {
+        const row = currentRows[rowIndex];
+        try { await moveBlock(row[0].uid, this.tableUid, rowIndex); } catch (restoreError) { moveFailed = true; errors.push(restoreError); }
+        for (let col = 1; col < row.length; col += 1) {
+          try { await moveBlock(row[col].uid, row[col - 1].uid, 0); } catch (restoreError) { moveFailed = true; errors.push(restoreError); }
+        }
+      }
+      for (const item of [...updated].reverse()) {
+        try { await updateBlock(item.uid, item.from); } catch (restoreError) { updateFailed = true; errors.push(restoreError); }
+      }
+      for (const item of mintedCells) {
+        item.cell.uid = item.oldUid;
+        if (item.rowHeight !== undefined) { model.rowHeights[item.oldUid] = item.rowHeight; delete model.rowHeights[item.newUid]; }
+        if (item.alignment !== undefined) { model.alignments[item.oldUid] = item.alignment; delete model.alignments[item.newUid]; }
+      }
+      if (!moveFailed) {
+        for (const uid of [...createdUids].reverse()) { try { await deleteBlock(uid); } catch (cleanupError) { errors.push(cleanupError); } }
+        try { await deleteBlock(stagingUid); } catch (cleanupError) { errors.push(cleanupError); }
+      } else {
+        console.error("[roam-grid] Structural restore incomplete; staging kept", errors);
+        toast(`Roam Grid could not fully restore the table after a failed save. Remaining cells are under roam-grid/staging:: ${this.tableUid} on [[roam/grid/metadata]].`, "danger", 12000);
+      }
+      if (error && typeof error === "object") {
+        error.rgRollbackAttempted = true;
+        error.rgRollbackComplete = errors.length === 0;
+        error.rgRollbackGraphRestored = !moveFailed && !updateFailed;
+      }
+      throw error;
     }
+    try { await deleteBlock(stagingUid); } catch { /* best effort cleanup */ }
   }
 
   dispose() { this.watchCallback = null; this.watchHandler = null; this.contentSaving = false; this.deferredStructuralWatches.length = 0; this.expectedStructuralTransitions.length = 0; this.selfWrites.clear(); return this.watch?.(); }
@@ -7748,7 +7965,10 @@ function ensureCellContent(cell) {
 function disposeRichHost(content, host) {
   if (!host || host.__rgDisposed) return;
   host.__rgDisposed = true;
-  try { globalThis.window?.roamAlphaAPI?.ui?.components?.unmountNode?.({ el: host }); } catch { /* host may not be Roam-owned */ }
+  try {
+    const pending = globalThis.window?.roamAlphaAPI?.ui?.components?.unmountNode?.({ el: host });
+    pending?.catch?.(() => {});
+  } catch { /* host may not be Roam-owned */ }
   host.remove();
   content?.__rgRichHosts?.delete(host);
 }

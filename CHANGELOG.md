@@ -9,6 +9,12 @@
   in one undo step.
 - **No repaint or lost typing after a column or row insert saves.** Roam's real
   block uids are patched into the mounted grid instead of rebuilding it.
+- **Column and row inserts write only what changed.** A column insert is one
+  create and at most one move per row instead of re-parenting the whole table,
+  so repeated inserts stay far below Roam's 1,500 writes/minute limit.
+- **A failed structural save no longer strands or deletes cells.** It moves every
+  original cell back and removes only what it created; it waits out Roam's write
+  limit instead of failing mid-save.
 
 ## 0.18.1
 
