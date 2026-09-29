@@ -1,7 +1,7 @@
 import test, { afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { FormulaEngine, GridEditorController, GridModel, GridView, NativeCellEditorOverlay, NativeGridSession, RegistrySet, claimKeyboard, formulaCanPointReference, keyboardOwner, moveFormulaReferenceCoordinate, nativeEditorEnabled, nativeOverlayStrayRepair, paintRichCellContent, queryBlockReferenceSources, recentsCacheReady, recentsDisabled, releaseKeyboard, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, resetNativeEditorHealth, resetRoamRecents, resetSuggestionRendering, roamSuggestionPlainText, runtime, sanitizeNativePasteText, searchRoamRecentSuggestions, settingsCache, syncPortalThemeFromRoot, wrapSelectionOnPair } from "../src/extension.js";
+import { FormulaEngine, GridEditorController, GridModel, GridView, NativeCellEditorOverlay, NativeGridSession, RegistrySet, UndoHistory, claimKeyboard, formulaCanPointReference, keyboardOwner, moveFormulaReferenceCoordinate, nativeEditorEnabled, nativeOverlayStrayRepair, paintRichCellContent, queryBlockReferenceSources, recentsCacheReady, recentsDisabled, releaseKeyboard, releaseRichCellHosts, renderStableCellContent, replaceGridViewportContents, resetNativeEditorHealth, resetRoamRecents, resetSuggestionRendering, roamSuggestionPlainText, runtime, sanitizeNativePasteText, searchRoamRecentSuggestions, settingsCache, syncPortalThemeFromRoot, wrapSelectionOnPair } from "../src/extension.js";
 
 class MiniClassList {
   constructor() { this.values = new Set(); }
@@ -3197,4 +3197,123 @@ test("nextFrame resolves via the timeout race when requestAnimationFrame drops c
   const elapsed = Date.now() - started;
   assert.ok(elapsed >= 400, `resolved via timeout after ~${elapsed}ms (not the rAF that will never fire)`);
   harness.overlay.teardown();
+});
+
+function remapHarness() {
+  const model = new GridModel({ rows: [[{ uid: "local0001", raw: "a" }, { uid: "local0002", raw: "b" }], [{ uid: "local0003", raw: "c" }, { uid: "local0004", raw: "d" }]], columnIds: ["col0", "col1"], tableUid: "table0001" });
+  const badges = [];
+  const makeCell = (uid) => {
+    const cell = { dataset: { uid }, badges: [], querySelectorAll() { return [...cell.badges]; } };
+    const badge = { remove() { cell.badges = cell.badges.filter((entry) => entry !== badge); } };
+    cell.badges.push(badge); badges.push(badge);
+    return cell;
+  };
+  const cells = new Map();
+  for (let row = 0; row < 2; row += 1) for (let col = 0; col < 2; col += 1) cells.set(`${row}:${col}`, makeCell(model.getCell(row, col).uid));
+  const heads = [0, 1].map((row) => ({ dataset: { rowUid: model.rowKey(row) } }));
+  const resizes = [0, 1].map((row) => ({ dataset: { rowUid: model.rowKey(row) } }));
+  const gridElement = { querySelectorAll: () => [...heads, ...resizes] };
+  const editorController = { state: { active: true } };
+  const counted = [];
+  const view = Object.assign(Object.create(GridView.prototype), {
+    model, cells, gridElement, viewport: {}, editorController, nativeOverlay: null, inlineReferencesUid: null,
+    cellCoordinatesByUid: new Map(), session: { refreshes: 0, scheduleReferenceCountRefresh() { this.refreshes += 1; } },
+    updateCellReferenceCount: (cell, uid) => counted.push([cell.dataset.uid, uid]),
+  });
+  return { view, model, cells, heads, resizes, editorController, badges, counted };
+}
+
+test("remapCellUids repoints mounted cells, coordinates, and row handles without rebuilding", () => {
+  const { view, model, cells, heads, resizes, editorController, badges, counted } = remapHarness();
+  const before = [...cells.values()];
+  const map = new Map([["local0001", "roam00001"], ["local0003", "roam00003"]]);
+  for (const row of model.rows) for (const cell of row) if (map.has(cell.uid)) cell.uid = map.get(cell.uid);
+  const rowUidMap = new Map([[heads[0].dataset.rowUid, "roam00001"], [heads[1].dataset.rowUid, "roam00003"]]);
+  const all = new Map([...map, ...rowUidMap]);
+  assert.equal(view.remapCellUids(all), true);
+  assert.deepEqual([...cells.values()].map((cell) => cell.dataset.uid), ["roam00001", "local0002", "roam00003", "local0004"]);
+  assert.deepEqual([...cells.values()], before, "same cell element objects");
+  assert.ok([...cells.values()].every((cell, index) => cell === before[index]));
+  assert.deepEqual(view.cellCoordinatesByUid.get("roam00003"), { row: 1, col: 0 });
+  assert.equal(view.cellCoordinatesByUid.has("local0001"), false);
+  assert.deepEqual([heads[0].dataset.rowUid, resizes[1].dataset.rowUid], ["roam00001", "roam00003"]);
+  assert.equal(view.editorController, editorController);
+  assert.deepEqual(editorController.state, { active: true });
+  assert.equal(view.session.refreshes, 1);
+  assert.deepEqual(counted, [["roam00001", "roam00001"], ["roam00003", "roam00003"]]);
+  assert.equal(badges.filter((badge) => cells.get("0:0").badges.includes(badge)).length, 0, "stale badges removed on remapped cells");
+  assert.equal(cells.get("0:1").badges.length, 1, "untouched cells keep their badges");
+});
+
+test("remapCellUids declines while a native overlay or inline references own a remapped uid", () => {
+  const { view } = remapHarness();
+  view.nativeOverlay = { state: { uid: "local0002" } };
+  assert.equal(view.remapCellUids(new Map([["local0002", "roam00002"]])), false);
+  view.nativeOverlay = null; view.inlineReferencesUid = "local0004";
+  assert.equal(view.remapCellUids(new Map([["local0004", "roam00004"]])), false);
+  view.inlineReferencesUid = null; view.gridElement = null;
+  assert.equal(view.remapCellUids(new Map()), false);
+});
+
+function columnHarness() {
+  const model = new GridModel({
+    rows: [[{ uid: "c00", raw: "1" }, { uid: "c01", raw: "=A1*2" }, { uid: "c02", raw: "z" }], [{ uid: "c10", raw: "2" }, { uid: "c11", raw: "x" }, { uid: "c12", raw: "y" }]],
+    columnIds: ["colA", "colB", "colC"], widths: { colB: 180 }, tableUid: "table0001",
+  });
+  model.history = new UndoHistory();
+  const view = Object.assign(Object.create(GridView.prototype), {
+    model, selection: { startRow: 0, endRow: 0, startCol: 1, endCol: 1 }, selected: null,
+    commitMutation(label, mutation) { try { model.transact(label, mutation); return Promise.resolve(model); } catch { return Promise.resolve(null); } },
+    select(range) { this.selected = range; },
+  });
+  return { view, model };
+}
+
+test("inserted columns inherit the source column width and undo removes both", async () => {
+  const { view, model } = columnHarness();
+  await view.insertAxis("column", 1, true);
+  assert.equal(model.widths[model.columnIds[2]], 180);
+  await view.insertAxis("column", 1, false);
+  assert.equal(model.widths[model.columnIds[1]], 180);
+  view.selection = { startRow: 0, endRow: 0, startCol: 1, endCol: 1 };
+  view.insertCol();
+  assert.equal(model.widths[model.columnIds[2]], 180);
+  assert.equal(model.colCount, 6);
+  const widthsBefore = Object.keys(model.widths).length;
+  await view.insertAxis("column", 0, true);
+  assert.equal(Object.keys(model.widths).length, widthsBefore, "no width written when the source has none");
+  assert.equal(model.undo(), true);
+  assert.equal(model.colCount, 6);
+  assert.equal(Object.keys(model.widths).length, widthsBefore);
+});
+
+test("duplicate column copies values, formulas verbatim, width, alignment, header flag, one undo", async () => {
+  const { view, model } = columnHarness();
+  model.setAlignment(0, 1, "right"); model.toggleHeaderColumn(1);
+  const depth = model.history.entries.length;
+  await view.duplicateColumn(1, true);
+  assert.equal(model.colCount, 4);
+  assert.deepEqual([model.getRaw(0, 2), model.getRaw(1, 2)], ["=A1*2", "x"], "the copy computes the same value as the source");
+  assert.equal(model.widths[model.columnIds[2]], 180);
+  assert.equal(model.getAlignment(0, 2), "right");
+  assert.equal(model.isHeaderColumn(2), true);
+  assert.equal(view.selected.startCol, 2);
+  assert.equal(model.history.entries.length, depth + 1, "one undo entry");
+  assert.equal(model.undo(), true);
+  assert.equal(model.colCount, 3);
+  assert.equal(model.getRaw(0, 1), "=A1*2");
+  assert.equal(model.isHeaderColumn(1), true);
+
+  const left = columnHarness();
+  await left.view.duplicateColumn(1, false);
+  assert.deepEqual([left.model.getRaw(0, 1), left.model.getRaw(0, 2)], ["=A1*2", "=A1*2"], "no #REF! when duplicating next to column A");
+  assert.equal(left.model.widths[left.model.columnIds[1]], 180);
+  assert.equal(left.model.getRaw(1, 1), "x");
+
+  const merged = columnHarness();
+  merged.model.setRaw(1, 1, "");
+  merged.model.merge({ startRow: 0, endRow: 1, startCol: 1, endCol: 1 });
+  await merged.view.duplicateColumn(1, true);
+  assert.equal(merged.model.colCount, 4);
+  assert.deepEqual([merged.model.getRaw(0, 2), merged.model.getRaw(1, 2)], ["=A1*2", ""], "a cell covered in the source stays blank in the copy");
 });

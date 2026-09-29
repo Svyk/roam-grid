@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.18.2
+
+- **Inserted columns keep their neighbor's width.** Insert left/right and the
+  toolbar `＋ Col` copy the adjacent column's explicit width to the new one.
+- **Duplicate left / Duplicate right.** The column menu copies values (formulas
+  keep pointing at the same cells), width, alignment, and the header-column flag
+  in one undo step.
+- **No repaint or lost typing after a column or row insert saves.** Roam's real
+  block uids are patched into the mounted grid instead of rebuilding it.
+
 ## 0.18.1
 
 - **Full toolbar Extension Tools.** Adds `rg_resize_table`,

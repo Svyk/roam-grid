@@ -1,5 +1,5 @@
-/* Roam Grid v0.18.1 | MIT | generated from src/extension.js */
-const VERSION = "0.18.1";
+/* Roam Grid v0.18.2 | MIT | generated from src/extension.js */
+const VERSION = "0.18.2";
 const LARGE_GRID_OFF_TOAST = "Large grids are experimental and off.";
 const EXPERIMENTAL_LARGE_GRID_KEY = "experimental-large-grid";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
@@ -4231,7 +4231,7 @@ export class NativeGridSession {
         else if (payloadRawByUid.has(uid)) this.dirtyCells.set(uid, { ...dirty, baseRaw: payloadRawByUid.get(uid) });
       }
       this.structuralPending = false;
-      if (uidMap.size) for (const view of this.views) view.render();
+      if (uidMap.size) for (const view of this.views) if (!view.remapCellUids?.(uidMap)) view.render();
       if (version !== this.changeVersion) {
         clearTimeout(this.saveTimer); this.saveTimer = setTimeout(() => this.structuralPending ? this.flushSave() : this.flushContentSave(), getSetting("writes-content-debounce-ms"));
       }
@@ -10792,6 +10792,31 @@ export class GridView {
 
   hasCustomCellRenderers() { return Boolean(runtime.registries?.cellRenderers?.size); }
 
+  /** After a structural save swaps local uids for Roam's, repoint the mounted DOM instead of
+   *  rebuilding it: a full render here repaints every cell and disposes an in-progress edit. */
+  remapCellUids(uidMap) {
+    if (!this.gridElement || !this.viewport) return false;
+    if (uidMap.has(this.nativeOverlay?.state?.uid) || uidMap.has(this.inlineReferencesUid)) return false;
+    for (const cell of this.cells.values()) {
+      const newUid = uidMap.get(cell.dataset.uid);
+      if (!newUid) continue;
+      cell.dataset.uid = newUid;
+      for (const badge of [...(cell.querySelectorAll?.(".rg-cell-reference-count, .rg-cell-comment-count") || [])]) badge.remove();
+      this.updateCellReferenceCount(cell, newUid);
+    }
+    this.cellCoordinatesByUid.clear();
+    for (let row = 0; row < this.model.rowCount; row += 1) for (let col = 0; col < this.model.colCount; col += 1) {
+      if (this.model.isCovered(row, col)) continue;
+      this.cellCoordinatesByUid.set(this.model.getCell(row, col).uid, { row, col });
+    }
+    for (const el of this.gridElement.querySelectorAll(".rg-row-header, .rg-row-resize")) {
+      const newUid = uidMap.get(el.dataset.rowUid);
+      if (newUid) el.dataset.rowUid = newUid;
+    }
+    this.session?.scheduleReferenceCountRefresh?.();
+    return true;
+  }
+
   patchRowDeletion(context) {
     if (!context || context.viewport !== this.viewport || context.gridElement !== this.gridElement || !this.viewport || !this.gridElement) return false;
     if (this.editorController?.state || this.nativeOverlay?.active || this.resizeCleanup || this.rowResizePreview || this.columnResizePreview || this.dragSelecting || this.fillStart) return false;
@@ -11859,13 +11884,40 @@ export class GridView {
   mergeSelection() { this.commitMutation("Merge cells", () => this.model.merge(this.selection), true); }
   unmergeSelection() { this.commitMutation("Unmerge cells", () => { if (!this.model.unmerge(this.selection.startRow, this.selection.startCol)) throw new GridError("NOT_MERGED", "The active cell is not merged"); }, true); }
   insertRow() { const row = this.selection.endRow + 1; this.commitMutation("Insert row", () => this.model.insertRows(row, 1), true); this.select({ startRow: row, endRow: row, startCol: this.selection.startCol, endCol: this.selection.startCol }); }
-  insertCol() { const col = this.selection.endCol + 1; this.commitMutation("Insert column", () => this.model.insertCols(col, 1), true); this.select({ startRow: this.selection.startRow, endRow: this.selection.startRow, startCol: col, endCol: col }); }
+  insertColumnLike(sourceCol, at) {
+    return this.commitMutation("Insert column", () => {
+      const width = this.model.widths[this.model.columnIds[sourceCol]];
+      this.model.insertCols(at, 1);
+      if (width != null) this.model.widths[this.model.columnIds[at]] = width;
+    }, true);
+  }
+  insertCol() { const col = this.selection.endCol + 1; this.insertColumnLike(this.selection.endCol, col); this.select({ startRow: this.selection.startRow, endRow: this.selection.startRow, startCol: col, endCol: col }); }
   insertAxis(type, index, after) {
     const at = clamp(index + (after ? 1 : 0), 0, type === "row" ? this.model.rowCount : this.model.colCount);
     const row = type === "row" ? at : this.selection.startRow;
     const col = type === "column" ? at : this.selection.startCol;
-    return this.commitMutation(`Insert ${type}`, () => type === "row" ? this.model.insertRows(at, 1) : this.model.insertCols(at, 1), true).then((model) => {
+    const committed = type === "row" ? this.commitMutation("Insert row", () => this.model.insertRows(at, 1), true) : this.insertColumnLike(index, at);
+    return committed.then((model) => {
       if (model) this.select({ startRow: clamp(row, 0, this.model.rowCount - 1), endRow: clamp(row, 0, this.model.rowCount - 1), startCol: clamp(col, 0, this.model.colCount - 1), endCol: clamp(col, 0, this.model.colCount - 1) });
+    });
+  }
+  duplicateColumn(index, after) {
+    const at = after ? index + 1 : index;
+    const src = after ? index : index + 1;
+    return this.commitMutation("Duplicate column", () => {
+      const width = this.model.widths[this.model.columnIds[index]];
+      const wasHeader = this.model.isHeaderColumn(index);
+      this.model.insertCols(at, 1);
+      if (width != null) this.model.widths[this.model.columnIds[at]] = width;
+      if (wasHeader && !this.model.isHeaderColumn(at)) this.model.toggleHeaderColumn(at);
+      for (let row = 0; row < this.model.rowCount; row += 1) {
+        if (this.model.isCovered(row, src) || this.model.isCovered(row, at)) continue;
+        this.model.setRaw(row, at, this.model.getRaw(row, src));
+        const alignment = this.model.getAlignment(row, src);
+        if (alignment) this.model.setAlignment(row, at, alignment);
+      }
+    }, true).then((model) => {
+      if (model) this.select({ startRow: this.selection.startRow, endRow: this.selection.startRow, startCol: at, endCol: at });
     });
   }
   deleteAxis(type, index) {
@@ -12004,7 +12056,9 @@ export class GridView {
         item("Sort ascending", () => this.commitMutation("Sort rows", () => this.model.sortBy(index, "asc"), true), { icon: "sort" }),
         item("Sort descending", () => this.commitMutation("Sort rows", () => this.model.sortBy(index, "desc"), true), { icon: "sort-desc" }),
         item("Insert left", () => this.insertAxis("column", index, false), { icon: "arrow-left" }),
-        item("Insert right", () => this.insertAxis("column", index, true), { icon: "arrow-right" })
+        item("Insert right", () => this.insertAxis("column", index, true), { icon: "arrow-right" }),
+        item("Duplicate left", () => this.duplicateColumn(index, false), { icon: "duplicate" }),
+        item("Duplicate right", () => this.duplicateColumn(index, true), { icon: "duplicate" })
       );
     } else {
       menu.append(

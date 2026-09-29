@@ -684,3 +684,30 @@ test("a pull-watch firing mid-saveContent is deferred so it cannot clobber the a
   assert.equal(events[0].structural, false);
   assert.ok(events[0].changes.some((change) => change.uid === uid && change.raw === "someone else"), "the replay carries the concurrent external edit");
 });
+
+function flushSaveHarness(view) {
+  const model = new GridModel({ rows: [[{ uid: "local0001", raw: "one" }]], tableUid: "table0001" });
+  model.baseSnapshot = model.snapshot(); model.baseFingerprint = "base";
+  const saved = new GridModel({ rows: [[{ uid: "roam00001", raw: "one" }]], tableUid: "table0001" });
+  saved.baseSnapshot = saved.snapshot(); saved.baseFingerprint = "saved";
+  const session = {
+    model, adapter: { model, save: async () => saved }, tableUid: "table0001", disposed: false, structuralPending: true, metadataDirty: true,
+    dirtyCells: new Map(), editRevisions: new Map(), changeVersion: 1, savedVersion: 0, saveTimer: null, views: new Set([view]),
+    setSaving() {}, prunePersistenceUids: NativeGridSession.prototype.prunePersistenceUids,
+  };
+  return session;
+}
+
+test("a structural save remaps the mounted view in place and skips the full render", async () => {
+  const calls = [];
+  const view = { remapCellUids: (map) => { calls.push(["remap", [...map]]); return true; }, render: () => calls.push(["render"]) };
+  await NativeGridSession.prototype.flushSave.call(flushSaveHarness(view));
+  assert.deepEqual(calls, [["remap", [["local0001", "roam00001"]]]]);
+});
+
+test("a structural save falls back to render when the view declines or lacks the remap", async () => {
+  const calls = [];
+  await NativeGridSession.prototype.flushSave.call(flushSaveHarness({ remapCellUids: () => false, render: () => calls.push("declined") }));
+  await NativeGridSession.prototype.flushSave.call(flushSaveHarness({ render: () => calls.push("absent") }));
+  assert.deepEqual(calls, ["declined", "absent"]);
+});
