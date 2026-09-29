@@ -344,3 +344,79 @@ test("disposeRichHost (via releaseRichCellHosts) swallows a rejected unmountNode
   assert.deepEqual(unhandled, []);
   assert.equal(content.__rgRichHosts.has(host), false);
 });
+
+/* ---------------------------- minimal-write column deletion ---------------------------- */
+
+const COLUMN_DELETIONS = {
+  "a middle column": { mutate: (m) => m.deleteCols(1, 1), expect: (r) => [`a${r}`, `c${r}`, `d${r}`], counts: { create: 1, move: 6, update: 0, delete: 1 } },
+  "column 0": { mutate: (m) => m.deleteCols(0, 1), expect: (r) => [`b${r}`, `c${r}`, `d${r}`], counts: { create: 1, move: 6, update: 0, delete: 1 } },
+  "the last column": { mutate: (m) => m.deleteCols(3, 1), expect: (r) => [`a${r}`, `b${r}`, `c${r}`], counts: { create: 1, move: 3, update: 0, delete: 1 } },
+  "a middle run of two": { mutate: (m) => m.deleteCols(1, 2), expect: (r) => [`a${r}`, `d${r}`], counts: { create: 1, move: 6, update: 0, delete: 1 } },
+  "two non-adjacent columns": { mutate: (m) => { m.deleteCols(2, 1); m.deleteCols(0, 1); }, expect: (r) => [`b${r}`, `d${r}`], counts: { create: 1, move: 12, update: 0, delete: 1 } },
+};
+
+for (const [name, spec] of Object.entries(COLUMN_DELETIONS)) {
+  test(`column deletion of ${name} writes minimal moves through one staging block`, async (t) => {
+    const h = setup(t, GRID());
+    const before = h.matrix();
+    spec.mutate(h.model);
+    const kept = h.model.rows.map((row) => row.map((c) => c.uid));
+    await h.adapter.save(h.model, { saveMetadata: false });
+    assert.deepEqual(h.counts(), spec.counts);
+    const after = h.matrix();
+    after.forEach((row, r) => assert.deepEqual(row.map(([, s]) => s), spec.expect(r)));
+    assert.deepEqual(after.map((row) => row.map(([uid]) => uid)), kept, "survivor uids unchanged");
+    const survivors = new Set(kept.flat());
+    for (const [uid] of before.flat()) assert.equal(h.nodes.has(uid), survivors.has(uid), `${uid} presence`);
+    assert.equal(h.staging().length, 0);
+    assert.equal(h.nodes.get(TABLE).children.length, 3);
+  });
+
+  test(`column deletion rollback of ${name} restores the exact tree at every write`, async (t) => {
+    const probe = setup(t, GRID());
+    spec.mutate(probe.model); probe.model.setRaw(0, 0, probe.model.getRaw(0, 0) + "!");
+    await probe.adapter.save(probe.model, { saveMetadata: false });
+    const writes = probe.log.length;
+    for (let failAt = 1; failAt <= writes; failAt += 1) {
+      let seen = 0;
+      const h = setup(t, GRID(), { failIf: () => { seen += 1; return seen === failAt; } });
+      const original = h.matrix(); const size = h.nodes.size;
+      spec.mutate(h.model); h.model.setRaw(0, 0, h.model.getRaw(0, 0) + "!");
+      let caught = null;
+      try { await h.adapter.save(h.model, { saveMetadata: false }); } catch (error) { caught = error; }
+      assert.ok(caught, `write ${failAt} must fail the save`);
+      if (failAt < writes) { assert.equal(caught.rgRollbackAttempted, true); assert.equal(caught.rgRollbackGraphRestored, true); }
+      assert.deepEqual(h.matrix(), original, `tree restored after failure at write ${failAt}`);
+      assert.equal(h.nodes.size, size);
+      assert.equal(h.staging().length, 0);
+    }
+  });
+}
+
+test("column deletion applies formula rewrites as updates", async (t) => {
+  const h = setup(t, [["1", "2", "=B1"], ["3", "4", "=B2"]]);
+  h.model.deleteCols(0, 1);
+  await h.adapter.save(h.model, { saveMetadata: false });
+  assert.equal(h.counts().update, 2);
+  assert.equal(h.counts().move, 4);
+  assert.deepEqual(h.matrix().map((row) => row.map(([, s]) => s)), [["2", "=A1"], ["4", "=A2"]]);
+});
+
+test("column deletion that also deletes rows or inserts anything is not column-deletion-only", async (t) => {
+  const h = setup(t, GRID());
+  const mixed = h.adapter.load(); mixed.deleteCols(1, 1); mixed.deleteRows(0, 1);
+  assert.equal(h.adapter.persistColumnDeletionOnly(mixed, rg.getTree(TABLE)), null);
+  const swapped = h.adapter.load(); swapped.deleteCols(1, 1); swapped.insertCols(0, 1);
+  assert.equal(h.adapter.persistColumnDeletionOnly(swapped, rg.getTree(TABLE)), null);
+  const inserted = h.adapter.load(); inserted.deleteCols(1, 1); inserted.insertRows(1, 1);
+  assert.equal(h.adapter.persistColumnDeletionOnly(inserted, rg.getTree(TABLE)), null);
+  const reordered = h.adapter.load(); reordered.deleteCols(1, 1);
+  for (const row of reordered.rows) row.reverse();
+  assert.equal(h.adapter.persistColumnDeletionOnly(reordered, rg.getTree(TABLE)), null);
+  const uneven = h.adapter.load(); uneven.deleteCols(1, 1);
+  uneven.rows[1] = [uneven.rows[1][1], uneven.rows[1][2]];
+  assert.equal(h.adapter.persistColumnDeletionOnly(uneven, rg.getTree(TABLE)), null);
+  await h.adapter.save(mixed, { saveMetadata: false });
+  assert.equal(h.matrix().length, 2);
+  assert.equal(h.matrix()[0].length, 3);
+});

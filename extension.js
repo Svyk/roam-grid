@@ -3747,7 +3747,7 @@ export class NativeTableAdapter {
       }
       return;
     }
-    return this.persistDeletionOnly(model, currentTree) || this.persistInsertionOnly(model, currentTree) || this.reconcile(model, currentTree);
+    return this.persistDeletionOnly(model, currentTree) || this.persistColumnDeletionOnly(model, currentTree) || this.persistInsertionOnly(model, currentTree) || this.reconcile(model, currentTree);
   }
 
   persistDeletionOnly(model, currentTree) {
@@ -3808,6 +3808,103 @@ export class NativeTableAdapter {
       if (result.errors.length) console.error("[roam-grid] Row deletion rollback incomplete", result.errors);
       throw error;
     }
+  }
+
+  /** Pure column deletion: every row loses the SAME column indexes. Survivors are re-parented only
+   *  where their parent changes, and each removed run is staged by moving its head (it carries the
+   *  rest of the run). Anything else returns null and falls through. */
+  persistColumnDeletionOnly(model, currentTree) {
+    const currentRows = tableCells(currentTree);
+    const rowsBefore = currentRows.length;
+    if (!rowsBefore || model.rowCount !== rowsBefore) return null;
+    const colsBefore = currentRows[0].length;
+    if (currentRows.some((row) => row.length !== colsBefore)) return null;
+    if (!(model.colCount > 0 && model.colCount < colsBefore) || model.rows.some((row) => row.length !== model.colCount)) return null;
+    const keep = []; let cursor = 0;
+    for (const cell of model.rows[0]) {
+      while (cursor < colsBefore && currentRows[0][cursor].uid !== cell.uid) cursor += 1;
+      if (cursor >= colsBefore) return null;
+      keep.push(cursor); cursor += 1;
+    }
+    for (let row = 0; row < rowsBefore; row += 1) {
+      if (keep.some((col, index) => currentRows[row][col].uid !== model.rows[row][index].uid)) return null;
+    }
+    const updates = [];
+    for (let row = 0; row < rowsBefore; row += 1) for (let index = 0; index < keep.length; index += 1) {
+      const desired = model.getRaw(row, index); const current = nativeStoredRaw(currentRows[row][keep[index]].string);
+      if (desired !== current) updates.push({ uid: model.rows[row][index].uid, from: current, raw: desired });
+    }
+    const keepSet = new Set(keep);
+    const steps = [];
+    for (let row = 0; row < rowsBefore; row += 1) {
+      const cells = currentRows[row];
+      const parentOf = (col) => (col === 0 ? { parent: this.tableUid, order: row } : { parent: cells[col - 1].uid, order: 0 });
+      const survivors = [];
+      keep.forEach((col, index) => {
+        const was = parentOf(col);
+        const expected = index === 0 ? { parent: this.tableUid, order: row } : { parent: cells[keep[index - 1]].uid, order: 0 };
+        if (was.parent !== expected.parent) survivors.push({ uid: cells[col].uid, from: was, to: expected });
+      });
+      const heads = [];
+      for (let col = 0; col < colsBefore; col += 1) if (!keepSet.has(col) && (col === 0 || keepSet.has(col - 1))) heads.push({ uid: cells[col].uid, from: parentOf(col) });
+      steps.push({ survivors, heads });
+    }
+    const moveCount = steps.reduce((sum, step) => sum + step.survivors.length + step.heads.length, 0);
+    const mutationEstimate = moveCount + updates.length + 2;
+    if (mutationEstimate > getSetting("writes-native-budget")) throw new GridError("MUTATION_BUDGET", `Column deletion requires about ${mutationEstimate} Roam writes; copy to a large grid instead`);
+    return this.createColumnDeletionTransaction(steps, updates);
+  }
+
+  async createColumnDeletionTransaction(steps, updates) {
+    let stagingUid;
+    try { stagingUid = await this.metadataStore.createStaging(this.tableUid); }
+    catch (error) {
+      if (error && typeof error === "object") { error.rgRollbackAttempted = true; error.rgRollbackComplete = true; error.rgRollbackGraphRestored = true; }
+      throw error;
+    }
+    const moved = []; const appliedUpdates = []; let rollbackResult = null; let committed = false;
+    const rollback = async () => {
+      if (rollbackResult) return rollbackResult;
+      const errors = []; let moveFailed = false; let updateFailed = false;
+      for (const item of [...moved].reverse()) {
+        try { await moveBlock(item.uid, item.fromParent, item.fromOrder); }
+        catch (error) { moveFailed = true; errors.push(error); }
+      }
+      for (const item of [...appliedUpdates].reverse()) {
+        try { await updateBlock(item.uid, nativePersistedRaw(item.from)); }
+        catch (error) { updateFailed = true; errors.push(error); }
+      }
+      if (!moveFailed) {
+        try { await deleteBlock(stagingUid); }
+        catch (error) { errors.push(error); }
+      }
+      rollbackResult = { complete: errors.length === 0, graphRestored: !moveFailed && !updateFailed, errors };
+      return rollbackResult;
+    };
+    try {
+      for (const step of steps) {
+        for (const item of step.survivors) {
+          moved.push({ uid: item.uid, fromParent: item.from.parent, fromOrder: item.from.order });
+          await moveBlock(item.uid, item.to.parent, item.to.order);
+        }
+        for (const item of step.heads) {
+          moved.push({ uid: item.uid, fromParent: item.from.parent, fromOrder: item.from.order });
+          await moveBlock(item.uid, stagingUid, "last");
+        }
+      }
+      for (const item of updates) { appliedUpdates.push(item); await updateBlock(item.uid, nativePersistedRaw(item.raw)); }
+    } catch (error) {
+      const result = await rollback();
+      error.rgRollbackAttempted = true;
+      error.rgRollbackComplete = result.complete;
+      error.rgRollbackGraphRestored = result.graphRestored;
+      if (result.errors.length) console.error("[roam-grid] Column deletion rollback incomplete", result.errors);
+      throw error;
+    }
+    return {
+      commit: async () => { await deleteBlock(stagingUid); committed = true; },
+      rollback: () => (committed ? Promise.resolve({ complete: false, errors: [new Error("Deletion was already committed")] }) : rollback()),
+    };
   }
 
   /** A pure insertion of whole new rows OR whole new columns writes only what changed: new cells are
