@@ -6992,6 +6992,38 @@ export function createExtensionToolsRegistration() {
         return createPublicApi().insertChart(uid, { type: String(type), startRow: Number(start_row), startCol: Number(start_col), endRow: Number(end_row), endCol: Number(end_col), title }).then((model) => ({ ok: true, uid, charts: model.charts.length })).catch((error) => ({ ok: false, error: error?.message || String(error) }));
       }),
     },
+    {
+      name: "rg_create_table_from_rows",
+      description: "Create a native {{table}} from cell text, with merges, header rows, alignment, and widths. One write when every cell round-trips. Requires parent_uid or after_uid.",
+      parameters: objectParams({
+        parent_uid: { type: "string", description: "Parent block uid. Required unless after_uid is set." },
+        after_uid: { type: "string", description: "Insert the new table after this block uid." },
+        order: { description: "Child order under parent_uid: \"last\" (default) or a 0-based index." },
+        rows: { type: "array", description: "Row arrays of cell strings. Ragged rows are padded with empty cells.", items: { type: "array", items: { type: "string" } } },
+        merges: { type: "array", description: "Merges as { row, col, rowSpan, colSpan }. Covered cells must be empty.", items: { type: "object" } },
+        header_rows: { type: "number", description: "How many leading rows are headers. Default 0." },
+        alignments: { type: "object", description: "Cell alignment keyed by \"row,col\": left, center, or right." },
+        column_alignments: { type: "array", description: "Alignment for each column index: left, center, or right.", items: { type: "string" } },
+        widths: { type: "object", description: "Column widths in pixels, keyed by column index." },
+        enhance: { type: "boolean", description: "Store Roam Grid metadata for merges, headers, alignment, and widths. Default true." },
+      }, ["rows"]),
+      execute: wrapSafeExecute(({ parent_uid, after_uid, order, rows, merges, header_rows, alignments, column_alignments, widths, enhance } = {}) => {
+        if (!parent_uid && !after_uid) return { ok: false, error: "parent_uid or after_uid is required" };
+        return createPublicApi().createTableFromModel({
+          parentUid: parent_uid || null,
+          afterUid: after_uid || null,
+          order,
+          rows,
+          merges,
+          headerRows: header_rows,
+          alignments,
+          columnAlignments: column_alignments,
+          widths,
+          enhance,
+          returnInfo: true,
+        }).then((info) => ({ ok: true, uid: info.uid, path: info.path, writes: info.writes }));
+      }),
+    },
   ];
   return { name: "Roam Grid", version: VERSION, tools };
 }
@@ -7011,10 +7043,300 @@ export function savedTemplateNameList(registry = runtime.registries, store = run
   return [...byKey.values()].sort((a, b) => a.localeCompare(b));
 }
 
+/** Hard cap for `createTableFromModel`. The markdown path is one Roam write either way. */
+export const TABLE_FROM_MODEL_MAX_ROWS = 500;
+export const TABLE_FROM_MODEL_MAX_COLS = 50;
+
+const TABLE_ALIGNMENTS = new Set(["left", "center", "right"]);
+// A backslash before one of these is removed by fromMarkdown (measured 2026-10-07). A backslash
+// before a letter is kept. Anything else is unmeasured, so that cell takes the sequential path.
+const MARKDOWN_CONSUMED_AFTER_BACKSLASH = new Set(["\\", "#", "`", "*", "-", ".", ">", "[", "]", "(", ")"]);
+
+/**
+ * One cell as fromMarkdown bullet lines. The first line is the bullet body; the rest are
+ * indented continuations. Returns null when the stored string would not equal `text`.
+ * Empty is `[""]` (an empty bullet). fromMarkdown trims a space, so the sequential path is
+ * what writes the `" "` Roam Grid uses for an empty native cell.
+ */
+export function encodeNativeTableCell(text) {
+  const value = String(text ?? "");
+  if (value === "") return [""];
+  if (/[\t\r\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(value)) return null;
+  const lines = value.split("\n");
+  if (lines.some((line) => line === "" || /^ /.test(line) || / $/.test(line))) return null;
+  const encoded = lines.map((line, index) => encodeNativeTableLine(line, index > 0));
+  return encoded.some((line) => line == null) ? null : encoded;
+}
+
+function encodeNativeTableLine(line, continuation) {
+  if (/^([-*_])(\s*\1){2,}$/.test(line)) return null;
+  if (continuation && (line.includes("\\") || /^\+ /.test(line) || /^\d+\) /.test(line))) return null;
+  const protectedLine = protectMarkdownBackslashes(line);
+  if (protectedLine == null) return null;
+  if (/^#{1,}(?: +|$)/.test(line) || line.startsWith("```")) return `\\${protectedLine}`;
+  if (continuation && /^[-*] /.test(line)) return `\\${protectedLine}`;
+  if (continuation && /^(\d+)\. /.test(line)) {
+    const number = line.match(/^(\d+)/)[1];
+    return `${number}\\.${protectedLine.slice(number.length + 1)}`;
+  }
+  return protectedLine;
+}
+
+function protectMarkdownBackslashes(line) {
+  let out = "";
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (char !== "\\") { out += char; continue; }
+    const next = line[index + 1];
+    if (next == null) { out += "\\"; continue; }
+    if (/[A-Za-z]/.test(next)) { out += "\\"; continue; }
+    if (MARKDOWN_CONSUMED_AFTER_BACKSLASH.has(next)) { out += "\\\\"; continue; }
+    return null;
+  }
+  return out;
+}
+
+/** Outliner markdown for one native table: root `{{[[table]]}}`, then one nested chain per row.
+ *  Returns null when any cell cannot round-trip through fromMarkdown. */
+export function buildNativeTableMarkdown(matrix) {
+  const lines = ["- {{[[table]]}}"];
+  for (const row of matrix) {
+    for (let col = 0; col < row.length; col += 1) {
+      const encoded = encodeNativeTableCell(row[col]);
+      if (!encoded) return null;
+      const indent = "  ".repeat(col + 1);
+      encoded.forEach((line, index) => {
+        lines.push(index === 0 ? `${indent}- ${line}` : `${indent}  ${line}`);
+      });
+    }
+  }
+  return lines.join("\n");
+}
+
+function integerOption(value, fallback) {
+  if (value == null || value === "") return fallback;
+  const number = typeof value === "string" && /^-?\d+$/.test(value) ? Number(value) : value;
+  return Number.isInteger(number) ? number : Number.NaN;
+}
+
+function coveredMergeCells(merges) {
+  const covered = new Set();
+  for (const merge of merges) {
+    for (let row = merge.row; row < merge.row + merge.rowSpan; row += 1) {
+      for (let col = merge.col; col < merge.col + merge.colSpan; col += 1) {
+        if (row === merge.row && col === merge.col) continue;
+        covered.add(`${row},${col}`);
+      }
+    }
+  }
+  return covered;
+}
+
+function normalizeTableMerges(merges, rowCount, colCount, matrix) {
+  if (merges == null) return [];
+  if (!Array.isArray(merges)) throw new GridError("INVALID_MERGE", "merges must be an array");
+  const normalized = [];
+  for (const merge of merges) {
+    const row = Number(merge?.row);
+    const col = Number(merge?.col);
+    const rowSpan = Number(merge?.rowSpan);
+    const colSpan = Number(merge?.colSpan);
+    if (![row, col, rowSpan, colSpan].every(Number.isInteger)) throw new GridError("INVALID_MERGE", "merge coordinates must be integers");
+    if (rowSpan < 1 || colSpan < 1) throw new GridError("INVALID_MERGE", "merge span must be at least 1");
+    if (rowSpan === 1 && colSpan === 1) throw new GridError("INVALID_MERGE", "a merge must cover more than one cell");
+    if (row < 0 || col < 0 || row + rowSpan > rowCount || col + colSpan > colCount) throw new GridError("INVALID_MERGE", "merge is outside the table");
+    for (let r = row; r < row + rowSpan; r += 1) {
+      for (let c = col; c < col + colSpan; c += 1) {
+        if (r === row && c === col) continue;
+        if (matrix[r][c] !== "") throw new GridError("INVALID_MERGE", `covered cell ${r},${c} must be empty`);
+      }
+    }
+    if (normalized.some((item) => row < item.row + item.rowSpan && item.row < row + rowSpan && col < item.col + item.colSpan && item.col < col + colSpan)) {
+      throw new GridError("INVALID_MERGE", "merges overlap");
+    }
+    const next = { row, col, rowSpan, colSpan };
+    if (typeof merge.id === "string" && merge.id) next.id = merge.id;
+    normalized.push(next);
+  }
+  return normalized;
+}
+
+function normalizeTableAlignments(spec, rowCount, colCount, merges) {
+  const covered = coveredMergeCells(merges);
+  const grid = Array.from({ length: rowCount }, () => Array(colCount).fill(null));
+  if (spec.columnAlignments != null) {
+    if (!Array.isArray(spec.columnAlignments)) throw new GridError("ALIGNMENT", "columnAlignments must be an array");
+    spec.columnAlignments.forEach((value, col) => {
+      if (value == null || value === "") return;
+      if (!TABLE_ALIGNMENTS.has(value)) throw new GridError("ALIGNMENT", `Unsupported alignment: ${value}`);
+      if (col >= colCount) throw new GridError("ALIGNMENT", "columnAlignments has more entries than columns");
+      for (let row = 0; row < rowCount; row += 1) if (!covered.has(`${row},${col}`)) grid[row][col] = value;
+    });
+  }
+  if (spec.alignments != null) {
+    if (!spec.alignments || typeof spec.alignments !== "object" || Array.isArray(spec.alignments)) throw new GridError("ALIGNMENT", "alignments must be an object keyed by \"row,col\"");
+    for (const [key, value] of Object.entries(spec.alignments)) {
+      const match = /^(\d+),(\d+)$/.exec(key);
+      if (!match) throw new GridError("ALIGNMENT", `alignment key must be "row,col", not ${key}`);
+      const row = Number(match[1]);
+      const col = Number(match[2]);
+      if (row >= rowCount || col >= colCount) throw new GridError("ALIGNMENT", `alignment ${key} is outside the table`);
+      if (covered.has(key)) throw new GridError("ALIGNMENT", `alignment ${key} is on a covered cell`);
+      if (!TABLE_ALIGNMENTS.has(value)) throw new GridError("ALIGNMENT", `Unsupported alignment: ${value}`);
+      grid[row][col] = value;
+    }
+  }
+  return grid;
+}
+
+function normalizeTableWidths(widths, colCount) {
+  const values = Array(colCount).fill(null);
+  if (widths == null) return values;
+  if (!widths || typeof widths !== "object" || Array.isArray(widths)) throw new GridError("WIDTH", "widths must be an object of column index to pixels");
+  for (const [key, value] of Object.entries(widths)) {
+    if (!/^\d+$/.test(key)) throw new GridError("WIDTH", `width key must be a column index, not ${key}`);
+    const col = Number(key);
+    if (col >= colCount) throw new GridError("WIDTH", `width for column ${col} is outside the table`);
+    const px = typeof value === "string" && /^\d+$/.test(value) ? Number(value) : value;
+    if (!Number.isFinite(px)) throw new GridError("WIDTH", `width for column ${col} must be a number of pixels`);
+    values[col] = px;
+  }
+  return values;
+}
+
+function normalizeTableMatrix(rows) {
+  if (!Array.isArray(rows) || rows.length < 1) throw new GridError("TABLE_SHAPE", "rows must be a non-empty array of cell arrays");
+  const matrix = rows.map((row, rowIndex) => {
+    if (!Array.isArray(row)) throw new GridError("TABLE_SHAPE", `row ${rowIndex} must be an array`);
+    return row.map((cell, col) => {
+      if (cell == null) return "";
+      if (typeof cell !== "string") throw new GridError("TABLE_CELL", `cell ${rowIndex},${col} must be a string`);
+      return cell;
+    });
+  });
+  const colCount = Math.max(...matrix.map((row) => row.length));
+  if (colCount < 1) throw new GridError("TABLE_SHAPE", "a table needs at least one column");
+  for (const row of matrix) while (row.length < colCount) row.push("");
+  return matrix;
+}
+
+/** Validates a createTableFromModel spec and chooses markdown or sequential. Does not write. */
+export function planTableFromModel(spec = {}) {
+  const matrix = normalizeTableMatrix(spec.rows);
+  const rowCount = matrix.length;
+  const colCount = matrix[0].length;
+  if (rowCount > TABLE_FROM_MODEL_MAX_ROWS || colCount > TABLE_FROM_MODEL_MAX_COLS) {
+    throw new GridError("TABLE_TOO_LARGE", `A table is at most ${TABLE_FROM_MODEL_MAX_ROWS} rows by ${TABLE_FROM_MODEL_MAX_COLS} columns (${rowCount}×${colCount})`);
+  }
+  const merges = normalizeTableMerges(spec.merges, rowCount, colCount, matrix);
+  const headerRows = integerOption(spec.headerRows, 0);
+  if (!Number.isInteger(headerRows) || headerRows < 0 || headerRows > rowCount) throw new GridError("HEADER_ROWS", "headerRows must be an integer from 0 through the row count");
+  const alignments = normalizeTableAlignments(spec, rowCount, colCount, merges);
+  const widths = normalizeTableWidths(spec.widths, colCount);
+  const markdown = buildNativeTableMarkdown(matrix);
+  const cells = rowCount * colCount;
+  if (!markdown && cells > getSetting("writes-native-budget")) {
+    throw new GridError("MUTATION_BUDGET", `Creating this table cell by cell would write ${cells} blocks, above the native write budget`);
+  }
+  return {
+    matrix, merges, headerRows, alignments, widths, rowCount, colCount,
+    enhance: spec.enhance !== false,
+    path: markdown ? "markdown" : "sequential",
+    markdown,
+    writes: markdown ? 1 : 1 + cells,
+  };
+}
+
+function resolveTableWriteLocation(spec) {
+  const parentUid = spec.parentUid || null;
+  const afterUid = spec.afterUid || null;
+  if (!parentUid && !afterUid) throw new GridError("MISSING_PARENT", "createTableFromModel requires parentUid or afterUid");
+  if (parentUid && afterUid) throw new GridError("MISSING_PARENT", "createTableFromModel takes parentUid or afterUid, not both");
+  if (afterUid) {
+    const position = blockParentPosition(afterUid);
+    if (!position) throw new GridError("MISSING_PARENT", "afterUid is not a placed block");
+    return { parentUid: position.parentUid, order: position.order + 1 };
+  }
+  const order = integerOption(spec.order, null);
+  if (spec.order == null || spec.order === "" || spec.order === "last") return { parentUid, order: "last" };
+  if (spec.order === "first") return { parentUid, order: "first" };
+  if (!Number.isInteger(order) || order < 0) throw new GridError("TABLE_ORDER", "order must be \"last\", \"first\", or an index");
+  return { parentUid, order };
+}
+
+async function writeTableFromMarkdown(markdown, location) {
+  const api = roam();
+  const fromMarkdown = api.data?.block?.fromMarkdown;
+  if (typeof fromMarkdown !== "function") return null;
+  const result = await withRoamWriteRetry(() => fromMarkdown.call(api.data.block, {
+    location: { "parent-uid": location.parentUid, order: location.order },
+    "markdown-string": markdown,
+  }));
+  const uid = result?.uids?.[0] || null;
+  if (!uid) throw new GridError("MARKDOWN_WRITE", "fromMarkdown did not return a table block");
+  return uid;
+}
+
+async function writeTableSequentially(matrix, location) {
+  const tableUid = await createBlock(location.parentUid, "{{[[table]]}}", location.order);
+  for (let row = 0; row < matrix.length; row += 1) {
+    let parentUid = tableUid;
+    for (let col = 0; col < matrix[row].length; col += 1) {
+      const text = matrix[row][col] === "" ? " " : matrix[row][col];
+      parentUid = await createBlock(parentUid, text, col === 0 ? row : 0);
+    }
+  }
+  return tableUid;
+}
+
+async function enhanceCreatedTable(tableUid, plan) {
+  const loaded = new NativeTableAdapter(tableUid).load();
+  if (loaded.rowCount !== plan.rowCount || loaded.colCount !== plan.colCount) {
+    throw new GridError("MARKDOWN_SHAPE", `The written table is ${loaded.rowCount}×${loaded.colCount}, not ${plan.rowCount}×${plan.colCount}`);
+  }
+  loaded.frozenRows = plan.headerRows;
+  loaded.merges = plan.merges.map((merge) => ({ ...merge }));
+  loaded.validateMerges({ repair: true });
+  plan.widths.forEach((width, col) => {
+    if (width == null || !loaded.columnIds[col]) return;
+    loaded.widths[loaded.columnIds[col]] = clamp(Math.round(width), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width"));
+  });
+  for (let row = 0; row < loaded.rowCount; row += 1) {
+    for (let col = 0; col < loaded.colCount; col += 1) {
+      const alignment = plan.alignments[row]?.[col];
+      if (alignment && !loaded.isCovered(row, col)) loaded.setAlignment(row, col, alignment);
+    }
+  }
+  for (let row = 0; row < plan.headerRows; row += 1) if (!loaded.isHeaderRow(row)) loaded.toggleHeaderRow(row);
+  await runtime.metadata.set(tableUid, loaded, "native");
+  syncEnhancedUidGuard();
+  scheduleScan(document);
+}
+
+export async function createTableFromModel(spec = {}) {
+  const plan = planTableFromModel(spec);
+  const location = resolveTableWriteLocation(spec);
+  let { path, writes } = plan;
+  let tableUid = null;
+  if (path === "markdown") {
+    tableUid = await writeTableFromMarkdown(plan.markdown, location);
+    if (!tableUid) {
+      const cells = plan.rowCount * plan.colCount;
+      if (cells > getSetting("writes-native-budget")) throw new GridError("MUTATION_BUDGET", `Creating this table cell by cell would write ${cells} blocks, above the native write budget`);
+      path = "sequential";
+      writes = 1 + cells;
+    }
+  }
+  if (!tableUid) tableUid = await writeTableSequentially(plan.matrix, location);
+  if (plan.enhance) await enhanceCreatedTable(tableUid, plan);
+  return spec.returnInfo ? { uid: tableUid, writes, path } : tableUid;
+}
+
 export function createPublicApi() {
   const registries = runtime.registries;
   return {
     version: VERSION,
+    capabilities: ["createTableFromModel"],
     registerFormulaFunction: (name, fn, options) => registries.registerFormulaFunction(name, fn, options),
     registerCellRenderer: (name, renderer) => registries.register(registries.cellRenderers, name, renderer),
     registerCellEditor: (name, editor) => registries.register(registries.cellEditors, name, editor),
@@ -7089,6 +7411,7 @@ export function createPublicApi() {
       const model = emptyTableModel(dims.rows, dims.cols);
       return createNativeTableFromModel(model, afterUid, { parentUid });
     },
+    createTableFromModel: (spec) => createTableFromModel(spec),
     importGrid,
     exportGrid,
     renderChartSvg,

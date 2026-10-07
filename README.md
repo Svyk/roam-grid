@@ -128,6 +128,7 @@ Roam Grid registers tools on `window.RoamExtensionTools["roam-grid"]` so Chief o
 | `rg_enhance_table` | Enhance a native `{{table}}` block by uid without focusing it |
 | `rg_restore_native` | Restore an enhanced native grid to a plain Roam table by uid |
 | `rg_create_table` | Create a new native grid. Requires `parent_uid` or `after_uid` |
+| `rg_create_table_from_rows` | Create a native table from cell text in one write, with merges, header rows, alignment, and widths. Requires `parent_uid` or `after_uid` |
 | `rg_set_cell` | Set a cell value (row/col 0-indexed). Formulas begin with `=` but not `==` |
 | `rg_add_formula` | Set a formula cell. A leading `=` is added if missing; `==` is refused |
 | `rg_apply_patch` | Apply one or more v1 grid patches (object or array) by uid |

@@ -193,6 +193,7 @@ test("createExtensionToolsRegistration exposes the roam-grid contract", () => {
   const names = registration.tools.map((tool) => tool.name);
   assert.deepEqual(names.sort(), [
     "rg_add_formula", "rg_apply_patch", "rg_create_from_template", "rg_create_table",
+    "rg_create_table_from_rows",
     "rg_delete_cols", "rg_delete_rows", "rg_enhance_table", "rg_export_grid", "rg_fill",
     "rg_get_cell", "rg_get_grid", "rg_insert_chart", "rg_insert_cols", "rg_insert_rows",
     "rg_list_grids", "rg_list_templates", "rg_merge", "rg_resize_table", "rg_restore_native",

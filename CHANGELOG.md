@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Create an enhanced native table in one write.** `roamGrid.v1.createTableFromModel` and the Extension Tool `rg_create_table_from_rows` write a `{{[[table]]}}` with one `fromMarkdown` call when every cell round-trips, then store merges, header rows, alignment, and widths. A table that cannot round-trip uses the existing cell-by-cell path. `v1.capabilities` includes `createTableFromModel`. No version bump.
+
 ## 0.18.2
 
 - **Inserted columns keep their neighbor's width.** Insert left/right and the
