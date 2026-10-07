@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.18.4
 
-- Column and row resizing, the fill handle and image resizing follow a zoomed ancestor (for example a Plexus Diagram board), so a drag moves the edge by exactly what the pointer moved.
+- **Resizing works inside a zoomed board.** Column and row resize drags (and their edge handles) measure the grid's on-screen scale when the drag starts, so inside a zoomed ancestor such as a Plexus Diagram board the edge moves exactly with the pointer. `elementScale(el)` is exported for other extensions.
 
 ## 0.18.3
 

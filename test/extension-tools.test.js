@@ -189,7 +189,7 @@ test("sibling keys survive disposer and the pre-existing registry is left in pla
 test("createExtensionToolsRegistration exposes the roam-grid contract", () => {
   const registration = createExtensionToolsRegistration();
   assert.equal(registration.name, "Roam Grid");
-  assert.equal(registration.version, "0.18.3");
+  assert.equal(registration.version, "0.18.4");
   const names = registration.tools.map((tool) => tool.name);
   assert.deepEqual(names.sort(), [
     "rg_add_formula", "rg_apply_patch", "rg_create_from_template", "rg_create_table",

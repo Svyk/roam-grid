@@ -446,7 +446,7 @@ test("a written table whose shape does not match the plan is removed and rewritt
 
 test("v1 exposes createTableFromModel, its version and capabilities", () => {
   const api = createPublicApi();
-  assert.equal(api.version, "0.18.3");
+  assert.equal(api.version, "0.18.4");
   assert.deepEqual(api.capabilities, ["createTableFromModel"]);
   assert.equal(typeof api.createTableFromModel, "function");
 });
