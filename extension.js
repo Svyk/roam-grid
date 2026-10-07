@@ -812,6 +812,19 @@ export class GridError extends Error {
 }
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+/** Screen-per-layout scale of an element under a zoomed ancestor (a transformed host such as a
+ *  Plexus Diagram board). Pointer deltas are screen pixels; divide by this to get layout pixels.
+ *  Falls back to 1 when the element has no layout size or is not meaningfully scaled. */
+export function elementScale(el) {
+  const one = { x: 1, y: 1 };
+  if (!el || typeof el.getBoundingClientRect !== "function") return one;
+  const rect = el.getBoundingClientRect();
+  const axis = (shown, layout) => {
+    const ratio = Number(shown) / Number(layout);
+    return Number(layout) > 0 && Number.isFinite(ratio) && ratio > 0 && Math.abs(ratio - 1) >= 0.01 ? ratio : 1;
+  };
+  return { x: axis(rect.width, el.offsetWidth), y: axis(rect.height, el.offsetHeight) };
+}
 const deepClone = (value) => JSON.parse(JSON.stringify(value));
 const ordered = (items = []) => [...items].sort((a, b) => (a.order ?? a[":block/order"] ?? 0) - (b.order ?? b[":block/order"] ?? 0));
 const makeLocalUid = () => `rg_${cryptoId()}`;
@@ -11665,9 +11678,9 @@ export class GridView {
     const offset = this.headersOn() ? 1 : 0;
     const resolvedTracks = getComputedStyle(this.gridElement).gridTemplateColumns.split(/\s+/);
     const baseWidths = Object.fromEntries(this.model.columnIds.map((columnId, col) => [columnId, Number.parseFloat(resolvedTracks[col + offset]) || this.model.widths[columnId] || getSetting("sizing-default-col-width")]));
-    const startX = event.clientX; const startWidth = baseWidths[id]; let moved = false;
+    const startX = event.clientX; const scaleX = elementScale(this.root).x; const startWidth = baseWidths[id]; let moved = false;
     const move = (moveEvent) => {
-      const requested = clamp(Math.round(startWidth + moveEvent.clientX - startX), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width"));
+      const requested = clamp(Math.round(startWidth + (moveEvent.clientX - startX) / scaleX), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width"));
       moved ||= requested !== startWidth;
       const widths = this.model.fitToWidth ? fittedTrackResize(baseWidths, id, requested) : { ...baseWidths, [id]: requested };
       this.columnResizePreview = { id, widths };
@@ -11732,10 +11745,10 @@ export class GridView {
     const offset = this.headersOn() ? 1 : 0;
     const resolvedTracks = getComputedStyle(this.gridElement).gridTemplateRows.split(/\s+/);
     const startHeight = Number.parseFloat(resolvedTracks[row + offset]) || this.model.getRowHeight(row) || getSetting("sizing-default-row-height");
-    const startY = event.clientY; let moved = false;
+    const startY = event.clientY; const scaleY = elementScale(this.root).y; let moved = false;
     const move = (moveEvent) => {
       moved = true;
-      this.rowResizePreview = { row, height: clamp(Math.round(startHeight + moveEvent.clientY - startY), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height")) };
+      this.rowResizePreview = { row, height: clamp(Math.round(startHeight + (moveEvent.clientY - startY) / scaleY), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height")) };
       this.applyGridTemplateRows();
     };
     const up = () => {
@@ -13755,15 +13768,15 @@ export class LargeGridView {
   }
 
   startRowResize(row, event) {
-    event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.(); const startY = event.clientY; const startHeight = this.store.rowHeight(row); let moved = false;
-    const move = (moveEvent) => { moved = true; this.rowResizePreview = { row, height: clamp(Math.round(startHeight + moveEvent.clientY - startY), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height")) }; this.rowMetricsKey = null; this.scheduleRender(); };
+    event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.(); const startY = event.clientY; const scaleY = elementScale(this.root).y; const startHeight = this.store.rowHeight(row); let moved = false;
+    const move = (moveEvent) => { moved = true; this.rowResizePreview = { row, height: clamp(Math.round(startHeight + (moveEvent.clientY - startY) / scaleY), getSetting("sizing-min-row-height"), getSetting("sizing-max-row-height")) }; this.rowMetricsKey = null; this.scheduleRender(); };
     const up = () => { const height = this.rowResizePreview?.height ?? startHeight; cleanup(); this.rowResizePreview = null; if (!moved) return; this.store.setRowHeight(row, height); this.scheduleSave(true); this.scheduleRender(); };
     const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
     this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
   }
   startColumnResize(col, event) {
-    event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.(); const startX = event.clientX; const startWidth = this.columnWidth(col); let moved = false;
-    const move = (moveEvent) => { moved = true; this.columnResizePreview = { col, width: clamp(Math.round(startWidth + moveEvent.clientX - startX), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width")) }; this.scheduleRender(); };
+    event.preventDefault(); event.stopPropagation(); this.resizeCleanup?.(); const startX = event.clientX; const scaleX = elementScale(this.root).x; const startWidth = this.columnWidth(col); let moved = false;
+    const move = (moveEvent) => { moved = true; this.columnResizePreview = { col, width: clamp(Math.round(startWidth + (moveEvent.clientX - startX) / scaleX), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width")) }; this.scheduleRender(); };
     const up = () => { const width = this.columnResizePreview?.width ?? startWidth; cleanup(); this.columnResizePreview = null; if (!moved) return; this.store.setColumnWidth(col, width); this.scheduleSave(true); this.scheduleRender(); };
     const cleanup = () => { document.removeEventListener("pointermove", move); document.removeEventListener("pointerup", up); this.resizeCleanup = null; };
     this.resizeCleanup = cleanup; document.addEventListener("pointermove", move); document.addEventListener("pointerup", up);
@@ -13888,7 +13901,8 @@ export class LargeGridView {
    *  metrics the renderer uses, so the drop coordinate matches what the cursor was visually over. */
   dropCellAt(clientX, clientY) {
     const rect = this.canvas.getBoundingClientRect();
-    const x = clientX - rect.left; const y = clientY - rect.top;
+    const scale = elementScale(this.canvas);
+    const x = (clientX - rect.left) / scale.x; const y = (clientY - rect.top) / scale.y;
     const row = clamp(this.rowAtOffset(y), 0, Math.max(0, this.store.manifest.rowCount - 1));
     const { colCount } = this.store.manifest;
     let col = 0; let left = this.headerWidth();

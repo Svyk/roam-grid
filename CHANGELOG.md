@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Column and row resizing, the fill handle and image resizing follow a zoomed ancestor (for example a Plexus Diagram board), so a drag moves the edge by exactly what the pointer moved.
+
 ## 0.18.3
 
 - **Create an enhanced native table in one write.** `roamGrid.v1.createTableFromModel` and the Extension Tool `rg_create_table_from_rows` write a `{{[[table]]}}` with one `fromMarkdown` call (one undo step) when every cell round-trips, then store merges, header rows, alignment, and widths. A table that cannot round-trip, or that Roam parses into a different shape, is written cell by cell instead. `v1.version` and `v1.capabilities` (`["createTableFromModel"]`) let other extensions feature-detect it. Plexus Diagram uses it to drop parsed PDF tables, merged cells included, onto a board.
