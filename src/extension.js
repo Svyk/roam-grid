@@ -1,4 +1,4 @@
-const VERSION = "0.18.2";
+const VERSION = "0.18.3";
 const LARGE_GRID_OFF_TOAST = "Large grids are experimental and off.";
 const EXPERIMENTAL_LARGE_GRID_KEY = "experimental-large-grid";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;

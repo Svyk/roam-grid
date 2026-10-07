@@ -1,5 +1,5 @@
-/* Roam Grid v0.18.2 | MIT | generated from src/extension.js */
-const VERSION = "0.18.2";
+/* Roam Grid v0.18.3 | MIT | generated from src/extension.js */
+const VERSION = "0.18.3";
 const LARGE_GRID_OFF_TOAST = "Large grids are experimental and off.";
 const EXPERIMENTAL_LARGE_GRID_KEY = "experimental-large-grid";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;

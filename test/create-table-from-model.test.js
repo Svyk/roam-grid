@@ -444,9 +444,9 @@ test("a written table whose shape does not match the plan is removed and rewritt
   assert.equal(runtime.metadata.has(info.uid), true);
 });
 
-test("v1 exposes createTableFromModel without a version bump", () => {
+test("v1 exposes createTableFromModel, its version and capabilities", () => {
   const api = createPublicApi();
-  assert.equal(api.version, "0.18.2");
+  assert.equal(api.version, "0.18.3");
   assert.deepEqual(api.capabilities, ["createTableFromModel"]);
   assert.equal(typeof api.createTableFromModel, "function");
 });
