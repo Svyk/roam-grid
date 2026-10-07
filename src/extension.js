@@ -7320,6 +7320,14 @@ export async function createTableFromModel(spec = {}) {
   let tableUid = null;
   if (path === "markdown") {
     tableUid = await writeTableFromMarkdown(plan.markdown, location);
+    // Roam parsed the markdown into a different shape: remove that table and write cell by cell.
+    if (tableUid) {
+      const loaded = new NativeTableAdapter(tableUid).load();
+      if (loaded.rowCount !== plan.rowCount || loaded.colCount !== plan.colCount) {
+        await deleteBlock(tableUid);
+        tableUid = null;
+      }
+    }
     if (!tableUid) {
       const cells = plan.rowCount * plan.colCount;
       if (cells > getSetting("writes-native-budget")) throw new GridError("MUTATION_BUDGET", `Creating this table cell by cell would write ${cells} blocks, above the native write budget`);

@@ -425,17 +425,23 @@ test("afterUid, order, and a bad location are resolved before the write", async 
   await rejectsCode(() => createTableFromModel({ parentUid: "pageHome", order: -1, rows: [["A"]] }), "TABLE_ORDER");
 });
 
-test("a written table whose shape does not match the plan is left in place", async (t) => {
+test("a written table whose shape does not match the plan is removed and rewritten cell by cell", async (t) => {
+  let wrongUid = null;
   const mock = await boot(t, { fromMarkdown: (_args, { nextUid, attach }) => {
     const uid = nextUid();
+    wrongUid = uid;
     const table = { uid, string: "{{[[table]]}}", order: 0, children: [{ uid: nextUid(), string: "only", order: 0, children: [] }] };
     attach("pageHome", table, "last");
     return { uids: [uid] };
   } });
-  await rejectsCode(() => createTableFromModel({ parentUid: "pageHome", rows: [["A", "B"], ["C", "D"]] }), "MARKDOWN_SHAPE");
+  const info = await createTableFromModel({ parentUid: "pageHome", rows: [["A", "B"], ["C", "D"]], returnInfo: true });
+  assert.equal(info.path, "sequential");
+  assert.equal(info.writes, 5);
+  assert.notEqual(info.uid, wrongUid);
+  assert.equal(mock.blocks.has(wrongUid), false);
   const tables = [...mock.blocks.values()].filter((block) => block.string === "{{[[table]]}}");
   assert.equal(tables.length, 1);
-  assert.equal(runtime.metadata.has(tables[0].uid), false);
+  assert.equal(runtime.metadata.has(info.uid), true);
 });
 
 test("v1 exposes createTableFromModel without a version bump", () => {
