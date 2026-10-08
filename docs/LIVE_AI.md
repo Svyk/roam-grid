@@ -59,3 +59,26 @@ The write is one `roamAlphaAPI.data.block.fromMarkdown` call, so it is one undo 
 `v1.version` is the extension version. `v1.capabilities` includes `"createTableFromModel"`.
 
 The Extension Tool `rg_create_table_from_rows` takes the same options in snake_case (`parent_uid` or `after_uid`, `rows`, `merges`, `header_rows`, `alignments`, `column_alignments`, `widths`, `enhance`). It returns `{ ok, uid, path, writes }`.
+
+## Layout requests (agents outside the browser)
+
+An agent that writes through the Roam API, such as an MCP server, cannot call `window.roamGrid`. It leaves a request block as a top-level child of `[[roam/grid/metadata]]`:
+
+```
+roam-grid/layout-request:: {"tableUid":"zNoXiJVfD","merges":[{"row":0,"col":0,"rowSpan":1,"colSpan":12}],"headerRows":[0,2],"frozenRows":3,"alignments":{"0,0":"center"},"widths":{"0":260}}
+```
+
+Roam Grid applies pending requests when it loads, and at once while Roam is open (a pull watch on the metadata page). **Roam Grid: Apply pending layout requests** runs them by hand. A plain table is enhanced first. A mounted grid takes the request as one undoable edit; an unmounted one is saved straight to its metadata, so the request never races the grid's own in-memory layout the way a hand-edited `roam-grid/table::` block does.
+
+Every field except `tableUid` is optional. An absent field keeps the current layout; a present one replaces it.
+
+- `merges`: `{ row, col, rowSpan, colSpan }`, 0-based. Covered cells must be empty.
+- `headerRows`: a count of leading rows, or a list of row indexes. A count also sets `frozenRows`.
+- `frozenRows`: rows frozen at the top.
+- `alignments` (keyed `"row,col"`) and `columnAlignments`: `left`, `center`, or `right`. Either one replaces all cell alignments.
+- `widths`: pixels keyed by column index.
+- `fitToWidth`: `true` or `false`.
+
+An applied request is deleted. A request that fails is rewritten as `roam-grid/layout-request-error:: <reason> · <original JSON>` and is not retried; fix it and change the prefix back to resend it.
+
+The same layout is available in the browser as `roamGrid.v1.applyLayout(tableUid, spec)` and the Extension Tool `rg_apply_layout` (snake_case fields). `v1.capabilities` includes `"applyLayout"` and `"layoutRequests"`.

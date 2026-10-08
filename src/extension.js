@@ -1,4 +1,4 @@
-const VERSION = "0.18.5";
+const VERSION = "0.18.6";
 const LARGE_GRID_OFF_TOAST = "Large grids are experimental and off.";
 const EXPERIMENTAL_LARGE_GRID_KEY = "experimental-large-grid";
 const NATIVE_MARKER = /\{\{(?:\[\[)?table(?:\]\])?\}\}/i;
@@ -253,6 +253,9 @@ export const runtime = {
   lastFocusedUid: null,
   keyboardOwner: null,
   commentArmed: false,
+  layoutRequestsRunning: false,
+  layoutRequestsQueued: false,
+  layoutRequestTimer: null,
   // Native-overlay health is per session, never persisted: a graph that cannot mount Roam's editor
   // today may be able to after a reload, and a disabled flag on disk would outlive the cause.
   nativeEditorDisabledUntil: 0,
@@ -3183,6 +3186,7 @@ export class MetadataStore {
   constructor() {
     this.pageUid = null;
     this.entries = new Map();
+    this.pendingLayoutRequests = 0;
   }
 
   async initialize() {
@@ -3197,9 +3201,11 @@ export class MetadataStore {
 
   async reload() {
     this.entries.clear();
+    this.pendingLayoutRequests = 0;
     if (!this.pageUid) return;
     const tree = getTree(this.pageUid);
     for (const block of tree?.children || []) {
+      if (block.string.startsWith(LAYOUT_REQUEST_PREFIX)) this.pendingLayoutRequests += 1;
       if (!block.string.startsWith(METADATA_PREFIX)) continue;
       try {
         const value = JSON.parse(block.string.slice(METADATA_PREFIX.length).trim());
@@ -7037,6 +7043,26 @@ export function createExtensionToolsRegistration() {
         }).then((info) => ({ ok: true, uid: info.uid, path: info.path, writes: info.writes }));
       }),
     },
+    {
+      name: "rg_apply_layout",
+      description: "Set merges, header rows, frozen rows, alignment, and widths on an existing native {{table}} by uid, enhancing it first if needed. Omitted fields keep their current layout.",
+      parameters: objectParams({
+        uid: uidProp,
+        merges: { type: "array", description: "Merges as { row, col, rowSpan, colSpan }, replacing the current ones. Covered cells must be empty.", items: { type: "object" } },
+        header_rows: { description: "A count of leading header rows, or a list of 0-based row indexes." },
+        frozen_rows: { type: "number", description: "Rows frozen at the top. Defaults to header_rows when that is a count." },
+        alignments: { type: "object", description: "Cell alignment keyed by \"row,col\": left, center, or right." },
+        column_alignments: { type: "array", description: "Alignment for each column index: left, center, or right.", items: { type: "string" } },
+        widths: { type: "object", description: "Column widths in pixels, keyed by column index." },
+        fit_to_width: { type: "boolean", description: "Fit columns to the page width." },
+      }, ["uid"]),
+      execute: wrapSafeExecute(({ uid, merges, header_rows, frozen_rows, alignments, column_alignments, widths, fit_to_width } = {}) => {
+        if (!uid) return { ok: false, error: "uid is required" };
+        const fields = { merges, headerRows: header_rows, frozenRows: frozen_rows, alignments, columnAlignments: column_alignments, widths, fitToWidth: fit_to_width };
+        const spec = Object.fromEntries(Object.entries(fields).filter(([, value]) => value !== undefined));
+        return createPublicApi().applyLayout(uid, spec).then(() => ({ ok: true, uid }));
+      }),
+    },
   ];
   return { name: "Roam Grid", version: VERSION, tools };
 }
@@ -7353,11 +7379,166 @@ export async function createTableFromModel(spec = {}) {
   return spec.returnInfo ? { uid: tableUid, writes, path } : tableUid;
 }
 
+/** Agents that write through the Roam API (an MCP server, a script) cannot reach `window.roamGrid`,
+ *  so they leave a layout request block on [[roam/grid/metadata]]. Roam Grid applies it through the
+ *  same session and metadata owner as every other edit, then deletes it. */
+export const LAYOUT_REQUEST_PREFIX = "roam-grid/layout-request::";
+export const LAYOUT_REQUEST_ERROR_PREFIX = "roam-grid/layout-request-error::";
+const LAYOUT_REQUEST_FIELDS = new Set(["tableUid", "merges", "headerRows", "frozenRows", "alignments", "columnAlignments", "widths", "fitToWidth"]);
+
+function normalizeLayoutHeaderRows(value, rowCount) {
+  if (Number.isInteger(value)) {
+    if (value < 0 || value > rowCount) throw new GridError("HEADER_ROWS", "headerRows must be an integer from 0 through the row count, or a list of row indexes");
+    return Array.from({ length: value }, (_, row) => row);
+  }
+  if (!Array.isArray(value)) throw new GridError("HEADER_ROWS", "headerRows must be an integer count or a list of row indexes");
+  for (const row of value) if (!Number.isInteger(row) || row < 0 || row >= rowCount) throw new GridError("HEADER_ROWS", `header row ${row} is outside the table`);
+  return [...new Set(value)].sort((a, b) => a - b);
+}
+
+/** Validates a layout request against a table's current cells. Every field is optional; an absent
+ *  field leaves that part of the layout alone, a present one replaces it. Does not write. */
+export function planLayoutRequest(spec, matrix, existingMerges = []) {
+  if (!spec || typeof spec !== "object" || Array.isArray(spec)) throw new GridError("LAYOUT_REQUEST", "A layout request must be a JSON object");
+  for (const key of Object.keys(spec)) if (!LAYOUT_REQUEST_FIELDS.has(key)) throw new GridError("LAYOUT_REQUEST", `Unknown layout request field ${key}`);
+  const rowCount = matrix.length;
+  const colCount = matrix[0]?.length || 0;
+  const plan = {};
+  if (spec.merges !== undefined) plan.merges = normalizeTableMerges(spec.merges, rowCount, colCount, matrix);
+  if (spec.headerRows !== undefined) plan.headerRows = normalizeLayoutHeaderRows(spec.headerRows, rowCount);
+  if (spec.frozenRows !== undefined) {
+    if (!Number.isInteger(spec.frozenRows) || spec.frozenRows < 0 || spec.frozenRows > rowCount) throw new GridError("FROZEN_ROWS", "frozenRows must be an integer from 0 through the row count");
+    plan.frozenRows = spec.frozenRows;
+  } else if (Number.isInteger(spec.headerRows)) plan.frozenRows = spec.headerRows;
+  if (spec.alignments !== undefined || spec.columnAlignments !== undefined) plan.alignments = normalizeTableAlignments(spec, rowCount, colCount, plan.merges ?? existingMerges);
+  if (spec.widths !== undefined) plan.widths = normalizeTableWidths(spec.widths, colCount);
+  if (spec.fitToWidth !== undefined) {
+    if (typeof spec.fitToWidth !== "boolean") throw new GridError("LAYOUT_REQUEST", "fitToWidth must be true or false");
+    plan.fitToWidth = spec.fitToWidth;
+  }
+  return plan;
+}
+
+/** Applies a planned layout to a model. Run it inside a transaction so it is one undo step. */
+export function applyLayoutPlan(model, plan) {
+  if (plan.merges) {
+    model.merges = plan.merges.map((merge) => ({ ...merge }));
+    model.validateMerges({ repair: true });
+  }
+  if (plan.frozenRows != null) model.frozenRows = plan.frozenRows;
+  if (plan.headerRows) model.headerRows = plan.headerRows.map((row) => model.rowKey(row)).filter(Boolean);
+  if (plan.widths) {
+    plan.widths.forEach((width, col) => {
+      if (width == null || !model.columnIds[col]) return;
+      model.widths[model.columnIds[col]] = clamp(Math.round(width), getSetting("sizing-min-col-width"), getSetting("sizing-max-col-width"));
+    });
+  }
+  if (plan.alignments) {
+    model.alignments = {};
+    for (let row = 0; row < model.rowCount; row += 1) {
+      for (let col = 0; col < model.colCount; col += 1) {
+        const alignment = plan.alignments[row]?.[col];
+        if (alignment && !model.isCovered(row, col)) model.setAlignment(row, col, alignment);
+      }
+    }
+  }
+  if (plan.fitToWidth != null) model.fitToWidth = plan.fitToWidth;
+  return model;
+}
+
+/** Applies a layout to a native table, enhancing it first when it is still plain. A mounted grid
+ *  takes it as one undoable mutation; an unmounted one is saved straight to its metadata. */
+export async function applyTableLayout(tableUid, spec) {
+  if (!tableUid || typeof tableUid !== "string") throw new GridError("NOT_TABLE", "A layout request needs a tableUid");
+  if (runtime.metadata.entries.get(tableUid)?.value?.mode === "large") throw new GridError("LARGE_GRID", "Layout requests apply to native tables, not large grids");
+  const session = runtime.sessions.get(tableUid);
+  if (session?.model) {
+    const plan = planLayoutRequest(spec, rawRows(session.model), session.model.merges);
+    const committed = await session.commitMutation(null, "Apply layout request", () => applyLayoutPlan(session.model, plan), true);
+    if (!committed) throw new GridError("LAYOUT_REQUEST", "The open grid could not apply this layout");
+    return tableUid;
+  }
+  const enhanced = runtime.metadata.has(tableUid);
+  const model = new NativeTableAdapter(tableUid).load(enhanced ? null : displayDefaults());
+  applyLayoutPlan(model, planLayoutRequest(spec, rawRows(model), model.merges));
+  await runtime.metadata.set(tableUid, model, "native");
+  if (!enhanced) { syncEnhancedUidGuard(); scheduleScan(document); }
+  return tableUid;
+}
+
+/** Applies and deletes every pending layout request on [[roam/grid/metadata]]. A request that
+ *  fails is rewritten as a layout-request-error block with the reason, so it is never retried. */
+export async function processLayoutRequests() {
+  const result = { applied: 0, failed: 0, errors: [] };
+  if (!runtime.metadata) return result;
+  if (runtime.layoutRequestsRunning) { runtime.layoutRequestsQueued = true; return result; }
+  runtime.layoutRequestsRunning = true;
+  try {
+    const pageUid = runtime.metadata.pageUid || getPageUid(METADATA_PAGE);
+    if (!pageUid) return result;
+    runtime.metadata.pageUid = pageUid;
+    for (const block of getTree(pageUid)?.children || []) {
+      if (!block.string.startsWith(LAYOUT_REQUEST_PREFIX)) continue;
+      const body = block.string.slice(LAYOUT_REQUEST_PREFIX.length).trim();
+      try {
+        const spec = JSON.parse(body);
+        await applyTableLayout(spec?.tableUid, spec);
+        await deleteBlock(block.uid);
+        result.applied += 1;
+      } catch (error) {
+        const message = error?.message || String(error);
+        result.failed += 1;
+        result.errors.push({ blockUid: block.uid, error: message });
+        await updateBlock(block.uid, `${LAYOUT_REQUEST_ERROR_PREFIX} ${message} · ${body}`);
+      }
+    }
+    return result;
+  } finally {
+    runtime.layoutRequestsRunning = false;
+    if (runtime.layoutRequestsQueued) { runtime.layoutRequestsQueued = false; scheduleLayoutRequests(); }
+  }
+}
+
+function reportLayoutRequests(result) {
+  if (result.applied) toast(`Applied ${result.applied} table layout request${result.applied === 1 ? "" : "s"}.`, "success");
+  if (result.failed) toast(`${result.failed} table layout request${result.failed === 1 ? "" : "s"} failed. See roam-grid/layout-request-error on [[roam/grid/metadata]].`, "warning", 8000);
+}
+
+function scheduleLayoutRequests() {
+  if (runtime.layoutRequestTimer) return;
+  runtime.layoutRequestTimer = trackedTimeout(() => {
+    runtime.layoutRequestTimer = null;
+    processLayoutRequests().then(reportLayoutRequests).catch((error) => console.warn("[roam-grid] Layout requests failed", error));
+  }, 300);
+}
+
+/** Watches [[roam/grid/metadata]] so a request written while Roam is open applies at once. */
+function watchLayoutRequests() {
+  const pageUid = runtime.metadata?.pageUid || getPageUid(METADATA_PAGE);
+  const data = roam().data;
+  if (!pageUid || typeof data?.addPullWatch !== "function") return;
+  const pattern = "[{:block/children [:block/string]}]";
+  const entity = `[:block/uid "${pageUid}"]`;
+  const handler = (_before, after) => {
+    if ((after?.[":block/children"] || []).some((child) => String(child?.[":block/string"] || "").startsWith(LAYOUT_REQUEST_PREFIX))) scheduleLayoutRequests();
+  };
+  data.addPullWatch(pattern, entity, handler);
+  runtime.disposers.push(() => { try { data.removePullWatch(pattern, entity, handler); } catch { /* Roam already tore it down */ } });
+}
+
+async function applyLayoutRequestsCommand() {
+  try {
+    const result = await processLayoutRequests();
+    if (!result.applied && !result.failed) toast("No pending table layout requests.", "primary");
+    else reportLayoutRequests(result);
+  } catch (error) { toast(error.message, "danger"); }
+}
+
 export function createPublicApi() {
   const registries = runtime.registries;
   return {
     version: VERSION,
-    capabilities: ["createTableFromModel"],
+    capabilities: ["createTableFromModel", "applyLayout", "layoutRequests"],
     registerFormulaFunction: (name, fn, options) => registries.registerFormulaFunction(name, fn, options),
     registerCellRenderer: (name, renderer) => registries.register(registries.cellRenderers, name, renderer),
     registerCellEditor: (name, editor) => registries.register(registries.cellEditors, name, editor),
@@ -7433,6 +7614,8 @@ export function createPublicApi() {
       return createNativeTableFromModel(model, afterUid, { parentUid });
     },
     createTableFromModel: (spec) => createTableFromModel(spec),
+    applyLayout: (tableUid, spec) => applyTableLayout(tableUid, spec ?? {}),
+    processLayoutRequests: () => processLayoutRequests(),
     importGrid,
     exportGrid,
     renderChartSvg,
@@ -14803,6 +14986,7 @@ function registerCommands(extensionAPI) {
     ["Roam Grid: Import from a PDF on this page…", importFromPdfCommand],
     ["Roam Grid: Export", exportFocusedCommand],
     ["Roam Grid: Restore discarded edits", restoreDiscardedEditsCommand],
+    ["Roam Grid: Apply pending layout requests", applyLayoutRequestsCommand],
     ["Roam Grid: Undo", () => commandOnActive("undo")],
     ["Roam Grid: Redo", () => commandOnActive("redo")],
     ["Roam Grid: Insert chart", () => commandOnActive("insertChart")],
@@ -14954,6 +15138,9 @@ async function onload({ extensionAPI }) {
     runtime.observer = new MutationObserver(handleDomMutations); runtime.observer.observe(document.querySelector(".roam-app") || document.body, { childList: true, subtree: true });
     installPortalObservers();
     scheduleScan(document);
+    watchLayoutRequests();
+    // Steady state costs no timer: the load-time metadata read already counted pending requests.
+    if (runtime.metadata.pendingLayoutRequests) scheduleLayoutRequests();
   } catch (error) {
     await onunload();
     throw error;
@@ -15004,6 +15191,7 @@ async function onunload() {
   } finally {
     for (const dispose of runtime.disposers.splice(0)) { try { dispose(); } catch (error) { console.warn("[roam-grid] Disposer failed during unload", error); } }
     cancelRecentsWarm();
+    runtime.layoutRequestTimer = null; runtime.layoutRequestsRunning = false; runtime.layoutRequestsQueued = false;
     // Session health is per load, never persisted: a reload must start from a clean slate instead of
     // carrying a graph's mount-failure or budget flags across the unload boundary.
     resetNativeEditorHealth();

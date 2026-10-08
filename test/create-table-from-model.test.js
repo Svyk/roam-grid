@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   GridError,
   GridModel,
+  LAYOUT_REQUEST_ERROR_PREFIX,
+  LAYOUT_REQUEST_PREFIX,
   MetadataStore,
   RegistrySet,
   TABLE_FROM_MODEL_MAX_COLS,
@@ -12,7 +14,9 @@ import {
   createPublicApi,
   createTableFromModel,
   encodeNativeTableCell,
+  planLayoutRequest,
   planTableFromModel,
+  processLayoutRequests,
   runtime,
   settingsCache,
 } from "../src/extension.js";
@@ -121,7 +125,10 @@ function installCreateTableMock({ fromMarkdown = "parse" } = {}) {
           } else parent.children.push(node);
         },
         update: async ({ block }) => { if (blocks.has(block.uid)) blocks.get(block.uid).string = block.string; },
-        delete: async ({ block }) => { blocks.delete(block.uid); },
+        delete: async ({ block }) => {
+          blocks.delete(block.uid);
+          for (const parent of blocks.values()) if (parent.children) parent.children = parent.children.filter((child) => child.uid !== block.uid);
+        },
       },
     },
   }, dispatchEvent() {} };
@@ -446,8 +453,10 @@ test("a written table whose shape does not match the plan is removed and rewritt
 
 test("v1 exposes createTableFromModel, its version and capabilities", () => {
   const api = createPublicApi();
-  assert.equal(api.version, "0.18.5");
-  assert.deepEqual(api.capabilities, ["createTableFromModel"]);
+  assert.equal(api.version, "0.18.6");
+  assert.deepEqual(api.capabilities, ["createTableFromModel", "applyLayout", "layoutRequests"]);
+  assert.equal(typeof api.applyLayout, "function");
+  assert.equal(typeof api.processLayoutRequests, "function");
   assert.equal(typeof api.createTableFromModel, "function");
 });
 
@@ -491,4 +500,128 @@ test("rg_create_table_from_rows returns ok, uid, and path", async (t) => {
   const rejected = await tool.execute({ parent_uid: "pageHome", rows: [[1]] });
   assert.equal(rejected.ok, false);
   assert.match(rejected.error, /must be a string/);
+});
+
+const LAYOUT_ROWS = [
+  ["Title", "", "", ""],
+  ["Meals", "5", "Note", ""],
+  ["Item", "g", "kcal", "Protein"],
+  ["Beef", "907", "152", "21"],
+  ["TOTAL", "", "", "=SUM(D4:D4)"],
+];
+
+async function plainTable(rows = LAYOUT_ROWS) {
+  return createTableFromModel({ parentUid: "pageHome", rows, enhance: false });
+}
+
+test("planLayoutRequest validates against the table's cells and keeps absent fields absent", () => {
+  const matrix = LAYOUT_ROWS.map((row) => [...row]);
+  assert.deepEqual(planLayoutRequest({ tableUid: "t" }, matrix), {});
+  const plan = planLayoutRequest({ merges: [{ row: 0, col: 0, rowSpan: 1, colSpan: 4 }], headerRows: [2, 0, 2], widths: { 0: 200 } }, matrix);
+  assert.deepEqual(plan.headerRows, [0, 2]);
+  assert.equal(plan.frozenRows, undefined, "a header-row list does not imply frozen rows");
+  assert.equal(plan.widths[0], 200);
+  assert.equal(planLayoutRequest({ headerRows: 2 }, matrix).frozenRows, 2, "a header-row count freezes those rows");
+  assert.equal(planLayoutRequest({ headerRows: 2, frozenRows: 3 }, matrix).frozenRows, 3);
+  throwsCode(() => planLayoutRequest({ merges: [{ row: 1, col: 1, rowSpan: 1, colSpan: 2 }] }, matrix), "INVALID_MERGE");
+  throwsCode(() => planLayoutRequest({ headerRows: [9] }, matrix), "HEADER_ROWS");
+  throwsCode(() => planLayoutRequest({ frozenRows: -1 }, matrix), "FROZEN_ROWS");
+  throwsCode(() => planLayoutRequest({ colour: "red" }, matrix), "LAYOUT_REQUEST");
+  throwsCode(() => planLayoutRequest([], matrix), "LAYOUT_REQUEST");
+  throwsCode(() => planLayoutRequest({ alignments: { "0,1": "center" } }, matrix, [{ row: 0, col: 0, rowSpan: 1, colSpan: 4 }]), "ALIGNMENT");
+});
+
+test("a layout request block enhances a plain table, applies its layout, and is deleted", async (t) => {
+  const mock = await boot(t);
+  const tableUid = await plainTable();
+  assert.equal(runtime.metadata.has(tableUid), false);
+  mock.addPage("roam/grid/metadata", "pageMeta");
+  const request = {
+    tableUid,
+    merges: [{ row: 0, col: 0, rowSpan: 1, colSpan: 4 }, { row: 1, col: 2, rowSpan: 1, colSpan: 2 }, { row: 4, col: 0, rowSpan: 1, colSpan: 3 }],
+    headerRows: [0, 2],
+    frozenRows: 3,
+    alignments: { "0,0": "center", "4,0": "right" },
+    widths: { 0: 240 },
+  };
+  mock.addBlock("req1", `${LAYOUT_REQUEST_PREFIX} ${JSON.stringify(request)}`);
+  mock.blocks.get("pageMeta").children.push(mock.blocks.get("req1"));
+
+  const result = await processLayoutRequests();
+  assert.deepEqual(result, { applied: 1, failed: 0, errors: [] });
+  assert.equal(mock.blocks.has("req1"), false, "the request is deleted once applied");
+  assert.equal(runtime.metadata.has(tableUid), true);
+  const model = modelOf(tableUid);
+  assert.equal(model.merges.length, 3);
+  assert.equal(model.merges[0].colSpan, 4);
+  assert.ok(model.merges.every((merge) => merge.id));
+  assert.equal(model.frozenRows, 3);
+  assert.equal(model.isHeaderRow(0), true);
+  assert.equal(model.isHeaderRow(1), false);
+  assert.equal(model.isHeaderRow(2), true);
+  assert.equal(model.getAlignment(0, 3), "center", "a merged region shares its anchor's alignment");
+  assert.equal(model.getAlignment(4, 0), "right");
+  assert.equal(model.widths[model.columnIds[0]], 240);
+  assert.equal(model.getRaw(4, 3), "=SUM(D4:D4)", "cell text is never rewritten");
+
+  const again = await processLayoutRequests();
+  assert.deepEqual(again, { applied: 0, failed: 0, errors: [] });
+});
+
+test("a later request replaces only the fields it names", async (t) => {
+  const mock = await boot(t);
+  const tableUid = await plainTable();
+  mock.addPage("roam/grid/metadata", "pageMeta");
+  const meta = mock.blocks.get("pageMeta");
+  mock.addBlock("req1", `${LAYOUT_REQUEST_PREFIX} ${JSON.stringify({ tableUid, widths: { 0: 240 }, headerRows: 1 })}`);
+  meta.children.push(mock.blocks.get("req1"));
+  await processLayoutRequests();
+  mock.addBlock("req2", `${LAYOUT_REQUEST_PREFIX} ${JSON.stringify({ tableUid, merges: [{ row: 0, col: 0, rowSpan: 1, colSpan: 4 }] })}`);
+  meta.children.push(mock.blocks.get("req2"));
+  const result = await processLayoutRequests();
+  assert.equal(result.applied, 1);
+  const model = modelOf(tableUid);
+  assert.equal(model.merges.length, 1);
+  assert.equal(model.widths[model.columnIds[0]], 240, "widths from the first request survive");
+  assert.equal(model.frozenRows, 1);
+  assert.equal(model.isHeaderRow(0), true);
+});
+
+test("a request that cannot apply becomes an error block and is not retried", async (t) => {
+  const mock = await boot(t);
+  const tableUid = await plainTable();
+  mock.addPage("roam/grid/metadata", "pageMeta");
+  const meta = mock.blocks.get("pageMeta");
+  const bad = JSON.stringify({ tableUid, merges: [{ row: 3, col: 0, rowSpan: 1, colSpan: 2 }] });
+  mock.addBlock("req1", `${LAYOUT_REQUEST_PREFIX} ${bad}`);
+  mock.addBlock("req2", `${LAYOUT_REQUEST_PREFIX} {not json`);
+  mock.addBlock("req3", `${LAYOUT_REQUEST_PREFIX} ${JSON.stringify({ tableUid: "missing", headerRows: 1 })}`);
+  meta.children.push(mock.blocks.get("req1"), mock.blocks.get("req2"), mock.blocks.get("req3"));
+
+  const result = await processLayoutRequests();
+  assert.equal(result.applied, 0);
+  assert.equal(result.failed, 3);
+  assert.match(mock.blocks.get("req1").string, new RegExp(`^${LAYOUT_REQUEST_ERROR_PREFIX} .*covered cell 3,1 must be empty · `));
+  assert.ok(mock.blocks.get("req1").string.endsWith(bad), "the original request is kept for fixing");
+  assert.ok(mock.blocks.get("req2").string.startsWith(LAYOUT_REQUEST_ERROR_PREFIX));
+  assert.ok(mock.blocks.get("req3").string.startsWith(LAYOUT_REQUEST_ERROR_PREFIX));
+  assert.equal(runtime.metadata.has(tableUid), false, "a failed request enhances nothing");
+  assert.equal((await processLayoutRequests()).failed, 0, "error blocks are not retried");
+});
+
+test("rg_apply_layout sets merges and header rows on a table by uid", async (t) => {
+  await boot(t);
+  const tableUid = await plainTable();
+  const tool = createExtensionToolsRegistration().tools.find((item) => item.name === "rg_apply_layout");
+  assert.ok(tool);
+  assert.deepEqual(tool.parameters.required, ["uid"]);
+  assert.equal((await tool.execute({})).ok, false);
+  const applied = await tool.execute({ uid: tableUid, merges: [{ row: 0, col: 0, rowSpan: 1, colSpan: 4 }], header_rows: 1 });
+  assert.deepEqual(applied, { ok: true, uid: tableUid });
+  const model = modelOf(tableUid);
+  assert.equal(model.merges[0].colSpan, 4);
+  assert.equal(model.frozenRows, 1);
+  const rejected = await tool.execute({ uid: tableUid, merges: [{ row: 3, col: 0, rowSpan: 1, colSpan: 2 }] });
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.error, /must be empty/);
 });
