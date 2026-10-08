@@ -14167,6 +14167,115 @@ export async function importCommand() {
   input.click();
 }
 
+/** The URL inside a `{{[[pdf]]: url}}` (or `{{pdf: url}}`) block, else null. */
+export function pdfUrlOfBlockString(string) {
+  const match = /\{\{\s*(?:\[\[pdf\]\]|pdf)\s*:\s*([^}]+?)\s*\}\}/iu.exec(String(string ?? ""));
+  return match ? match[1] : null;
+}
+
+/** A readable name for a PDF block: the last path segment of its (possibly firebase-encoded) URL. */
+export function pdfLabelOfUrl(url) {
+  const path = String(url ?? "").split(/[?#]/u)[0];
+  let decoded = path;
+  try { decoded = decodeURIComponent(path); } catch { decoded = path; }
+  return decoded.split("/").filter(Boolean).pop() || "PDF";
+}
+
+/** `{{[[pdf]]}}` blocks on a page, the focused one first. Reads only. */
+export function pdfBlocksOnPage(pageUid, { focusedUid: focused = null, api = roam() } = {}) {
+  const found = [];
+  const seen = new Set();
+  const add = (uid, string) => {
+    const url = pdfUrlOfBlockString(string);
+    if (!uid || !url || seen.has(uid)) return;
+    seen.add(uid);
+    found.push({ uid, url, label: pdfLabelOfUrl(url) });
+  };
+  const pull = api.data?.pull ? (...args) => api.data.pull(...args) : api.pull ? (...args) => api.pull(...args) : null;
+  if (focused && pull) add(focused, pull("[:block/string]", [":block/uid", focused])?.[":block/string"]);
+  if (pageUid && typeof api.q === "function") {
+    const rows = api.q(`[:find ?uid ?string :in $ ?page :where [?p :block/uid ?page] [?b :block/page ?p] [?b :block/uid ?uid] [?b :block/string ?string]]`, String(pageUid)) || [];
+    for (const [uid, string] of rows) add(uid, string);
+  }
+  return found;
+}
+
+export function describePdfTable(table) {
+  const parts = [`p. ${table.page}`, table.caption || "Table", `${table.rows}×${table.cols}`];
+  if (table.merged) parts.push(`${table.merged} merged`);
+  return parts.join(" · ");
+}
+
+/** Why a PDF gave nothing, or what is left over. Null when there is nothing to say. */
+export function pdfImportNotice(result) {
+  const needs = result?.needsOcr || [];
+  const pagesText = needs.length === 1 ? `page ${needs[0]}` : `pages ${needs.join(", ")}`;
+  const state = result?.ocr?.state;
+  const reader = result?.ocr?.source ? "" : state && state !== "ready"
+    ? " No reader is ready: open Plexus Engines (Plexus Diagram settings) to set one up, then import again."
+    : "";
+  if (!result?.tables?.length) {
+    if (needs.length) return `This PDF has scanned ${pagesText} and no table could be read from them.${reader}`;
+    return "No tables found in this PDF.";
+  }
+  if (needs.length) return `Scanned ${pagesText} ${needs.length === 1 ? "has" : "have"} not been read.${reader}`;
+  return null;
+}
+
+/** The whole PDF import flow with its effects injected: Plexus reads, the user chooses, createTableFromModel writes. */
+export async function runPdfImport({ plexus, pdfs, choose, notify, create }) {
+  if (!plexus || typeof plexus.tablesFromPdf !== "function" || !Array.isArray(plexus.capabilities) || !plexus.capabilities.includes("tablesFromPdf")) {
+    notify("Importing from a PDF needs Plexus Diagram, which reads the tables. Install or update it, then try again.", "warning", 8000);
+    return null;
+  }
+  if (!pdfs.length) {
+    notify("There is no {{[[pdf]]}} block on this page.", "warning");
+    return null;
+  }
+  let pdf = pdfs[0];
+  if (pdfs.length > 1) {
+    const index = await choose("Import a table from which PDF?", pdfs.map((item, i) => ({ label: item.label, description: item.url, value: i, primary: i === 0 })));
+    if (index == null) return null;
+    pdf = pdfs[index];
+  }
+  notify(`Reading tables from ${pdf.label}…`, "primary", 3000);
+  let result;
+  try { result = await plexus.tablesFromPdf({ url: pdf.url, scan: "auto" }); }
+  catch (error) { notify(`Could not read the PDF: ${error?.message || error}`, "danger", 8000); return null; }
+  const notice = pdfImportNotice(result);
+  if (!result?.tables?.length) {
+    notify(notice, "warning", 8000);
+    return null;
+  }
+  let table = result.tables[0];
+  if (result.tables.length > 1) {
+    const index = await choose("Which table?", result.tables.map((item, i) => ({ label: describePdfTable(item), description: item.caption || "", value: i, primary: i === 0 })));
+    if (index == null) return null;
+    table = result.tables[index];
+  }
+  let info;
+  try { info = await create({ ...table.spec, afterUid: pdf.uid, returnInfo: true }); }
+  catch (error) { notify(`Import failed: ${error?.message || error}`, "danger", 8000); return null; }
+  notify(`Imported ${table.rows} × ${table.cols} from ${pdf.label}.`, "success");
+  if (notice) notify(notice, "warning", 8000);
+  return { uid: info.uid, page: table.page, rows: table.rows, cols: table.cols };
+}
+
+export async function importFromPdfCommand() {
+  try {
+    const open = await roam().ui.mainWindow.getOpenPageOrBlockUid();
+    const pageUid = blockPageUid(open) || open;
+    const focused = focusedUid();
+    return await runPdfImport({
+      plexus: globalThis.window?.PlexusDiagram,
+      pdfs: pdfBlocksOnPage(pageUid, { focusedUid: focused }),
+      choose: (title, choices) => showChoice(title, choices),
+      notify: (message, intent, timeout) => toast(message, intent, timeout),
+      create: (spec) => createTableFromModel(spec),
+    });
+  } catch (error) { toast(`Import failed: ${error.message}`, "danger", 8000); return null; }
+}
+
 async function exportFocusedCommand() {
   const mount = activeMount();
   if (mount instanceof GridView) return exportCommand(mount.model);
@@ -14692,6 +14801,7 @@ function registerCommands(extensionAPI) {
     ["Roam Grid: New large grid", newLargeGrid],
     ["Roam Grid: Copy/convert table", convertFocusedGrid],
     ["Roam Grid: Import", importCommand],
+    ["Roam Grid: Import from a PDF on this page…", importFromPdfCommand],
     ["Roam Grid: Export", exportFocusedCommand],
     ["Roam Grid: Restore discarded edits", restoreDiscardedEditsCommand],
     ["Roam Grid: Undo", () => commandOnActive("undo")],

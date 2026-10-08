@@ -41,6 +41,7 @@ All in the command palette:
 - **Roam Grid: New large grid** — available when **Experimental — Large grids** is on
 - **Roam Grid: Copy/convert table**
 - **Roam Grid: Import**
+- **Roam Grid: Import from a PDF on this page…** — lists the `{{[[pdf]]}}` blocks on the page, reads their tables through Plexus Diagram (scanned pages need a reader set up in Plexus Engines), and creates a grid with merges, header rows, and widths after the PDF block
 - **Roam Grid: Export**
 - **Roam Grid: Restore discarded edits**
 - **Roam Grid: Undo**
