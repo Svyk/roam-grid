@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.6
+
+- **Agents can lay out a table without the browser.** An agent that writes through the Roam API (for example an MCP server) leaves a `roam-grid/layout-request::` block on `[[roam/grid/metadata]]` with merges, header rows, frozen rows, alignment, and widths by row and column index. Roam Grid applies it on load or as soon as it appears, enhancing a plain table first, then deletes it. A request that cannot apply becomes a `roam-grid/layout-request-error::` block with the reason. **Roam Grid: Apply pending layout requests** runs them by hand. In the browser the same thing is `roamGrid.v1.applyLayout` and the Extension Tool `rg_apply_layout`. See [docs/LIVE_AI.md](docs/LIVE_AI.md#layout-requests-agents-outside-the-browser).
+
 ## 0.18.5
 
 - **Import tables from a PDF.** The command "Roam Grid: Import from a PDF on this page…" asks which table to take from a PDF on the current page (Plexus Diagram reads born-digital and scanned PDFs) and writes it as a grid after the PDF block, with merged cells, header rows and column widths kept. It needs Plexus Diagram 3.7.0 (`PlexusDiagram.tablesFromPdf`); without it the command says so.

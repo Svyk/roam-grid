@@ -130,6 +130,7 @@ Roam Grid registers tools on `window.RoamExtensionTools["roam-grid"]` so Chief o
 | `rg_restore_native` | Restore an enhanced native grid to a plain Roam table by uid |
 | `rg_create_table` | Create a new native grid. Requires `parent_uid` or `after_uid` |
 | `rg_create_table_from_rows` | Create a native table from cell text in one write, with merges, header rows, alignment, and widths. Requires `parent_uid` or `after_uid` |
+| `rg_apply_layout` | Set merges, header rows, frozen rows, alignment, and widths on a native table by uid, enhancing it first if needed |
 | `rg_set_cell` | Set a cell value (row/col 0-indexed). Formulas begin with `=` but not `==` |
 | `rg_add_formula` | Set a formula cell. A leading `=` is added if missing; `==` is refused |
 | `rg_apply_patch` | Apply one or more v1 grid patches (object or array) by uid |
@@ -147,6 +148,10 @@ Roam Grid registers tools on `window.RoamExtensionTools["roam-grid"]` so Chief o
 | `rg_sort` | Sort rows by a column. direction is \"asc\" or \"desc\". Header rows stay put |
 | `rg_export_grid` | Export an enhanced grid as text (csv, tsv, markdown, json). No download |
 | `rg_insert_chart` | Insert a chart spec (line, column, bar, scatter) onto the model |
+
+### Agents outside the browser
+
+An agent that writes through the Roam API (an MCP server, a script) can't call these tools. It writes a `roam-grid/layout-request::` block on `[[roam/grid/metadata]]` instead, and Roam Grid applies it on load or as soon as it appears. See [Layout requests](docs/LIVE_AI.md#layout-requests-agents-outside-the-browser).
 
 ## License
 
