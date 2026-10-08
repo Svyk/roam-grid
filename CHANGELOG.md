@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.5
+
+- **Import tables from a PDF.** The command "Roam Grid: Import from a PDF on this page…" asks which table to take from a PDF on the current page (Plexus Diagram reads born-digital and scanned PDFs) and writes it as a grid after the PDF block, with merged cells, header rows and column widths kept. It needs Plexus Diagram 3.7.0 (`PlexusDiagram.tablesFromPdf`); without it the command says so.
+
 ## 0.18.4
 
 - **Resizing works inside a zoomed board.** Column and row resize drags (and their edge handles) measure the grid's on-screen scale when the drag starts, so inside a zoomed ancestor such as a Plexus Diagram board the edge moves exactly with the pointer. `elementScale(el)` is exported for other extensions.
