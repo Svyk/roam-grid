@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.6
+
+- **Faster pages with many tables.** Cell reference and comment badges load in idle time with one shared query for every table on screen, the theme is read once per frame instead of once per table, and tables far below the visible area keep Roam's own table until you scroll near them. Unfolding a block with ten tables spends about 0.05 s in Roam Grid instead of 1.2 s.
+
 ## 0.18.5
 
 - **Import tables from a PDF.** The command "Roam Grid: Import from a PDF on this page…" asks which table to take from a PDF on the current page (Plexus Diagram reads born-digital and scanned PDFs) and writes it as a grid after the PDF block, with merged cells, header rows and column widths kept. It needs Plexus Diagram 3.7.0 (`PlexusDiagram.tablesFromPdf`); without it the command says so.
