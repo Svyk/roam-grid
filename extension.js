@@ -145,6 +145,7 @@ const COMMENT_COMPOSE_MODE_KEY = "comments-compose-mode";
  */
 const SETTING_DESCRIPTORS = [
   { key: NATIVE_BUDGET_KEY, group: "Writes", name: "Native write budget", description: "Maximum Roam block mutations in one structural operation. Larger operations should use large-grid mode.", control: "input", type: "int", default: MAX_NATIVE_MUTATIONS, min: 50, max: 5000, scope: "graph", apply: "next-op", stage: "pending" },
+  { key: "performance-defer-offscreen", group: "Performance", name: "Enhance tables near the viewport only", description: "Leave tables more than about one screen away as Roam's native table until they scroll close. Off enhances every table at once.", control: "switch", type: "bool", default: true, scope: "graph", apply: "next-op", stage: "pending" },
   { key: "writes-content-debounce-ms", group: "Writes", name: "Content save delay (ms)", description: "How long typing settles before edited cells are written back to Roam.", control: "input", type: "int", default: DEFAULT_CONTENT_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "pending" },
   { key: "writes-large-debounce-ms", group: "Writes", name: "Large-grid save delay (ms)", description: "How long a large grid settles before its chunks are uploaded.", control: "input", type: "int", default: DEFAULT_LARGE_SAVE_MS, min: 0, max: 5000, scope: "graph", apply: "next-op", stage: "pending" },
   { key: "session-idle-ms", group: "Writes", name: "Session idle timeout (ms)", description: "How long an unmounted grid session stays warm before it is released.", control: "input", type: "int", default: SESSION_IDLE_MS, min: 200, max: 60000, scope: "graph", apply: "immediate", stage: "pending" },
@@ -4212,7 +4213,6 @@ export class NativeGridSession {
     this.commentThreads = new Map();
     this.commentPageUid = null;
     this.referenceCountFrame = null;
-    this.referenceCountTimer = null;
     this.discardedEdits = null;
     // Cell uids whose block is currently mounted in a `NativeCellEditorOverlay`. Roam writes a
     // native block through its own lane, so every keystroke can arrive as an external content
@@ -4296,29 +4296,28 @@ export class NativeGridSession {
   setSaving(value) { for (const view of this.views) view.root?.classList?.toggle("rg-root--saving", value); }
 
   scheduleReferenceCountRefresh() {
-    if (this.disposed || this.referenceCountFrame != null || this.referenceCountTimer != null) return;
-    const afterPaint = () => {
-      this.referenceCountFrame = null;
-      this.referenceCountTimer = setTimeout(() => {
-        this.referenceCountTimer = null;
-        this.refreshCellBadges();
-      }, 0);
-    };
+    if (this.disposed || this.referenceCountFrame != null || badgeBatch.sessions.has(this)) return;
+    const afterPaint = () => { this.referenceCountFrame = null; enqueueBadgeRefresh(this); };
     if (typeof globalThis.requestAnimationFrame === "function") this.referenceCountFrame = globalThis.requestAnimationFrame(afterPaint);
-    else this.referenceCountTimer = setTimeout(() => { this.referenceCountTimer = null; this.refreshCellBadges(); }, 0);
+    else enqueueBadgeRefresh(this);
   }
 
-  refreshCellBadges() {
-    const counts = this.refreshReferenceCounts();
-    this.refreshCommentThreads();
+  refreshCellBadges(shared = null) {
+    const counts = this.refreshReferenceCounts(shared?.counts || null);
+    this.refreshCommentThreads(shared?.threadsByPage || null);
     return counts;
   }
 
-  refreshReferenceCounts() {
+  refreshReferenceCounts(sharedCounts = null) {
     if (this.disposed) return this.referenceCounts;
     const uids = this.model.rows.flat().map((cell) => cell.uid).filter(Boolean);
     let next;
-    try { next = queryBlockReferenceCounts(uids); }
+    try {
+      if (sharedCounts) {
+        next = new Map();
+        for (const uid of new Set(uids.map(String))) if (sharedCounts.has(uid)) next.set(uid, sharedCounts.get(uid));
+      } else next = queryBlockReferenceCounts(uids);
+    }
     catch (error) { console.warn("[roam-grid] Could not refresh cell reference counts", error); return this.referenceCounts; }
     const changed = new Set();
     for (const uid of new Set([...this.referenceCounts.keys(), ...next.keys()])) {
@@ -4334,12 +4333,16 @@ export class NativeGridSession {
 
   /** Comment writes land on the page, not the table subtree, so the pull watch never sees them.  A
    *  thread merged optimistically by `addCellComment` makes this refresh diff to an empty set. */
-  refreshCommentThreads() {
+  refreshCommentThreads(threadsByPage = null) {
     if (this.disposed || !getSetting("comments-enabled")) return this.commentThreads;
     let next;
     try {
       this.commentPageUid = this.commentPageUid || blockPageUid(this.tableUid);
-      next = this.commentPageUid ? queryCommentThreadIndex(this.commentPageUid) : new Map();
+      if (!this.commentPageUid) next = new Map();
+      else if (threadsByPage) {
+        if (!threadsByPage.has(this.commentPageUid)) threadsByPage.set(this.commentPageUid, queryCommentThreadIndex(this.commentPageUid));
+        next = threadsByPage.get(this.commentPageUid);
+      } else next = queryCommentThreadIndex(this.commentPageUid);
     } catch (error) { console.warn("[roam-grid] Could not refresh cell comment threads", error); return this.commentThreads; }
     const changed = diffCommentThreadIndex(this.commentThreads, next);
     this.commentThreads = next;
@@ -4725,7 +4728,7 @@ export class NativeGridSession {
   dispose() {
     if (this.disposed) return;
     this.disposed = true; clearTimeout(this.saveTimer); clearTimeout(this.idleTimer);
-    clearTimeout(this.referenceCountTimer);
+    badgeBatch.sessions.delete(this);
     if (this.referenceCountFrame != null) globalThis.cancelAnimationFrame?.(this.referenceCountFrame);
     this.adapter.dispose?.(); this.stopWatch = null; this.views.clear(); this.activeEditorView = null; this.dirtyCells.clear(); this.discardedEdits = null;
   }
@@ -7603,7 +7606,33 @@ export function pinnedGridThemePalette(mode = getSetting("appearance-theme")) {
   return null;
 }
 
+// One host-theme sample serves every grid that mounts or syncs in the same frame: each
+// `getComputedStyle` read forces a style recalc while Roam is still dirty, so N grids sampling
+// separately cost N recalcs. The sample drops on the next frame boundary, on any theme-bridge
+// mutation, and on an explicit theme change.
+const themeSampleCache = { doc: null, key: null, values: null, frame: null };
+
+export function invalidateThemeSample() {
+  themeSampleCache.doc = null; themeSampleCache.key = null; themeSampleCache.values = null;
+  if (themeSampleCache.frame != null && typeof globalThis.cancelAnimationFrame === "function") globalThis.cancelAnimationFrame(themeSampleCache.frame);
+  themeSampleCache.frame = null;
+}
+
+function rememberThemeSample(doc, key, values) {
+  invalidateThemeSample();
+  themeSampleCache.doc = doc; themeSampleCache.key = key; themeSampleCache.values = values;
+  const requestFrame = globalThis.requestAnimationFrame || ((callback) => setTimeout(callback, 0));
+  themeSampleCache.frame = requestFrame(() => { themeSampleCache.frame = null; invalidateThemeSample(); });
+}
+
+function themeSampleKey(nativeElement) {
+  let sidebar = false;
+  try { sidebar = Boolean(nativeElement?.closest?.("#roam-right-sidebar-content, .rm-sidebar-outline")); } catch { sidebar = false; }
+  return `${gridThemeSignature(nativeElement)}|${sidebar ? "sidebar" : "main"}`;
+}
+
 function resyncGridTheme(surface) {
+  invalidateThemeSample();
   runtime.gridThemePalette = null;
   runtime.gridThemeSignature = null;
   if (surface?.session) surface.session.themePalette = null;
@@ -7658,6 +7687,12 @@ export function syncGridThemeFromHost(nativeElement, gridRoot, getStyle = global
   if (!gridRoot?.style) return { changed: false, values: { ...GRID_THEME_FALLBACKS } };
   const pinned = pinnedGridThemePalette();
   if (pinned) return { changed: applyGridThemeValues(gridRoot, pinned), values: { ...pinned } };
+  const doc = globalThis.document || null;
+  const sampleKey = themeSampleKey(nativeElement);
+  if (themeSampleCache.values && themeSampleCache.doc === doc && themeSampleCache.key === sampleKey) {
+    const values = { ...themeSampleCache.values };
+    return { changed: applyGridThemeValues(gridRoot, values), values };
+  }
   const host = nativeElement?.parentElement || gridRoot.parentElement || globalThis.document?.body || null;
   const cell = nativeElement?.querySelector?.("td,th,[role='gridcell']") || null;
   const hostStyle = computedStyleOf(host, getStyle);
@@ -7679,6 +7714,7 @@ export function syncGridThemeFromHost(nativeElement, gridRoot, getStyle = global
     "--rg-muted": muted,
     "--rg-active": active,
   };
+  rememberThemeSample(doc, sampleKey, { ...values });
   const changed = applyGridThemeValues(gridRoot, values);
   return { changed, values };
 }
@@ -7698,7 +7734,9 @@ export function createGridThemeBridge(nativeElement, gridRoot, {
     return result;
   };
   const schedule = () => {
-    if (disposed || frame != null) return;
+    if (disposed) return;
+    invalidateThemeSample();
+    if (frame != null) return;
     const requestFrame = globalThis.requestAnimationFrame || ((callback) => setTimeout(callback, 0));
     frame = requestFrame(() => { frame = null; sync(); });
   };
@@ -8075,6 +8113,43 @@ export function resolveSourceModel(tableUid, { sessions = runtime.sessions, load
   const live = sessions?.get?.(uid)?.model;
   if (live) return live;
   return loadModel(uid) || null;
+}
+
+const BADGE_IDLE_TIMEOUT_MS = 1000;
+const badgeBatch = { sessions: new Set(), idleId: null, timerId: null, cancelIdle: null };
+
+/** Mount-time badge work (reference counts, comment threads) runs in idle time, and every session
+ *  that asks before the idle callback fires shares ONE reference-count query over the union of
+ *  their cell uids. A disposed session drops out of the batch. */
+export function enqueueBadgeRefresh(session) {
+  if (!session || session.disposed) return;
+  badgeBatch.sessions.add(session);
+  if (badgeBatch.idleId != null || badgeBatch.timerId != null) return;
+  const run = () => { badgeBatch.idleId = null; badgeBatch.timerId = null; badgeBatch.cancelIdle = null; flushBadgeBatch(); };
+  if (typeof globalThis.requestIdleCallback === "function") {
+    badgeBatch.idleId = globalThis.requestIdleCallback(run, { timeout: BADGE_IDLE_TIMEOUT_MS });
+    badgeBatch.cancelIdle = typeof globalThis.cancelIdleCallback === "function" ? globalThis.cancelIdleCallback : null;
+  } else badgeBatch.timerId = setTimeout(run, 0);
+}
+
+export function flushBadgeBatch() {
+  const sessions = [...badgeBatch.sessions].filter((session) => !session.disposed);
+  badgeBatch.sessions.clear();
+  if (!sessions.length) return;
+  const union = new Set();
+  for (const session of sessions) for (const row of session.model.rows) for (const cell of row) if (cell.uid) union.add(String(cell.uid));
+  let counts = null;
+  try { counts = queryBlockReferenceCounts([...union]); }
+  catch (error) { console.warn("[roam-grid] Could not refresh cell reference counts", error); }
+  const shared = { counts, threadsByPage: new Map() };
+  for (const session of sessions) session.refreshCellBadges(shared);
+}
+
+export function cancelBadgeBatch() {
+  if (badgeBatch.idleId != null && typeof badgeBatch.cancelIdle === "function") badgeBatch.cancelIdle(badgeBatch.idleId);
+  if (badgeBatch.timerId != null) clearTimeout(badgeBatch.timerId);
+  badgeBatch.idleId = null; badgeBatch.timerId = null; badgeBatch.cancelIdle = null;
+  badgeBatch.sessions.clear();
 }
 
 export function queryBlockReferenceCounts(uids, api = roam()) {
@@ -14732,21 +14807,64 @@ export function installPortalObservers({ MutationObserverClass = globalThis.Muta
   return disposePortalObservers;
 }
 
+function mountNativeSafely(nativeElement) {
+  let info = null;
+  try {
+    info = nativeTableInstanceInfo(nativeElement); if (!info || runtime.viewsByNative.get(nativeElement)?.root?.isConnected) return;
+    mountNativeInstance(nativeElement, info);
+  } catch (error) {
+    console.error("[roam-grid] Mount failed", info?.uid, error);
+    nativeElement.classList.remove("rg-native-hidden", "rg-native-pending");
+    nativeElement.parentElement?.querySelector?.(".rg-root")?.remove();
+    toast(`Roam Grid could not enhance ${info?.uid || "table"}: ${error.message}`, "danger", 10000);
+  }
+}
+
+const deferredMounts = { observer: null, callbacks: new WeakMap() };
+
+/** Hands a native table to a shared IntersectionObserver so it mounts only once it is within about
+ *  one viewport of the visible area; until then Roam's native table stays untouched. Returns true
+ *  when the mount was deferred (the caller must not mount now). An enhanced table stays enhanced:
+ *  the observation is dropped on first intersection. */
+export function deferOffscreenMount(nativeElement, mount, {
+  IntersectionObserverClass = globalThis.IntersectionObserver,
+  enabled = getSetting("performance-defer-offscreen") !== false,
+} = {}) {
+  if (!enabled || typeof IntersectionObserverClass !== "function" || !nativeElement) return false;
+  if (!deferredMounts.observer) {
+    deferredMounts.observer = new IntersectionObserverClass((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const callback = deferredMounts.callbacks.get(entry.target);
+        deferredMounts.observer?.unobserve(entry.target);
+        deferredMounts.callbacks.delete(entry.target);
+        if (callback && entry.target.isConnected !== false) callback(entry.target);
+      }
+    }, { rootMargin: "100% 0px" });
+  }
+  if (deferredMounts.callbacks.has(nativeElement)) return true;
+  deferredMounts.callbacks.set(nativeElement, mount);
+  deferredMounts.observer.observe(nativeElement);
+  return true;
+}
+
+export function disposeDeferredMounts() {
+  deferredMounts.observer?.disconnect?.();
+  deferredMounts.observer = null;
+  deferredMounts.callbacks = new WeakMap();
+}
+
 async function scanMounts() {
   if (!runtime.metadata) return;
   const roots = runtime.pendingScanRoots.size ? [...runtime.pendingScanRoots] : [document]; runtime.pendingScanRoots.clear();
   for (const root of roots) {
     for (const nativeElement of nativeTablesWithin(root)) {
-      let info = null;
-      try {
-        info = nativeTableInstanceInfo(nativeElement); if (!info || runtime.viewsByNative.get(nativeElement)?.root?.isConnected) continue;
-        mountNativeInstance(nativeElement, info);
-      } catch (error) {
-        console.error("[roam-grid] Mount failed", info?.uid, error);
-        nativeElement.classList.remove("rg-native-hidden", "rg-native-pending");
-        nativeElement.parentElement?.querySelector?.(".rg-root")?.remove();
-        toast(`Roam Grid could not enhance ${info?.uid || "table"}: ${error.message}`, "danger", 10000);
-      }
+      if (runtime.viewsByNative.get(nativeElement)?.root?.isConnected) continue;
+      let known = null;
+      try { known = nativeTableInstanceInfo(nativeElement); } catch { known = null; }
+      if (!known) continue;
+      if (deferOffscreenMount(nativeElement, mountNativeSafely)) continue;
+      mountNativeSafely(nativeElement);
     }
     claimRangeMounts(root);
   }
@@ -15004,7 +15122,7 @@ async function onunload() {
     runtime.guardLargeStyle?.remove(); runtime.guardLargeStyle = null;
   } finally {
     for (const dispose of runtime.disposers.splice(0)) { try { dispose(); } catch (error) { console.warn("[roam-grid] Disposer failed during unload", error); } }
-    cancelRecentsWarm();
+    cancelRecentsWarm(); cancelBadgeBatch(); disposeDeferredMounts(); invalidateThemeSample();
     // Session health is per load, never persisted: a reload must start from a clean slate instead of
     // carrying a graph's mount-failure or budget flags across the unload boundary.
     resetNativeEditorHealth();

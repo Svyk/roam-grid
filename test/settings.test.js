@@ -62,6 +62,7 @@ import {
  * derived from the schema the regression would be tautological — it must fail when a default moves.
  */
 const TODAYS_CONSTANTS = {
+  "performance-defer-offscreen": true,
   "writes-native-budget": 1200,
   "writes-content-debounce-ms": 220,
   "writes-large-debounce-ms": 500,
@@ -122,6 +123,7 @@ const TODAYS_CONSTANTS = {
  */
 const PENDING_KEYS = [
   "writes-native-budget",
+  "performance-defer-offscreen",
   "writes-content-debounce-ms",
   "writes-large-debounce-ms",
   "session-idle-ms",
