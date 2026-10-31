@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.18.7
+
+- **Agents can lay out a table without the browser.** An agent that writes through the Roam API (for example an MCP server) leaves a `roam-grid/layout-request::` block on `[[roam/grid/metadata]]` with merges, header rows, frozen rows, alignment, and widths by row and column index. Roam Grid applies it on load or as soon as it appears, enhancing a plain table first, then deletes it. A request that cannot apply becomes a `roam-grid/layout-request-error::` block with the reason. **Roam Grid: Apply pending layout requests** runs them by hand. In the browser the same thing is `roamGrid.v1.applyLayout` and the Extension Tool `rg_apply_layout`. See [docs/LIVE_AI.md](docs/LIVE_AI.md#layout-requests-agents-outside-the-browser).
+
 ## 0.18.6
 
 - **Faster pages with many tables.** Cell reference and comment badges load in idle time with one shared query for every table on screen, the theme is read once per frame instead of once per table, and tables far below the visible area keep Roam's own table until you scroll near them. Unfolding a block with ten tables spends about 0.05 s in Roam Grid instead of 1.2 s.
