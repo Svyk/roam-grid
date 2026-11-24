@@ -1,0 +1,16 @@
+ docs/ARCHITECTURE.md            |   32 +
+ docs/TESTING.md                 |  118 ++
+ extension.css                   |  162 ++-
+ extension.js                    | 2588 +++++++++++++++++++++++++++++++++------
+ src/extension.js                | 2588 +++++++++++++++++++++++++++++++++------
+ test/comments.test.js           |  525 ++++++++
+ test/editor-dom.test.js         |    7 +-
+ test/keyboard-ownership.test.js |  417 +++++++
+ test/large-grid-store.test.js   |   64 +-
+ test/lifecycle.test.js          |  262 ++++
+ test/mounting.test.js           |  145 ++-
+ test/persistence-lane.test.js   |  121 +-
+ test/range-reference.test.js    |  582 +++++++++
+ test/settings.test.js           |  815 ++++++++++++
+ test/undo-history.test.js       |  912 ++++++++++++++
+ 15 files changed, 8537 insertions(+), 801 deletions(-)
